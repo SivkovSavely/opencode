@@ -6,7 +6,6 @@ import { ServerConnection } from "@/runtime/server/registry"
 import type { WslServersPlatform } from "@/servers/wsl/types"
 import type { UpdaterPlatform } from "@/shell/updates/types"
 import type { DraftStore } from "@/runtime/persistence/drafts"
-import type { BrowserPanePlatform } from "./browser-pane"
 import type { DesktopExtension } from "@opencode/plugin/desktop/protocol"
 import type { Plugin } from "@opencode/plugin/desktop"
 
@@ -122,8 +121,6 @@ type PlatformBase = {
   /** Record a fatal renderer error in platform logs (desktop only) */
   recordFatalRendererError?(error: FatalRendererErrorLog): Promise<void>
 
-  /** Native browser pane hosted by the platform (desktop only). */
-  browserPane?: BrowserPanePlatform
   extensions?: DesktopExtension.Transport
   extensionPlugins?: readonly Plugin.Definition[]
 }

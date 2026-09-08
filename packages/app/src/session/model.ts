@@ -7,7 +7,6 @@ import { useData } from "@/runtime/server/current"
 import { same } from "@/runtime/persistence/equality"
 import { containsDirectory, isProjectDirectory, isWorkspaceDirectory } from "@/workspaces/paths"
 import { projectForSession } from "@/shell/layout/helpers"
-import { useBrowserAttachments } from "./browser/attachments"
 import { createSessionTabs } from "./helpers"
 import {
   normalizeSessionTab,
@@ -30,7 +29,6 @@ export function useSessionModel() {
   const data = useData()
   const server = useServer()
   const shellTabs = useTabs()
-  const attachments = useBrowserAttachments()
   const extensions = useOptionalDesktopExtensions()
   const layout = useSessionLayout()
   const location = useWorkspaceLocation()
@@ -90,11 +88,6 @@ export function useSessionModel() {
         .filter((panel) => panel.session.sessionID === sessionID() && panel.session.server.id === server.key)
         .map((panel) => panel.key) ?? [],
     fileBrowser: () => isDesktop() && !!sessionID(),
-    // Same flag the side panel uses, so keyboard tab commands see the browser tab the panel shows.
-    browser: () => {
-      const id = sessionID()
-      return !!id && attachments.state(server, id)?.registration !== undefined
-    },
   })
 
   return {
