@@ -18,12 +18,16 @@ const providerID = ProviderV2.ID.make("test")
 const retryProvider = "test"
 const it = testEffect(LayerNode.compile(LayerNode.group([SessionStatus.node, CrossSpawnSpawner.node])))
 
-function apiError(headers?: Record<string, string>): SessionV1.APIError {
+function apiError(
+  headers?: Record<string, string>,
+  options: { statusCode?: number; isRetryable?: boolean; responseBody?: string } = {},
+): SessionV1.APIError {
   return Schema.decodeUnknownSync(SessionV1.APIError.Schema)(
     new SessionV1.APIError({
       message: "boom",
-      isRetryable: true,
+      isRetryable: options.isRetryable ?? true,
       responseHeaders: headers,
+      ...options,
     }).toObject(),
   )
 }
@@ -94,6 +98,129 @@ describe("session.retry.delay", () => {
     expect(SessionRetry.delay(1, error)).toBe(SessionRetry.RETRY_MAX_DELAY)
   })
 
+  test("uses Codex usage reset metadata with a safety second", () => {
+    const error = apiError(undefined, {
+      statusCode: 429,
+      isRetryable: false,
+      responseBody: JSON.stringify({ error: { type: "usage_limit_reached", resets_in_seconds: 1436 } }),
+    })
+    expect(SessionRetry.delay(1, error)).toBe(1_437_000)
+  })
+
+  test.each([
+    ["primary", 1437],
+    ["secondary", 1438],
+  ])("honors an exhausted Codex %s bucket", (bucket, reset) => {
+    const error = apiError(
+      {
+        [`x-codex-${bucket}-used-percent`]: "100",
+        [`x-codex-${bucket}-reset-after-seconds`]: String(reset),
+      },
+      {
+        statusCode: 429,
+        isRetryable: false,
+        responseBody: JSON.stringify({ error: { type: "usage_limit_reached" } }),
+      },
+    )
+    expect(SessionRetry.delay(1, error)).toBe((reset + 1) * 1000)
+  })
+
+  test("waits for the later reset when both Codex buckets are exhausted", () => {
+    const error = apiError(
+      {
+        "x-codex-primary-used-percent": "100",
+        "x-codex-primary-reset-after-seconds": "1437",
+        "x-codex-secondary-used-percent": "100",
+        "x-codex-secondary-reset-after-seconds": "604800",
+      },
+      {
+        statusCode: 429,
+        isRetryable: false,
+        responseBody: JSON.stringify({ error: { type: "usage_limit_reached", resets_in_seconds: 1436 } }),
+      },
+    )
+    expect(SessionRetry.delay(1, error)).toBe(604_801_000)
+  })
+
+  test("ignores a longer Codex bucket that is not exhausted", () => {
+    const error = apiError(
+      {
+        "x-codex-primary-used-percent": "100",
+        "x-codex-primary-reset-after-seconds": "1437",
+        "x-codex-secondary-used-percent": "80",
+        "x-codex-secondary-reset-after-seconds": "604800",
+      },
+      {
+        statusCode: 429,
+        isRetryable: false,
+        responseBody: JSON.stringify({ error: { type: "usage_limit_reached", resets_in_seconds: 1436 } }),
+      },
+    )
+    expect(SessionRetry.delay(1, error)).toBe(1438_000)
+  })
+
+  test("does not use Codex reset headers on non-429 responses", () => {
+    const error = apiError(
+      {
+        "x-codex-primary-used-percent": "100",
+        "x-codex-primary-reset-after-seconds": "604800",
+      },
+      {
+        statusCode: 500,
+        responseBody: JSON.stringify({ error: { type: "usage_limit_reached", resets_in_seconds: 604800 } }),
+      },
+    )
+    expect(SessionRetry.delay(10, error, 0)).toBe(30_000)
+  })
+
+  test("does not use Codex reset headers when no bucket is exhausted", () => {
+    const error = apiError(
+      {
+        "x-codex-primary-used-percent": "80",
+        "x-codex-primary-reset-after-seconds": "1437",
+        "x-codex-secondary-used-percent": "60",
+        "x-codex-secondary-reset-after-seconds": "604800",
+      },
+      { statusCode: 429, isRetryable: false, responseBody: JSON.stringify({ error: { type: "other" } }) },
+    )
+    expect(SessionRetry.delay(10, error, 0)).toBe(30_000)
+  })
+
+  test("chooses the larger body and exhausted-bucket reset", () => {
+    const error = apiError(
+      {
+        "x-codex-primary-used-percent": "100",
+        "x-codex-primary-reset-after-seconds": "1437",
+      },
+      {
+        statusCode: 429,
+        isRetryable: false,
+        responseBody: JSON.stringify({ error: { type: "usage_limit_reached", resets_in_seconds: 1436 } }),
+      },
+    )
+    expect(SessionRetry.delay(1, error)).toBe(1438_000)
+  })
+
+  test.each(["bad", "NaN", "-1", "Infinity"])("ignores malformed Codex reset value %s", (reset) => {
+    const error = apiError(
+      {
+        "x-codex-primary-used-percent": "100",
+        "x-codex-primary-reset-after-seconds": reset,
+      },
+      {
+        statusCode: 429,
+        isRetryable: false,
+        responseBody: JSON.stringify({ error: { type: "usage_limit_reached", resets_in_seconds: reset } }),
+      },
+    )
+    expect(SessionRetry.delay(10, error, 0)).toBe(30_000)
+  })
+
+  test("keeps fallback backoff capped when unrelated headers are present", () => {
+    const error = apiError({ "content-type": "application/json" }, { statusCode: 429, isRetryable: false })
+    expect(SessionRetry.delay(20, error, 0)).toBe(SessionRetry.RETRY_MAX_DELAY_NO_HEADERS)
+  })
+
   it.instance("policy updates retry status and increments attempts", () =>
     Effect.gen(function* () {
       const sessionID = SessionID.make("session-retry-test")
@@ -124,10 +251,10 @@ describe("session.retry.delay", () => {
     }),
   )
 
-  it.instance("policy stops after five retries", () =>
+  it.instance("policy stops ordinary retryable errors after five retries", () =>
     Effect.gen(function* () {
       const attempts: number[] = []
-      const error = apiError({ "retry-after-ms": "0" })
+      const error = apiError({ "retry-after-ms": "0" }, { statusCode: 500 })
       const step = yield* Schedule.toStepWithMetadata(
         SessionRetry.policy({
           provider: "test",
@@ -144,6 +271,24 @@ describe("session.retry.delay", () => {
       )
 
       expect(attempts).toStrictEqual([1, 2, 3, 4, 5])
+    }),
+  )
+
+  it.instance("policy keeps retrying 429 errors beyond the normal retry limit", () =>
+    Effect.gen(function* () {
+      const attempts: number[] = []
+      const error = apiError({ "retry-after-ms": "0" }, { statusCode: 429, isRetryable: false })
+      const step = yield* Schedule.toStepWithMetadata(
+        SessionRetry.policy({
+          provider: "test",
+          parse: Schema.decodeUnknownSync(SessionV1.APIError.Schema),
+          set: (info) => Effect.sync(() => attempts.push(info.attempt)),
+        }),
+      )
+
+      yield* Effect.forEach(Array.from({ length: 8 }), () => Effect.ignore(step(error)))
+
+      expect(attempts).toStrictEqual([1, 2, 3, 4, 5, 6, 7, 8])
     }),
   )
 })
@@ -283,6 +428,11 @@ describe("session.retry.retryable", () => {
     )
 
     expect(SessionRetry.retryable(error, retryProvider)).toEqual({ message: "Internal server error" })
+  })
+
+  test("retries 429 errors even when isRetryable is false", () => {
+    const error = apiError(undefined, { statusCode: 429, isRetryable: false })
+    expect(SessionRetry.retryable(error, retryProvider)).toEqual({ message: "boom" })
   })
 
   test("retries 502 bad gateway errors", () => {

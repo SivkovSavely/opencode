@@ -46,35 +46,62 @@ function cap(ms: number) {
 
 export function delay(attempt: number, error?: SessionV1.APIError, random = Math.random()) {
   if (error) {
-    const headers = error.data.responseHeaders
-    if (headers) {
-      const retryAfterMs = headers["retry-after-ms"]
-      if (retryAfterMs) {
-        const parsedMs = Number.parseFloat(retryAfterMs)
-        if (!Number.isNaN(parsedMs)) {
-          return cap(parsedMs)
-        }
-      }
+    const quotaReset = codexQuotaReset(error)
+    if (quotaReset !== undefined) return cap(Math.ceil((quotaReset + 1) * 1000))
 
-      const retryAfter = headers["retry-after"]
-      if (retryAfter) {
-        const parsedSeconds = Number.parseFloat(retryAfter)
-        if (!Number.isNaN(parsedSeconds)) {
-          // convert seconds to milliseconds
-          return cap(Math.ceil(parsedSeconds * 1000))
-        }
-        // Try parsing as HTTP date format
-        const parsed = Date.parse(retryAfter) - Date.now()
-        if (!Number.isNaN(parsed) && parsed > 0) {
-          return cap(Math.ceil(parsed))
-        }
-      }
+    const retryAfterMs = getHeader(error.data.responseHeaders, "retry-after-ms")
+    const parsedMs = retryAfterMs === undefined ? undefined : nonNegative(retryAfterMs)
+    if (parsedMs !== undefined) return cap(parsedMs)
 
-      return cap(exponential(attempt, random))
+    const retryAfter = getHeader(error.data.responseHeaders, "retry-after")
+    if (retryAfter !== undefined) {
+      const parsedSeconds = nonNegative(retryAfter)
+      if (parsedSeconds !== undefined) {
+        // convert seconds to milliseconds
+        return cap(Math.ceil(parsedSeconds * 1000))
+      }
+      // Try parsing as HTTP date format
+      const parsed = Date.parse(retryAfter) - Date.now()
+      if (Number.isFinite(parsed) && parsed > 0) {
+        return cap(Math.ceil(parsed))
+      }
     }
   }
 
   return cap(Math.min(exponential(attempt, random), RETRY_MAX_DELAY_NO_HEADERS))
+}
+
+function codexQuotaReset(error: SessionV1.APIError) {
+  if (error.data.statusCode !== 429) return undefined
+  const body = parseJSON(error.data.responseBody)
+  if (!isRecord(body) || !isRecord(body.error) || body.error.type !== "usage_limit_reached") return undefined
+
+  const values = [nonNegative(body.error.resets_in_seconds)]
+  for (const bucket of ["primary", "secondary"]) {
+    const used = nonNegative(getHeader(error.data.responseHeaders, `x-codex-${bucket}-used-percent`))
+    if (used === undefined || used < 100) continue
+    const reset = nonNegative(getHeader(error.data.responseHeaders, `x-codex-${bucket}-reset-after-seconds`))
+    if (reset !== undefined) values.push(reset)
+  }
+
+  const valid = values.filter((value): value is number => value !== undefined)
+  return valid.length > 0 ? Math.max(...valid) : undefined
+}
+
+function getHeader(headers: Record<string, string> | undefined, name: string) {
+  if (!headers) return undefined
+  const normalized = name.toLowerCase()
+  const direct = headers[normalized]
+  if (direct !== undefined) return direct
+  const key = Object.keys(headers).find((value) => value.toLowerCase() === normalized)
+  return key === undefined ? undefined : headers[key]
+}
+
+function nonNegative(value: unknown) {
+  if (value === undefined || value === null || (typeof value === "string" && value.trim() === "")) return undefined
+  if (typeof value !== "number" && typeof value !== "string") return undefined
+  const parsed = Number(value)
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : undefined
 }
 
 function exponential(attempt: number, random: number) {
@@ -87,10 +114,12 @@ export function retryable(error: Err, provider: string) {
   if (SessionV1.ContextOverflowError.isInstance(error)) return undefined
   if (SessionV1.APIError.isInstance(error)) {
     const status = error.data.statusCode
+    const isRateLimit = status === 429
     // 5xx errors are transient server failures and should always be retried,
     // even when the provider SDK doesn't explicitly mark them as retryable.
     if (
       !error.data.isRetryable &&
+      !isRateLimit &&
       !(status !== undefined && status >= 500) &&
       !matchesRetryableMessage(error.data.message) &&
       !matchesRetryableMessage(error.data.responseBody)
@@ -190,7 +219,8 @@ export function policy(opts: {
       const error = opts.parse(meta.input)
       const retry = retryable(error, opts.provider)
       if (!retry) return Cause.done(meta.attempt)
-      if (meta.attempt > RETRY_MAX_RETRIES) return Cause.done(meta.attempt)
+      const isRateLimit = SessionV1.APIError.isInstance(error) && error.data.statusCode === 429
+      if (!isRateLimit && meta.attempt > RETRY_MAX_RETRIES) return Cause.done(meta.attempt)
       return Effect.gen(function* () {
         const wait = delay(meta.attempt, SessionV1.APIError.isInstance(error) ? error : undefined)
         const now = yield* Clock.currentTimeMillis
