@@ -7389,6 +7389,105 @@ export type GlobalUpgradeResponses = {
 
 export type GlobalUpgradeResponse = GlobalUpgradeResponses[keyof GlobalUpgradeResponses]
 
+export type GlobalRuntimeData = {
+  body?: never
+  path?: never
+  query?: never
+  url: "/global/runtime"
+}
+
+export type GlobalRuntimeErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+}
+
+export type GlobalRuntimeError = GlobalRuntimeErrors[keyof GlobalRuntimeErrors]
+
+export type GlobalRuntimeResponses = {
+  /**
+   * Runtime lifecycle status
+   */
+  200: {
+    state: "running" | "draining" | "quiescent" | "stopping"
+    action?: "restart" | "shutdown"
+    active: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    parked: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    restartSupported: boolean
+    lineage: string
+    instance: string
+  }
+}
+
+export type GlobalRuntimeResponse = GlobalRuntimeResponses[keyof GlobalRuntimeResponses]
+
+export type GlobalRuntimeRestartData = {
+  body?: never
+  path?: never
+  query?: never
+  url: "/global/runtime/restart"
+}
+
+export type GlobalRuntimeRestartErrors = {
+  /**
+   * BadRequest | InvalidRequestError
+   */
+  400: EffectHttpApiErrorBadRequest | InvalidRequestError
+}
+
+export type GlobalRuntimeRestartError = GlobalRuntimeRestartErrors[keyof GlobalRuntimeRestartErrors]
+
+export type GlobalRuntimeRestartResponses = {
+  /**
+   * Restart request accepted
+   */
+  200: {
+    state: "running" | "draining" | "quiescent" | "stopping"
+    action?: "restart" | "shutdown"
+    active: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    parked: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    restartSupported: boolean
+    lineage: string
+    instance: string
+  }
+}
+
+export type GlobalRuntimeRestartResponse = GlobalRuntimeRestartResponses[keyof GlobalRuntimeRestartResponses]
+
+export type GlobalRuntimeShutdownData = {
+  body?: never
+  path?: never
+  query?: never
+  url: "/global/runtime/shutdown"
+}
+
+export type GlobalRuntimeShutdownErrors = {
+  /**
+   * BadRequest | InvalidRequestError
+   */
+  400: EffectHttpApiErrorBadRequest | InvalidRequestError
+}
+
+export type GlobalRuntimeShutdownError = GlobalRuntimeShutdownErrors[keyof GlobalRuntimeShutdownErrors]
+
+export type GlobalRuntimeShutdownResponses = {
+  /**
+   * Shutdown request accepted
+   */
+  200: {
+    state: "running" | "draining" | "quiescent" | "stopping"
+    action?: "restart" | "shutdown"
+    active: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    parked: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    restartSupported: boolean
+    lineage: string
+    instance: string
+  }
+}
+
+export type GlobalRuntimeShutdownResponse = GlobalRuntimeShutdownResponses[keyof GlobalRuntimeShutdownResponses]
+
 export type EventSubscribeData = {
   body?: never
   path?: never

@@ -86,6 +86,12 @@ import type {
   GlobalEventResponses,
   GlobalHealthErrors,
   GlobalHealthResponses,
+  GlobalRuntimeErrors,
+  GlobalRuntimeResponses,
+  GlobalRuntimeRestartErrors,
+  GlobalRuntimeRestartResponses,
+  GlobalRuntimeShutdownErrors,
+  GlobalRuntimeShutdownResponses,
   GlobalUpgradeErrors,
   GlobalUpgradeResponses,
   InstanceDisposeErrors,
@@ -1315,6 +1321,34 @@ export class Config extends HeyApiClient {
   }
 }
 
+export class Runtime extends HeyApiClient {
+  /**
+   * Restart server when safe
+   *
+   * Stop admitting work, park active sessions, and restart this runtime when quiescent.
+   */
+  public restart<ThrowOnError extends boolean = false>(options?: Options<never, ThrowOnError>) {
+    return (options?.client ?? this.client).post<
+      GlobalRuntimeRestartResponses,
+      GlobalRuntimeRestartErrors,
+      ThrowOnError
+    >({ url: "/global/runtime/restart", ...options })
+  }
+
+  /**
+   * Shut down server when safe
+   *
+   * Stop admitting work, park active sessions, and shut down this runtime when quiescent.
+   */
+  public shutdown<ThrowOnError extends boolean = false>(options?: Options<never, ThrowOnError>) {
+    return (options?.client ?? this.client).post<
+      GlobalRuntimeShutdownResponses,
+      GlobalRuntimeShutdownErrors,
+      ThrowOnError
+    >({ url: "/global/runtime/shutdown", ...options })
+  }
+}
+
 export class Global extends HeyApiClient {
   /**
    * Get health
@@ -1376,9 +1410,26 @@ export class Global extends HeyApiClient {
     })
   }
 
+  /**
+   * Get runtime lifecycle status
+   *
+   * Get the lifecycle state of this OpenCode runtime.
+   */
+  public runtime<ThrowOnError extends boolean = false>(options?: Options<never, ThrowOnError>) {
+    return (options?.client ?? this.client).get<GlobalRuntimeResponses, GlobalRuntimeErrors, ThrowOnError>({
+      url: "/global/runtime",
+      ...options,
+    })
+  }
+
   private _config?: Config
   get config(): Config {
     return (this._config ??= new Config({ client: this.client }))
+  }
+
+  private _runtime?: Runtime
+  get runtime2(): Runtime {
+    return (this._runtime ??= new Runtime({ client: this.client }))
   }
 }
 

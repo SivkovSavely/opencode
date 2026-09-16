@@ -770,6 +770,56 @@ function App(props: { onSnapshot?: () => Promise<string[]>; pluginHost: TuiPlugi
         category: "System",
       },
       {
+        name: "runtime.restart",
+        title: "Restart server when safe",
+        slashName: "restart-server",
+        category: "System",
+        run: async () => {
+          const status = await sdk.client.global.runtime()
+          if (status.data?.lineage === "unavailable" || status.data?.restartSupported === false) {
+            toast.show({ message: "This server does not support restart.", variant: "warning" })
+            return
+          }
+          const confirmed = await DialogConfirm.show(
+            dialog,
+            "Restart OpenCode server?",
+            `Server: ${sdk.url}\n\nActive sessions will finish their current safe work, park, and resume after the server restarts.`,
+            "Restart when safe",
+          )
+          if (!confirmed) return
+          await sdk.client.global.runtime2.restart()
+          toast.show({
+            message: "Server restart requested; waiting for active sessions to reach safe checkpoints.",
+            variant: "info",
+          })
+        },
+      },
+      {
+        name: "runtime.shutdown",
+        title: "Shut down server when safe",
+        slashName: "shutdown-server",
+        category: "System",
+        run: async () => {
+          const status = await sdk.client.global.runtime()
+          if (status.data?.lineage === "unavailable") {
+            toast.show({ message: "This server does not support shutdown.", variant: "warning" })
+            return
+          }
+          const confirmed = await DialogConfirm.show(
+            dialog,
+            "Shut down OpenCode server?",
+            `Server: ${sdk.url}\n\nActive sessions will finish their current safe work and park before the server shuts down.`,
+            "Shut down when safe",
+          )
+          if (!confirmed) return
+          await sdk.client.global.runtime2.shutdown()
+          toast.show({
+            message: "Server shutdown requested; waiting for active sessions to reach safe checkpoints.",
+            variant: "info",
+          })
+        },
+      },
+      {
         name: "opencode.debug",
         title: "View debug info",
         slashName: "debug",

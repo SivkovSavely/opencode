@@ -14,6 +14,16 @@ const GlobalHealth = Schema.Struct({
   version: Schema.String,
 })
 
+export const RuntimeStatus = Schema.Struct({
+  state: Schema.Literals(["running", "draining", "quiescent", "stopping"]),
+  action: Schema.optional(Schema.Literals(["restart", "shutdown"])),
+  active: Schema.Number,
+  parked: Schema.Number,
+  restartSupported: Schema.Boolean,
+  lineage: Schema.String,
+  instance: Schema.String,
+})
+
 const SyncEventSchemas = EventManifest.Latest.values()
   .flatMap((definition) => {
     if (!definition.durable) return []
@@ -71,6 +81,9 @@ export const GlobalPaths = {
   config: "/global/config",
   dispose: "/global/dispose",
   upgrade: "/global/upgrade",
+  runtime: "/global/runtime",
+  runtimeRestart: "/global/runtime/restart",
+  runtimeShutdown: "/global/runtime/shutdown",
 } as const
 
 export const GlobalApi = HttpApi.make("global").add(
@@ -132,6 +145,35 @@ export const GlobalApi = HttpApi.make("global").add(
           identifier: "global.upgrade",
           summary: "Upgrade opencode",
           description: "Upgrade opencode to the specified version.",
+        }),
+      ),
+      HttpApiEndpoint.get("runtime", GlobalPaths.runtime, {
+        success: described(RuntimeStatus, "Runtime lifecycle status"),
+      }).annotateMerge(
+        OpenApi.annotations({
+          identifier: "global.runtime",
+          summary: "Get runtime lifecycle status",
+          description: "Get the lifecycle state of this OpenCode runtime.",
+        }),
+      ),
+      HttpApiEndpoint.post("runtimeRestart", GlobalPaths.runtimeRestart, {
+        success: described(RuntimeStatus, "Restart request accepted"),
+        error: HttpApiError.BadRequest,
+      }).annotateMerge(
+        OpenApi.annotations({
+          identifier: "global.runtime.restart",
+          summary: "Restart server when safe",
+          description: "Stop admitting work, park active sessions, and restart this runtime when quiescent.",
+        }),
+      ),
+      HttpApiEndpoint.post("runtimeShutdown", GlobalPaths.runtimeShutdown, {
+        success: described(RuntimeStatus, "Shutdown request accepted"),
+        error: HttpApiError.BadRequest,
+      }).annotateMerge(
+        OpenApi.annotations({
+          identifier: "global.runtime.shutdown",
+          summary: "Shut down server when safe",
+          description: "Stop admitting work, park active sessions, and shut down this runtime when quiescent.",
         }),
       ),
     )

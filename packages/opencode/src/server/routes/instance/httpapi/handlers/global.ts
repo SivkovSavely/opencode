@@ -6,13 +6,15 @@ import { EventDiagnostics, type SubscriberHandle } from "@opencode-ai/core/event
 import { Installation } from "@/installation"
 import { disposeAllInstancesAndEmitGlobalDisposed } from "@/server/global-lifecycle"
 import { InstallationVersion } from "@opencode-ai/core/installation/version"
-import { Effect, Queue } from "effect"
+import { Effect, Option, Queue } from "effect"
 import * as Stream from "effect/Stream"
 import { HttpServerResponse } from "effect/unstable/http"
 import { HttpApiBuilder } from "effect/unstable/httpapi"
 import * as Sse from "effect/unstable/encoding/Sse"
 import { RootHttpApi } from "../api"
 import { GlobalUpgradeInput } from "../groups/global"
+import { RuntimeLifecycle } from "@/server/runtime-lifecycle"
+import { HttpApiError } from "effect/unstable/httpapi"
 
 function globalEventType(data: unknown) {
   if (!data || typeof data !== "object" || !("payload" in data)) return "unknown"
@@ -87,6 +89,10 @@ export const globalHandlers = HttpApiBuilder.group(RootHttpApi, "global", (handl
     const config = yield* Config.Service
     const installation = yield* Installation.Service
     const bridge = yield* EffectBridge.make()
+    const runtime = Option.getOrElse(
+      yield* Effect.serviceOption(RuntimeLifecycle.Service),
+      () => RuntimeLifecycle.current() ?? RuntimeLifecycle.unavailable(),
+    )
 
     const health = Effect.fn("GlobalHttpApi.health")(function* () {
       return { healthy: true as const, version: InstallationVersion }
@@ -140,6 +146,17 @@ export const globalHandlers = HttpApiBuilder.group(RootHttpApi, "global", (handl
       return HttpServerResponse.jsonUnsafe(result)
     })
 
+    const runtimeStatus = Effect.fn("GlobalHttpApi.runtimeStatus")(function* () {
+      return yield* runtime.status()
+    })
+
+    const runtimeRequest = Effect.fn("GlobalHttpApi.runtimeRequest")(function* (action: "restart" | "shutdown") {
+      if (action === "restart" && !runtime.identity.restartSupported) {
+        return yield* new HttpApiError.BadRequest({})
+      }
+      return yield* runtime.request(action)
+    })
+
     return handlers
       .handle("health", health)
       .handleRaw("event", event)
@@ -147,5 +164,8 @@ export const globalHandlers = HttpApiBuilder.group(RootHttpApi, "global", (handl
       .handle("configUpdate", configUpdate)
       .handle("dispose", dispose)
       .handle("upgrade", upgrade)
+      .handle("runtime", runtimeStatus)
+      .handle("runtimeRestart", () => runtimeRequest("restart"))
+      .handle("runtimeShutdown", () => runtimeRequest("shutdown"))
   }),
 )

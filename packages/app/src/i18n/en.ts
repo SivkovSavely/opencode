@@ -19,7 +19,22 @@ export const dict = {
   "command.category.permissions": "Permissions",
   "command.category.workspace": "Workspace",
   "command.category.settings": "Settings",
+  "command.category.system": "System",
   "command.logs.export": "Export logs",
+  "command.runtime.restart": "Restart server when safe",
+  "command.runtime.shutdown": "Shut down server when safe",
+  "dialog.runtime.restart.title": "Restart OpenCode server?",
+  "dialog.runtime.shutdown.title": "Shut down OpenCode server?",
+  "dialog.runtime.restart.message":
+    "Server: {{server}}\n\nActive sessions will finish their current safe work, park, and resume after the server restarts.",
+  "dialog.runtime.shutdown.message":
+    "Server: {{server}}\n\nActive sessions will finish their current safe work and park before the server shuts down.",
+  "dialog.runtime.restart.confirm": "Restart when safe",
+  "dialog.runtime.shutdown.confirm": "Shut down when safe",
+  "dialog.runtime.accepted.restart": "Server restart requested; waiting for active sessions to reach safe checkpoints.",
+  "dialog.runtime.accepted.shutdown":
+    "Server shutdown requested; waiting for active sessions to reach safe checkpoints.",
+  "dialog.runtime.unsupported": "This server does not support the requested runtime action.",
 
   "theme.scheme.system": "System",
   "theme.scheme.light": "Light",
