@@ -2,6 +2,7 @@ import { Config } from "@/config/config"
 import { GlobalBus, type GlobalEvent as GlobalBusEvent } from "@/bus/global"
 import { EffectBridge } from "@/effect/bridge"
 import { EventV2 } from "@opencode-ai/core/event"
+import { EventDiagnostics, type SubscriberHandle } from "@opencode-ai/core/event-diagnostics"
 import { Installation } from "@/installation"
 import { disposeAllInstancesAndEmitGlobalDisposed } from "@/server/global-lifecycle"
 import { InstallationVersion } from "@opencode-ai/core/installation/version"
@@ -13,25 +14,49 @@ import * as Sse from "effect/unstable/encoding/Sse"
 import { RootHttpApi } from "../api"
 import { GlobalUpgradeInput } from "../groups/global"
 
-function eventData(data: unknown): Sse.Event {
+function globalEventType(data: unknown) {
+  if (!data || typeof data !== "object" || !("payload" in data)) return "unknown"
+  const payload = data.payload
+  if (!payload || typeof payload !== "object" || !("type" in payload) || typeof payload.type !== "string")
+    return "unknown"
+  return payload.type
+}
+
+function eventData(data: unknown, subscriberID: SubscriberHandle | undefined): Sse.Event {
+  const serialized = JSON.stringify(data)
+  if (EventDiagnostics.enabled) {
+    EventDiagnostics.serialized(subscriberID, globalEventType(data), serialized.length, Buffer.byteLength(serialized))
+  }
   return {
     _tag: "Event",
     event: "message",
     id: undefined,
-    data: JSON.stringify(data),
+    data: serialized,
   }
 }
 
 function eventResponse() {
   return Effect.gen(function* () {
     yield* Effect.logInfo("global event connected")
+    let subscriberID: Parameters<typeof EventDiagnostics.serialized>[0]
     const events = Stream.callback<GlobalBusEvent>((queue) => {
-      const handler = (event: GlobalBusEvent) => Queue.offerUnsafe(queue, event)
       return Effect.acquireRelease(
-        Effect.sync(() => GlobalBus.on("event", handler)),
-        () => Effect.sync(() => GlobalBus.off("event", handler)),
+        Effect.sync(() => {
+          subscriberID = EventDiagnostics.connectSubscriber({ transport: "global-event" })
+          const handler = (event: GlobalBusEvent) => {
+            EventDiagnostics.queueOffer(subscriberID, globalEventType(event))
+            Queue.offerUnsafe(queue, event)
+          }
+          GlobalBus.on("event", handler)
+          return { handler }
+        }),
+        ({ handler }) =>
+          Effect.sync(() => {
+            GlobalBus.off("event", handler)
+            EventDiagnostics.disconnectSubscriber(subscriberID)
+          }),
       )
-    })
+    }).pipe(Stream.map((event) => (EventDiagnostics.queueDrain(subscriberID, globalEventType(event)), event)))
     const heartbeat = Stream.tick("10 seconds").pipe(
       Stream.drop(1),
       Stream.map(() => ({ payload: { id: EventV2.ID.create(), type: "server.heartbeat", properties: {} } })),
@@ -40,7 +65,7 @@ function eventResponse() {
     return HttpServerResponse.stream(
       Stream.make({ payload: { id: EventV2.ID.create(), type: "server.connected", properties: {} } }).pipe(
         Stream.concat(events.pipe(Stream.merge(heartbeat, { haltStrategy: "left" }))),
-        Stream.map(eventData),
+        Stream.map((event) => eventData(event, subscriberID)),
         Stream.pipeThroughChannel(Sse.encode()),
         Stream.encodeText,
         Stream.ensuring(Effect.logInfo("global event disconnected")),

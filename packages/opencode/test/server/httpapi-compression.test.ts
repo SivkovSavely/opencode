@@ -1,5 +1,7 @@
 import { afterEach, describe, expect, test } from "bun:test"
 import { gunzipSync, inflateSync } from "node:zlib"
+import { GlobalBus } from "../../src/bus/global"
+import { EventDiagnostics } from "@opencode-ai/core/event-diagnostics"
 import { Server } from "../../src/server/server"
 import { resetDatabase } from "../fixture/db"
 import { disposeAllInstances, tmpdir } from "../fixture/fixture"
@@ -135,17 +137,36 @@ describe("HttpApi compression", () => {
 
     test("/global/event SSE is not compressed", async () => {
       const controller = new AbortController()
+      const listenersBefore = GlobalBus.listenerCount("event")
+      const subscribersBefore = EventDiagnostics.activeSubscriberCount()
       const response = await app().request("/global/event", {
         headers: { "accept-encoding": "gzip" },
         signal: controller.signal,
       })
+      const reader = response.body?.getReader()
       try {
         expect(response.status).toBe(200)
         expect(response.headers.get("content-encoding")).toBeNull()
+        if (!reader) throw new Error("missing response body")
+        const connected = await reader.read()
+        expect(new TextDecoder().decode(connected.value)).toContain("server.connected")
+        expect(GlobalBus.listenerCount("event")).toBe(listenersBefore)
+        expect(EventDiagnostics.activeSubscriberCount()).toBe(subscribersBefore)
+
+        const event = reader.read()
+        for (let attempt = 0; attempt < 100 && GlobalBus.listenerCount("event") === listenersBefore; attempt++) {
+          await new Promise<void>((resolve) => setImmediate(resolve))
+        }
+        expect(GlobalBus.listenerCount("event")).toBe(listenersBefore + 1)
+        expect(EventDiagnostics.activeSubscriberCount()).toBe(subscribersBefore + (EventDiagnostics.enabled ? 1 : 0))
+        GlobalBus.emit("event", { directory: "global", payload: { type: "test.event", properties: {} } })
+        expect(new TextDecoder().decode((await event).value)).toContain("test.event")
       } finally {
         controller.abort()
-        await response.body?.cancel().catch(() => {})
+        await reader?.cancel().catch(() => {})
       }
+      expect(GlobalBus.listenerCount("event")).toBe(listenersBefore)
+      expect(EventDiagnostics.activeSubscriberCount()).toBe(subscribersBefore)
     })
   })
 })

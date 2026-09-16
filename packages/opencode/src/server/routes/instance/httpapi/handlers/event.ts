@@ -2,6 +2,7 @@ import { EventV2Bridge } from "@/event-v2-bridge"
 import { InstanceState } from "@/effect/instance-state"
 import { GlobalBus } from "@/bus/global"
 import { EventV2 } from "@opencode-ai/core/event"
+import { EventDiagnostics, type SubscriberHandle } from "@opencode-ai/core/event-diagnostics"
 import { Effect, Queue } from "effect"
 import * as Stream from "effect/Stream"
 import { HttpServerResponse } from "effect/unstable/http"
@@ -9,12 +10,16 @@ import { HttpApiBuilder } from "effect/unstable/httpapi"
 import * as Sse from "effect/unstable/encoding/Sse"
 import { EventApi } from "../groups/event"
 
-function eventData(data: unknown): Sse.Event {
+function eventData(data: { type: string }, subscriberID: SubscriberHandle | undefined): Sse.Event {
+  const serialized = JSON.stringify(data)
+  if (EventDiagnostics.enabled) {
+    EventDiagnostics.serialized(subscriberID, data.type, serialized.length, Buffer.byteLength(serialized))
+  }
   return {
     _tag: "Event",
     event: "message",
     id: undefined,
-    data: JSON.stringify(data),
+    data: serialized,
   }
 }
 
@@ -29,9 +34,21 @@ function eventResponse(events: EventV2.Interface) {
     // Listener registration is eager, so events published after this point cannot
     // be lost while the HTTP body fiber is starting or emitting server.connected.
     const queue = yield* Queue.unbounded<EventV2.Payload>()
-    const unsubscribe = yield* events.listen((event) => Effect.sync(() => Queue.offerUnsafe(queue, event)))
+    const subscriberID = EventDiagnostics.connectSubscriber({
+      transport: "event",
+      directory: instance.directory,
+      workspaceID,
+    })
+    yield* Effect.addFinalizer(() => Effect.sync(() => EventDiagnostics.disconnectSubscriber(subscriberID)))
+    const unsubscribe = yield* events.listen((event) =>
+      Effect.sync(() => {
+        EventDiagnostics.queueOffer(subscriberID, event.type)
+        Queue.offerUnsafe(queue, event)
+      }),
+    )
     yield* Effect.addFinalizer(() => unsubscribe)
     const stream = Stream.fromQueue(queue).pipe(
+      Stream.map((event) => (EventDiagnostics.queueDrain(subscriberID, event.type), event)),
       Stream.filter(
         (event) =>
           event.location?.directory === instance.directory &&
@@ -69,7 +86,7 @@ function eventResponse(events: EventV2.Interface) {
     return HttpServerResponse.stream(
       Stream.make({ id: eventID(), type: "server.connected", properties: {} }).pipe(
         Stream.concat(output.pipe(Stream.merge(heartbeat, { haltStrategy: "left" }))),
-        Stream.map(eventData),
+        Stream.map((event) => eventData(event, subscriberID)),
         Stream.pipeThroughChannel(Sse.encode()),
         Stream.encodeText,
         Stream.ensuring(Effect.logInfo("event disconnected")),

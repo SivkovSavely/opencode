@@ -10,6 +10,7 @@ import { Hash } from "@opencode-ai/core/util/hash"
 import { Config } from "@/config/config"
 import { Global } from "@opencode-ai/core/global"
 import { Info } from "@opencode-ai/schema/file-diff"
+import { EventDiagnostics } from "@opencode-ai/core/event-diagnostics"
 
 export const Patch = Schema.Struct({
   hash: Schema.String,
@@ -20,8 +21,15 @@ export type Patch = typeof Patch.Type
 export const FileDiff = Info
 export type FileDiff = typeof FileDiff.Type
 
+export type DiffContext = {
+  sessionID?: string
+  messageID?: string
+}
+
 const prune = "7.days"
-const limit = 2 * 1024 * 1024
+const MAX_SNAPSHOT_UNTRACKED_FILE_BYTES = 2 * 1024 * 1024
+export const MAX_FULL_DIFF_FILE_BYTES = 2 * 1024 * 1024
+export const MAX_FULL_DIFF_CHURN = 20_000
 const core = ["-c", "core.longpaths=true", "-c", "core.symlinks=true"]
 const cfg = ["-c", "core.autocrlf=false", ...core]
 const quote = [...cfg, "-c", "core.quotepath=false"]
@@ -41,7 +49,7 @@ export interface Interface {
   readonly restore: (snapshot: string) => Effect.Effect<void>
   readonly revert: (patches: Patch[]) => Effect.Effect<void>
   readonly diff: (hash: string) => Effect.Effect<string>
-  readonly diffFull: (from: string, to: string) => Effect.Effect<FileDiff[]>
+  readonly diffFull: (from: string, to: string, context?: DiffContext) => Effect.Effect<FileDiff[]>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/Snapshot") {}
@@ -68,6 +76,7 @@ const layer: Layer.Layer<Service, never, FSUtil.Service | AppProcess.Service | C
         const state = {
           directory: ctx.directory,
           worktree: ctx.worktree,
+          projectID: ctx.project.id,
           gitdir: path.join(Global.Path.data, "snapshot", ctx.project.id, Hash.fast(ctx.worktree)),
           vcs: ctx.project.vcs,
         }
@@ -284,7 +293,7 @@ const layer: Layer.Layer<Service, never, FSUtil.Service | AppProcess.Service | C
                     Effect.map((stat) => {
                       if (!stat || stat.type !== "File") return
                       const size = typeof stat.size === "bigint" ? Number(stat.size) : stat.size
-                      return size > limit ? item : undefined
+                      return size > MAX_SNAPSHOT_UNTRACKED_FILE_BYTES ? item : undefined
                     }),
                   ),
               ),
@@ -543,7 +552,19 @@ const layer: Layer.Layer<Service, never, FSUtil.Service | AppProcess.Service | C
           )
         })
 
-        const diffFull = Effect.fnUntraced(function* (from: string, to: string) {
+        const diffFull = Effect.fnUntraced(function* (from: string, to: string, context?: DiffContext) {
+          const diagnosticsEnabled = EventDiagnostics.enabled
+          const operationStarted = diagnosticsEnabled ? performance.now() : 0
+          const operationID = diagnosticsEnabled
+            ? EventDiagnostics.diffFullStart({
+                from,
+                to,
+                directory: state.directory,
+                projectID: state.projectID,
+                ...context,
+              })
+            : undefined
+          let completed = false
           return yield* locked(
             Effect.gen(function* () {
               type Row = {
@@ -732,20 +753,152 @@ const layer: Layer.Layer<Service, never, FSUtil.Service | AppProcess.Service | C
                 rows.push(...filtered)
               }
 
+              EventDiagnostics.diffFullFiles(operationID, rows.length)
+              let totalBeforeChars = 0
+              let totalBeforeBytes = 0
+              let totalAfterChars = 0
+              let totalAfterBytes = 0
+              let totalPatchChars = 0
+              let totalPatchBytes = 0
+              let slowestFile: { filename: string; elapsedMs: number } | undefined
+              let largestInput: { filename: string; bytes: number } | undefined
+              let largestPatch: { filename: string; bytes: number } | undefined
+              let skippedFiles = 0
+              let skippedBytes = 0
+              let largestSkippedInput: { filename: string; bytes: number } | undefined
+              const skippedReasonCounts = { size: 0, churn: 0 }
               const step = 100
-              const patch = (file: string, before: string, after: string) =>
-                formatPatch(structuredPatch(file, file, before, after, "", "", { context: Number.MAX_SAFE_INTEGER }))
+              const sizes = (value: string) => {
+                const chars = value.length
+                // UTF-8 is at most three bytes per JavaScript string code unit.
+                const bytes =
+                  !diagnosticsEnabled && chars <= MAX_FULL_DIFF_FILE_BYTES / 3 ? chars : Buffer.byteLength(value)
+                return { chars, bytes }
+              }
+              const patch = (row: Row, before: string, after: string) => {
+                const started = diagnosticsEnabled ? performance.now() : 0
+                const output = formatPatch(
+                  structuredPatch(row.file, row.file, before, after, "", "", { context: Number.MAX_SAFE_INTEGER }),
+                )
+                if (diagnosticsEnabled) {
+                  const elapsedMs = performance.now() - started
+                  const patchSize = { chars: output.length, bytes: Buffer.byteLength(output) }
+                  EventDiagnostics.diffFileEnd({
+                    operationID,
+                    filename: row.file,
+                    elapsedMs,
+                    patchChars: patchSize.chars,
+                    patchBytes: patchSize.bytes,
+                  })
+                  if (!slowestFile || elapsedMs > slowestFile.elapsedMs) slowestFile = { filename: row.file, elapsedMs }
+                  if (!largestPatch || patchSize.bytes > largestPatch.bytes) {
+                    largestPatch = { filename: row.file, bytes: patchSize.bytes }
+                  }
+                  totalPatchChars += patchSize.chars
+                  totalPatchBytes += patchSize.bytes
+                }
+                return output
+              }
 
               for (let i = 0; i < rows.length; i += step) {
                 const run = rows.slice(i, i + step)
                 const text = yield* load(run)
+                const loadedSizes = text
+                  ? new Map(
+                      Array.from(text, ([file, value]) => [
+                        file,
+                        { before: sizes(value.before), after: sizes(value.after) },
+                      ]),
+                    )
+                  : undefined
+                if (diagnosticsEnabled) {
+                  const batchSizes = Array.from(loadedSizes?.values() ?? []).reduce(
+                    (sum, item) => ({
+                      beforeChars: sum.beforeChars + item.before.chars,
+                      beforeBytes: sum.beforeBytes + item.before.bytes,
+                      afterChars: sum.afterChars + item.after.chars,
+                      afterBytes: sum.afterBytes + item.after.bytes,
+                    }),
+                    { beforeChars: 0, beforeBytes: 0, afterChars: 0, afterBytes: 0 },
+                  )
+                  EventDiagnostics.diffBatch({
+                    operationID,
+                    batchIndex: i / step,
+                    files: run.length,
+                    ...batchSizes,
+                  })
+                }
 
                 for (const row of run) {
                   const hit = text?.get(row.file) ?? { before: "", after: "" }
                   const [before, after] = row.binary ? ["", ""] : text ? [hit.before, hit.after] : yield* show(row)
+                  if (row.binary) {
+                    result.push({
+                      file: row.file,
+                      patch: "",
+                      additions: row.additions,
+                      deletions: row.deletions,
+                      status: row.status,
+                    })
+                    continue
+                  }
+                  const beforeSize = loadedSizes?.get(row.file)?.before ?? sizes(before)
+                  const afterSize = loadedSizes?.get(row.file)?.after ?? sizes(after)
+                  const inputBytes = beforeSize.bytes + afterSize.bytes
+                  if (diagnosticsEnabled) {
+                    totalBeforeChars += beforeSize.chars
+                    totalBeforeBytes += beforeSize.bytes
+                    totalAfterChars += afterSize.chars
+                    totalAfterBytes += afterSize.bytes
+                    if (!largestInput || inputBytes > largestInput.bytes)
+                      largestInput = { filename: row.file, bytes: inputBytes }
+                  }
+                  EventDiagnostics.diffFileStart({
+                    operationID,
+                    filename: row.file,
+                    beforeChars: beforeSize.chars,
+                    beforeBytes: beforeSize.bytes,
+                    afterChars: afterSize.chars,
+                    afterBytes: afterSize.bytes,
+                    additions: row.additions,
+                    deletions: row.deletions,
+                    status: row.status,
+                  })
+                  const reason = [
+                    ...(Math.max(beforeSize.bytes, afterSize.bytes) > MAX_FULL_DIFF_FILE_BYTES
+                      ? ["size" as const]
+                      : []),
+                    ...(row.additions + row.deletions > MAX_FULL_DIFF_CHURN ? ["churn" as const] : []),
+                  ]
+                  if (reason.length) {
+                    skippedFiles++
+                    skippedBytes += inputBytes
+                    if (!largestSkippedInput || inputBytes > largestSkippedInput.bytes)
+                      largestSkippedInput = { filename: row.file, bytes: inputBytes }
+                    for (const item of reason) skippedReasonCounts[item]++
+                    EventDiagnostics.diffFileSkipped({
+                      operationID,
+                      filename: row.file,
+                      reason,
+                      beforeBytes: beforeSize.bytes,
+                      afterBytes: afterSize.bytes,
+                      additions: row.additions,
+                      deletions: row.deletions,
+                      sizeLimit: MAX_FULL_DIFF_FILE_BYTES,
+                      churnLimit: MAX_FULL_DIFF_CHURN,
+                    })
+                    result.push({
+                      file: row.file,
+                      patch: "",
+                      additions: row.additions,
+                      deletions: row.deletions,
+                      status: row.status,
+                    })
+                    continue
+                  }
                   result.push({
                     file: row.file,
-                    patch: row.binary ? "" : patch(row.file, before, after),
+                    patch: patch(row, before, after),
                     additions: row.additions,
                     deletions: row.deletions,
                     status: row.status,
@@ -753,8 +906,51 @@ const layer: Layer.Layer<Service, never, FSUtil.Service | AppProcess.Service | C
                 }
               }
 
+              if (diagnosticsEnabled) {
+                EventDiagnostics.diffFullEnd({
+                  operationID,
+                  elapsedMs: performance.now() - operationStarted,
+                  files: result.length,
+                  totalBeforeChars,
+                  totalBeforeBytes,
+                  totalAfterChars,
+                  totalAfterBytes,
+                  totalPatchChars,
+                  totalPatchBytes,
+                  skippedFiles,
+                  skippedBytes,
+                  skippedReasonCounts,
+                  largestSkippedInput,
+                  slowestFile,
+                  largestInput,
+                  largestPatch,
+                })
+                completed = true
+              }
               return result
             }),
+          ).pipe(
+            Effect.ensuring(
+              Effect.sync(() => {
+                if (!diagnosticsEnabled || completed) return
+                completed = true
+                EventDiagnostics.diffFullEnd({
+                  operationID,
+                  elapsedMs: performance.now() - operationStarted,
+                  files: 0,
+                  totalBeforeChars: 0,
+                  totalBeforeBytes: 0,
+                  totalAfterChars: 0,
+                  totalAfterBytes: 0,
+                  totalPatchChars: 0,
+                  totalPatchBytes: 0,
+                  skippedFiles: 0,
+                  skippedBytes: 0,
+                  skippedReasonCounts: { size: 0, churn: 0 },
+                  aborted: true,
+                })
+              }),
+            ),
           )
         })
 
@@ -791,8 +987,8 @@ const layer: Layer.Layer<Service, never, FSUtil.Service | AppProcess.Service | C
       diff: Effect.fn("Snapshot.diff")(function* (hash: string) {
         return yield* InstanceState.useEffect(state, (s) => s.diff(hash))
       }),
-      diffFull: Effect.fn("Snapshot.diffFull")(function* (from: string, to: string) {
-        return yield* InstanceState.useEffect(state, (s) => s.diffFull(from, to))
+      diffFull: Effect.fn("Snapshot.diffFull")(function* (from: string, to: string, context?: DiffContext) {
+        return yield* InstanceState.useEffect(state, (s) => s.diffFull(from, to, context))
       }),
     })
   }),

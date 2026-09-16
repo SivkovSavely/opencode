@@ -1,4 +1,5 @@
 import { EventV2 } from "@opencode-ai/core/event"
+import { EventDiagnostics, type SubscriberHandle } from "@opencode-ai/core/event-diagnostics"
 import { OpenCodeEvent } from "@opencode-ai/protocol/groups/event"
 import { Effect, Schema, Stream } from "effect"
 import { HttpServerResponse } from "effect/unstable/http"
@@ -8,12 +9,17 @@ import { Api } from "../api"
 
 const subscriberCapacity = 256
 
-function eventData(data: unknown): Sse.Event {
+function eventData(data: unknown, subscriberID: SubscriberHandle | undefined): Sse.Event {
+  const encoded = Schema.encodeUnknownSync(OpenCodeEvent)(data)
+  const serialized = JSON.stringify(encoded)
+  if (EventDiagnostics.enabled) {
+    EventDiagnostics.serialized(subscriberID, encoded.type, serialized.length, Buffer.byteLength(serialized))
+  }
   return {
     _tag: "Event",
     event: "message",
     id: undefined,
-    data: JSON.stringify(Schema.encodeUnknownSync(OpenCodeEvent)(data)),
+    data: serialized,
   }
 }
 
@@ -27,13 +33,19 @@ export const EventHandler = HttpApiBuilder.group(Api, "server.event", (handlers)
           type: "server.connected",
           data: {},
         }
+        let subscriberID: SubscriberHandle | undefined
         const output = Stream.unwrap(
           Effect.gen(function* () {
             // Acquiring the bounded stream installs its listener before readiness is observable.
-            const live = yield* EventV2.allBounded(events, subscriberCapacity)
+            const live = yield* EventV2.allBounded(events, subscriberCapacity, (id) => {
+              subscriberID = id
+            })
             return Stream.make(connected).pipe(Stream.concat(live))
           }),
-        ).pipe(Stream.map(eventData), Stream.pipeThroughChannel(Sse.encode()))
+        ).pipe(
+          Stream.map((event) => eventData(event, subscriberID)),
+          Stream.pipeThroughChannel(Sse.encode()),
+        )
         const heartbeat = Stream.tick("15 seconds").pipe(Stream.map(() => ": heartbeat\n\n"))
         return HttpServerResponse.stream(
           output.pipe(Stream.merge(heartbeat, { haltStrategy: "left" }), Stream.encodeText),

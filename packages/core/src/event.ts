@@ -8,6 +8,7 @@ import { Database } from "./database/database"
 import { EventSequenceTable, EventTable } from "./event/sql"
 import { Location } from "./location"
 import { makeGlobalNode } from "./effect/app-node"
+import { EventDiagnostics, type SubscriberHandle } from "./event-diagnostics"
 import { isDeepStrictEqual } from "node:util"
 import { Durable } from "@opencode-ai/schema/durable-event-manifest"
 
@@ -149,18 +150,30 @@ export interface Interface {
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/Event") {}
 
-export const allBounded = (events: Interface, capacity: number) =>
+export const allBounded = (
+  events: Interface,
+  capacity: number,
+  onSubscriberID?: (subscriber: SubscriberHandle | undefined) => void,
+) =>
   Effect.gen(function* () {
     const queue = yield* Queue.dropping<Payload, SubscriberOverflowError>(capacity)
+    const subscriberID = EventDiagnostics.connectSubscriber({ transport: "api-event" })
+    onSubscriberID?.(subscriberID)
+    yield* Effect.addFinalizer(() => Effect.sync(() => EventDiagnostics.disconnectSubscriber(subscriberID)))
     const unsubscribe = yield* events.listen((event) =>
       Queue.offer(queue, event).pipe(
-        Effect.flatMap((accepted) =>
-          accepted ? Effect.void : Queue.fail(queue, new SubscriberOverflowError({ capacity })).pipe(Effect.asVoid),
-        ),
+        Effect.flatMap((accepted) => {
+          EventDiagnostics.queueOffer(subscriberID, event.type, accepted)
+          return accepted
+            ? Effect.void
+            : Queue.fail(queue, new SubscriberOverflowError({ capacity })).pipe(Effect.asVoid)
+        }),
       ),
     )
     yield* Effect.addFinalizer(() => unsubscribe.pipe(Effect.andThen(Queue.shutdown(queue)), Effect.asVoid))
-    return Stream.fromQueue(queue)
+    return Stream.fromQueue(queue).pipe(
+      Stream.map((event) => (EventDiagnostics.queueDrain(subscriberID, event.type), event)),
+    )
   })
 
 export interface LayerOptions {
@@ -404,6 +417,7 @@ export const layerWith = (options?: LayerOptions) =>
         )
 
       function notify(event: Payload, isolateListeners: boolean) {
+        EventDiagnostics.logicalEvent(event.type)
         return Effect.gen(function* () {
           yield* Effect.forEach(
             listeners,

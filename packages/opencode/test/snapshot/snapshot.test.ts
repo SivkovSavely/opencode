@@ -6,7 +6,7 @@ import { FSUtil } from "@opencode-ai/core/fs-util"
 import fs from "fs/promises"
 import path from "path"
 import { Effect, Fiber, Layer } from "effect"
-import { Snapshot } from "../../src/snapshot"
+import { MAX_FULL_DIFF_CHURN, MAX_FULL_DIFF_FILE_BYTES, Snapshot } from "../../src/snapshot"
 import {
   disposeAllInstances,
   provideInstance,
@@ -898,6 +898,77 @@ it.instance(
       expect(diffs[0].deletions).toBe(0)
     }),
   ),
+  { git: true },
+)
+
+it.instance(
+  "diffFull skips an oversized file and continues with following files",
+  Effect.gen(function* () {
+    const tmp = yield* bootstrap()
+    const snapshot = yield* Snapshot.Service
+    yield* write(`${tmp.path}/large.txt`, "before\n")
+    yield* write(`${tmp.path}/normal.txt`, "before\n")
+    const before = yield* snapshot.track()
+    expect(before).toBeTruthy()
+    yield* write(`${tmp.path}/large.txt`, "x".repeat(MAX_FULL_DIFF_FILE_BYTES + 1))
+    yield* write(`${tmp.path}/normal.txt`, "after\n")
+    const after = yield* snapshot.track()
+    expect(after).toBeTruthy()
+
+    const diffs = yield* snapshot.diffFull(before!, after!)
+    const large = diffs.find((item) => item.file === "large.txt")
+    const normal = diffs.find((item) => item.file === "normal.txt")
+    expect(large).toMatchObject({ file: "large.txt", patch: "", status: "modified" })
+    expect(large?.additions).toBeGreaterThan(0)
+    expect(normal?.patch).toContain("+after")
+  }),
+  { git: true },
+)
+
+it.instance(
+  "diffFull permits a file exactly at the size limit",
+  Effect.gen(function* () {
+    const tmp = yield* bootstrap()
+    const snapshot = yield* Snapshot.Service
+    const lines = MAX_FULL_DIFF_FILE_BYTES / 2
+    yield* write(`${tmp.path}/boundary.txt`, "x\n".repeat(lines))
+    const before = yield* snapshot.track()
+    expect(before).toBeTruthy()
+    yield* write(`${tmp.path}/boundary.txt`, "x\n".repeat(lines - 1) + "y\n")
+    const after = yield* snapshot.track()
+    expect(after).toBeTruthy()
+
+    const diff = (yield* snapshot.diffFull(before!, after!))[0]
+    expect(diff.file).toBe("boundary.txt")
+    expect(diff.patch).not.toBe("")
+  }),
+  { git: true },
+)
+
+it.instance(
+  "diffFull skips a file with extreme churn",
+  Effect.gen(function* () {
+    const tmp = yield* bootstrap()
+    const snapshot = yield* Snapshot.Service
+    const lines = MAX_FULL_DIFF_CHURN + 1
+    const exactLines = MAX_FULL_DIFF_CHURN / 2
+    yield* write(`${tmp.path}/generated.c`, "old\n".repeat(lines))
+    yield* write(`${tmp.path}/exact.c`, "old\n".repeat(exactLines))
+    const before = yield* snapshot.track()
+    expect(before).toBeTruthy()
+    yield* write(`${tmp.path}/generated.c`, "new\n".repeat(lines))
+    yield* write(`${tmp.path}/exact.c`, "new\n".repeat(exactLines))
+    const after = yield* snapshot.track()
+    expect(after).toBeTruthy()
+
+    const diffs = yield* snapshot.diffFull(before!, after!)
+    const generated = diffs.find((item) => item.file === "generated.c")!
+    const exact = diffs.find((item) => item.file === "exact.c")!
+    expect(generated).toMatchObject({ file: "generated.c", patch: "", status: "modified" })
+    expect(generated.additions + generated.deletions).toBeGreaterThan(MAX_FULL_DIFF_CHURN)
+    expect(exact.additions + exact.deletions).toBe(MAX_FULL_DIFF_CHURN)
+    expect(exact.patch).not.toBe("")
+  }),
   { git: true },
 )
 

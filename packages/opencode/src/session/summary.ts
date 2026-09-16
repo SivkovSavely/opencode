@@ -66,7 +66,11 @@ function unquoteGitPath(input: string) {
 export interface Interface {
   readonly summarize: (input: { sessionID: SessionID; messageID: MessageID }) => Effect.Effect<void>
   readonly diff: (input: { sessionID: SessionID; messageID?: MessageID }) => Effect.Effect<Snapshot.FileDiff[]>
-  readonly computeDiff: (input: { messages: SessionV1.WithParts[] }) => Effect.Effect<Snapshot.FileDiff[]>
+  readonly computeDiff: (input: {
+    messages: SessionV1.WithParts[]
+    sessionID?: SessionID
+    messageID?: MessageID
+  }) => Effect.Effect<Snapshot.FileDiff[]>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/SessionSummary") {}
@@ -79,7 +83,11 @@ const layer = Layer.effect(
     const events = yield* EventV2Bridge.Service
     const config = yield* Config.Service
 
-    const computeDiff = Effect.fn("SessionSummary.computeDiff")(function* (input: { messages: SessionV1.WithParts[] }) {
+    const computeDiff = Effect.fn("SessionSummary.computeDiff")(function* (input: {
+      messages: SessionV1.WithParts[]
+      sessionID?: SessionID
+      messageID?: MessageID
+    }) {
       let from: string | undefined
       let to: string | undefined
       for (const item of input.messages) {
@@ -95,7 +103,9 @@ const layer = Layer.effect(
           if (part.type === "step-finish" && part.snapshot) to = part.snapshot
         }
       }
-      if (from && to) return yield* snapshot.diffFull(from, to)
+      if (from && to) {
+        return yield* snapshot.diffFull(from, to, { sessionID: input.sessionID, messageID: input.messageID })
+      }
       return []
     })
 
@@ -121,7 +131,7 @@ const layer = Layer.effect(
       )
       const target = messages.find((m) => m.info.id === input.messageID)
       if (!target || target.info.role !== "user") return
-      const msgDiffs = yield* computeDiff({ messages })
+      const msgDiffs = yield* computeDiff({ messages, sessionID: input.sessionID, messageID: input.messageID })
       target.info.summary = { ...target.info.summary, diffs: msgDiffs }
       yield* sessions.updateMessage(target.info)
     })
