@@ -65,6 +65,7 @@ import { partDefaultOpen } from "./part-default-open"
 import { animate } from "motion"
 import { attached, inline, kind, typeLabel } from "./message-file"
 import { readPartText } from "./message-part-text"
+import { formatTimestamp, formatToolTimestamp } from "./timestamp"
 import { SessionProgressIndicatorV2 } from "../v2/components/session-progress-indicator-v2"
 
 async function writeClipboard(text: string): Promise<boolean> {
@@ -1114,12 +1115,13 @@ export function ContextToolGroup(props: {
           <Index each={props.parts}>
             {(partAccessor) => {
               const trigger = createMemo(() => contextToolTrigger(partAccessor(), i18n))
+              const timestamp = createMemo(() => formatToolTimestamp(partAccessor().state, i18n.locale()))
               const running = createMemo(
                 () => partAccessor().state.status === "pending" || partAccessor().state.status === "running",
               )
               return (
                 <div data-slot="context-tool-group-item">
-                  <div data-component="tool-trigger">
+                  <div data-component="tool-trigger" data-has-timestamp={timestamp() ? "true" : undefined}>
                     <div data-slot="basic-tool-tool-trigger-content">
                       <div data-slot="basic-tool-tool-info">
                         <div data-slot="basic-tool-tool-info-structured">
@@ -1139,6 +1141,13 @@ export function ContextToolGroup(props: {
                         </div>
                       </div>
                     </div>
+                    <Show when={timestamp()}>
+                      {(value) => (
+                        <span data-slot="tool-timestamp" class="text-12-regular text-text-weak cursor-default">
+                          {value()}
+                        </span>
+                      )}
+                    </Show>
                   </div>
                 </div>
               )
@@ -1218,12 +1227,9 @@ export function UserMessageDisplay(props: {
     const match = data.store.provider?.all?.get(providerID)
     return match?.models?.[modelID]?.name ?? modelID
   })
-  const timefmt = createMemo(() => new Intl.DateTimeFormat(i18n.locale(), { timeStyle: "short" }))
-
   const stamp = createMemo(() => {
     const created = props.message.time?.created
-    if (typeof created !== "number") return ""
-    return timefmt().format(created)
+    return formatTimestamp(created, i18n.locale())
   })
 
   const metaHead = createMemo(() => {
@@ -1570,63 +1576,73 @@ PART_MAPPING["tool"] = function ToolPartDisplay(props) {
   return (
     <Show when={!hideQuestion()}>
       <div data-component="tool-part-wrapper" data-timeline-part-id={part().id}>
-        <Switch>
-          <Match when={part().state.status === "error" && (part().state as any).error}>
-            {(error) => {
-              const cleaned = error().replace("Error: ", "")
-              if (part().tool === "question" && cleaned.includes("dismissed this question")) {
+        <div data-slot="tool-part-content">
+          <Switch>
+            <Match when={part().state.status === "error" && (part().state as any).error}>
+              {(error) => {
+                const cleaned = error().replace("Error: ", "")
+                if (part().tool === "question" && cleaned.includes("dismissed this question")) {
+                  return (
+                    <div style="width: 100%; display: flex; justify-content: flex-end;">
+                      <span class="text-13-regular text-text-weak cursor-default">
+                        {i18n.t("ui.messagePart.questions.dismissed")}
+                      </span>
+                    </div>
+                  )
+                }
                 return (
-                  <div style="width: 100%; display: flex; justify-content: flex-end;">
-                    <span class="text-13-regular text-text-weak cursor-default">
-                      {i18n.t("ui.messagePart.questions.dismissed")}
-                    </span>
-                  </div>
+                  <ToolErrorCard
+                    tool={part().tool}
+                    error={error()}
+                    title={
+                      part().tool === "websearch" ? webSearchProviderLabel(partMetadata().provider, i18n) : undefined
+                    }
+                    defaultOpen={props.defaultOpen}
+                    open={controlledOpen()}
+                    onOpenChange={props.onToolOpenChange ? handleToolOpenChange : undefined}
+                    subtitle={taskSubtitle()}
+                    href={taskHref()}
+                    onSubtitleClick={(event) => {
+                      if (!data.navigateToSession) return
+                      if (event.button !== 0 || event.altKey || event.ctrlKey || event.metaKey || event.shiftKey)
+                        return
+                      const id = taskId()
+                      if (!id) return
+                      event.preventDefault()
+                      data.navigateToSession(id)
+                    }}
+                  />
                 )
-              }
-              return (
-                <ToolErrorCard
-                  tool={part().tool}
-                  error={error()}
-                  title={
-                    part().tool === "websearch" ? webSearchProviderLabel(partMetadata().provider, i18n) : undefined
-                  }
-                  defaultOpen={props.defaultOpen}
-                  open={controlledOpen()}
-                  onOpenChange={props.onToolOpenChange ? handleToolOpenChange : undefined}
-                  subtitle={taskSubtitle()}
-                  href={taskHref()}
-                  onSubtitleClick={(event) => {
-                    if (!data.navigateToSession) return
-                    if (event.button !== 0 || event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return
-                    const id = taskId()
-                    if (!id) return
-                    event.preventDefault()
-                    data.navigateToSession(id)
-                  }}
-                />
-              )
-            }}
-          </Match>
-          <Match when={true}>
-            <Dynamic
-              component={render()}
-              input={input()}
-              tool={part().tool}
-              sessionID={part().sessionID}
-              metadata={partMetadata()}
-              // @ts-expect-error
-              output={part().state.output}
-              status={part().state.status}
-              hideDetails={props.hideDetails}
-              defaultOpen={props.defaultOpen}
-              open={controlledOpen()}
-              onOpenChange={props.onToolOpenChange ? handleToolOpenChange : undefined}
-              deferContent={props.deferToolContent}
-              virtualizeDiff={props.virtualizeDiff}
-              onContentRendered={props.onContentRendered}
-            />
-          </Match>
-        </Switch>
+              }}
+            </Match>
+            <Match when={true}>
+              <Dynamic
+                component={render()}
+                input={input()}
+                tool={part().tool}
+                sessionID={part().sessionID}
+                metadata={partMetadata()}
+                // @ts-expect-error
+                output={part().state.output}
+                status={part().state.status}
+                hideDetails={props.hideDetails}
+                defaultOpen={props.defaultOpen}
+                open={controlledOpen()}
+                onOpenChange={props.onToolOpenChange ? handleToolOpenChange : undefined}
+                deferContent={props.deferToolContent}
+                virtualizeDiff={props.virtualizeDiff}
+                onContentRendered={props.onContentRendered}
+              />
+            </Match>
+          </Switch>
+        </div>
+        <Show when={formatToolTimestamp(part().state, i18n.locale())}>
+          {(value) => (
+            <span data-slot="tool-timestamp" class="text-12-regular text-text-weak cursor-default">
+              {value()}
+            </span>
+          )}
+        </Show>
       </div>
     </Show>
   )
@@ -1695,6 +1711,7 @@ PART_MAPPING["text"] = function TextPartDisplay(props) {
     const items = [
       agent ? agent[0]?.toUpperCase() + agent.slice(1) : "",
       model(),
+      formatTimestamp((props.message as AssistantMessage).time.created, i18n.locale()),
       duration(),
       interrupted() ? i18n.t("ui.message.interrupted") : "",
     ]

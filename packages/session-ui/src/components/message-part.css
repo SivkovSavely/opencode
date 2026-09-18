@@ -665,6 +665,20 @@
   }
 }
 
+[data-component="context-tool-group-item"] {
+  [data-component="tool-trigger"][data-has-timestamp="true"] {
+    [data-slot="basic-tool-tool-trigger-content"] {
+      flex: 1 1 auto;
+      max-width: none;
+    }
+  }
+
+  &:hover [data-slot="tool-timestamp"] {
+    opacity: 1;
+    visibility: visible;
+  }
+}
+
 [data-component="diagnostics"] {
   display: flex;
   flex-direction: column;
@@ -722,6 +736,36 @@
 
 [data-component="tool-part-wrapper"] {
   width: 100%;
+  min-width: 0;
+  display: flex;
+  align-items: flex-start;
+
+  [data-slot="tool-part-content"] {
+    flex: 1 1 auto;
+    min-width: 0;
+  }
+
+  &:hover [data-slot="tool-timestamp"] {
+    opacity: 1;
+    visibility: visible;
+  }
+}
+
+[data-slot="tool-timestamp"] {
+  box-sizing: border-box;
+  flex: 0 0 56px;
+  width: 56px;
+  height: 32px;
+  margin-left: 8px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+  transition: opacity 0.15s ease;
 }
 
 [data-component="dock-prompt"][data-kind="permission"] {
