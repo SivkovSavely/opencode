@@ -1072,6 +1072,10 @@ const layer = Layer.effect(
       })
 
       if (input.noReply === true) return yield* work
+      yield* Effect.logInfo("restart diagnostic runtime admission requested", {
+        sessionID: input.sessionID,
+        parentSessionID: session.parentID,
+      })
       yield* runtime
         .admit({
           sessionID: input.sessionID,
@@ -1079,6 +1083,10 @@ const layer = Layer.effect(
           parentSessionID: session.parentID,
         })
         .pipe(Effect.orDie)
+      yield* Effect.logInfo("restart diagnostic runtime admission accepted", {
+        sessionID: input.sessionID,
+        parentSessionID: session.parentID,
+      })
       return yield* Effect.acquireUseRelease(
         work,
         () => loop({ sessionID: input.sessionID }),
@@ -1102,7 +1110,12 @@ const layer = Layer.effect(
         const session = yield* sessions.get(sessionID).pipe(Effect.orDie)
 
         while (true) {
-          if (!(yield* runtime.beforeTurn(sessionID))) {
+          const beforeTurn = yield* runtime.beforeTurn(sessionID)
+          if (!beforeTurn) {
+            yield* Effect.logInfo("restart diagnostic loop stopped at beforeTurn", {
+              sessionID,
+              point: "beforeTurn",
+            })
             yield* runtime.park(sessionID)
             break
           }
@@ -1352,7 +1365,14 @@ const layer = Layer.effect(
             Effect.onInterrupt(() => finalizeInterruptedAssistant),
           )
           if (outcome === "break") break
-          if (!(yield* runtime.checkpoint(sessionID))) break
+          const checkpoint = yield* runtime.checkpoint(sessionID)
+          if (!checkpoint) {
+            yield* Effect.logInfo("restart diagnostic loop stopped at checkpoint", {
+              sessionID,
+              point: "checkpoint",
+            })
+            break
+          }
           continue
         }
 

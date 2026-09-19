@@ -101,6 +101,14 @@ const listenEffect: (opts: ListenOptions) => Effect.Effect<EffectListener, unkno
     const listenerUrl = makeURL(opts.hostname, address.port)
     const unpublishMdns = yield* setupMdns(opts, address.port, state.scope)
     url = listenerUrl
+    yield* Effect.logInfo("restart diagnostic runtime startup", {
+      lineage: lifecycle.identity.lineage,
+      instance: lifecycle.identity.instance,
+      restartSupported: lifecycle.identity.restartSupported,
+      databasePath: Database.path(),
+      hostname: opts.hostname,
+      port: address.port,
+    })
 
     return {
       hostname: opts.hostname,

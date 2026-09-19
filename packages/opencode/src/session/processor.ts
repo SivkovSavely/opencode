@@ -2,7 +2,7 @@ import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { Image } from "@/image/image"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
-import { Cause, Deferred, Effect, Exit, Layer, Context, Scope, Schema } from "effect"
+import { Cause, Deferred, Duration, Effect, Exit, Layer, Context, Scope, Schema } from "effect"
 import * as Stream from "effect/Stream"
 import { Agent } from "@/agent/agent"
 import { Config } from "@/config/config"
@@ -677,28 +677,53 @@ const layer = Layer.effect(
               SessionRetry.policy({
                 provider: input.model.providerID,
                 parse,
-                set: (info) => {
-                  return Effect.all(
-                    [
-                      status.set(ctx.sessionID, {
-                        type: "retry",
-                        attempt: info.attempt,
-                        message: info.message,
-                        action: info.action,
-                        next: info.next,
-                      }),
-                      runtime.retry(ctx.sessionID, info.next),
-                    ],
-                    { discard: true },
-                  )
-                },
+                set: (info) =>
+                  Effect.gen(function* () {
+                    yield* Effect.logInfo("restart diagnostic retry scheduled", {
+                      sessionID: ctx.sessionID,
+                      attempt: info.attempt,
+                      provider: input.model.providerID,
+                      retryAt: info.next,
+                      remainingMs: Math.max(0, info.next - Date.now()),
+                      message: info.message.slice(0, 200),
+                      messageLength: info.message.length,
+                      action: info.action,
+                    })
+                    yield* Effect.all(
+                      [
+                        status.set(ctx.sessionID, {
+                          type: "retry",
+                          attempt: info.attempt,
+                          message: info.message,
+                          action: info.action,
+                          next: info.next,
+                        }),
+                        runtime.retry(ctx.sessionID, info.next),
+                      ],
+                      { discard: true },
+                    )
+                  }),
                 wait: (duration) =>
                   Effect.gen(function* () {
+                    const waitMs = Duration.toMillis(duration)
+                    yield* Effect.logInfo("restart diagnostic retry wait beginning", {
+                      sessionID: ctx.sessionID,
+                      provider: input.model.providerID,
+                      waitMs,
+                    })
                     const timerWon = yield* Effect.raceFirst(
                       Effect.sleep(duration).pipe(Effect.as(true)),
                       runtime.awaitDraining.pipe(Effect.as(false)),
                     )
-                    if (!timerWon || !(yield* runtime.resumeRetry(ctx.sessionID))) {
+                    const resumed = timerWon ? yield* runtime.resumeRetry(ctx.sessionID) : undefined
+                    yield* Effect.logInfo("restart diagnostic retry wait ended", {
+                      sessionID: ctx.sessionID,
+                      provider: input.model.providerID,
+                      outcome: timerWon ? "retry_deadline" : "runtime_drain",
+                      waitMs,
+                      resumeRetry: resumed,
+                    })
+                    if (!timerWon || !resumed) {
                       yield* new RuntimeLifecycle.RuntimeDrainingError({ message: "Runtime is draining" })
                     }
                     yield* status.set(ctx.sessionID, { type: "busy" })
@@ -707,7 +732,13 @@ const layer = Layer.effect(
             ),
             Effect.catchIf(
               (error) => error instanceof RuntimeLifecycle.RuntimeDrainingError,
-              () => Effect.void,
+              () =>
+                Effect.gen(function* () {
+                  yield* Effect.logInfo("restart diagnostic RuntimeDrainingError consumed", {
+                    sessionID: ctx.sessionID,
+                    provider: input.model.providerID,
+                  })
+                }),
             ),
             Effect.catch(halt),
             Effect.ensuring(cleanup()),

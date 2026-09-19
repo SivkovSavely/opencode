@@ -189,6 +189,17 @@ export const TaskTool = Tool.define(
         ...(runInBackground ? { background: true } : {}),
       }
 
+      const taskDiagnostic = (event: string, fields: Record<string, unknown> = {}) =>
+        Effect.logInfo(`restart diagnostic TaskTool ${event}`, {
+          parentSessionID: ctx.sessionID,
+          parentAssistantMessageID: ctx.messageID,
+          parentCallID: ctx.callID,
+          childSessionID: nextSession.id,
+          mode: runInBackground ? "background" : "foreground",
+          childAgent: next.name,
+          ...fields,
+        })
+
       yield* ctx.metadata({
         title: params.description,
         metadata,
@@ -198,6 +209,7 @@ export const TaskTool = Tool.define(
       if (!ops) return yield* Effect.fail(new Error("TaskTool requires promptOps in ctx.extra"))
 
       const runTask = Effect.fn("TaskTool.runTask")(function* () {
+        yield* taskDiagnostic("runTask started")
         const parts = yield* ops.resolvePromptParts(params.prompt)
         const result = yield* ops.prompt({
           messageID: MessageID.ascending(),
@@ -210,7 +222,16 @@ export const TaskTool = Tool.define(
           agent: next.name,
           parts,
         })
+        const text = result.parts.findLast((item) => item.type === "text")?.text ?? ""
+        const assistant = result.info.role === "assistant" ? result.info : undefined
+        yield* taskDiagnostic("child prompt returned", {
+          childAssistantMessageID: assistant?.id,
+          finish: assistant?.finish,
+          containsError: assistant?.error !== undefined,
+          textResultLength: text.length,
+        })
         if (result.info.role === "assistant" && result.info.error) {
+          yield* taskDiagnostic("TaskTool reports child error", { status: "error", outputLength: 0 })
           const message =
             "message" in result.info.error.data && typeof result.info.error.data.message === "string"
               ? result.info.error.data.message
@@ -219,9 +240,10 @@ export const TaskTool = Tool.define(
         }
         const failed = result.parts.findLast((item) => item.type === "tool" && item.state.status === "error")
         if (failed?.type === "tool" && failed.state.status === "error") {
+          yield* taskDiagnostic("TaskTool reports child error", { status: "error", outputLength: 0 })
           return yield* Effect.fail(new Error(`Subagent failed (task_id: ${nextSession.id}): ${failed.state.error}`))
         }
-        return result.parts.findLast((item) => item.type === "text")?.text ?? ""
+        return text
       })
 
       const inject = Effect.fn("TaskTool.injectBackgroundResult")(function* (
@@ -254,17 +276,22 @@ export const TaskTool = Tool.define(
       })
 
       const notify = Effect.fn("TaskTool.notifyBackgroundResult")(function* (jobID: string) {
-        yield* background.wait({ id: jobID }).pipe(
-          Effect.flatMap((result) => {
-            if (result.info?.status === "completed") return inject("completed", result.info.output ?? "")
-            if (result.info?.status === "error") return inject("error", result.info.error ?? "")
-            return Effect.void
-          }),
-          Effect.forkIn(scope, { startImmediately: true }),
-        )
+        yield* Effect.gen(function* () {
+          yield* taskDiagnostic("background wait started", { jobID, wait: "notification" })
+          const result = yield* background.wait({ id: jobID })
+          yield* taskDiagnostic("background wait returned", {
+            jobID,
+            status: result.info?.status,
+            outputLength: result.info?.output?.length ?? 0,
+          })
+          if (result.info?.status === "completed") yield* inject("completed", result.info.output ?? "")
+          if (result.info?.status === "error") yield* inject("error", result.info.error ?? "")
+        }).pipe(Effect.forkIn(scope, { startImmediately: true }))
       })
 
-      if (yield* background.extend({ id: nextSession.id, run: runTask() })) {
+      const extended = yield* background.extend({ id: nextSession.id, run: runTask() })
+      yield* taskDiagnostic("background extend returned", { extended, jobID: nextSession.id })
+      if (extended) {
         return {
           title: params.description,
           metadata: {
@@ -294,6 +321,11 @@ export const TaskTool = Tool.define(
           notify(nextSession.id),
         ]),
         run: runTask().pipe(Effect.onInterrupt(() => ops.cancel(nextSession.id))),
+      })
+      yield* taskDiagnostic("background job started", {
+        jobID: info.id,
+        status: info.status,
+        outputLength: info.output?.length ?? 0,
       })
 
       function backgroundResult() {
@@ -331,13 +363,42 @@ export const TaskTool = Tool.define(
         }),
         () =>
           Effect.gen(function* () {
-            const result = yield* Effect.raceFirst(
-              background.wait({ id: nextSession.id }).pipe(Effect.map((waited) => waited.info)),
-              background.waitForPromotion(nextSession.id),
+            yield* taskDiagnostic("foreground wait started", { jobID: nextSession.id, wait: "completion_or_promotion" })
+            const wake = yield* Effect.raceFirst(
+              background
+                .wait({ id: nextSession.id })
+                .pipe(Effect.map((waited) => ({ source: "completion" as const, info: waited.info }))),
+              background
+                .waitForPromotion(nextSession.id)
+                .pipe(Effect.map((promoted) => ({ source: "promotion" as const, info: promoted }))),
             )
-            if (result?.metadata?.background === true) return backgroundResult()
-            if (result?.status === "error") return yield* Effect.fail(new Error(result.error ?? "Task failed"))
-            if (result?.status === "cancelled") return yield* Effect.fail(new Error("Task cancelled"))
+            const result = wake.info
+            yield* taskDiagnostic("foreground wait woke", {
+              jobID: nextSession.id,
+              wake: wake.source,
+              status: result?.status,
+              promoted: result?.metadata?.background === true,
+              outputLength: result?.output?.length ?? 0,
+            })
+            if (result?.metadata?.background === true) {
+              yield* taskDiagnostic("TaskTool reports child promoted", {
+                status: "promoted",
+                outputLength: 0,
+              })
+              return backgroundResult()
+            }
+            if (result?.status === "error") {
+              yield* taskDiagnostic("TaskTool reports child error", { status: "error", outputLength: 0 })
+              return yield* Effect.fail(new Error(result.error ?? "Task failed"))
+            }
+            if (result?.status === "cancelled") {
+              yield* taskDiagnostic("TaskTool reports child cancelled", { status: "cancelled", outputLength: 0 })
+              return yield* Effect.fail(new Error("Task cancelled"))
+            }
+            yield* taskDiagnostic("TaskTool reports child completed", {
+              status: "completed",
+              outputLength: result?.output?.length ?? 0,
+            })
             return {
               title: params.description,
               metadata,

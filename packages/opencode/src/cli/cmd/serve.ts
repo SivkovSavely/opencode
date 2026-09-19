@@ -26,6 +26,11 @@ export const ServeCommand = effectCmd({
     const { RuntimeLifecycle } = yield* Effect.promise(() => import("../../server/runtime-lifecycle"))
     const runtime = RuntimeLifecycle.current()
     if (runtime) {
+      yield* Effect.logInfo("restart diagnostic recovery invocation beginning", {
+        lineage: runtime.identity.lineage,
+        instance: runtime.identity.instance,
+        restartSupported: runtime.identity.restartSupported,
+      })
       yield* Effect.promise(() =>
         AppRuntime.runPromise(
           Effect.gen(function* () {
@@ -40,6 +45,11 @@ export const ServeCommand = effectCmd({
           }),
         ),
       )
+      yield* Effect.logInfo("restart diagnostic recovery scheduling complete", {
+        lineage: runtime.identity.lineage,
+        instance: runtime.identity.instance,
+        note: "recover scheduled recovery fibers; asynchronous recovery may still be running",
+      })
     }
 
     const requestShutdown = () => {
