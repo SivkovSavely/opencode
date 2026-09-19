@@ -2,7 +2,7 @@ import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { Image } from "@/image/image"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
-import { Cause, Deferred, Duration, Effect, Exit, Layer, Context, Scope, Schema } from "effect"
+import { Cause, Deferred, Effect, Exit, Layer, Context, Scope, Schema } from "effect"
 import * as Stream from "effect/Stream"
 import { Agent } from "@/agent/agent"
 import { Config } from "@/config/config"
@@ -693,11 +693,21 @@ const layer = Layer.effect(
                   )
                 },
                 wait: (duration) =>
-                  Effect.raceFirst(
-                    Effect.sleep(duration).pipe(Effect.as(duration)),
-                    runtime.awaitDraining.pipe(Effect.as(Duration.zero)),
-                  ),
+                  Effect.gen(function* () {
+                    const timerWon = yield* Effect.raceFirst(
+                      Effect.sleep(duration).pipe(Effect.as(true)),
+                      runtime.awaitDraining.pipe(Effect.as(false)),
+                    )
+                    if (!timerWon || !(yield* runtime.resumeRetry(ctx.sessionID))) {
+                      yield* new RuntimeLifecycle.RuntimeDrainingError({ message: "Runtime is draining" })
+                    }
+                    yield* status.set(ctx.sessionID, { type: "busy" })
+                  }),
               }),
+            ),
+            Effect.catchIf(
+              (error) => error instanceof RuntimeLifecycle.RuntimeDrainingError,
+              () => Effect.void,
             ),
             Effect.catch(halt),
             Effect.ensuring(cleanup()),

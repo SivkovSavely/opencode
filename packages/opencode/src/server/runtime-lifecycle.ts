@@ -1,7 +1,7 @@
 import { Database } from "@opencode-ai/core/database/database"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { sql } from "drizzle-orm"
-import { Context, Deferred, Duration, Effect, Layer, Schema, Scope, SynchronizedRef } from "effect"
+import { Clock, Context, Deferred, Duration, Effect, Layer, Schema, Scope, SynchronizedRef } from "effect"
 import { randomUUID } from "node:crypto"
 
 export type Action = "restart" | "shutdown"
@@ -50,6 +50,7 @@ export type Interface = {
   readonly beforeTurn: (sessionID: string) => Effect.Effect<boolean>
   readonly checkpoint: (sessionID: string) => Effect.Effect<boolean>
   readonly retry: (sessionID: string, retryAt: number) => Effect.Effect<void>
+  readonly resumeRetry: (sessionID: string) => Effect.Effect<boolean>
   readonly park: (sessionID: string) => Effect.Effect<void>
   readonly complete: (sessionID: string) => Effect.Effect<void>
   readonly awaitDraining: Effect.Effect<void>
@@ -92,6 +93,7 @@ type LocalExecution = {
   fence: number
   leases: number
   mode: "active" | "retry_wait" | "parked"
+  retryAt?: number
 }
 
 type LocalState = {
@@ -158,9 +160,10 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
   const claim = Effect.fnUntraced(function* (record: Row) {
     const database = databaseRef.current ?? (yield* Database.Service)
     const nextFence = record.fence + 1
-    const result = yield* database.db.run(sql`
+    yield* database.db.run(sql`
       UPDATE runtime_execution
-      SET owner_instance = ${identity.instance}, fence = ${nextFence}, state = ${"active"}, retry_at = NULL,
+      SET owner_instance = ${identity.instance}, fence = ${nextFence},
+          state = ${record.retry_at === null ? "active" : "retry_wait"}, retry_at = ${record.retry_at},
           time_updated = ${Date.now()}
       WHERE session_id = ${record.session_id}
         AND owner_lineage = ${identity.lineage}
@@ -176,16 +179,11 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
       `),
     )
     if (!current) return undefined
-    return {
-      ...toExecutionRecord(record),
-      ownerInstance: identity.instance,
-      fence: nextFence,
-      state: "active" as const,
-    }
+    return toExecutionRecord(current)
   })
 
   const checkQuiescent = Effect.fnUntraced(function* () {
-    const shouldStop = SynchronizedRef.modify(ref, (state) => {
+    const shouldStop = yield* SynchronizedRef.modify(ref, (state) => {
       if (state.phase !== "draining" || state.active.size > 0) return [false, state] as const
       return [true, { ...state, phase: "quiescent" }] as const
     })
@@ -300,42 +298,46 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
   })
 
   const release = Effect.fn("RuntimeLifecycle.release")(function* (sessionID: string) {
-    const action = SynchronizedRef.modify(ref, (state) => {
-      const current = state.active.get(sessionID)
-      if (!current) return [Effect.void, state] as const
-      if (current.leases > 1) {
+    const released = yield* SynchronizedRef.modifyEffect(
+      ref,
+      Effect.fnUntraced(function* (state) {
+        const current = state.active.get(sessionID)
+        if (!current) return [false, state] as const
+        if (current.leases > 1) {
+          const active = new Map(state.active)
+          active.set(sessionID, { ...current, leases: current.leases - 1 })
+          return [false, { ...state, active }] as const
+        }
+        const nextState = state.phase === "draining" ? "parked" : "completed"
+        yield* update(sessionID, current.fence, nextState, current.mode === "retry_wait" ? current.retryAt : undefined)
         const active = new Map(state.active)
-        active.set(sessionID, { ...current, leases: current.leases - 1 })
-        return [Effect.void, { ...state, active }] as const
-      }
-      const active = new Map(state.active)
-      active.delete(sessionID)
-      const nextState = state.phase === "draining" ? "parked" : "completed"
-      const operation = update(sessionID, current.fence, nextState).pipe(
-        Effect.tap(() =>
-          Effect.logInfo(nextState === "parked" ? "execution parked" : "execution completed", {
-            sessionID,
-            lineage: identity.lineage,
-            instance: identity.instance,
-          }),
-        ),
-        Effect.tap(() => checkQuiescent()),
-      )
-      return [operation, { ...state, active }] as const
+        active.delete(sessionID)
+        return [true, { ...state, active }] as const
+      }),
+    )
+    if (!released) return
+    yield* Effect.logInfo("execution released", {
+      sessionID,
+      lineage: identity.lineage,
+      instance: identity.instance,
     })
-    yield* action
+    yield* checkQuiescent()
   })
 
   const park = Effect.fn("RuntimeLifecycle.park")(function* (sessionID: string) {
-    const current = SynchronizedRef.getUnsafe(ref).active.get(sessionID)
-    if (!current) return
-    yield* update(sessionID, current.fence, "parked")
+    const parked = yield* SynchronizedRef.modifyEffect(
+      ref,
+      Effect.fnUntraced(function* (state) {
+        const current = state.active.get(sessionID)
+        if (!current) return [false, state] as const
+        yield* update(sessionID, current.fence, "parked", current.mode === "retry_wait" ? current.retryAt : undefined)
+        const active = new Map(state.active)
+        active.delete(sessionID)
+        return [true, { ...state, active }] as const
+      }),
+    )
+    if (!parked) return
     yield* Effect.logInfo("execution parked", { sessionID, lineage: identity.lineage, instance: identity.instance })
-    yield* SynchronizedRef.update(ref, (state) => {
-      const active = new Map(state.active)
-      active.delete(sessionID)
-      return { ...state, active }
-    })
     yield* checkQuiescent()
   })
 
@@ -352,7 +354,8 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
   })
 
   const beforeTurn = Effect.fn("RuntimeLifecycle.beforeTurn")(function* (sessionID: string) {
-    return SynchronizedRef.getUnsafe(ref).phase === "running" && SynchronizedRef.getUnsafe(ref).active.has(sessionID)
+    const current = SynchronizedRef.getUnsafe(ref).active.get(sessionID)
+    return SynchronizedRef.getUnsafe(ref).phase === "running" && current?.mode === "active"
   })
 
   const checkpoint = Effect.fn("RuntimeLifecycle.checkpoint")(function* (sessionID: string) {
@@ -362,14 +365,38 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
   })
 
   const retry = Effect.fn("RuntimeLifecycle.retry")(function* (sessionID: string, retryAt: number) {
-    const current = SynchronizedRef.getUnsafe(ref).active.get(sessionID)
-    if (!current) return
-    yield* update(sessionID, current.fence, "retry_wait", retryAt)
-    yield* SynchronizedRef.update(ref, (state) => {
-      const active = new Map(state.active)
-      active.set(sessionID, { ...current, mode: "retry_wait" })
-      return { ...state, active }
-    })
+    const parked = yield* SynchronizedRef.modifyEffect(
+      ref,
+      Effect.fnUntraced(function* (state) {
+        const current = state.active.get(sessionID)
+        if (!current) return [false, state] as const
+        yield* update(sessionID, current.fence, "retry_wait", retryAt)
+        const active = new Map(state.active)
+        if (state.phase === "running") {
+          active.set(sessionID, { ...current, mode: "retry_wait", retryAt })
+        } else {
+          active.delete(sessionID)
+        }
+        return [state.phase !== "running", { ...state, active }] as const
+      }),
+    )
+    if (parked) yield* checkQuiescent()
+  })
+
+  const resumeRetry = Effect.fn("RuntimeLifecycle.resumeRetry")(function* (sessionID: string) {
+    return yield* SynchronizedRef.modifyEffect(
+      ref,
+      Effect.fnUntraced(function* (state) {
+        const current = state.active.get(sessionID)
+        if (state.phase !== "running" || !current || current.mode !== "retry_wait") {
+          return [false, state] as const
+        }
+        yield* update(sessionID, current.fence, "active")
+        const active = new Map(state.active)
+        active.set(sessionID, { ...current, mode: "active", retryAt: undefined })
+        return [true, { ...state, active }] as const
+      }),
+    )
   })
 
   const awaitDraining = Deferred.await(draining)
@@ -400,40 +427,37 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
             active.set(record.sessionID, {
               fence: record.fence,
               leases: 0,
-              mode: row.state === "retry_wait" ? "retry_wait" : "active",
+              mode: record.state === "retry_wait" ? "retry_wait" : "active",
+              retryAt: record.retryAt,
             })
             return { ...state, active }
           })
-          if (row.retry_at && row.retry_at > Date.now()) {
-            yield* Effect.sleep(Duration.millis(row.retry_at - Date.now())).pipe(Effect.raceFirst(awaitDraining))
-            if (!SynchronizedRef.getUnsafe(ref).active.has(record.sessionID)) return
-            yield* SynchronizedRef.update(ref, (state) => {
-              const active = new Map(state.active)
-              const current = active.get(record.sessionID)
-              if (current) active.set(record.sessionID, { ...current, mode: "active" })
-              return { ...state, active }
-            })
-          }
-          yield* run(record).pipe(
-            Effect.tap(() => Effect.logInfo("execution recovery completed", { sessionID: record.sessionID })),
-            Effect.tap(() => complete(record.sessionID)),
-            Effect.catch((error) =>
-              Effect.gen(function* () {
-                const current = SynchronizedRef.getUnsafe(ref).active.get(record.sessionID)
-                if (current) {
-                  yield* update(record.sessionID, current.fence, "recovery_needed")
-                  yield* SynchronizedRef.update(ref, (state) => {
-                    const active = new Map(state.active)
-                    active.delete(record.sessionID)
-                    return { ...state, active }
-                  })
-                  yield* checkQuiescent()
-                }
-                yield* Effect.logError("execution recovery failed", { sessionID: record.sessionID, error })
-              }),
-            ),
-            Effect.forkIn(scope, { startImmediately: true }),
-          )
+          yield* Effect.gen(function* () {
+            const now = yield* Clock.currentTimeMillis
+            if (record.retryAt !== undefined && record.retryAt > now) {
+              yield* Effect.sleep(Duration.millis(record.retryAt - now)).pipe(Effect.raceFirst(awaitDraining))
+            }
+            if (record.state === "retry_wait" && !(yield* resumeRetry(record.sessionID))) return
+            yield* run({ ...record, state: "active", retryAt: undefined }).pipe(
+              Effect.tap(() => Effect.logInfo("execution recovery completed", { sessionID: record.sessionID })),
+              Effect.tap(() => complete(record.sessionID)),
+              Effect.catch((error) =>
+                Effect.gen(function* () {
+                  const current = SynchronizedRef.getUnsafe(ref).active.get(record.sessionID)
+                  if (current) {
+                    yield* update(record.sessionID, current.fence, "recovery_needed")
+                    yield* SynchronizedRef.update(ref, (state) => {
+                      const active = new Map(state.active)
+                      active.delete(record.sessionID)
+                      return { ...state, active }
+                    })
+                    yield* checkQuiescent()
+                  }
+                  yield* Effect.logError("execution recovery failed", { sessionID: record.sessionID, error })
+                }),
+              ),
+            )
+          }).pipe(Effect.forkIn(scope, { startImmediately: true }))
         }),
       { concurrency: "unbounded", discard: true },
     )
@@ -473,6 +497,7 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
     beforeTurn,
     checkpoint,
     retry,
+    resumeRetry,
     park,
     complete,
     awaitDraining,
@@ -496,6 +521,7 @@ export function unavailable(): Interface {
     beforeTurn: () => Effect.succeed(true),
     checkpoint: () => Effect.succeed(true),
     retry: () => Effect.void,
+    resumeRetry: () => Effect.succeed(true),
     park: () => Effect.void,
     complete: () => Effect.void,
     awaitDraining: Effect.never,
