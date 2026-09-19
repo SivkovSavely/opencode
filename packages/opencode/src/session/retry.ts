@@ -209,11 +209,11 @@ function parseJSON(value: unknown) {
   })
 }
 
-export function policy(opts: {
+export function policy<E = never>(opts: {
   provider: string
   parse: (error: unknown) => Err
   set: (input: { attempt: number; message: string; action?: Retryable["action"]; next: number }) => Effect.Effect<void>
-  wait?: (duration: Duration.Duration) => Effect.Effect<Duration.Duration>
+  wait?: (duration: Duration.Duration) => Effect.Effect<void, E>
 }) {
   return Schedule.fromStepWithMetadata(
     Effect.succeed((meta: Schedule.InputMetadata<unknown>) => {
@@ -232,8 +232,11 @@ export function policy(opts: {
           next: now + wait,
         })
         const duration = Duration.millis(wait)
-        const next = opts.wait ? yield* opts.wait(duration) : duration
-        return [meta.attempt, next] as [number, Duration.Duration]
+        if (opts.wait) {
+          yield* opts.wait(duration)
+          return [meta.attempt, Duration.zero] as [number, Duration.Duration]
+        }
+        return [meta.attempt, duration] as [number, Duration.Duration]
       })
     }),
   )

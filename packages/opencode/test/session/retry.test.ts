@@ -4,7 +4,8 @@ import { SessionV1 } from "@opencode-ai/core/v1/session"
 import type { NamedError } from "@opencode-ai/core/util/error"
 import { APICallError } from "ai"
 import { setTimeout as sleep } from "node:timers/promises"
-import { Effect, Schedule, Schema } from "effect"
+import { Deferred, Effect, Fiber, Ref, Schedule, Schema } from "effect"
+import * as TestClock from "effect/testing/TestClock"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { SessionRetry } from "../../src/session/retry"
 import { MessageV2 } from "../../src/session/message-v2"
@@ -248,6 +249,102 @@ describe("session.retry.delay", () => {
         attempt: 2,
         message: "boom",
       })
+    }),
+  )
+
+  it.effect("custom retry wait consumes the retry delay exactly once", () =>
+    Effect.gen(function* () {
+      const attempts = yield* Ref.make(0)
+      const waitStarted = yield* Deferred.make<void>()
+      const error = apiError({ "retry-after-ms": "1000" })
+      const retrying = Effect.gen(function* () {
+        yield* Ref.update(attempts, (value) => value + 1)
+        if ((yield* Ref.get(attempts)) === 1) return yield* Effect.fail(error)
+        return "ok"
+      }).pipe(
+        Effect.retry(
+          SessionRetry.policy({
+            provider: retryProvider,
+            parse: Schema.decodeUnknownSync(SessionV1.APIError.Schema),
+            set: () => Effect.void,
+            wait: (duration) =>
+              Effect.gen(function* () {
+                yield* Deferred.succeed(waitStarted, undefined)
+                yield* Effect.sleep(duration)
+              }),
+          }),
+        ),
+        Effect.forkChild,
+      )
+      const fiber = yield* retrying
+
+      yield* Deferred.await(waitStarted)
+      expect(yield* Ref.get(attempts)).toBe(1)
+
+      yield* TestClock.adjust(999)
+      expect(yield* Ref.get(attempts)).toBe(1)
+
+      yield* TestClock.adjust(1)
+      expect(yield* Ref.get(attempts)).toBe(2)
+      expect(yield* Fiber.join(fiber)).toBe("ok")
+    }),
+  )
+
+  it.effect("default retry policy lets the schedule own the retry delay", () =>
+    Effect.gen(function* () {
+      const attempts = yield* Ref.make(0)
+      const firstFailed = yield* Deferred.make<void>()
+      const error = apiError({ "retry-after-ms": "1000" })
+      const retrying = Effect.gen(function* () {
+        yield* Ref.update(attempts, (value) => value + 1)
+        if ((yield* Ref.get(attempts)) === 1) {
+          yield* Deferred.succeed(firstFailed, undefined)
+          return yield* Effect.fail(error)
+        }
+        return "ok"
+      }).pipe(
+        Effect.retry(
+          SessionRetry.policy({
+            provider: retryProvider,
+            parse: Schema.decodeUnknownSync(SessionV1.APIError.Schema),
+            set: () => Effect.void,
+          }),
+        ),
+        Effect.forkChild,
+      )
+      const fiber = yield* retrying
+
+      yield* Deferred.await(firstFailed)
+      yield* Effect.yieldNow
+      yield* TestClock.adjust(999)
+      expect(yield* Ref.get(attempts)).toBe(1)
+
+      yield* TestClock.adjust(1)
+      expect(yield* Ref.get(attempts)).toBe(2)
+      expect(yield* Fiber.join(fiber)).toBe("ok")
+    }),
+  )
+
+  it.effect("Effect.retry keeps 429 failures retryable beyond the normal limit", () =>
+    Effect.gen(function* () {
+      const attempts = yield* Ref.make(0)
+      const error = apiError({ "retry-after-ms": "0" }, { statusCode: 429, isRetryable: false })
+      const result = yield* Effect.gen(function* () {
+        yield* Ref.update(attempts, (value) => value + 1)
+        if ((yield* Ref.get(attempts)) < SessionRetry.RETRY_MAX_RETRIES + 3) return yield* Effect.fail(error)
+        return "ok"
+      }).pipe(
+        Effect.retry(
+          SessionRetry.policy({
+            provider: retryProvider,
+            parse: Schema.decodeUnknownSync(SessionV1.APIError.Schema),
+            set: () => Effect.void,
+          }),
+        ),
+      )
+
+      expect(result).toBe("ok")
+      expect(yield* Ref.get(attempts)).toBe(SessionRetry.RETRY_MAX_RETRIES + 3)
     }),
   )
 
