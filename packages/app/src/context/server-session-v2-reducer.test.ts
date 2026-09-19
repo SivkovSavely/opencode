@@ -115,7 +115,9 @@ describe("v2 session reducer", () => {
         assistantMessageID: "msg_assistant",
         callID: "call_1",
         metadata: {},
+        structured: { count: 1 },
         content: [{ type: "text", text: "done" }],
+        result: { type: "json", value: { count: 1 } },
         executed: true,
       },
     })
@@ -136,7 +138,24 @@ describe("v2 session reducer", () => {
     expect(messages[0]).toMatchObject({
       type: "assistant",
       retry: undefined,
-      content: [{ type: "tool", id: "call_1", state: { status: "completed", content: [{ text: "done" }] } }],
+      content: [
+        {
+          type: "tool",
+          id: "call_1",
+          state: {
+            status: "completed",
+            content: [{ text: "done" }],
+            metadata: {
+              __opencode_raw_tool_details: {
+                hasStructured: true,
+                structured: { count: 1 },
+                hasResult: true,
+                result: { type: "json", value: { count: 1 } },
+              },
+            },
+          },
+        },
+      ],
     })
   })
 

@@ -170,6 +170,9 @@ export const dict: Record<string, string> = {
   "ui.basicTool.called": "Called `{{tool}}`",
   "ui.toolErrorCard.failed": "Failed",
   "ui.toolErrorCard.copyError": "Copy error",
+  "ui.tool.rawDetails.request": "Request",
+  "ui.tool.rawDetails.response": "Response",
+  "ui.tool.rawDetails.noResponse": "No response yet",
 
   "ui.common.file.one": "file",
   "ui.common.file.other": "files",

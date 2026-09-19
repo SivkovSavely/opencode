@@ -26,6 +26,7 @@ export interface BasicToolProps {
   icon: IconProps["name"]
   trigger: TriggerTitle | JSX.Element | ((open: Accessor<boolean>) => JSX.Element)
   children?: JSX.Element
+  rawDetails?: () => JSX.Element
   status?: string
   hideDetails?: boolean
   defaultOpen?: boolean
@@ -34,6 +35,7 @@ export interface BasicToolProps {
   forceOpen?: boolean
   allowOpenWhilePending?: boolean
   defer?: boolean
+  deferContent?: boolean
   locked?: boolean
   animated?: boolean
   onSubtitleClick?: () => void
@@ -42,6 +44,10 @@ export interface BasicToolProps {
   triggerHref?: string
   triggerAsLink?: boolean
   clickable?: boolean
+}
+
+export function DeferredToolDetails(props: { render: () => JSX.Element }) {
+  return props.render()
 }
 
 const SPRING = { type: "spring" as const, visualDuration: 0.35, bounce: 0 }
@@ -84,14 +90,15 @@ function scheduleFrameMount(fn: () => void) {
 }
 
 export function BasicTool(props: BasicToolProps) {
+  const defer = () => !!props.rawDetails || props.defer === true || props.deferContent === true
   const [state, setState] = createStore({
     open: props.defaultOpen ?? false,
-    ready: !props.defer && (props.defaultOpen ?? false),
+    ready: !defer() && (props.defaultOpen ?? false),
   })
   const open = () => props.open ?? state.open
   const ready = () => state.ready
   const pending = () => props.status === "pending" || props.status === "running"
-  const hasChildren = () => (props.defer ? "children" in props : props.children)
+  const hasChildren = () => !!props.rawDetails || (defer() ? "children" in props : props.children)
   const dynamicTrigger = typeof props.trigger === "function" ? props.trigger(open) : undefined
 
   let cancelReady: (() => void) | undefined
@@ -113,7 +120,7 @@ export function BasicTool(props: BasicToolProps) {
   onCleanup(cancel)
 
   onMount(() => {
-    if (props.defer && open()) scheduleReady(true)
+    if (defer() && open()) scheduleReady(true)
   })
 
   const setOpen = (value: boolean) => {
@@ -131,7 +138,7 @@ export function BasicTool(props: BasicToolProps) {
     on(
       open,
       (value) => {
-        if (!props.defer) return
+        if (!defer()) return
         if (!value) {
           cancel()
           setState("ready", false)
@@ -177,7 +184,7 @@ export function BasicTool(props: BasicToolProps) {
   })
 
   const handleOpenChange = (value: boolean) => {
-    if (pending() && !props.allowOpenWhilePending) return
+    if (pending() && !props.allowOpenWhilePending && !props.rawDetails) return
     if (props.locked && !value) return
     setOpen(value)
   }
@@ -248,7 +255,14 @@ export function BasicTool(props: BasicToolProps) {
           </Switch>
         </div>
       </div>
-      <Show when={hasChildren() && !props.hideDetails && !props.locked && (!pending() || props.allowOpenWhilePending)}>
+      <Show
+        when={
+          hasChildren() &&
+          !props.hideDetails &&
+          !props.locked &&
+          (!pending() || props.allowOpenWhilePending || props.rawDetails)
+        }
+      >
         <Collapsible.Arrow />
       </Show>
     </div>
@@ -289,12 +303,22 @@ export function BasicTool(props: BasicToolProps) {
             overflow: initialOpen ? "visible" : "hidden",
           }}
         >
-          <Show when={!props.defer || ready()}>{props.children}</Show>
+          <Show when={!defer() || ready()}>
+            <Show when={!!props.rawDetails}>
+              <DeferredToolDetails render={props.rawDetails!} />
+            </Show>
+            {props.children}
+          </Show>
         </div>
       </Show>
       <Show when={!props.animated && hasChildren() && !props.hideDetails}>
         <Collapsible.Content>
-          <Show when={!props.defer || ready()}>{props.children}</Show>
+          <Show when={!defer() || ready()}>
+            <Show when={!!props.rawDetails}>
+              <DeferredToolDetails render={props.rawDetails!} />
+            </Show>
+            {props.children}
+          </Show>
         </Collapsible.Content>
       </Show>
     </Collapsible>
@@ -325,6 +349,8 @@ export function GenericTool(props: {
   status?: string
   hideDetails?: boolean
   input?: Record<string, unknown>
+  rawDetails?: () => JSX.Element
+  deferContent?: boolean
 }) {
   const i18n = useI18n()
 
@@ -338,6 +364,8 @@ export function GenericTool(props: {
         args: args(props.input),
       }}
       hideDetails={props.hideDetails}
+      rawDetails={props.rawDetails}
+      deferContent={props.deferContent}
     />
   )
 }

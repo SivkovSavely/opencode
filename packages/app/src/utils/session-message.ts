@@ -6,6 +6,7 @@ import type {
   SessionMessageUser,
 } from "@opencode-ai/client/promise"
 import type { AssistantMessage, FilePart, Message, Part, ToolPart, UserMessage } from "@opencode-ai/sdk/v2"
+import { RAW_TOOL_DETAILS_KEY } from "@opencode-ai/session-ui/raw-tool-details-key"
 import { Option, Schema } from "effect"
 
 const emptyTokens = { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } }
@@ -22,6 +23,60 @@ export const messageKey = (message: Pick<Message, "id" | "time">) => message.tim
 
 function record(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === "object" && !Array.isArray(value)
+}
+
+function has(value: Record<string, unknown>, key: string) {
+  return Object.prototype.hasOwnProperty.call(value, key)
+}
+
+function rawToolMetadata(state: unknown, providerExecuted: boolean, attachmentData?: FilePart[]) {
+  const source = record(state) ? state : {}
+  const metadata = record(source.metadata) ? source.metadata : {}
+  const stored = record(metadata[RAW_TOOL_DETAILS_KEY]) ? metadata[RAW_TOOL_DETAILS_KEY] : {}
+  const result: Record<string, unknown> = {
+    ...stored,
+    providerExecuted,
+    ...(has(source, "input") ? { input: source.input } : {}),
+  }
+  for (const key of ["result", "structured", "content", "outputPaths", "error"]) {
+    if (!has(source, key)) continue
+    result[`has${key[0]!.toUpperCase()}${key.slice(1)}`] = true
+    result[key] = source[key]
+  }
+  if (attachmentData?.length) {
+    result.attachments = attachmentData.map((item) => ({ mime: item.mime, name: item.filename }))
+  }
+  if (Array.isArray(source.attachments)) {
+    result.attachments = source.attachments.flatMap((item) => {
+      if (!record(item)) return []
+      return [
+        {
+          ...(typeof item.mime === "string" ? { mime: item.mime } : {}),
+          ...(typeof item.name === "string" ? { name: item.name } : {}),
+          ...(typeof item.filename === "string" ? { name: item.filename } : {}),
+          ...(typeof item.description === "string" ? { description: item.description } : {}),
+        },
+      ]
+    })
+  }
+  return result
+}
+
+function providerExecuted(tool: SessionMessageAssistantTool) {
+  const source = tool as unknown as Record<string, unknown>
+  if (typeof source.executed === "boolean") return source.executed
+  const providerValue = source.provider
+  const provider = record(providerValue) ? providerValue : undefined
+  return provider?.executed === true
+}
+
+function toolMetadata(name: string, state: unknown, executed: boolean, attachmentData?: FilePart[]) {
+  const source = record(state) ? state : {}
+  const metadata = record(source.metadata) ? source.metadata : {}
+  return {
+    ...normalizeToolMetadata(name, metadata),
+    [RAW_TOOL_DETAILS_KEY]: rawToolMetadata(state, executed, attachmentData),
+  }
 }
 
 function normalizeToolInput(name: string, input: Record<string, unknown>) {
@@ -300,55 +355,74 @@ function textPart(sessionID: string, messageID: string, ordinal: number, text: s
   }
 }
 
+type ToolSourceState = {
+  status: string
+  input: unknown
+  raw?: unknown
+  metadata?: unknown
+  content?: unknown
+  error?: unknown
+}
+
 function toolPart(sessionID: string, messageID: string, tool: SessionMessageAssistantTool): ToolPart {
   const start = tool.time.ran ?? tool.time.created
+  const executed = providerExecuted(tool)
+  const sourceState = tool.state as unknown as ToolSourceState
+  const status = sourceState.status
   const state = (() => {
-    if (tool.state.status === "streaming") {
-      const value = Option.getOrUndefined(decodeToolInput(tool.state.input))
+    if (status === "streaming" || status === "pending") {
+      const raw = typeof sourceState.input === "string" ? sourceState.input : (JSON.stringify(sourceState.input) ?? "")
+      const value = Option.getOrUndefined(decodeToolInput(raw))
       const input = normalizeToolInput(tool.name, record(value) ? value : {})
-      return { status: "pending" as const, input, raw: tool.state.input }
+      return { status: "pending" as const, input, raw }
     }
-    if (tool.state.status === "running") {
+    if (status === "running") {
       return {
         status: "running" as const,
-        input: normalizeToolInput(tool.name, tool.state.input),
-        // metadata: normalizeToolMetadata(tool.name, tool.state.structured),
-        metadata: normalizeToolMetadata(tool.name, tool.state.metadata ?? {}),
+        input: normalizeToolInput(tool.name, record(sourceState.input) ? sourceState.input : {}),
+        metadata: toolMetadata(tool.name, sourceState, executed),
         time: { start },
       }
     }
-    if (tool.state.status === "error") {
+    if (status === "error") {
+      const error =
+        typeof sourceState.error === "string"
+          ? sourceState.error
+          : record(sourceState.error) && typeof sourceState.error.message === "string"
+            ? sourceState.error.message
+            : ""
       return {
         status: "error" as const,
-        input: normalizeToolInput(tool.name, tool.state.input),
-        error: tool.state.error.message,
-        // metadata: normalizeToolMetadata(tool.name, tool.state.structured),
-        metadata: normalizeToolMetadata(tool.name, tool.state.metadata ?? {}),
+        input: normalizeToolInput(tool.name, record(sourceState.input) ? sourceState.input : {}),
+        error,
+        metadata: toolMetadata(tool.name, sourceState, executed),
         time: { start, end: tool.time.completed ?? start },
       }
     }
-    const attachments = tool.state.content.flatMap((item, index): FilePart[] =>
-      item.type === "file"
-        ? [
-            {
-              id: `${tool.id}:file:${index}`,
-              sessionID,
-              messageID,
-              type: "file",
-              mime: item.mime,
-              filename: item.name,
-              url: item.uri,
-            },
-          ]
-        : [],
-    )
+    const content = Array.isArray(sourceState.content) ? sourceState.content : []
+    const attachments = content.flatMap((item, index): FilePart[] => {
+      if (!record(item) || item.type !== "file" || typeof item.mime !== "string" || typeof item.uri !== "string")
+        return []
+      return [
+        {
+          id: `${tool.id}:file:${index}`,
+          sessionID,
+          messageID,
+          type: "file",
+          mime: item.mime,
+          filename: typeof item.name === "string" ? item.name : undefined,
+          url: item.uri,
+        },
+      ]
+    })
     return {
       status: "completed" as const,
-      input: normalizeToolInput(tool.name, tool.state.input),
-      output: tool.state.content.flatMap((item) => (item.type === "text" ? [item.text] : [])).join("\n"),
+      input: normalizeToolInput(tool.name, record(sourceState.input) ? sourceState.input : {}),
+      output: content
+        .flatMap((item) => (record(item) && item.type === "text" && typeof item.text === "string" ? [item.text] : []))
+        .join("\n"),
       title: tool.name,
-      // metadata: normalizeToolMetadata(tool.name, tool.state.structured),
-      metadata: normalizeToolMetadata(tool.name, tool.state.metadata ?? {}),
+      metadata: toolMetadata(tool.name, sourceState, executed, attachments),
       time: { start, end: tool.time.completed ?? start },
       attachments: attachments.length ? attachments : undefined,
     }
@@ -361,6 +435,10 @@ function toolPart(sessionID: string, messageID: string, tool: SessionMessageAssi
     callID: tool.id,
     tool: tool.name,
     state,
-    metadata: { providerState: tool.providerState, providerResultState: tool.providerResultState },
+    metadata: {
+      providerExecuted: executed,
+      providerState: tool.providerState,
+      providerResultState: tool.providerResultState,
+    },
   }
 }

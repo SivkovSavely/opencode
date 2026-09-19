@@ -67,6 +67,7 @@ import { attached, inline, kind, typeLabel } from "./message-file"
 import { readPartText } from "./message-part-text"
 import { formatTimestamp, formatToolTimestamp } from "./timestamp"
 import { SessionProgressIndicatorV2 } from "../v2/components/session-progress-indicator-v2"
+import { RawToolDetails, rawToolRequest, rawToolResponse } from "./raw-tool-details"
 
 async function writeClipboard(text: string): Promise<boolean> {
   const body = typeof document === "undefined" ? undefined : document.body
@@ -1116,30 +1117,26 @@ export function ContextToolGroup(props: {
             {(partAccessor) => {
               const trigger = createMemo(() => contextToolTrigger(partAccessor(), i18n))
               const timestamp = createMemo(() => formatToolTimestamp(partAccessor().state, i18n.locale()))
-              const running = createMemo(
-                () => partAccessor().state.status === "pending" || partAccessor().state.status === "running",
-              )
               return (
                 <div data-slot="context-tool-group-item">
-                  <div data-component="tool-trigger" data-has-timestamp={timestamp() ? "true" : undefined}>
-                    <div data-slot="basic-tool-tool-trigger-content">
-                      <div data-slot="basic-tool-tool-info">
-                        <div data-slot="basic-tool-tool-info-structured">
-                          <div data-slot="basic-tool-tool-info-main">
-                            <span data-slot="basic-tool-tool-title">
-                              <TextShimmer text={trigger().title} active={running()} />
-                            </span>
-                            <Show when={trigger().subtitle}>
-                              <span data-slot="basic-tool-tool-subtitle">{trigger().subtitle}</span>
-                            </Show>
-                            <Show when={trigger().args?.length}>
-                              <For each={trigger().args}>
-                                {(arg) => <span data-slot="basic-tool-tool-arg">{arg}</span>}
-                              </For>
-                            </Show>
-                          </div>
-                        </div>
-                      </div>
+                  <div data-component="tool-part-wrapper">
+                    <div data-slot="tool-part-content">
+                      <BasicTool
+                        icon="mcp"
+                        status={partAccessor().state.status}
+                        trigger={trigger()}
+                        rawDetails={
+                          ToolRegistry.rawDetails(partAccessor().tool)
+                            ? () => (
+                                <RawToolDetails
+                                  request={() => rawToolRequest(partAccessor())}
+                                  response={() => rawToolResponse(partAccessor())}
+                                />
+                              )
+                            : undefined
+                        }
+                        deferContent
+                      />
                     </div>
                     <Show when={timestamp()}>
                       {(value) => (
@@ -1475,6 +1472,7 @@ export interface ToolProps {
   onContentRendered?: () => void
   forceOpen?: boolean
   locked?: boolean
+  rawDetails?: () => JSX.Element
 }
 
 export type ToolComponent = Component<ToolProps>
@@ -1484,10 +1482,11 @@ const state: Record<
   {
     name: string
     render?: ToolComponent
+    rawDetails?: boolean
   }
 > = {}
 
-export function registerTool(input: { name: string; render?: ToolComponent }) {
+export function registerTool(input: { name: string; render?: ToolComponent; rawDetails?: boolean }) {
   state[input.name] = input
   return input
 }
@@ -1496,9 +1495,14 @@ export function getTool(name: string) {
   return state[name === "apply_patch" ? "patch" : name === "bash" ? "shell" : name]?.render
 }
 
+function getToolRawDetails(name: string) {
+  return state[name === "apply_patch" ? "patch" : name === "bash" ? "shell" : name]?.rawDetails ?? true
+}
+
 export const ToolRegistry = {
   register: registerTool,
   render: getTool,
+  rawDetails: getToolRawDetails,
 }
 
 function ToolFileAccordion(props: { path: string; actions?: JSX.Element; children: JSX.Element }) {
@@ -1570,6 +1574,10 @@ PART_MAPPING["tool"] = function ToolPartDisplay(props) {
   })
 
   const render = createMemo(() => ToolRegistry.render(part().tool) ?? GenericTool)
+  const rawDetails = createMemo(() => {
+    if (!ToolRegistry.rawDetails(part().tool)) return undefined
+    return () => <RawToolDetails request={() => rawToolRequest(part())} response={() => rawToolResponse(part())} />
+  })
   const controlledOpen = () => (props.onToolOpenChange ? (props.toolOpen ?? props.defaultOpen) : undefined)
   const handleToolOpenChange = (open: boolean) => props.onToolOpenChange?.(open)
 
@@ -1602,10 +1610,10 @@ PART_MAPPING["tool"] = function ToolPartDisplay(props) {
                     onOpenChange={props.onToolOpenChange ? handleToolOpenChange : undefined}
                     subtitle={taskSubtitle()}
                     href={taskHref()}
+                    rawDetails={rawDetails()}
                     onSubtitleClick={(event) => {
                       if (!data.navigateToSession) return
-                      if (event.button !== 0 || event.altKey || event.ctrlKey || event.metaKey || event.shiftKey)
-                        return
+                      if (event.button !== 0 || event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return
                       const id = taskId()
                       if (!id) return
                       event.preventDefault()
@@ -1632,6 +1640,7 @@ PART_MAPPING["tool"] = function ToolPartDisplay(props) {
                 deferContent={props.deferToolContent}
                 virtualizeDiff={props.virtualizeDiff}
                 onContentRendered={props.onContentRendered}
+                rawDetails={rawDetails()}
               />
             </Match>
           </Switch>
@@ -1792,6 +1801,7 @@ PART_MAPPING["reasoning"] = function ReasoningPartDisplay(props) {
 
 ToolRegistry.register({
   name: "read",
+  rawDetails: true,
   render(props) {
     const data = useData()
     const i18n = useI18n()
@@ -1832,6 +1842,7 @@ ToolRegistry.register({
 
 ToolRegistry.register({
   name: "list",
+  rawDetails: true,
   render(props) {
     const i18n = useI18n()
     return (
@@ -1839,25 +1850,14 @@ ToolRegistry.register({
         {...props}
         icon="bullet-list"
         trigger={{ title: i18n.t("ui.tool.list"), subtitle: getDirectory(props.input.path || "/") }}
-      >
-        <Show when={props.output}>
-          <div
-            data-component="tool-output"
-            data-scrollable
-            tabIndex={0}
-            role="region"
-            aria-label={i18n.t("ui.scrollView.ariaLabel")}
-          >
-            <Markdown text={props.output!} />
-          </div>
-        </Show>
-      </BasicTool>
+      />
     )
   },
 })
 
 ToolRegistry.register({
   name: "glob",
+  rawDetails: true,
   render(props) {
     const i18n = useI18n()
     return (
@@ -1869,25 +1869,14 @@ ToolRegistry.register({
           subtitle: getDirectory(props.input.path || "/"),
           args: props.input.pattern ? ["pattern=" + props.input.pattern] : [],
         }}
-      >
-        <Show when={props.output}>
-          <div
-            data-component="tool-output"
-            data-scrollable
-            tabIndex={0}
-            role="region"
-            aria-label={i18n.t("ui.scrollView.ariaLabel")}
-          >
-            <Markdown text={props.output!} />
-          </div>
-        </Show>
-      </BasicTool>
+      />
     )
   },
 })
 
 ToolRegistry.register({
   name: "grep",
+  rawDetails: true,
   render(props) {
     const i18n = useI18n()
     const args: string[] = []
@@ -1902,25 +1891,14 @@ ToolRegistry.register({
           subtitle: getDirectory(props.input.path || "/"),
           args,
         }}
-      >
-        <Show when={props.output}>
-          <div
-            data-component="tool-output"
-            data-scrollable
-            tabIndex={0}
-            role="region"
-            aria-label={i18n.t("ui.scrollView.ariaLabel")}
-          >
-            <Markdown text={props.output!} />
-          </div>
-        </Show>
-      </BasicTool>
+      />
     )
   },
 })
 
 ToolRegistry.register({
   name: "webfetch",
+  rawDetails: true,
   render(props) {
     const i18n = useI18n()
     const pending = createMemo(() => props.status === "pending" || props.status === "running")
@@ -1932,7 +1910,6 @@ ToolRegistry.register({
     return (
       <BasicTool
         {...props}
-        hideDetails
         icon="window-cursor"
         trigger={
           <div data-slot="basic-tool-tool-info-structured">
@@ -1967,6 +1944,7 @@ ToolRegistry.register({
 
 ToolRegistry.register({
   name: "websearch",
+  rawDetails: false,
   render(props) {
     const i18n = useI18n()
     const query = createMemo(() => {
@@ -1994,6 +1972,7 @@ ToolRegistry.register({
 
 ToolRegistry.register({
   name: "task",
+  rawDetails: false,
   render(props) {
     const data = useData()
     const i18n = useI18n()
@@ -2101,6 +2080,7 @@ ToolRegistry.register({
 
 ToolRegistry.register({
   name: "shell",
+  rawDetails: false,
   render(props) {
     const i18n = useI18n()
     const pending = () => props.status === "pending" || props.status === "running"
@@ -2171,6 +2151,7 @@ ToolRegistry.register({
 
 ToolRegistry.register({
   name: "edit",
+  rawDetails: false,
   render(props) {
     const i18n = useI18n()
     const fileComponent = useFileComponent()
@@ -2277,6 +2258,7 @@ ToolRegistry.register({
 
 ToolRegistry.register({
   name: "write",
+  rawDetails: false,
   render(props) {
     const i18n = useI18n()
     const fileComponent = useFileComponent()
@@ -2337,6 +2319,7 @@ ToolRegistry.register({
 
 ToolRegistry.register({
   name: "patch",
+  rawDetails: false,
   render(props) {
     const i18n = useI18n()
     const fileComponent = useFileComponent()
@@ -2541,6 +2524,7 @@ ToolRegistry.register({
 
 ToolRegistry.register({
   name: "todowrite",
+  rawDetails: false,
   render(props) {
     const i18n = useI18n()
     const todos = createMemo(() => {
@@ -2592,6 +2576,7 @@ ToolRegistry.register({
 
 ToolRegistry.register({
   name: "question",
+  rawDetails: false,
   render(props) {
     const i18n = useI18n()
     const questions = createMemo(() => (props.input.questions ?? []) as QuestionInfo[])
@@ -2637,6 +2622,7 @@ ToolRegistry.register({
 
 ToolRegistry.register({
   name: "skill",
+  rawDetails: false,
   render(props) {
     const i18n = useI18n()
     const title = createMemo(() => props.input.name || i18n.t("ui.tool.skill"))

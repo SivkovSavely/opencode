@@ -1,8 +1,41 @@
-import type { OpenCodeEvent, SessionMessageInfo, SessionPendingMessage } from "@opencode-ai/client/promise"
+import type { JsonValue, OpenCodeEvent, SessionMessageInfo, SessionPendingMessage } from "@opencode-ai/client/promise"
+import { RAW_TOOL_DETAILS_KEY } from "@opencode-ai/session-ui/raw-tool-details-key"
 
 type Assistant = Extract<SessionMessageInfo, { type: "assistant" }>
 type Compaction = Extract<SessionMessageInfo, { type: "compaction" }>
 type Shell = Extract<SessionMessageInfo, { type: "shell" }>
+
+function record(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === "object" && !Array.isArray(value)
+}
+
+function has(value: Record<string, unknown>, key: string) {
+  return Object.prototype.hasOwnProperty.call(value, key)
+}
+
+function toolMetadata(data: unknown, existing: unknown, input: unknown, providerExecuted: boolean, error?: unknown) {
+  const source = record(data) ? data : {}
+  const previous = record(existing) ? (existing as Record<string, JsonValue>) : {}
+  const stored = record(previous[RAW_TOOL_DETAILS_KEY])
+    ? (previous[RAW_TOOL_DETAILS_KEY] as Record<string, JsonValue>)
+    : {}
+  const raw: Record<string, JsonValue> = {
+    ...stored,
+    input: input as JsonValue,
+    providerExecuted,
+    ...(error === undefined ? {} : { hasError: true, error: error as JsonValue }),
+  }
+  for (const key of ["result", "structured", "content", "outputPaths"]) {
+    if (!has(source, key)) continue
+    raw[`has${key[0]!.toUpperCase()}${key.slice(1)}`] = true
+    raw[key] = source[key] as JsonValue
+  }
+  return {
+    ...previous,
+    ...(record(source.metadata) ? (source.metadata as Record<string, JsonValue>) : {}),
+    [RAW_TOOL_DETAILS_KEY]: raw,
+  }
+}
 
 export type V2SessionReduction = {
   sessionID: string
@@ -269,8 +302,11 @@ export function createV2SessionReducer() {
           ...tool,
           executed: event.data.executed,
           providerState: event.data.state,
-          // structured: {}, content: []
-          state: { status: "running", input: event.data.input, metadata: {} },
+          state: {
+            status: "running",
+            input: event.data.input,
+            metadata: toolMetadata(event.data, {}, event.data.input, event.data.executed),
+          },
           time: { ...tool.time, ran: event.created },
         }))
       case "session.tool.progress":
@@ -278,8 +314,10 @@ export function createV2SessionReducer() {
           tool.state.status === "running"
             ? {
                 ...tool,
-                // state: { ...tool.state, structured: event.data.structured, content: event.data.content },
-                state: { ...tool.state, metadata: event.data.metadata },
+                state: {
+                  ...tool.state,
+                  metadata: toolMetadata(event.data, tool.state.metadata, tool.state.input, tool.executed === true),
+                },
               }
             : tool,
         )
@@ -293,10 +331,13 @@ export function createV2SessionReducer() {
             state: {
               status: "completed",
               input: tool.state.input,
-              // structured: event.data.structured,
-              metadata: event.data.metadata,
+              metadata: toolMetadata(
+                event.data,
+                tool.state.metadata,
+                tool.state.input,
+                event.data.executed || tool.executed === true,
+              ),
               content: event.data.content,
-              // result: event.data.result,
             },
             time: { ...tool.time, completed: event.created },
           }
@@ -311,11 +352,15 @@ export function createV2SessionReducer() {
             state: {
               status: "error",
               input: typeof tool.state.input === "string" ? {} : tool.state.input,
-              // structured: tool.state.status === "running" ? tool.state.structured : {},
-              metadata: event.data.metadata ?? (tool.state.status === "running" ? tool.state.metadata : {}),
+              metadata: toolMetadata(
+                event.data,
+                tool.state.status === "running" ? tool.state.metadata : {},
+                tool.state.input,
+                event.data.executed || tool.executed === true,
+                event.data.error,
+              ),
               content: event.data.content,
               error: event.data.error,
-              // result: event.data.result,
             },
             time: { ...tool.time, completed: event.created },
           }

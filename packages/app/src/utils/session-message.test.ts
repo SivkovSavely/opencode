@@ -1,5 +1,7 @@
 import { describe, expect, test } from "bun:test"
 import type { SessionMessageInfo } from "@opencode-ai/client/promise"
+import { RAW_TOOL_DETAILS_KEY } from "@opencode-ai/session-ui/raw-tool-details-key"
+import type { ToolPart } from "@opencode-ai/sdk/v2"
 import { normalizeSessionMessages } from "./session-message"
 
 describe("normalizeSessionMessages", () => {
@@ -210,5 +212,71 @@ describe("normalizeSessionMessages", () => {
         }),
       }),
     ])
+  })
+
+  test("preserves provider and structured tool results for Web inspection", () => {
+    const source = [
+      { id: "msg_user", type: "user", text: "search", time: { created: 1 } },
+      {
+        id: "msg_assistant",
+        type: "assistant",
+        agent: "build",
+        model: { id: "model", providerID: "provider" },
+        content: [
+          {
+            type: "tool",
+            id: "call_mcp",
+            name: "mcp_search",
+            provider: { executed: true },
+            state: {
+              status: "completed",
+              input: { query: "foo", limit: 20 },
+              structured: { matches: 2 },
+              content: [{ type: "text", text: "foo.ts" }],
+              result: { type: "json", value: { matches: 2 } },
+            },
+            time: { created: 2, ran: 3, completed: 4 },
+          },
+        ],
+        time: { created: 2, completed: 4 },
+      },
+    ] as unknown as SessionMessageInfo[]
+
+    const tool = normalizeSessionMessages("ses_1", source).parts.get("msg_assistant")?.[0] as ToolPart
+    expect(tool.state.input).toEqual({ query: "foo", limit: 20 })
+    if (tool.state.status !== "completed") throw new Error("expected a completed tool")
+    expect(tool.state.metadata[RAW_TOOL_DETAILS_KEY]).toMatchObject({
+      providerExecuted: true,
+      input: { query: "foo", limit: 20 },
+      hasStructured: true,
+      structured: { matches: 2 },
+      hasResult: true,
+      result: { type: "json", value: { matches: 2 } },
+    })
+  })
+
+  test("projects canonical pending input without inventing a response", () => {
+    const source = [
+      { id: "msg_user", type: "user", text: "run it", time: { created: 1 } },
+      {
+        id: "msg_assistant",
+        type: "assistant",
+        agent: "build",
+        model: { id: "model", providerID: "provider" },
+        content: [
+          {
+            type: "tool",
+            id: "call_pending",
+            name: "custom_tool",
+            state: { status: "pending", input: '{"flag":true}' },
+            time: { created: 2 },
+          },
+        ],
+        time: { created: 2 },
+      },
+    ] as unknown as SessionMessageInfo[]
+
+    const tool = normalizeSessionMessages("ses_1", source).parts.get("msg_assistant")?.[0] as ToolPart
+    expect(tool.state).toMatchObject({ status: "pending", input: { flag: true }, raw: '{"flag":true}' })
   })
 })

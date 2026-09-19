@@ -1,4 +1,4 @@
-import { type ComponentProps, createMemo, Show, splitProps } from "solid-js"
+import { type ComponentProps, createMemo, Show, splitProps, type JSX } from "solid-js"
 import { createStore } from "solid-js/store"
 import { Card, CardDescription } from "@opencode-ai/ui/card"
 import { Collapsible } from "@opencode-ai/ui/collapsible"
@@ -6,6 +6,7 @@ import { Icon } from "@opencode-ai/ui/icon"
 import { IconButton } from "@opencode-ai/ui/icon-button"
 import { Tooltip } from "@opencode-ai/ui/tooltip"
 import { useI18n } from "@opencode-ai/ui/context/i18n"
+import { DeferredToolDetails } from "./basic-tool"
 
 export interface ToolErrorCardProps extends Omit<ComponentProps<typeof Card>, "children" | "variant"> {
   tool: string
@@ -17,6 +18,7 @@ export interface ToolErrorCardProps extends Omit<ComponentProps<typeof Card>, "c
   subtitle?: string
   href?: string
   onSubtitleClick?: (event: MouseEvent) => void
+  rawDetails?: () => JSX.Element
 }
 
 export function ToolErrorCard(props: ToolErrorCardProps) {
@@ -37,6 +39,7 @@ export function ToolErrorCard(props: ToolErrorCardProps) {
     "subtitle",
     "href",
     "onSubtitleClick",
+    "rawDetails",
   ])
   const setOpen = (value: boolean) => {
     if (props.open === undefined) setState("open", value)
@@ -154,6 +157,9 @@ export function ToolErrorCard(props: ToolErrorCardProps) {
               </div>
             </Show>
             <Show when={body()}>{(value) => <CardDescription>{value()}</CardDescription>}</Show>
+            <Show when={open() && !!split.rawDetails}>
+              <DeferredToolDetails render={split.rawDetails!} />
+            </Show>
           </div>
         </Collapsible.Content>
       </Collapsible>
