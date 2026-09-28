@@ -893,6 +893,8 @@ export const dict = {
   "settings.general.row.editToolPartsExpanded.title": "Espandi le parti dello strumento di modifica",
   "settings.general.row.editToolPartsExpanded.description":
     "Mostra le parti degli strumenti di modifica, scrittura e patch espanse per impostazione predefinita nella sequenza temporale",
+  "settings.general.row.enterNewline.title": "Invio aggiunge una nuova riga",
+  "settings.general.row.enterNewline.description": "Scambia Invio e Maiusc+Invio perché Invio aggiunga una nuova riga",
   "settings.general.row.newInterface.title": "Nuova disposizione",
   "settings.general.row.newInterface.badge": "Nuovo",
   "settings.general.row.newInterface.description":

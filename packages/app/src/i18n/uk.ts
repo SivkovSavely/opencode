@@ -1066,6 +1066,8 @@ export const dict = {
   "settings.general.row.editToolPartsExpanded.title": "Розгортати частини інструменту редагування",
   "settings.general.row.editToolPartsExpanded.description":
     "Показувати частини інструментів редагування, запису та патчів розгорнутими за замовчуванням на часовій шкалі",
+  "settings.general.row.enterNewline.title": "Enter додає новий рядок",
+  "settings.general.row.enterNewline.description": "Поміняйте Enter і Shift+Enter, щоб Enter додавав новий рядок",
   "settings.general.row.newInterface.title": "Новий макет",
   "settings.general.row.newInterface.badge": "Нове",
   "settings.general.row.newInterface.description":

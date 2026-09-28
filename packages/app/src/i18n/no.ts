@@ -1253,6 +1253,8 @@ export const dict = {
   "settings.general.row.showCustomAgents.title": "Vis agent",
   "settings.general.row.showCustomAgents.description":
     "Bytt mellom agenter i skrivefeltet. Når velgeren er skjult, brukes Build-agenten som standard.",
+  "settings.general.row.enterNewline.title": "Enter legger til en ny linje",
+  "settings.general.row.enterNewline.description": "Bytt Enter og Shift+Enter slik at Enter legger til en ny linje",
   "settings.general.row.newInterface.title": "Nytt oppsett",
   "settings.general.row.newInterface.badge": "Ny",
   "settings.general.row.newInterface.description":

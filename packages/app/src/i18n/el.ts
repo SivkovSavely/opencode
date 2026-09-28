@@ -984,6 +984,8 @@ export const dict = {
   "settings.general.row.editToolPartsExpanded.title": "Ανάπτυξη τμημάτων εργαλείου επεξεργασίας",
   "settings.general.row.editToolPartsExpanded.description":
     "Εμφάνιση τμημάτων του εργαλείου επεξεργασίας, εγγραφής και ενημέρωσης κώδικα που έχουν αναπτυχθεί από προεπιλογή στη γραμμή χρόνου",
+  "settings.general.row.enterNewline.title": "Το Enter προσθέτει νέα γραμμή",
+  "settings.general.row.enterNewline.description": "Εναλλάξτε το Enter και το Shift+Enter ώστε το Enter να προσθέτει νέα γραμμή",
   "settings.general.row.newInterface.title": "Νέα διάταξη",
   "settings.general.row.newInterface.badge": "Νέο",
   "settings.general.row.newInterface.description":

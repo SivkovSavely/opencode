@@ -334,6 +334,18 @@ export const SettingsGeneralV2: Component<{
         <ShellSetting controller={shell} />
 
         <SettingsRowV2
+          title={language.t("settings.general.row.enterNewline.title")}
+          description={language.t("settings.general.row.enterNewline.description")}
+        >
+          <div data-action="settings-enter-newline">
+            <Switch
+              checked={settings.general.enterNewline()}
+              onChange={(checked) => settings.general.setEnterNewline(checked)}
+            />
+          </div>
+        </SettingsRowV2>
+
+        <SettingsRowV2
           title={language.t("settings.general.row.reasoningSummaries.title")}
           description={language.t("settings.general.row.reasoningSummaries.description")}
         >

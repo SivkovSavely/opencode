@@ -974,6 +974,8 @@ export const dict = {
   "settings.general.row.editToolPartsExpanded.title": "Extinde părțile de editare",
   "settings.general.row.editToolPartsExpanded.description":
     "Afișează implicit părțile de editare, scriere și patch extinse în cronologie",
+  "settings.general.row.enterNewline.title": "Enter adaugă o linie nouă",
+  "settings.general.row.enterNewline.description": "Schimbă Enter și Shift+Enter pentru ca Enter să adauge o linie nouă",
   "settings.general.row.newInterface.title": "Aspect nou",
   "settings.general.row.newInterface.badge": "Nou",
   "settings.general.row.newInterface.description":

@@ -962,6 +962,8 @@ export const dict = {
   "settings.general.row.editToolPartsExpanded.title": "ຂະຫຍາຍພາກສ່ວນເຄື່ອງມືແກ້ໄຂ",
   "settings.general.row.editToolPartsExpanded.description":
     "ສະ​ແດງ​ການ​ແກ້​ໄຂ, ຂຽນ, ແລະ​ການ​ແກ້​ໄຂ​ສ່ວນ​ເຄື່ອງ​ມື​ທີ່​ຂະ​ຫຍາຍ​ໂດຍ​ຄ່າ​ເລີ່ມ​ຕົ້ນ​ໃນ​ໄລ​ຍະ​ເວ​ລາ",
+  "settings.general.row.enterNewline.title": "Enter ເພີ່ມບາດໃໝ່",
+  "settings.general.row.enterNewline.description": "ສະແກນ Enter ແລະ Shift+Enter ເພື່ອໃຫ້ Enter ເພີ່ມບາດໃໝ່",
   "settings.general.row.newInterface.title": "ໂຄງຮ່າງໃໝ່",
   "settings.general.row.newInterface.badge": "ໃໝ່",
   "settings.general.row.newInterface.description": "ໃຊ້ແຖບໃໝ່ ແລະຮູບແບບໜ້າຫຼັກ. ສະຫຼັບລະຫວ່າງໂຄງຮ່າງເປັນເວລາຈຳກັດ.",

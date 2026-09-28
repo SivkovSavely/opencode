@@ -44,6 +44,7 @@ export type PromptInputV2Props = {
   variantControlVisible?: boolean
   attachKeybind?: string[]
   attachShortcut?: string
+  enterNewline?: boolean
 }
 
 export function PromptInputV2(props: PromptInputV2Props) {
@@ -171,7 +172,7 @@ export function PromptInputV2(props: PromptInputV2Props) {
             }}
             onKeyDown={(event) => {
               if (props.controller.onKeyDown(event)) return
-              if (event.key === "Enter" && !event.shiftKey && !event.isComposing) {
+              if (event.key === "Enter" && !event.isComposing && event.shiftKey === !!props.enterNewline) {
                 event.preventDefault()
                 if (event.repeat) return
                 props.controller.submit()

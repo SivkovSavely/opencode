@@ -979,6 +979,8 @@ export const dict = {
   "settings.general.row.editToolPartsExpanded.title": "ترمیمی ٹول کے حصے پھیلائیں",
   "settings.general.row.editToolPartsExpanded.description":
     "ٹائم لائن میں ترمیم، تحریر اور پیچ ٹول کے حصے بطور طے شدہ پھیلے ہوئے دکھائیں۔",
+  "settings.general.row.enterNewline.title": "Enter نئی سطر شامل کرتا ہے",
+  "settings.general.row.enterNewline.description": "Enter اور Shift+Enter کو بدلیں تاکہ Enter نئی سطر شامل کرے",
   "settings.general.row.newInterface.title": "نیا لے آؤٹ",
   "settings.general.row.newInterface.badge": "نیا",
   "settings.general.row.newInterface.description":

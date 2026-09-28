@@ -985,6 +985,8 @@ export const dict = {
   "settings.general.row.editToolPartsExpanded.title": "တည်းဖြတ်ကိရိယာအစိတ်အပိုင်းများကို ချဲ့ထွင်ပါ။",
   "settings.general.row.editToolPartsExpanded.description":
     "အချိန်ဇယားတွင် ပုံသေဖြင့် ချဲ့ထွင်ထားသော တည်းဖြတ်ခြင်း၊ ရေးသားခြင်းနှင့် ဖာထေးခြင်း ကိရိယာအစိတ်အပိုင်းများကို ပြသပါ။",
+  "settings.general.row.enterNewline.title": "Enter သည် စာကြောင်းအသစ်ကို ထည့်သွင်းသည်",
+  "settings.general.row.enterNewline.description": "Enter နှင့် Shift+Enter ကို လဲမှတ်ပြီး Enter ဖြင့် စာကြောင်းအသစ်ထည့်သွင်းရန်",
   "settings.general.row.newInterface.title": "အပြင်အဆင်အသစ်",
   "settings.general.row.newInterface.badge": "အသစ်",
   "settings.general.row.newInterface.description":

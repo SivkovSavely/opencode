@@ -974,6 +974,8 @@ export const dict = {
   "settings.general.row.editToolPartsExpanded.title": "Fäll ut delar för redigeringsverktyg",
   "settings.general.row.editToolPartsExpanded.description":
     "Visa delar för redigerings-, skriv- och patchverktyg utfällda som standard i tidslinjen",
+  "settings.general.row.enterNewline.title": "Enter infogar en ny rad",
+  "settings.general.row.enterNewline.description": "Byt Enter och Shift+Enter så att Enter infogar en ny rad",
   "settings.general.row.newInterface.title": "Ny layout",
   "settings.general.row.newInterface.badge": "Ny",
   "settings.general.row.newInterface.description":

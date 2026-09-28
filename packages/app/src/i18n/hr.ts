@@ -980,6 +980,8 @@ export const dict = {
   "settings.general.row.editToolPartsExpanded.title": "Proširi uređivanje dijelova alata",
   "settings.general.row.editToolPartsExpanded.description":
     "Prikažite dijelove alata za uređivanje, pisanje i zakrpe prema zadanim postavkama na vremenskoj traci",
+  "settings.general.row.enterNewline.title": "Enter dodaje novi redak",
+  "settings.general.row.enterNewline.description": "Zamijeni Enter i Shift+Enter tako da Enter dodaje novi redak",
   "settings.general.row.newInterface.title": "Novi izgled",
   "settings.general.row.newInterface.badge": "Novi",
   "settings.general.row.newInterface.description":

@@ -977,6 +977,8 @@ export const dict = {
   "settings.general.row.editToolPartsExpanded.title": "संपादन टूल भागों का विस्तार करें",
   "settings.general.row.editToolPartsExpanded.description":
     "टाइमलाइन में डिफ़ॉल्ट रूप से विस्तारित संपादित करें, लिखें और पैच टूल पार्ट्स दिखाएं",
+  "settings.general.row.enterNewline.title": "Enter नई पंक्ति जोड़ता है",
+  "settings.general.row.enterNewline.description": "Enter और Shift+Enter को बदलें ताकि Enter नई पंक्ति जोड़े",
   "settings.general.row.newInterface.title": "नया लेआउट",
   "settings.general.row.newInterface.badge": "नया",
   "settings.general.row.newInterface.description":

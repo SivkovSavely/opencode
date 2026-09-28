@@ -969,6 +969,8 @@ export const dict: Record<string, string> = {
   "settings.general.row.editToolPartsExpanded.title": "सम्पादन उपकरण भागहरू विस्तार गर्नुहोस्",
   "settings.general.row.editToolPartsExpanded.description":
     "टाइमलाइनमा पूर्वनिर्धारित रूपमा विस्तार गरिएको सम्पादन, लेख्नुहोस् र प्याच उपकरण भागहरू देखाउनुहोस्",
+  "settings.general.row.enterNewline.title": "Enter ले नयाँ पंक्ति थप्छ",
+  "settings.general.row.enterNewline.description": "Enter र Shift+Enter साट्नुहोस् ताकि Enter ले नयाँ पंक्ति थप्ने",
   "settings.general.row.newInterface.title": "नयाँ लेआउट",
   "settings.general.row.newInterface.badge": "नयाँ",
   "settings.general.row.newInterface.description":

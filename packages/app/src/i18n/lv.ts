@@ -975,6 +975,8 @@ export const dict = {
   "settings.general.row.editToolPartsExpanded.title": "Izvērst rediģēšanas rīka daļas",
   "settings.general.row.editToolPartsExpanded.description":
     "Pēc noklusējuma rādīt rediģēšanas, rakstīšanas un labošanas rīka daļas izvērstas laika joslā",
+  "settings.general.row.enterNewline.title": "Enter pievieno jaunu rindu",
+  "settings.general.row.enterNewline.description": "Apmainiet Enter un Shift+Enter, lai Enter pievienotu jaunu rindu",
   "settings.general.row.newInterface.title": "Jauns izkārtojums",
   "settings.general.row.newInterface.badge": "Jauns",
   "settings.general.row.newInterface.description":

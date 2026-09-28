@@ -894,6 +894,8 @@ export const dict = {
   "settings.general.row.editToolPartsExpanded.title": "Expandir partes da ferramenta de edição",
   "settings.general.row.editToolPartsExpanded.description":
     "Mostrar partes das ferramentas de edição, escrita e patch expandidas por padrão na linha do tempo",
+  "settings.general.row.enterNewline.title": "Enter ouzhpenn ur liñvadenn nevez",
+  "settings.general.row.enterNewline.description": "Erallin Enter hag Shift+Enter evit ma ouzhpenn Enter ur liñvadenn nevez",
   "settings.general.row.newInterface.title": "Novo layout",
   "settings.general.row.newInterface.badge": "Novo",
   "settings.general.row.newInterface.description":

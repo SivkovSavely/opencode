@@ -974,6 +974,8 @@ export const dict = {
   "settings.general.row.editToolPartsExpanded.title": "ترمیم دے آلے دے حصیاں نو ودھاؤ",
   "settings.general.row.editToolPartsExpanded.description":
     "ٹائم لائن وچ ڈیفالٹ دے طور تے ودھائے گئے ترمیم، لکھن تے پیچ ٹول دے حصے وکھاؤ",
+  "settings.general.row.enterNewline.title": "Enter ਨਵੀਂ ਲਾਈ ਜੋੜਦਾ ਹੈ",
+  "settings.general.row.enterNewline.description": "Enter ਅਤੇ Shift+Enter ਨੂੰ ਬਦਲੋ ਤਾਂ ਕਿ Enter ਨਵੀਂ ਲਾਈ ਜੋੜੇ",
   "settings.general.row.newInterface.title": "نواں لے آؤٹ",
   "settings.general.row.newInterface.badge": "نواں",
   "settings.general.row.newInterface.description":

@@ -980,6 +980,8 @@ export const dict = {
   "settings.general.row.editToolPartsExpanded.title": "Tahrirlash vositasi qismlarini kengaytiring",
   "settings.general.row.editToolPartsExpanded.description":
     "Vaqt jadvalida sukut boʻyicha kengaytirilgan tahrirlash, yozish va tuzatish vositalari qismlarini koʻrsatish",
+  "settings.general.row.enterNewline.title": "Enter yangi qator qo'shadi",
+  "settings.general.row.enterNewline.description": "Enter va Shift+Enter almashtirilsin, shunda Enter yangi qator qo'shadi",
   "settings.general.row.newInterface.title": "Yangi tartib",
   "settings.general.row.newInterface.badge": "Yangi",
   "settings.general.row.newInterface.description":

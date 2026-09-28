@@ -965,6 +965,8 @@ export const dict = {
   "settings.general.row.editToolPartsExpanded.title": "ពង្រីកផ្នែកឧបករណ៍កែសម្រួល",
   "settings.general.row.editToolPartsExpanded.description":
     "បង្ហាញការកែសម្រួល សរសេរ និងផ្នែកឧបករណ៍បំណះដែលបានពង្រីកតាមលំនាំដើមនៅក្នុងបន្ទាត់ពេលវេលា",
+  "settings.general.row.enterNewline.title": "Enter បន្ថែមបន្ទាត់ថ្មី",
+  "settings.general.row.enterNewline.description": "ប្តូរ Enter និង Shift+Enter ដើម្បី Enter បន្ថែមបន្ទាត់ថ្មី",
   "settings.general.row.newInterface.title": "ប្លង់ថ្មី។",
   "settings.general.row.newInterface.badge": "ថ្មី។",
   "settings.general.row.newInterface.description": "ប្រើផ្ទាំងថ្មី និងប្លង់ផ្ទះ។ ប្តូររវាងប្លង់សម្រាប់រយៈពេលកំណត់។",

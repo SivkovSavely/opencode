@@ -870,6 +870,8 @@ export const dict = {
   "settings.general.row.editToolPartsExpanded.title": "Laajenna muokkaustyökalun osat",
   "settings.general.row.editToolPartsExpanded.description":
     "Näytä muokkaus-, kirjoitus- ja paikkaustyökalun osat oletusarvoisesti laajennettuina aikajanalla",
+  "settings.general.row.enterNewline.title": "Enter lisää uuden rivin",
+  "settings.general.row.enterNewline.description": "Vaihda Enter ja Shift+Enter, jotta Enter lisää uuden rivin",
   "settings.general.row.newInterface.title": "Uusi asettelu",
   "settings.general.row.newInterface.badge": "Uusi",
   "settings.general.row.newInterface.description":

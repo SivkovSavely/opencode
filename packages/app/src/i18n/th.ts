@@ -943,6 +943,8 @@ export const dict = {
   "settings.general.row.editToolPartsExpanded.title": "ขยายส่วนเครื่องมือ edit",
   "settings.general.row.editToolPartsExpanded.description":
     "แสดงส่วนเครื่องมือ edit, write และ patch แบบขยายตามค่าเริ่มต้นในไทม์ไลน์",
+  "settings.general.row.enterNewline.title": "Enter เพิ่มบรรทัดใหม่",
+  "settings.general.row.enterNewline.description": "สลับ Enter และ Shift+Enter เพื่อให้ Enter เพิ่มบรรทัดใหม่",
   "settings.general.row.newInterface.title": "เลย์เอาต์ใหม่",
   "settings.general.row.newInterface.badge": "ใหม่",
   "settings.general.row.newInterface.description":

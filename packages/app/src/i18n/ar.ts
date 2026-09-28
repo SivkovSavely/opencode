@@ -889,6 +889,8 @@ export const dict = {
   "settings.general.row.editToolPartsExpanded.title": "توسيع أجزاء أداة edit",
   "settings.general.row.editToolPartsExpanded.description":
     "إظهار أجزاء أدوات edit و write و patch موسعة بشكل افتراضي في الشريط الزمني",
+  "settings.general.row.enterNewline.title": "Enter يضيف سطرًا جديدًا",
+  "settings.general.row.enterNewline.description": "بدّل Enter و Shift+Enter بحيث يضيف Enter سطرًا جديدًا",
   "settings.general.row.newInterface.title": "التخطيط الجديد",
   "settings.general.row.newInterface.badge": "جديد",
   "settings.general.row.newInterface.description":

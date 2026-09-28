@@ -978,6 +978,8 @@ export const dict = {
   "settings.general.row.editToolPartsExpanded.title": "Проширете ги деловите на алатката за уредување",
   "settings.general.row.editToolPartsExpanded.description":
     "Прикажи ги деловите на алатката за уредување, пишување и закрпи стандардно проширени во временската линија",
+  "settings.general.row.enterNewline.title": "Enter додава нов ред",
+  "settings.general.row.enterNewline.description": "Заменете Enter и Shift+Enter за да Enter додава нов ред",
   "settings.general.row.newInterface.title": "Нов распоред",
   "settings.general.row.newInterface.badge": "Ново",
   "settings.general.row.newInterface.description":

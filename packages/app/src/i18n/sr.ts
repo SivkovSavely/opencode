@@ -973,6 +973,8 @@ export const dict = {
   "settings.general.row.editToolPartsExpanded.title": "Проширите делове алата за уређивање",
   "settings.general.row.editToolPartsExpanded.description":
     "Прикажите делове алата за уређивање, писање и закрпе проширене подразумевано на временској линији",
+  "settings.general.row.enterNewline.title": "Enter додаје нови ред",
+  "settings.general.row.enterNewline.description": "Замените Enter и Shift+Enter да Enter додаје нови ред",
   "settings.general.row.newInterface.title": "Нови изглед",
   "settings.general.row.newInterface.badge": "Ново",
   "settings.general.row.newInterface.description":

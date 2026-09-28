@@ -788,6 +788,8 @@ export const dict = {
   "settings.general.row.editToolPartsExpanded.title": "Edit-Tool-Abschnitte ausklappen",
   "settings.general.row.editToolPartsExpanded.description":
     "Edit-, Write- und Patch-Tool-Abschnitte standardmäßig in der Timeline ausgeklappt anzeigen",
+  "settings.general.row.enterNewline.title": "Enter fügt eine neue Zeile ein",
+  "settings.general.row.enterNewline.description": "Enter und Shift+Enter tauschen, sodass Enter eine neue Zeile einfügt",
   "settings.general.row.newInterface.title": "Neues Layout",
   "settings.general.row.newInterface.badge": "Neu",
   "settings.general.row.newInterface.description":

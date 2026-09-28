@@ -970,6 +970,8 @@ export const dict = {
   "settings.general.row.editToolPartsExpanded.title": "Stækkaðu breytingaverkfærahluta",
   "settings.general.row.editToolPartsExpanded.description":
     "Sýna breytinga-, skrifa- og plástraverkfæri hluta sjálfgefið stækkað á tímalínunni",
+  "settings.general.row.enterNewline.title": "Enter setur inn nýja línu",
+  "settings.general.row.enterNewline.description": "Skiptu á milli Enter og Shift+Enter svo Enter seti inn nýja línu",
   "settings.general.row.newInterface.title": "Nýtt skipulag",
   "settings.general.row.newInterface.badge": "Nýtt",
   "settings.general.row.newInterface.description":

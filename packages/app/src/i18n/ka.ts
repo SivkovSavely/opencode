@@ -969,6 +969,8 @@ export const dict = {
   "settings.general.row.editToolPartsExpanded.title": "გაფართოვდეს ხელსაწყოს ნაწილები",
   "settings.general.row.editToolPartsExpanded.description":
     "აჩვენეთ რედაქტირების, ჩაწერის და პაჩის ხელსაწყოს ნაწილები, რომლებიც ნაგულისხმევად გაფართოვდა ვადებში",
+  "settings.general.row.enterNewline.title": "Enter ამატებს ახალ სტრიქონს",
+  "settings.general.row.enterNewline.description": "შეცვალეთ Enter და Shift+Enter, რათა Enter ამატებდეს ახალ სტრიქონს",
   "settings.general.row.newInterface.title": "ახალი განლაგება",
   "settings.general.row.newInterface.badge": "ახალი",
   "settings.general.row.newInterface.description":

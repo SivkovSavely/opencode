@@ -895,6 +895,8 @@ export const dict = {
   "settings.general.row.editToolPartsExpanded.title": "Rozwijaj elementy narzędzia edit",
   "settings.general.row.editToolPartsExpanded.description":
     "Domyślnie pokazuj rozwinięte elementy narzędzi edit, write i patch na osi czasu",
+  "settings.general.row.enterNewline.title": "Enter dodaje nowy wiersz",
+  "settings.general.row.enterNewline.description": "Zamień Enter i Shift+Enter, aby Enter dodawał nowy wiersz",
   "settings.general.row.newInterface.title": "Nowy układ",
   "settings.general.row.newInterface.badge": "Nowość",
   "settings.general.row.newInterface.description":

@@ -975,6 +975,8 @@ export const dict = {
   "settings.general.row.editToolPartsExpanded.title": "Rozbalte části nástroje pro úpravy",
   "settings.general.row.editToolPartsExpanded.description":
     "Ve výchozím nastavení zobrazit na časové ose rozbalené části nástroje pro úpravy, zápis a opravy",
+  "settings.general.row.enterNewline.title": "Enter vloží nový řádek",
+  "settings.general.row.enterNewline.description": "Vyměňte Enter a Shift+Enter, aby Enter vkládal nový řádek",
   "settings.general.row.newInterface.title": "Nové rozložení",
   "settings.general.row.newInterface.badge": "Nové",
   "settings.general.row.newInterface.description":

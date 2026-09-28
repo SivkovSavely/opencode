@@ -972,6 +972,8 @@ export const dict = {
   "settings.general.row.editToolPartsExpanded.title": "Redaktirleme gurallarynyň böleklerini giňeltmek",
   "settings.general.row.editToolPartsExpanded.description":
     "Wagt tertibinde tertip boýunça giňeldilen redaktirlemegi, ýazmagy we patch gurallaryny görkeziň",
+  "settings.general.row.enterNewline.title": "Enter täze setir goşýar",
+  "settings.general.row.enterNewline.description": "Enter we Shift+Enter çalşylýar, şonda Enter täze setir goşýar",
   "settings.general.row.newInterface.title": "Täze düzüliş",
   "settings.general.row.newInterface.badge": "Täze",
   "settings.general.row.newInterface.description":

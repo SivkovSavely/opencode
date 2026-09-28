@@ -936,6 +936,8 @@ export const dict = {
   "settings.general.row.shellToolPartsExpanded.description": "默认在时间线中展开 Shell 工具调用详情",
   "settings.general.row.editToolPartsExpanded.title": "展开编辑工具调用",
   "settings.general.row.editToolPartsExpanded.description": "默认在时间线中展开 edit、write 和 patch 工具调用详情",
+  "settings.general.row.enterNewline.title": "Enter 换行",
+  "settings.general.row.enterNewline.description": "交换 Enter 和 Shift+Enter，让 Enter 用于换行",
   "settings.general.row.newInterface.title": "新布局",
   "settings.general.row.newInterface.badge": "新",
   "settings.general.row.newInterface.description": "使用新的标签页和主页布局。在有限时间内可在不同布局之间切换。",

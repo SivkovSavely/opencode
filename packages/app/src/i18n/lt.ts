@@ -984,6 +984,8 @@ export const dict = {
   "settings.general.row.editToolPartsExpanded.title": "Išplėskite redagavimo įrankio dalis",
   "settings.general.row.editToolPartsExpanded.description":
     "Rodyti pagal numatytuosius nustatymus laiko juostoje išplėstas redagavimo, rašymo ir pataisymo įrankio dalis",
+  "settings.general.row.enterNewline.title": "Enter prideda naują eilutę",
+  "settings.general.row.enterNewline.description": "Sukeiskite Enter ir Shift+Enter, kad Enter pridėtų naują eilutę",
   "settings.general.row.newInterface.title": "Naujas išdėstymas",
   "settings.general.row.newInterface.badge": "Nauja",
   "settings.general.row.newInterface.description":

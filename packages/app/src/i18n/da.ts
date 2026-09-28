@@ -834,6 +834,8 @@ export const dict = {
   "settings.general.row.editToolPartsExpanded.title": "Udvid edit-værktøjsdele",
   "settings.general.row.editToolPartsExpanded.description":
     "Vis edit-, write- og patch-værktøjsdele udvidet som standard i tidslinjen",
+  "settings.general.row.enterNewline.title": "Enter indsætter en ny linje",
+  "settings.general.row.enterNewline.description": "Byt Enter og Shift+Enter, så Enter indsætter en ny linje",
   "settings.general.row.newInterface.title": "Nyt layout",
   "settings.general.row.newInterface.badge": "Ny",
   "settings.general.row.newInterface.description":

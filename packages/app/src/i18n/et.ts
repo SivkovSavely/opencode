@@ -965,6 +965,8 @@ export const dict = {
   "settings.general.row.editToolPartsExpanded.title": "Laiendage tööriista osade redigeerimist",
   "settings.general.row.editToolPartsExpanded.description":
     "Kuva ajaskaalal vaikimisi laiendatud redigeerimis-, kirjutamis- ja paigatööriistade osad",
+  "settings.general.row.enterNewline.title": "Enter lisab uue rea",
+  "settings.general.row.enterNewline.description": "Vaheta Enter ja Shift+Enter, nii et Enter lisab uue rea",
   "settings.general.row.newInterface.title": "Uus paigutus",
   "settings.general.row.newInterface.badge": "Uus",
   "settings.general.row.newInterface.description":

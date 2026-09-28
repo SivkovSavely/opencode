@@ -976,6 +976,8 @@ export const dict = {
   "settings.general.row.editToolPartsExpanded.title": "Zgjero pjesët e veglave të redaktimit",
   "settings.general.row.editToolPartsExpanded.description":
     "Shfaq pjesët e veglave të modifikimit, shkrimit dhe korrigjimit të zgjeruara si parazgjedhje në afatin kohor",
+  "settings.general.row.enterNewline.title": "Enter shton një rresht të ri",
+  "settings.general.row.enterNewline.description": "Shkëmbeni Enter dhe Shift+Enter që Enter të shtojë një rresht të ri",
   "settings.general.row.newInterface.title": "Paraqitje e re",
   "settings.general.row.newInterface.badge": "E re",
   "settings.general.row.newInterface.description":

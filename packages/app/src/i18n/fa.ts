@@ -967,6 +967,8 @@ export const dict = {
   "settings.general.row.editToolPartsExpanded.title": "بخش‌های ابزار ویرایش را گسترش دهید",
   "settings.general.row.editToolPartsExpanded.description":
     "بخش‌های ابزار ویرایش، نوشتن و وصله را که به‌طور پیش‌فرض در جدول زمانی گسترش یافته‌اند، نمایش دهید",
+  "settings.general.row.enterNewline.title": "Enter یک خط جدید اضافه می‌کند",
+  "settings.general.row.enterNewline.description": "Enter و Shift+Enter را جابه‌جا کنید تا Enter خط جدید اضافه کند",
   "settings.general.row.newInterface.title": "چیدمان جدید",
   "settings.general.row.newInterface.badge": "جدید",
   "settings.general.row.newInterface.description":

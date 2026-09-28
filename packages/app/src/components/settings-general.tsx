@@ -348,6 +348,18 @@ export const SettingsGeneral: Component = () => {
         </SettingsRow>
 
         <SettingsRow
+          title={language.t("settings.general.row.enterNewline.title")}
+          description={language.t("settings.general.row.enterNewline.description")}
+        >
+          <div data-action="settings-enter-newline">
+            <Switch
+              checked={settings.general.enterNewline()}
+              onChange={(checked) => settings.general.setEnterNewline(checked)}
+            />
+          </div>
+        </SettingsRow>
+
+        <SettingsRow
           title={language.t("settings.general.row.reasoningSummaries.title")}
           description={language.t("settings.general.row.reasoningSummaries.description")}
         >

@@ -979,6 +979,8 @@ export const dict = {
   "settings.general.row.editToolPartsExpanded.title": "Засварлах хэрэгслийн хэсгүүдийг өргөжүүлэх",
   "settings.general.row.editToolPartsExpanded.description":
     "Он цагийн хэлхээс дээр анхдагчаар өргөтгөсөн засварлах, бичих, засварлах хэрэгслийн хэсгүүдийг харуул",
+  "settings.general.row.enterNewline.title": "Enter шинэ мөр нэмнэ",
+  "settings.general.row.enterNewline.description": "Enter болон Shift+Enter-ийг сольж, Enter шинэ мөр нэмэх болгоно",
   "settings.general.row.newInterface.title": "Шинэ зохион байгуулалт",
   "settings.general.row.newInterface.badge": "Шинэ",
   "settings.general.row.newInterface.description":

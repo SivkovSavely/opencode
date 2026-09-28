@@ -1050,6 +1050,8 @@ export const dict = {
   "settings.general.row.editToolPartsExpanded.title": "Bentangkan bagian alat edit",
   "settings.general.row.editToolPartsExpanded.description":
     "Tampilkan bagian alat edit, tulis, dan patch yang dibentangkan secara bawaan di linimasa",
+  "settings.general.row.enterNewline.title": "Enter menambahkan baris baru",
+  "settings.general.row.enterNewline.description": "Tukar Enter dan Shift+Enter agar Enter menambahkan baris baru",
   "settings.general.row.newInterface.title": "Tata letak baru",
   "settings.general.row.newInterface.badge": "Baru",
   "settings.general.row.newInterface.description":

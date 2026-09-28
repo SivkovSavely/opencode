@@ -946,6 +946,8 @@ export const dict = {
   "settings.general.row.shellToolPartsExpanded.description": "የሼል መሣሪያ ክፍሎችን በጊዜ መስመር በነባሪነት ያሳዩ",
   "settings.general.row.editToolPartsExpanded.title": "የመሳሪያ ክፍሎችን ዘርጋ",
   "settings.general.row.editToolPartsExpanded.description": "በጊዜ መስመር በነባሪነት የተዘረጉትን የመሳሪያ ክፍሎችን አርትዕ፣ ጻፍ እና ጠጋኝ አሳይ",
+  "settings.general.row.enterNewline.title": "Enter አዲር መስመር አክራል",
+  "settings.general.row.enterNewline.description": "Enter እና Shift+Enter እንደምን ብር ልክ እንውለውጥ ያድርጌው",
   "settings.general.row.newInterface.title": "አዲስ አቀማመጥ",
   "settings.general.row.newInterface.badge": "አዲስ",
   "settings.general.row.newInterface.description": "አዲሱን ትሮች እና የቤት አቀማመጥ ይጠቀሙ። ለተወሰነ ጊዜ በአቀማመጦች መካከል ይቀያይሩ።",

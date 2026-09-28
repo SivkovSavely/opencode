@@ -974,6 +974,8 @@ export const dict = {
   "settings.general.row.editToolPartsExpanded.title": "Razširite urejanje delov orodja",
   "settings.general.row.editToolPartsExpanded.description":
     "Prikaži privzeto razširjene dele orodja za urejanje, pisanje in popravljanje na časovnici",
+  "settings.general.row.enterNewline.title": "Enter doda novo vrstico",
+  "settings.general.row.enterNewline.description": "Zamenjajte Enter in Shift+Enter, da Enter doda novo vrstico",
   "settings.general.row.newInterface.title": "Nova postavitev",
   "settings.general.row.newInterface.badge": "Novo",
   "settings.general.row.newInterface.description":

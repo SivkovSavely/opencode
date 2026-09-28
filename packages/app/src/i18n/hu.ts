@@ -979,6 +979,8 @@ export const dict = {
   "settings.general.row.editToolPartsExpanded.title": "A Szerkesztőeszköz részei kibontása",
   "settings.general.row.editToolPartsExpanded.description":
     "Az idővonalon alapértelmezés szerint kibontott szerkesztési, írási és javítási eszközrészek megjelenítése",
+  "settings.general.row.enterNewline.title": "Az Enter új sort ad hozzá",
+  "settings.general.row.enterNewline.description": "Cseréld fel az Entert és a Shift+Entert, hogy az Enter új sort adjon hozzá",
   "settings.general.row.newInterface.title": "Új elrendezés",
   "settings.general.row.newInterface.badge": "Új",
   "settings.general.row.newInterface.description":

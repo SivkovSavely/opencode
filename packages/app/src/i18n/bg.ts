@@ -979,6 +979,8 @@ export const dict = {
   "settings.general.row.editToolPartsExpanded.title": "Разгънете части за редактиране на инструмента",
   "settings.general.row.editToolPartsExpanded.description":
     "Показване на части от инструмента за редактиране, писане и корекция, разширени по подразбиране във времевата линия",
+  "settings.general.row.enterNewline.title": "Enter добавя нов ред",
+  "settings.general.row.enterNewline.description": "Разменете Enter и Shift+Enter, за да добавя Enter нов ред",
   "settings.general.row.newInterface.title": "Ново оформление",
   "settings.general.row.newInterface.badge": "Нов",
   "settings.general.row.newInterface.description":

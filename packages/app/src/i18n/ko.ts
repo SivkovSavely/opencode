@@ -1038,6 +1038,8 @@ export const dict = {
   "settings.general.row.showCustomAgents.title": "에이전트 표시",
   "settings.general.row.showCustomAgents.description":
     "입력창에서 에이전트를 전환합니다. 숨기면 기본적으로 Build 에이전트를 사용합니다.",
+  "settings.general.row.enterNewline.title": "Enter로 줄바꿈",
+  "settings.general.row.enterNewline.description": "Enter와 Shift+Enter를 바꾸어 Enter로 줄바꿈합니다",
   "settings.general.row.newInterface.title": "새 레이아웃",
   "settings.general.row.newInterface.badge": "신규",
   "settings.general.row.newInterface.description":

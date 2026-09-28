@@ -982,6 +982,8 @@ export const dict = {
   "settings.general.row.editToolPartsExpanded.title": "Mở rộng các phần công cụ chỉnh sửa",
   "settings.general.row.editToolPartsExpanded.description":
     "Hiển thị các phần công cụ chỉnh sửa, viết và vá lỗi được mở rộng theo mặc định trong dòng thời gian",
+  "settings.general.row.enterNewline.title": "Enter thêm một dòng mới",
+  "settings.general.row.enterNewline.description": "Đổi chỗ Enter và Shift+Enter để Enter thêm dòng mới",
   "settings.general.row.newInterface.title": "Bố cục mới",
   "settings.general.row.newInterface.badge": "Mới",
   "settings.general.row.newInterface.description":

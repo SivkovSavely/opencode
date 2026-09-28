@@ -982,6 +982,8 @@ export const dict = {
   "settings.general.row.editToolPartsExpanded.title": "Bewerkingstoolonderdelen uitvouwen",
   "settings.general.row.editToolPartsExpanded.description":
     "Toon bewerkings-, schrijf- en patchtoolonderdelen standaard uitgevouwen in de tijdlijn",
+  "settings.general.row.enterNewline.title": "Enter voegt een nieuwe regel toe",
+  "settings.general.row.enterNewline.description": "Wissel Enter en Shift+Enter zodat Enter een nieuwe regel toevoegt",
   "settings.general.row.newInterface.title": "Nieuwe lay-out",
   "settings.general.row.newInterface.badge": "Nieuw",
   "settings.general.row.newInterface.description":

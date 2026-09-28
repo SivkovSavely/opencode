@@ -969,6 +969,8 @@ export const dict = {
   "settings.general.row.editToolPartsExpanded.title": "Kembangkan bahagian alat suntingan",
   "settings.general.row.editToolPartsExpanded.description":
     "Papar bahagian alat sunting, tulis, dan tampal dikembangkan secara lalai dalam garis masa",
+  "settings.general.row.enterNewline.title": "Enter menambah baris baharu",
+  "settings.general.row.enterNewline.description": "Tukar Enter dan Shift+Enter supaya Enter menambah baris baharu",
   "settings.general.row.newInterface.title": "Susun atur baharu",
   "settings.general.row.newInterface.badge": "Baharu",
   "settings.general.row.newInterface.description":

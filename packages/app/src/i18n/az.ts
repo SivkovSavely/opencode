@@ -981,6 +981,8 @@ export const dict = {
   "settings.general.row.editToolPartsExpanded.title": "Redaktə alət hissələrini genişlət",
   "settings.general.row.editToolPartsExpanded.description":
     "Zaman xəttində redaktə, yazma və patch alət hissələrini standart olaraq genişlədilmiş göstər",
+  "settings.general.row.enterNewline.title": "Enter yeni sətir əlavə edir",
+  "settings.general.row.enterNewline.description": "Enter və Shift+Enter dəyişdirilsin ki, Enter yeni sətir əlavə etsin",
   "settings.general.row.newInterface.title": "Yeni tərtibat",
   "settings.general.row.newInterface.badge": "Yeni",
   "settings.general.row.newInterface.description":

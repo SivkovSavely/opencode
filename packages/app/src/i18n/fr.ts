@@ -901,6 +901,8 @@ export const dict = {
   "settings.general.row.editToolPartsExpanded.title": "Développer les parties de l'outil edit",
   "settings.general.row.editToolPartsExpanded.description":
     "Afficher les parties des outils edit, write et patch développées par défaut dans la chronologie",
+  "settings.general.row.enterNewline.title": "Entrée ajoute une nouvelle ligne",
+  "settings.general.row.enterNewline.description": "Échangez Entrée et Maj+Entrée pour que Entrée ajoute une nouvelle ligne",
   "settings.general.row.newInterface.title": "Nouvelle mise en page",
   "settings.general.row.newInterface.badge": "Nouveau",
   "settings.general.row.newInterface.description":

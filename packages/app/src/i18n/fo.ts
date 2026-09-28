@@ -967,6 +967,8 @@ export const dict = {
   "settings.general.row.editToolPartsExpanded.title": "Víðka rætta tólpartar",
   "settings.general.row.editToolPartsExpanded.description":
     "Vís rætta, skriva og lappa tólpartar víðkaðir sum standard á tíðarlinjuni",
+  "settings.general.row.enterNewline.title": "Enter leggur nýja løg inn",
+  "settings.general.row.enterNewline.description": "Byt Enter og Shift+Enter, so Enter leggur nýja løg inn",
   "settings.general.row.newInterface.title": "Nýggj uppseting",
   "settings.general.row.newInterface.badge": "Nýtt",
   "settings.general.row.newInterface.description":

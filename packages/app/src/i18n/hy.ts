@@ -976,6 +976,8 @@ export const dict = {
   "settings.general.row.editToolPartsExpanded.title": "Ընդարձակել խմբագրման գործիքի մասերը",
   "settings.general.row.editToolPartsExpanded.description":
     "Ցուցադրել խմբագրման, գրելու և կարկատելու գործիքի մասերը, որոնք լռելյայն ընդլայնվել են ժամանակացույցում",
+  "settings.general.row.enterNewline.title": "Enter-ը նոր տող է ավելացնում",
+  "settings.general.row.enterNewline.description": "Փոխեք Enter-ը և Shift+Enter-ը, որպեսզի Enter-ը նոր տող ավելացնի",
   "settings.general.row.newInterface.title": "Նոր դասավորություն",
   "settings.general.row.newInterface.badge": "Նոր",
   "settings.general.row.newInterface.description":

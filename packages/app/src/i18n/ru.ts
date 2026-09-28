@@ -962,6 +962,8 @@ export const dict = {
   "settings.general.row.editToolPartsExpanded.title": "Разворачивать элементы инструмента edit",
   "settings.general.row.editToolPartsExpanded.description":
     "Показывать элементы инструментов edit, write и patch в ленте развернутыми по умолчанию",
+  "settings.general.row.enterNewline.title": "Enter добавляет новую строку",
+  "settings.general.row.enterNewline.description": "Поменяйте Enter и Shift+Enter, чтобы Enter добавлял новую строку",
   "settings.general.row.newInterface.title": "Новая компоновка",
   "settings.general.row.newInterface.badge": "Новое",
   "settings.general.row.newInterface.description":

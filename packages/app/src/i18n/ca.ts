@@ -980,6 +980,8 @@ export const dict = {
   "settings.general.row.editToolPartsExpanded.title": "Amplieu les parts d'eina d'edició",
   "settings.general.row.editToolPartsExpanded.description":
     "Mostra les parts de l'eina d'edició, escriptura i pedaç ampliades de manera predeterminada a la línia de temps",
+  "settings.general.row.enterNewline.title": "Enter afegeix una línia nova",
+  "settings.general.row.enterNewline.description": "Canvia Enter i Shift+Enter perquè Enter afegeixi una línia nova",
   "settings.general.row.newInterface.title": "Nou disseny",
   "settings.general.row.newInterface.badge": "Nou",
   "settings.general.row.newInterface.description":

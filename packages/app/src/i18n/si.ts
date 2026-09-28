@@ -965,6 +965,8 @@ export const dict: Record<string, string> = {
   "settings.general.row.editToolPartsExpanded.title": "සංස්කරණ මෙවලම් කොටස් පුළුල් කරන්න",
   "settings.general.row.editToolPartsExpanded.description":
     "කාලරේඛාව තුළ පෙරනිමියෙන් පුළුල් කරන ලද සංස්කරණය, ලිවීම සහ පැච් මෙවලම් කොටස් පෙන්වන්න",
+  "settings.general.row.enterNewline.title": "Enter නව පේළියක් එකතු කරයි",
+  "settings.general.row.enterNewline.description": "Enter සහ Shift+Enter මාරු කරමින් Enter නව පේළියක් එකතු කරයි",
   "settings.general.row.newInterface.title": "නව පිරිසැලසුම",
   "settings.general.row.newInterface.badge": "අලුත්",
   "settings.general.row.newInterface.description":

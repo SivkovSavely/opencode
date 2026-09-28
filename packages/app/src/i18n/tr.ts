@@ -964,6 +964,8 @@ export const dict = {
   "settings.general.row.editToolPartsExpanded.title": "Düzenleme araç bileşenlerini genişlet",
   "settings.general.row.editToolPartsExpanded.description":
     "Zaman çizelgesinde düzenleme, yazma ve yama araç bileşenlerini varsayılan olarak genişletilmiş göster",
+  "settings.general.row.enterNewline.title": "Enter yeni satır ekler",
+  "settings.general.row.enterNewline.description": "Enter'ın yeni satır eklemesi için Enter ve Shift+Enter'i değiştirin",
   "settings.general.row.newInterface.title": "Yeni düzen",
   "settings.general.row.newInterface.badge": "Yeni",
   "settings.general.row.newInterface.description":
