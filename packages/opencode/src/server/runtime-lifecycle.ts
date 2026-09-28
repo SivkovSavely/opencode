@@ -1,7 +1,7 @@
 import { Database } from "@opencode-ai/core/database/database"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { sql } from "drizzle-orm"
-import { Clock, Context, Deferred, Duration, Effect, Layer, Schema, Scope, SynchronizedRef } from "effect"
+import { Cause, Clock, Context, Deferred, Duration, Effect, Layer, Schema, Scope, SynchronizedRef } from "effect"
 import { randomUUID } from "node:crypto"
 
 export type Action = "restart" | "shutdown"
@@ -18,6 +18,15 @@ export type ExecutionState =
 export class RuntimeDrainingError extends Schema.TaggedErrorClass<RuntimeDrainingError>()("RuntimeDrainingError", {
   message: Schema.String,
 }) {}
+
+export class RuntimeFencedTransitionError extends Schema.TaggedErrorClass<RuntimeFencedTransitionError>()(
+  "RuntimeFencedTransitionError",
+  {
+    message: Schema.String,
+    sessionID: Schema.String,
+    operation: Schema.String,
+  },
+) {}
 
 export type ExecutionRecord = {
   sessionID: string
@@ -39,13 +48,7 @@ export type Interface = {
     readonly restartSupported: boolean
   }
   readonly bindDatabase: (database: Database.Interface) => void
-  readonly admit: (input: {
-    sessionID: string
-    directory: string
-    parentSessionID?: string
-    parentMessageID?: string
-    parentCallID?: string
-  }) => Effect.Effect<void, RuntimeDrainingError>
+  readonly admit: (input: AdmissionInput) => Effect.Effect<void, RuntimeDrainingError>
   readonly release: (sessionID: string) => Effect.Effect<void>
   readonly beforeTurn: (sessionID: string) => Effect.Effect<boolean>
   readonly checkpoint: (sessionID: string) => Effect.Effect<boolean>
@@ -59,7 +62,7 @@ export type Interface = {
   readonly request: (action: Action) => Effect.Effect<Status>
   readonly status: () => Effect.Effect<Status>
   readonly isParked: (sessionID: string) => Effect.Effect<boolean>
-  readonly recover: (run: (record: ExecutionRecord) => Effect.Effect<unknown>) => Effect.Effect<void>
+  readonly recover: (run: (record: ExecutionRecord) => Effect.Effect<unknown, unknown>) => Effect.Effect<void>
 }
 
 export type Status = {
@@ -101,6 +104,23 @@ type LocalState = {
   action?: Action
   drainStarted: boolean
   active: Map<string, LocalExecution>
+}
+
+type AdmissionInput = {
+  sessionID: string
+  directory: string
+  parentSessionID?: string
+  parentMessageID?: string
+  parentCallID?: string
+}
+
+type FencedTransitionInput = {
+  sessionID: string
+  operation: string
+  fence: number
+  expectedState: ExecutionState
+  nextState: ExecutionState
+  retryAt?: number
 }
 
 type ReleaseResult = {
@@ -165,21 +185,42 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
     return decodeRow(yield* database.db.get(sql`SELECT * FROM runtime_execution WHERE session_id = ${sessionID}`))
   })
 
-  const update = Effect.fnUntraced(function* (
-    sessionID: string,
-    fence: number,
-    state: ExecutionState,
-    retryAt?: number,
-  ) {
+  const update = Effect.fnUntraced(function* (input: FencedTransitionInput) {
     const database = databaseRef.current ?? (yield* Database.Service)
-    yield* database.db.run(sql`
+    const updated = decodeRow(
+      yield* database.db.get<Row>(sql`
       UPDATE runtime_execution
-      SET state = ${state}, retry_at = ${retryAt ?? null}, time_updated = ${Date.now()}
-      WHERE session_id = ${sessionID}
-        AND owner_lineage = ${identity.lineage}
-        AND owner_instance = ${identity.instance}
-        AND fence = ${fence}
-    `)
+       SET state = ${input.nextState}, retry_at = ${input.retryAt ?? null}, time_updated = ${Date.now()}
+       WHERE session_id = ${input.sessionID}
+         AND owner_lineage = ${identity.lineage}
+         AND owner_instance = ${identity.instance}
+         AND fence = ${input.fence}
+         AND state = ${input.expectedState}
+       RETURNING *
+    `),
+    )
+    if (updated) return updated
+
+    const current = yield* read(input.sessionID)
+    yield* Effect.logWarning("restart diagnostic fenced transition failed", {
+      sessionID: input.sessionID,
+      operation: input.operation,
+      expectedOwnerLineage: identity.lineage,
+      expectedOwnerInstance: identity.instance,
+      expectedFence: input.fence,
+      expectedState: input.expectedState,
+      requestedNextState: input.nextState,
+      requestedRetryAt: input.retryAt,
+      currentPersistedRow: current ? rowFields(current) : undefined,
+      currentRuntimeInstance: identity.instance,
+    })
+    return yield* Effect.die(
+      new RuntimeFencedTransitionError({
+        message: `Fenced ${input.operation} transition failed for session ${input.sessionID}`,
+        sessionID: input.sessionID,
+        operation: input.operation,
+      }),
+    )
   })
 
   const claim = Effect.fnUntraced(function* (record: Row) {
@@ -191,7 +232,8 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
       nextFence,
       lineage: identity.lineage,
     })
-    yield* database.db.run(sql`
+    const claimed = decodeRow(
+      yield* database.db.get<Row>(sql`
       UPDATE runtime_execution
       SET owner_instance = ${identity.instance}, fence = ${nextFence},
           state = ${record.retry_at === null ? "active" : "retry_wait"}, retry_at = ${record.retry_at},
@@ -200,16 +242,12 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
         AND owner_lineage = ${identity.lineage}
         AND owner_instance = ${record.owner_instance}
         AND fence = ${record.fence}
-        AND state IN ('parked', 'retry_wait')
+        AND state = ${record.state}
         AND desired_active = 1
-    `)
-    const current = decodeRow(
-      yield* database.db.get(sql`
-        SELECT * FROM runtime_execution
-        WHERE session_id = ${record.session_id} AND owner_instance = ${identity.instance} AND fence = ${nextFence}
-      `),
+      RETURNING *
+    `),
     )
-    if (!current) {
+    if (!claimed) {
       const latest = decodeRow(
         yield* database.db.get(sql`SELECT * FROM runtime_execution WHERE session_id = ${record.session_id}`),
       )
@@ -221,7 +259,7 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
       })
       return undefined
     }
-    const result = toExecutionRecord(current)
+    const result = toExecutionRecord(claimed)
     yield* Effect.logInfo("restart diagnostic recovery claim succeeded", {
       ...recordFields(result),
       newOwnerInstance: identity.instance,
@@ -311,73 +349,161 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
     return yield* status()
   })
 
-  const admit = Effect.fn("RuntimeLifecycle.admit")(function* (input: {
-    sessionID: string
-    directory: string
-    parentSessionID?: string
-    parentMessageID?: string
-    parentCallID?: string
-  }) {
-    const existing = yield* read(input.sessionID)
-    const localAdmission = yield* SynchronizedRef.modify(ref, (state) => {
-      const local = state.active.get(input.sessionID)
-      if (!local) return ["none" as const, state]
-      if (state.phase !== "running") return ["draining" as const, state]
-      const active = new Map(state.active)
-      active.set(input.sessionID, { ...local, leases: local.leases + 1, mode: "active" })
-      return ["admitted" as const, { ...state, active }]
-    })
-    if (localAdmission === "draining") yield* new RuntimeDrainingError({ message: "Runtime is draining" })
-    if (localAdmission === "admitted") return
-
-    const claimed = yield* SynchronizedRef.modify(ref, (state) => {
-      if (state.phase !== "running") {
-        return [Effect.fail(new RuntimeDrainingError({ message: "Runtime is draining" })), state] as const
-      }
-      const work = Effect.gen(function* () {
-        const database = databaseRef.current ?? (yield* Database.Service)
-        const row = yield* read(input.sessionID)
-        if (
-          row &&
-          row.state === "active" &&
-          (row.owner_lineage !== identity.lineage || row.owner_instance !== identity.instance)
-        ) {
-          return yield* Effect.fail(new RuntimeDrainingError({ message: "Session is owned by another runtime" }))
-        }
-        if (row && row.state === "parked") {
-          return yield* Effect.fail(new RuntimeDrainingError({ message: "Session is parked for recovery" }))
-        }
-        if (row && row.state === "retry_wait") {
-          return yield* Effect.fail(new RuntimeDrainingError({ message: "Session is waiting for retry" }))
-        }
-        const fence = row?.fence ?? 0
-        if (!row) {
-          yield* database.db.run(sql`
-            INSERT INTO runtime_execution
-              (id, session_id, directory, owner_lineage, owner_instance, fence, state, desired_active, retry_at,
-               parent_session_id, parent_message_id, parent_call_id, time_created, time_updated)
-            VALUES
-              (${input.sessionID}, ${input.sessionID}, ${input.directory}, ${identity.lineage}, ${identity.instance},
-               ${fence}, ${"active"}, 1, NULL, ${input.parentSessionID ?? null}, ${input.parentMessageID ?? null},
-               ${input.parentCallID ?? null}, ${Date.now()}, ${Date.now()})
-          `)
-        } else {
-          yield* database.db.run(sql`
-            UPDATE runtime_execution
-            SET directory = ${input.directory}, owner_lineage = ${identity.lineage}, owner_instance = ${identity.instance},
-                fence = ${fence}, state = ${"active"}, desired_active = 1, retry_at = NULL,
-                parent_session_id = ${input.parentSessionID ?? null}, parent_message_id = ${input.parentMessageID ?? null},
-                parent_call_id = ${input.parentCallID ?? null}, time_updated = ${Date.now()}
-            WHERE session_id = ${input.sessionID} AND fence = ${fence}
-          `)
-        }
-        return fence
+  const rejectAdmission = (input: AdmissionInput, reason: string, row?: Row) =>
+    Effect.gen(function* () {
+      yield* Effect.logWarning("restart diagnostic admission durable claim failed", {
+        sessionID: input.sessionID,
+        reason,
+        observed: row ? rowFields(row) : undefined,
+        currentRuntimeLineage: identity.lineage,
+        currentRuntimeInstance: identity.instance,
       })
-      const next = new Map(state.active)
-      next.set(input.sessionID, { fence: existing?.fence ?? 0, leases: 1, mode: "active" })
-      return [work, { ...state, active: next }] as const
+      return yield* new RuntimeDrainingError({ message: reason })
     })
-    yield* claimed
+
+  const admitDurably = Effect.fnUntraced(function* (input: AdmissionInput, row: Row | undefined) {
+    const database = databaseRef.current ?? (yield* Database.Service)
+    yield* Effect.logInfo("restart diagnostic admission durable claim beginning", {
+      sessionID: input.sessionID,
+      observed: row ? rowFields(row) : undefined,
+      currentRuntimeLineage: identity.lineage,
+      currentRuntimeInstance: identity.instance,
+    })
+
+    if (!row) {
+      const inserted = decodeRow(
+        yield* database.db.get<Row>(sql`
+          INSERT INTO runtime_execution
+            (id, session_id, directory, owner_lineage, owner_instance, fence, state, desired_active, retry_at,
+             parent_session_id, parent_message_id, parent_call_id, time_created, time_updated)
+          VALUES
+            (${input.sessionID}, ${input.sessionID}, ${input.directory}, ${identity.lineage}, ${identity.instance},
+             0, ${"active"}, 1, NULL, ${input.parentSessionID ?? null}, ${input.parentMessageID ?? null},
+             ${input.parentCallID ?? null}, ${Date.now()}, ${Date.now()})
+          ON CONFLICT (session_id) DO NOTHING
+          RETURNING *
+        `),
+      )
+      if (!inserted) {
+        const current = yield* read(input.sessionID)
+        yield* Effect.logWarning("restart diagnostic admission durable claim failed", {
+          sessionID: input.sessionID,
+          reason: current ? "insert compare-and-set conflict" : "insert returned no row",
+          current: current ? rowFields(current) : undefined,
+          currentRuntimeLineage: identity.lineage,
+          currentRuntimeInstance: identity.instance,
+        })
+        if (current) return yield* rejectAdmission(input, "Session was admitted by another runtime", current)
+        return yield* Effect.die(
+          new RuntimeFencedTransitionError({
+            message: `Durable admission failed for session ${input.sessionID}`,
+            sessionID: input.sessionID,
+            operation: "admit",
+          }),
+        )
+      }
+      yield* Effect.logInfo("restart diagnostic admission durable claim succeeded", {
+        ...rowFields(inserted),
+        takeover: false,
+        currentRuntimeInstance: identity.instance,
+      })
+      return inserted
+    }
+
+    if (
+      row.state === "active" &&
+      (row.owner_lineage !== identity.lineage || row.owner_instance !== identity.instance)
+    ) {
+      return yield* rejectAdmission(input, "Session is owned by another runtime", row)
+    }
+    if (row.state === "parked") return yield* rejectAdmission(input, "Session is parked for recovery", row)
+    if (row.state === "retry_wait") return yield* rejectAdmission(input, "Session is waiting for retry", row)
+    if (row.state === "recovery_needed" && row.owner_lineage !== identity.lineage) {
+      return yield* rejectAdmission(input, "Session requires recovery by its owning server identity", row)
+    }
+    if (!(["active", "completed", "cancelled", "recovery_needed"] as ExecutionState[]).includes(row.state)) {
+      return yield* rejectAdmission(input, `Session cannot be admitted from state ${row.state}`, row)
+    }
+
+    const takeover = row.state !== "active"
+    const nextFence = takeover ? row.fence + 1 : row.fence
+    const claimed = decodeRow(
+      yield* database.db.get<Row>(sql`
+        UPDATE runtime_execution
+        SET directory = ${input.directory}, owner_lineage = ${identity.lineage}, owner_instance = ${identity.instance},
+            fence = ${nextFence}, state = ${"active"}, desired_active = 1, retry_at = NULL,
+            parent_session_id = ${input.parentSessionID ?? row.parent_session_id},
+            parent_message_id = ${input.parentMessageID ?? row.parent_message_id},
+            parent_call_id = ${input.parentCallID ?? row.parent_call_id}, time_updated = ${Date.now()}
+        WHERE session_id = ${row.session_id}
+          AND owner_lineage = ${row.owner_lineage}
+          AND owner_instance = ${row.owner_instance}
+          AND fence = ${row.fence}
+          AND state = ${row.state}
+          AND desired_active = ${row.desired_active}
+        RETURNING *
+      `),
+    )
+    if (!claimed) {
+      const current = yield* read(input.sessionID)
+      yield* Effect.logWarning("restart diagnostic admission durable claim failed", {
+        sessionID: input.sessionID,
+        reason: "compare-and-set conflict",
+        observed: rowFields(row),
+        current: current ? rowFields(current) : undefined,
+        currentRuntimeLineage: identity.lineage,
+        currentRuntimeInstance: identity.instance,
+      })
+      return yield* Effect.die(
+        new RuntimeFencedTransitionError({
+          message: `Durable admission compare-and-set failed for session ${input.sessionID}`,
+          sessionID: input.sessionID,
+          operation: "admit",
+        }),
+      )
+    }
+    yield* Effect.logInfo("restart diagnostic admission durable claim succeeded", {
+      ...rowFields(claimed),
+      takeover,
+      previousOwnerInstance: row.owner_instance,
+      currentRuntimeInstance: identity.instance,
+    })
+    return claimed
+  })
+
+  const admit = Effect.fn("RuntimeLifecycle.admit")(function* (input: AdmissionInput) {
+    yield* SynchronizedRef.modifyEffect(
+      ref,
+      Effect.fnUntraced(function* (state) {
+        if (state.phase !== "running") {
+          return yield* new RuntimeDrainingError({ message: "Runtime is draining" })
+        }
+
+        const row = yield* read(input.sessionID)
+        const local = state.active.get(input.sessionID)
+        if (local) {
+          if (
+            local.mode !== "active" ||
+            !row ||
+            row.state !== "active" ||
+            row.owner_lineage !== identity.lineage ||
+            row.owner_instance !== identity.instance ||
+            row.fence !== local.fence
+          ) {
+            return yield* rejectAdmission(input, "Session is no longer owned by this runtime", row)
+          }
+          const claimed = yield* admitDurably(input, row)
+          const active = new Map(state.active)
+          active.set(input.sessionID, { fence: claimed.fence, leases: local.leases + 1, mode: "active" })
+          return [undefined, { ...state, active }] as const
+        }
+
+        const claimed = yield* admitDurably(input, row)
+        const active = new Map(state.active)
+        active.set(input.sessionID, { fence: claimed.fence, leases: 1, mode: "active" })
+        return [undefined, { ...state, active }] as const
+      }),
+    )
   })
 
   const release = Effect.fn("RuntimeLifecycle.release")(function* (sessionID: string) {
@@ -403,7 +529,14 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
           return [result, { ...state, active }] as const
         }
         const nextState = state.phase === "draining" ? "parked" : "completed"
-        yield* update(sessionID, current.fence, nextState, current.mode === "retry_wait" ? current.retryAt : undefined)
+        yield* update({
+          sessionID,
+          operation: "release",
+          fence: current.fence,
+          expectedState: current.mode === "retry_wait" ? "retry_wait" : "active",
+          nextState,
+          retryAt: nextState === "parked" && current.mode === "retry_wait" ? current.retryAt : undefined,
+        })
         const active = new Map(state.active)
         active.delete(sessionID)
         const result: ReleaseResult = {
@@ -444,7 +577,14 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
       Effect.fnUntraced(function* (state) {
         const current = state.active.get(sessionID)
         if (!current) return [false, state] as const
-        yield* update(sessionID, current.fence, "parked", current.mode === "retry_wait" ? current.retryAt : undefined)
+        yield* update({
+          sessionID,
+          operation: "park",
+          fence: current.fence,
+          expectedState: current.mode === "retry_wait" ? "retry_wait" : "active",
+          nextState: "parked",
+          retryAt: current.mode === "retry_wait" ? current.retryAt : undefined,
+        })
         const active = new Map(state.active)
         active.delete(sessionID)
         return [true, { ...state, active }] as const
@@ -468,8 +608,33 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
   })
 
   const complete = Effect.fn("RuntimeLifecycle.complete")(function* (sessionID: string) {
-    const current = SynchronizedRef.getUnsafe(ref).active.get(sessionID)
-    if (!current) {
+    const current = yield* SynchronizedRef.modifyEffect(
+      ref,
+      Effect.fnUntraced(function* (state) {
+        const current = state.active.get(sessionID)
+        if (!current) return [undefined, state] as const
+        if (current.leases > 0) return [null, state] as const
+        yield* update({
+          sessionID,
+          operation: "complete",
+          fence: current.fence,
+          expectedState: current.mode === "retry_wait" ? "retry_wait" : "active",
+          nextState: "completed",
+        })
+        const active = new Map(state.active)
+        active.delete(sessionID)
+        return [current.fence, { ...state, active }] as const
+      }),
+    )
+    if (current === null) {
+      yield* Effect.logInfo("restart diagnostic recovery completion retained admitted execution", {
+        sessionID,
+        lineage: identity.lineage,
+        instance: identity.instance,
+      })
+      return
+    }
+    if (current === undefined) {
       yield* Effect.logWarning("restart diagnostic complete no-op; execution absent", {
         sessionID,
         lineage: identity.lineage,
@@ -477,15 +642,9 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
       })
       return
     }
-    yield* update(sessionID, current.fence, "completed")
-    yield* SynchronizedRef.update(ref, (state) => {
-      const active = new Map(state.active)
-      active.delete(sessionID)
-      return { ...state, active }
-    })
     yield* Effect.logInfo("restart diagnostic execution marked completed", {
       sessionID,
-      fence: current.fence,
+      fence: current,
       lineage: identity.lineage,
       instance: identity.instance,
     })
@@ -493,9 +652,34 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
   })
 
   const beforeTurn = Effect.fn("RuntimeLifecycle.beforeTurn")(function* (sessionID: string) {
+    const allowed = yield* SynchronizedRef.modifyEffect(
+      ref,
+      Effect.fnUntraced(function* (state) {
+        const current = state.active.get(sessionID)
+        if (state.phase !== "running" || current?.mode !== "active") return [false, state] as const
+        const row = yield* read(sessionID)
+        if (
+          row?.state !== "active" ||
+          row.desired_active !== 1 ||
+          row.owner_lineage !== identity.lineage ||
+          row.owner_instance !== identity.instance ||
+          row.fence !== current.fence
+        ) {
+          yield* Effect.logWarning("restart diagnostic beforeTurn rejected; durable ownership lost", {
+            sessionID,
+            expectedOwnerLineage: identity.lineage,
+            expectedOwnerInstance: identity.instance,
+            expectedFence: current.fence,
+            currentPersistedRow: row ? rowFields(row) : undefined,
+            currentRuntimeInstance: identity.instance,
+          })
+          return [false, state] as const
+        }
+        return [true, state] as const
+      }),
+    )
     const current = SynchronizedRef.getUnsafe(ref).active.get(sessionID)
     const phase = SynchronizedRef.getUnsafe(ref).phase
-    const allowed = phase === "running" && current?.mode === "active"
     if (!allowed)
       yield* Effect.logInfo("restart diagnostic beforeTurn rejected", {
         sessionID,
@@ -536,7 +720,14 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
           const result: RetryResult = { parked: false, reason: "absent", phase: state.phase }
           return [result, state] as const
         }
-        yield* update(sessionID, current.fence, "retry_wait", retryAt)
+        yield* update({
+          sessionID,
+          operation: "retry",
+          fence: current.fence,
+          expectedState: current.mode === "retry_wait" ? "retry_wait" : "active",
+          nextState: "retry_wait",
+          retryAt,
+        })
         const active = new Map(state.active)
         if (state.phase === "running") {
           active.set(sessionID, { ...current, mode: "retry_wait", retryAt })
@@ -580,7 +771,13 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
           }
           return [result, state] as const
         }
-        yield* update(sessionID, current.fence, "active")
+        yield* update({
+          sessionID,
+          operation: "resumeRetry",
+          fence: current.fence,
+          expectedState: "retry_wait",
+          nextState: "active",
+        })
         const active = new Map(state.active)
         active.set(sessionID, { ...current, mode: "active", retryAt: undefined })
         const result: ResumeResult = { resumed: true, phase: state.phase, mode: current.mode, fence: current.fence }
@@ -603,8 +800,87 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
   const awaitDrain = Deferred.await(drained)
   const awaitStop = Deferred.await(stopped)
 
+  const quarantineStaleActive = Effect.fnUntraced(function* (row: Row, logDetails: boolean) {
+    const database = databaseRef.current ?? (yield* Database.Service)
+    const quarantined = decodeRow(
+      yield* database.db.get<Row>(sql`
+        UPDATE runtime_execution
+        SET state = ${"recovery_needed"}, fence = ${row.fence + 1}, retry_at = NULL, time_updated = ${Date.now()}
+        WHERE session_id = ${row.session_id}
+          AND owner_lineage = ${row.owner_lineage}
+          AND owner_instance = ${row.owner_instance}
+          AND fence = ${row.fence}
+          AND state = ${"active"}
+          AND desired_active = 1
+        RETURNING *
+      `),
+    )
+    if (quarantined) {
+      if (logDetails)
+        yield* Effect.logInfo("restart diagnostic stale active quarantined", {
+          ...rowFields(row),
+          newState: quarantined.state,
+          newFence: quarantined.fence,
+          currentRuntimeInstance: identity.instance,
+        })
+      return "quarantined" as const
+    }
+
+    const current = decodeRow(
+      yield* database.db.get(sql`SELECT * FROM runtime_execution WHERE session_id = ${row.session_id}`),
+    )
+    if (logDetails)
+      yield* Effect.logWarning("restart diagnostic stale active quarantine conflict", {
+        ...rowFields(row),
+        current: current ? rowFields(current) : undefined,
+        currentRuntimeInstance: identity.instance,
+      })
+    return "conflict" as const
+  })
+
+  const claimForRecovery = Effect.fnUntraced(function* (row: Row) {
+    return yield* SynchronizedRef.modifyEffect(
+      ref,
+      Effect.fnUntraced(function* (state) {
+        if (state.phase !== "running") return [undefined, state] as const
+        const record = yield* claim(row)
+        if (!record) return [undefined, state] as const
+        const active = new Map(state.active)
+        active.set(record.sessionID, {
+          fence: record.fence,
+          leases: 0,
+          mode: record.state === "retry_wait" ? "retry_wait" : "active",
+          retryAt: record.retryAt,
+        })
+        return [record, { ...state, active }] as const
+      }),
+    )
+  })
+
+  const markRecoveryNeeded = Effect.fnUntraced(function* (sessionID: string) {
+    const transitioned = yield* SynchronizedRef.modifyEffect(
+      ref,
+      Effect.fnUntraced(function* (state) {
+        const current = state.active.get(sessionID)
+        if (!current) return [undefined, state] as const
+        yield* update({
+          sessionID,
+          operation: "recovery_needed",
+          fence: current.fence,
+          expectedState: current.mode === "retry_wait" ? "retry_wait" : "active",
+          nextState: "recovery_needed",
+        })
+        const active = new Map(state.active)
+        active.delete(sessionID)
+        return [current.fence, { ...state, active }] as const
+      }),
+    )
+    if (transitioned !== undefined) yield* checkQuiescent()
+    return transitioned
+  })
+
   const recover = Effect.fn("RuntimeLifecycle.recover")(function* (
-    run: (record: ExecutionRecord) => Effect.Effect<unknown>,
+    run: (record: ExecutionRecord) => Effect.Effect<unknown, unknown>,
   ) {
     const database = databaseRef.current ?? (yield* Database.Service)
     const candidates = yield* database.db.all<Row>(sql`
@@ -612,25 +888,59 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
       WHERE desired_active = 1 AND state NOT IN ('completed', 'cancelled')
       ORDER BY time_updated ASC
     `)
-    const rows = candidates.filter(
-      (row) => row.owner_lineage === identity.lineage && (row.state === "parked" || row.state === "retry_wait"),
+    const staleActive = candidates.filter(
+      (row) =>
+        row.state === "active" && row.owner_lineage === identity.lineage && row.owner_instance !== identity.instance,
     )
+    const quarantines = yield* Effect.forEach(
+      staleActive.map((row, index) => ({ row, logDetails: index < 20 })),
+      ({ row, logDetails }) => quarantineStaleActive(row, logDetails),
+      { concurrency: "unbounded" },
+    )
+    const rows = yield* database.db.all<Row>(sql`
+      SELECT * FROM runtime_execution
+      WHERE desired_active = 1
+        AND owner_lineage = ${identity.lineage}
+        AND state IN ('parked', 'retry_wait')
+      ORDER BY time_updated ASC
+    `)
+    const eligibleSessionIDs = new Set(rows.map((row) => row.session_id))
+    const quarantined = quarantines.filter((result) => result === "quarantined").length
+    const conflicts = quarantines.length - quarantined
+    yield* Effect.logInfo("restart diagnostic stale active reconciliation summary", {
+      staleActiveFound: staleActive.length,
+      staleActiveQuarantined: quarantined,
+      staleActiveCasConflicts: conflicts,
+      staleActiveDiagnosticsOmitted: Math.max(0, staleActive.length - 20),
+      currentLineage: identity.lineage,
+      currentInstance: identity.instance,
+    })
+    const diagnosticRows = candidates.slice(0, 50)
     yield* Effect.forEach(
-      candidates,
+      diagnosticRows,
       (row) =>
         Effect.logInfo("restart diagnostic recovery candidate", {
           ...rowFields(row),
           ownerLineageMatches: row.owner_lineage === identity.lineage,
-          eligibleForRecovery: rows.includes(row),
+          eligibleForRecovery: eligibleSessionIDs.has(row.session_id),
           currentLineage: identity.lineage,
           currentInstance: identity.instance,
         }),
       { concurrency: "unbounded", discard: true },
     )
+    if (candidates.length > diagnosticRows.length)
+      yield* Effect.logInfo("restart diagnostic recovery candidates omitted", {
+        omitted: candidates.length - diagnosticRows.length,
+        currentLineage: identity.lineage,
+        currentInstance: identity.instance,
+      })
     yield* Effect.logInfo("restart diagnostic recovery scan summary", {
       totalNonterminalDesiredActive: candidates.length,
       sameLineageCandidates: candidates.filter((row) => row.owner_lineage === identity.lineage).length,
       eligibleParkedOrRetryWait: rows.length,
+      staleActiveFound: staleActive.length,
+      staleActiveQuarantined: quarantined,
+      staleActiveCasConflicts: conflicts,
       currentLineage: identity.lineage,
       currentInstance: identity.instance,
     })
@@ -638,18 +948,8 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
       rows,
       (row) =>
         Effect.gen(function* () {
-          const record = yield* claim(row)
+          const record = yield* claimForRecovery(row)
           if (!record) return
-          yield* SynchronizedRef.update(ref, (state) => {
-            const active = new Map(state.active)
-            active.set(record.sessionID, {
-              fence: record.fence,
-              leases: 0,
-              mode: record.state === "retry_wait" ? "retry_wait" : "active",
-              retryAt: record.retryAt,
-            })
-            return { ...state, active }
-          })
           yield* Effect.gen(function* () {
             const now = yield* Clock.currentTimeMillis
             const remainingMs = record.retryAt === undefined ? 0 : Math.max(0, record.retryAt - now)
@@ -714,35 +1014,56 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
                 }),
               ),
               Effect.tap(() => complete(record.sessionID)),
-              Effect.catch((error) =>
+            )
+          }).pipe(
+            Effect.onInterrupt(() =>
+              Effect.uninterruptible(
                 Effect.gen(function* () {
-                  const current = SynchronizedRef.getUnsafe(ref).active.get(record.sessionID)
-                  if (current) {
-                    yield* update(record.sessionID, current.fence, "recovery_needed")
-                    yield* SynchronizedRef.update(ref, (state) => {
-                      const active = new Map(state.active)
-                      active.delete(record.sessionID)
-                      return { ...state, active }
-                    })
-                    yield* checkQuiescent()
-                    yield* Effect.logWarning("restart diagnostic recovery row transitioned to recovery_needed", {
-                      ...recordFields(record),
-                      fence: current.fence,
-                      lineage: identity.lineage,
-                      instance: identity.instance,
-                    })
-                  }
-                  yield* Effect.logError("restart diagnostic recovery failed", {
+                  const fence = yield* markRecoveryNeeded(record.sessionID).pipe(
+                    Effect.catchCause(() => Effect.succeed(undefined)),
+                  )
+                  yield* Effect.logWarning("restart diagnostic recovery interrupted", {
                     sessionID: record.sessionID,
-                    errorType: error instanceof Error ? error.name : typeof error,
-                    rowTransitioned: Boolean(current),
+                    rowTransitioned: fence !== undefined,
+                    fence,
                     lineage: identity.lineage,
                     instance: identity.instance,
                   })
                 }),
               ),
-            )
-          }).pipe(Effect.forkIn(scope, { startImmediately: true }))
+            ),
+            Effect.catchCause((cause) =>
+              Effect.gen(function* () {
+                const fence = yield* markRecoveryNeeded(record.sessionID).pipe(
+                  Effect.catchCause((cause) =>
+                    Effect.logError("restart diagnostic recovery transition failed", {
+                      sessionID: record.sessionID,
+                      causeType: typeof cause,
+                      lineage: identity.lineage,
+                      instance: identity.instance,
+                    }).pipe(Effect.as(undefined)),
+                  ),
+                )
+                if (fence !== undefined) {
+                  yield* Effect.logWarning("restart diagnostic recovery row transitioned to recovery_needed", {
+                    ...recordFields(record),
+                    fence,
+                    lineage: identity.lineage,
+                    instance: identity.instance,
+                  })
+                }
+                const error = Cause.squash(cause)
+                yield* Effect.logError("restart diagnostic recovery failed", {
+                  sessionID: record.sessionID,
+                  errorType: error instanceof Error ? error.name : typeof error,
+                  rowTransitioned: fence !== undefined,
+                  lineage: identity.lineage,
+                  instance: identity.instance,
+                })
+              }),
+            ),
+            Effect.forkIn(scope, { startImmediately: true }),
+          )
         }),
       { concurrency: "unbounded", discard: true },
     )
