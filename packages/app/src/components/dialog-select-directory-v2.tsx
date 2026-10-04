@@ -26,6 +26,7 @@ import {
   displayPickerPath,
   pickerParent,
   pickerRoot,
+  projectSearchRoots,
 } from "./directory-picker-domain"
 import "./dialog-select-directory-v2.css"
 import { DividerV2 } from "@opencode-ai/ui/v2/divider-v2"
@@ -42,7 +43,7 @@ interface DialogSelectDirectoryV2Props {
 
 export function DialogSelectDirectoryV2(props: DialogSelectDirectoryV2Props) {
   const global = useGlobal()
-  const { sync, sdk } = global.ensureServerCtx(props.server)
+  const { sync, sdk, projects } = global.ensureServerCtx(props.server)
   const dialog = useDialog()
   const language = useLanguage()
   const policy = pickerMode(props.mode ?? "directory", props.start)
@@ -87,7 +88,12 @@ export function DialogSelectDirectoryV2(props: DialogSelectDirectoryV2Props) {
       fallbackPath()?.home ||
       fallbackPath()?.directory,
   )
-  const search = createDirectorySearch({ sdk, home, base: () => root() || start() })
+  const search = createDirectorySearch({
+    sdk,
+    home,
+    base: () => root() || start(),
+    extraRoots: () => projectSearchRoots(projects.list().map((project) => project.worktree)),
+  })
   const [suggestions] = createResource(input, async (value) => {
     const cleaned = cleanPickerInput(value)
     const typed = cleaned.replace(/\/+$/, "")

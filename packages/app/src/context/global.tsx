@@ -6,6 +6,7 @@ import { pathKey } from "@/utils/path-key"
 import { useServerHealth } from "@/utils/server-health"
 import { createServerSdkContext } from "./server-sdk"
 import { createServerSyncContext } from "./server-sync"
+import { createServerProjectSync } from "./project-list-sync"
 import { getOwner } from "solid-js/web"
 import { QueryClient } from "@tanstack/solid-query"
 import type { ServerScope } from "@/utils/server-scope"
@@ -109,6 +110,7 @@ function createServerCtx(
   })
   const sdk = createServerSdkContext(conn, scope)
   const sync = createServerSyncContext(sdk)
+  const projectSync = createServerProjectSync({ sdk, projects })
 
   function enrich(project: { worktree: string; expanded: boolean }) {
     const [childStore] = sync.child(project.worktree, { bootstrap: false })
@@ -149,6 +151,20 @@ function createServerCtx(
       ...projects,
       list: projectsList,
       recentlyClosed: recentlyClosedList,
+      // Local state updates first so the sidebar stays responsive; the server list is then
+      // reconciled from the response and from server.projects.updated events.
+      open(directory: string) {
+        projects.open(directory)
+        projectSync.send({ type: "add", directory })
+      },
+      close(directory: string) {
+        projects.close(directory)
+        projectSync.send({ type: "remove", directory })
+      },
+      move(directory: string, toIndex: number) {
+        projects.move(directory, toIndex)
+        projectSync.send({ type: "move", directory, toIndex })
+      },
     },
   }
 }

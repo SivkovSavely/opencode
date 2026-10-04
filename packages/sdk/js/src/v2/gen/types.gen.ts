@@ -93,6 +93,7 @@ export type Event =
   | EventWorktreeFailed
   | EventServerConnected
   | EventGlobalDisposed
+  | EventServerProjectsUpdated
   | EventServerInstanceDisposed
 
 export type QuestionReplied = {
@@ -1600,6 +1601,13 @@ export type GlobalEvent = {
           [key: string]: unknown
         }
       }
+    | {
+        id: string
+        type: "server.projects.updated"
+        properties: {
+          projects: Array<string>
+        }
+      }
     | EventServerInstanceDisposed
     | SyncEventSessionCreated
     | SyncEventSessionUpdated
@@ -2032,6 +2040,10 @@ export type Config = {
   }
 }
 
+export type EffectHttpApiErrorInternalServerError = {
+  _tag: "InternalServerError"
+}
+
 export type Model = {
   id: string
   providerID: string
@@ -2137,10 +2149,6 @@ export type ConsoleState = {
   consoleManagedProviders: Array<string>
   activeOrgName?: string
   switchableOrgCount: number
-}
-
-export type EffectHttpApiErrorInternalServerError = {
-  _tag: "InternalServerError"
 }
 
 export type ToolListItem = {
@@ -2944,6 +2952,7 @@ export type V2Event =
   | WorktreeFailed
   | ServerConnected
   | GlobalDisposed
+  | ServerProjectsUpdated
 
 export type V2EventStream = string
 
@@ -6108,6 +6117,23 @@ export type GlobalDisposed = {
   }
 }
 
+export type ServerProjectsUpdated = {
+  id: string
+  metadata?: {
+    [key: string]: unknown
+  }
+  type: "server.projects.updated"
+  durable?: {
+    aggregateID: string
+    seq: number
+    version: number
+  }
+  location?: LocationRef
+  data: {
+    projects: Array<string>
+  }
+}
+
 export type QuestionV2Request = {
   id: string
   sessionID: string
@@ -7055,6 +7081,14 @@ export type EventGlobalDisposed = {
   }
 }
 
+export type EventServerProjectsUpdated = {
+  id: string
+  type: "server.projects.updated"
+  properties: {
+    projects: Array<string>
+  }
+}
+
 export type CredentialOAuth = {
   type: "oauth"
   methodID: string
@@ -7328,6 +7362,85 @@ export type GlobalConfigUpdateResponses = {
 }
 
 export type GlobalConfigUpdateResponse = GlobalConfigUpdateResponses[keyof GlobalConfigUpdateResponses]
+
+export type GlobalProjectsListData = {
+  body?: never
+  path?: never
+  query?: never
+  url: "/global/projects"
+}
+
+export type GlobalProjectsListErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+  /**
+   * InternalServerError
+   */
+  500: EffectHttpApiErrorInternalServerError
+}
+
+export type GlobalProjectsListError = GlobalProjectsListErrors[keyof GlobalProjectsListErrors]
+
+export type GlobalProjectsListResponses = {
+  /**
+   * Added project list
+   */
+  200: {
+    projects: Array<string>
+  }
+}
+
+export type GlobalProjectsListResponse = GlobalProjectsListResponses[keyof GlobalProjectsListResponses]
+
+export type GlobalProjectsUpdateData = {
+  body?:
+    | {
+        type: "merge"
+        projects: Array<string>
+      }
+    | {
+        type: "add"
+        directory: string
+      }
+    | {
+        type: "remove"
+        directory: string
+      }
+    | {
+        type: "move"
+        directory: string
+        toIndex: number
+      }
+  path?: never
+  query?: never
+  url: "/global/projects"
+}
+
+export type GlobalProjectsUpdateErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+  /**
+   * InternalServerError
+   */
+  500: EffectHttpApiErrorInternalServerError
+}
+
+export type GlobalProjectsUpdateError = GlobalProjectsUpdateErrors[keyof GlobalProjectsUpdateErrors]
+
+export type GlobalProjectsUpdateResponses = {
+  /**
+   * Successfully updated added projects
+   */
+  200: {
+    projects: Array<string>
+  }
+}
+
+export type GlobalProjectsUpdateResponse = GlobalProjectsUpdateResponses[keyof GlobalProjectsUpdateResponses]
 
 export type GlobalDisposeData = {
   body?: never

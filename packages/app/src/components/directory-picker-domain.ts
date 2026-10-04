@@ -321,7 +321,44 @@ export function displayPickerPath(path: string, input: string, home: string) {
   return pickerTilde(value, home) || value
 }
 
-export function createDirectorySearch(args: { sdk: ServerSDK; base: () => string | undefined; home: () => string }) {
+// Immediate parents of already-added projects act as extra fuzzy search roots so sibling
+// projects can be added without typing the parent path first. Capped so a large added
+// list cannot fan out into an unbounded number of directory listings.
+export const MAX_PROJECT_SEARCH_ROOTS = 6
+
+export function projectSearchRoots(projects: ReadonlyArray<string>) {
+  const seen = new Set<string>()
+  const roots: string[] = []
+  for (const project of projects) {
+    const parent = canonicalPickerPath(pickerParent(trimPickerPath(project)))
+    if (!parent) continue
+    const key = /^[A-Za-z]:\//.test(parent) || parent.startsWith("//") ? parent.toLowerCase() : parent
+    if (seen.has(key)) continue
+    seen.add(key)
+    roots.push(parent)
+  }
+  return roots.slice(0, MAX_PROJECT_SEARCH_ROOTS)
+}
+
+// Inputs that already name a filesystem location must stay on the normal picker base
+// instead of fanning out over the extra roots.
+function explicitPickerInput(raw: string) {
+  return (
+    raw === "." ||
+    raw === ".." ||
+    raw.startsWith("./") ||
+    raw.startsWith("../") ||
+    raw.startsWith("~") ||
+    !!pickerRoot(raw)
+  )
+}
+
+export function createDirectorySearch(args: {
+  sdk: ServerSDK
+  base: () => string | undefined
+  home: () => string
+  extraRoots?: () => string[]
+}) {
   const cache = new Map<string, Promise<Array<{ name: string; absolute: string }>>>()
   let current = 0
 
@@ -364,6 +401,13 @@ export function createDirectorySearch(args: { sdk: ServerSDK; base: () => string
     return fuzzysort.go(query, items, { key: "name", limit }).map((item) => item.obj.absolute)
   }
 
+  const find = async (directory: string, query: string) => {
+    return args.sdk.api.file
+      .find({ location: { directory }, query, type: "directory", limit: 50 })
+      .then((result) => result.data.map((entry) => joinPickerPath(directory, entry.path)))
+      .catch(() => [] as string[])
+  }
+
   return async (filter: string) => {
     const token = ++current
     const active = () => token === current
@@ -373,25 +417,29 @@ export function createDirectorySearch(args: { sdk: ServerSDK; base: () => string
     const raw = normalizePickerDrive(value)
     const pathInput = raw.startsWith("~") || !!pickerRoot(raw) || raw.includes("/")
     const query = normalizePickerDrive(input.path)
+    // Additional roots augment ordinary relative fuzzy paths only. An empty query keeps
+    // listing the normal base alone so the default view is not flooded with siblings.
+    const extra = !explicitPickerInput(raw) && query ? (args.extraRoots?.() ?? []) : []
     if (!pathInput) {
-      const results = await args.sdk.api.file
-        .find({ location: { directory: input.directory }, query, type: "directory", limit: 50 })
-        .then((result) => result.data.map((entry) => entry.path))
-        .catch(() => [])
+      const scopedDirectories = [input.directory, ...extra]
+      const results = Array.from(new Set((await Promise.all(scopedDirectories.map((dir) => find(dir, query)))).flat()))
       if (!active()) return []
-      if (results.length) {
-        return results.map((path) => joinPickerPath(input.directory, path)).slice(0, 50)
+      if (results.length) return results.slice(0, 50)
+      if (!query) {
+        const listing = await directories(input.directory)
+        if (!active()) return []
+        return listing.map((item) => item.absolute)
       }
-      const fallback = query
-        ? await match(input.directory, query, 50)
-        : (await directories(input.directory)).map((item) => item.absolute)
+      const fallback = Array.from(
+        new Set((await Promise.all(scopedDirectories.map((dir) => match(dir, query, 50)))).flat()),
+      )
       if (!active()) return []
-      return fallback
+      return fallback.slice(0, 50)
     }
     const segments = query.replace(/^\/+/, "").split("/")
     const head = segments.slice(0, -1).filter((part) => part && part !== ".")
     const tail = segments.at(-1) ?? ""
-    let paths = [input.directory]
+    let paths = Array.from(new Set([input.directory, ...extra]))
     for (const part of head) {
       if (!active()) return []
       if (part === "..") {

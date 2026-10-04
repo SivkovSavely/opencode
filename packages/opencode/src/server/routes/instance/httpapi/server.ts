@@ -115,6 +115,7 @@ import { corsVaryFix } from "./middleware/cors-vary"
 import { errorLayer } from "./middleware/error"
 import { fenceLayer } from "./middleware/fence"
 import { schemaErrorLayer } from "./middleware/schema-error"
+import { GlobalProjectList } from "@/server/global-project-list"
 import { RuntimeLifecycle } from "@/server/runtime-lifecycle"
 
 export const context = Context.makeUnsafe<unknown>(new Map())
@@ -221,6 +222,7 @@ const app = LayerNode.group([
   Git.node,
   Ripgrep.node,
   Storage.node,
+  GlobalProjectList.node,
   Snapshot.node,
   Plugin.node,
   ModelsDev.node,

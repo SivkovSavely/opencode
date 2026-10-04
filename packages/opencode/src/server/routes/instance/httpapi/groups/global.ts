@@ -7,6 +7,7 @@ import "@/server/event"
 import { Schema } from "effect"
 import { HttpApi, HttpApiEndpoint, HttpApiError, HttpApiGroup, OpenApi } from "effect/unstable/httpapi"
 import semver from "semver"
+import { GlobalProjectList } from "@/server/global-project-list"
 import { described } from "./metadata"
 
 const GlobalHealth = Schema.Struct({
@@ -75,10 +76,13 @@ const GlobalUpgradeResult = Schema.Union([
   }),
 ])
 
+const GlobalProjects = Schema.Struct({ projects: Schema.Array(Schema.String) })
+
 export const GlobalPaths = {
   health: "/global/health",
   event: "/global/event",
   config: "/global/config",
+  projects: "/global/projects",
   dispose: "/global/dispose",
   upgrade: "/global/upgrade",
   runtime: "/global/runtime",
@@ -125,6 +129,28 @@ export const GlobalApi = HttpApi.make("global").add(
           identifier: "global.config.update",
           summary: "Update global configuration",
           description: "Update global OpenCode configuration settings and preferences.",
+        }),
+      ),
+      HttpApiEndpoint.get("projectsList", GlobalPaths.projects, {
+        success: described(GlobalProjects, "Added project list"),
+        error: HttpApiError.InternalServerError,
+      }).annotateMerge(
+        OpenApi.annotations({
+          identifier: "global.projects.list",
+          summary: "Get added projects",
+          description: "Get the ordered list of project directories added to this OpenCode server.",
+        }),
+      ),
+      HttpApiEndpoint.patch("projectsUpdate", GlobalPaths.projects, {
+        payload: GlobalProjectList.Operation,
+        success: described(GlobalProjects, "Successfully updated added projects"),
+        error: HttpApiError.InternalServerError,
+      }).annotateMerge(
+        OpenApi.annotations({
+          identifier: "global.projects.update",
+          summary: "Update added projects",
+          description:
+            "Add, remove, reorder, or merge project directories in the server-wide added project list.",
         }),
       ),
       HttpApiEndpoint.post("dispose", GlobalPaths.dispose, {

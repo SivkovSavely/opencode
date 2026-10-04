@@ -8,6 +8,7 @@ import { Config } from "../../src/config/config"
 import { Installation } from "../../src/installation"
 import { MoveSession } from "@opencode-ai/core/control-plane/move-session"
 import { ServerAuth } from "../../src/server/auth"
+import { GlobalProjectList } from "../../src/server/global-project-list"
 import { RootHttpApi } from "../../src/server/routes/instance/httpapi/api"
 import { GlobalPaths } from "../../src/server/routes/instance/httpapi/groups/global"
 import { controlHandlers } from "../../src/server/routes/instance/httpapi/handlers/control"
@@ -36,6 +37,15 @@ const apiLayer = HttpRouter.serve(
       method: () => Effect.succeed("npm"),
       latest: () => Effect.succeed("9.9.9"),
       upgrade: () => Effect.void,
+    }),
+  ),
+  Layer.provide(
+    Layer.mock(GlobalProjectList.Service)({
+      list: () => Effect.succeed(["/repo"]),
+      apply: (operation) =>
+        Effect.succeed(
+          operation.type === "add" ? [operation.directory, "/repo"] : GlobalProjectList.applyOperation(["/repo"], operation),
+        ),
     }),
   ),
   Layer.provide(ServerAuth.Config.configLayer({ password: Option.none(), username: "opencode" })),
@@ -70,6 +80,38 @@ describe("global HttpApi", () => {
     Effect.gen(function* () {
       const response = yield* HttpClientRequest.post(GlobalPaths.upgrade).pipe(
         HttpClientRequest.bodyJsonUnsafe({ target: "latest" }),
+        HttpClient.execute,
+      )
+
+      expect(response.status).toBe(400)
+    }),
+  )
+
+  it.live("serves the added project list", () =>
+    Effect.gen(function* () {
+      const response = yield* HttpClientRequest.get(GlobalPaths.projects).pipe(HttpClient.execute)
+
+      expect(response.status).toBe(200)
+      expect(yield* response.json).toEqual({ projects: ["/repo"] })
+    }),
+  )
+
+  it.live("applies semantic project list mutations", () =>
+    Effect.gen(function* () {
+      const response = yield* HttpClientRequest.patch(GlobalPaths.projects).pipe(
+        HttpClientRequest.bodyJsonUnsafe({ type: "add", directory: "/added" }),
+        HttpClient.execute,
+      )
+
+      expect(response.status).toBe(200)
+      expect(yield* response.json).toEqual({ projects: ["/added", "/repo"] })
+    }),
+  )
+
+  it.live("rejects invalid project list mutations", () =>
+    Effect.gen(function* () {
+      const response = yield* HttpClientRequest.patch(GlobalPaths.projects).pipe(
+        HttpClientRequest.bodyJsonUnsafe({ type: "move", directory: "/repo", toIndex: "first" }),
         HttpClient.execute,
       )
 

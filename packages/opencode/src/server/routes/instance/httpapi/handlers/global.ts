@@ -3,7 +3,9 @@ import { GlobalBus, type GlobalEvent as GlobalBusEvent } from "@/bus/global"
 import { EffectBridge } from "@/effect/bridge"
 import { EventV2 } from "@opencode-ai/core/event"
 import { EventDiagnostics, type SubscriberHandle } from "@opencode-ai/core/event-diagnostics"
+import { ServerEvent } from "@opencode-ai/schema/server-event"
 import { Installation } from "@/installation"
+import { GlobalProjectList } from "@/server/global-project-list"
 import { disposeAllInstancesAndEmitGlobalDisposed } from "@/server/global-lifecycle"
 import { InstallationVersion } from "@opencode-ai/core/installation/version"
 import { Effect, Option, Queue } from "effect"
@@ -88,6 +90,7 @@ export const globalHandlers = HttpApiBuilder.group(RootHttpApi, "global", (handl
   Effect.gen(function* () {
     const config = yield* Config.Service
     const installation = yield* Installation.Service
+    const projectList = yield* GlobalProjectList.Service
     const bridge = yield* EffectBridge.make()
     const runtime = Option.getOrElse(
       yield* Effect.serviceOption(RuntimeLifecycle.Service),
@@ -110,6 +113,29 @@ export const globalHandlers = HttpApiBuilder.group(RootHttpApi, "global", (handl
       const result = yield* config.updateGlobal(ctx.payload)
       if (result.changed) bridge.fork(disposeAllInstancesAndEmitGlobalDisposed({ swallowErrors: true }))
       return result.info
+    })
+
+    const projectsList = Effect.fn("GlobalHttpApi.projectsList")(function* () {
+      const projects = yield* projectList
+        .list()
+        .pipe(Effect.mapError(() => new HttpApiError.InternalServerError({})))
+      return { projects }
+    })
+
+    const projectsUpdate = Effect.fn("GlobalHttpApi.projectsUpdate")(function* (ctx: {
+      payload: GlobalProjectList.Operation
+    }) {
+      const projects = yield* projectList
+        .apply(ctx.payload)
+        .pipe(Effect.mapError(() => new HttpApiError.InternalServerError({})))
+      GlobalBus.emit("event", {
+        directory: "global",
+        payload: {
+          type: ServerEvent.ProjectsUpdated.type,
+          properties: { projects },
+        },
+      })
+      return { projects }
     })
 
     const dispose = Effect.fn("GlobalHttpApi.dispose")(function* () {
@@ -162,6 +188,8 @@ export const globalHandlers = HttpApiBuilder.group(RootHttpApi, "global", (handl
       .handleRaw("event", event)
       .handle("configGet", configGet)
       .handle("configUpdate", configUpdate)
+      .handle("projectsList", projectsList)
+      .handle("projectsUpdate", projectsUpdate)
       .handle("dispose", dispose)
       .handle("upgrade", upgrade)
       .handle("runtime", runtimeStatus)

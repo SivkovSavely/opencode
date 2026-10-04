@@ -20,7 +20,56 @@ import {
   pickerParent,
   pickerRoot,
   pickerAbsoluteInput,
+  projectSearchRoots,
+  MAX_PROJECT_SEARCH_ROOTS,
 } from "./directory-picker-domain"
+
+const SIBLING_TREE: Record<string, string[]> = {
+  "/home/luke": ["Projects/", "ExternalProjects/", "notes/"],
+  "/home/luke/Projects": ["opencode/", "foo/", "Android/"],
+  "/home/luke/ExternalProjects": ["opencode-queue/", "space-bunny/"],
+  "/home/luke/ExternalProjects/space-bunny": ["src/", "assets/"],
+  "/home/luke/ExternalProjects/space-bunny/src": ["index.ts"],
+  "/home/luke/ExternalProjects/opencode-queue": ["src/", "docs/"],
+  "/home/luke/ExternalProjects/opencode-queue/src": ["main.ts"],
+  "/home/luke/Projects/Android": ["app/"],
+  "C:/Users/luke": ["repos/"],
+  "C:/Users/luke/repos": ["opencode/", "space-bunny/"],
+  "//Server/Share": ["opencode/", "space-bunny/"],
+}
+
+function treeSdk(calls: string[] = []) {
+  const entries = (directory: string) => SIBLING_TREE[directory] ?? []
+  return {
+    api: {
+      file: {
+        list: (input: { location?: { directory?: string } }) => {
+          const directory = input.location?.directory ?? ""
+          calls.push(`list:${directory}`)
+          return Promise.resolve({
+            data: entries(directory).map((path) => ({ path, type: "directory" as const })),
+          })
+        },
+        find: (input: { location?: { directory?: string }; query: string }) => {
+          const directory = input.location?.directory ?? ""
+          calls.push(`find:${directory}`)
+          const query = input.query.toLowerCase()
+          return Promise.resolve({
+            data: entries(directory)
+              .filter((name) => name.toLowerCase().includes(query))
+              .map((path) => ({ path })),
+          })
+        },
+      },
+    },
+  } as unknown as Parameters<typeof createDirectorySearch>[0]["sdk"]
+}
+
+const SIBLING_PROJECTS = [
+  "/home/luke/Projects/opencode",
+  "/home/luke/Projects/foo",
+  "/home/luke/ExternalProjects/opencode-queue",
+]
 
 test("maps server directory entries into Pierre paths", () => {
   expect(
@@ -307,4 +356,95 @@ test("returns absolute directories and relative files", () => {
   expect(selectedTreePath("/home/luke/repo", "src/index.ts", "file")).toBe("src/index.ts")
   expect(selectedTreePath("/home/luke/repo/src", "index.ts", "file", "/home/luke/repo")).toBe("src/index.ts")
   expect(selectedTreePath("/home/luke/repo", "src/", "file")).toBeUndefined()
+})
+
+test("derives one search root per added project parent", () => {
+  expect(projectSearchRoots(SIBLING_PROJECTS)).toEqual(["/home/luke/Projects", "/home/luke/ExternalProjects"])
+  expect(projectSearchRoots(["C:\\repos\\alpha", "C:/repos/beta", "//Server/Share/gamma", "/solo"])).toEqual([
+    "C:/repos",
+    "//Server/Share",
+    "/",
+  ])
+  expect(projectSearchRoots(Array.from({ length: 30 }, (_, index) => `/parent-${index}/project`))).toHaveLength(
+    MAX_PROJECT_SEARCH_ROOTS,
+  )
+})
+
+test("finds a bare fuzzy name among the added projects' siblings", async () => {
+  const calls: string[] = []
+  const search = createDirectorySearch({
+    sdk: treeSdk(calls),
+    home: () => "/home/luke",
+    base: () => "/home/luke",
+    extraRoots: () => projectSearchRoots(SIBLING_PROJECTS),
+  })
+
+  expect(await search("andr")).toEqual(["/home/luke/Projects/Android"])
+  expect(calls).toContain("find:/home/luke/Projects")
+  expect(calls).toContain("find:/home/luke/ExternalProjects")
+})
+
+test("searches a shared project parent only once", async () => {
+  const calls: string[] = []
+  const search = createDirectorySearch({
+    sdk: treeSdk(calls),
+    home: () => "/home/luke",
+    base: () => "/home/luke",
+    extraRoots: () => projectSearchRoots(["/home/luke/Projects/alpha", "/home/luke/Projects/beta"]),
+  })
+
+  await search("android")
+
+  expect(calls.filter((call) => call === "find:/home/luke/Projects")).toHaveLength(1)
+})
+
+test("resolves multi-segment relative input from the project parents", async () => {
+  const search = createDirectorySearch({
+    sdk: treeSdk(),
+    home: () => "/home/luke",
+    base: () => "/home/luke",
+    extraRoots: () => projectSearchRoots([...SIBLING_PROJECTS, "/home/luke/ExternalProjects/space-bunny"]),
+  })
+
+  expect(await search("space/src")).toContain("/home/luke/ExternalProjects/space-bunny/src")
+  expect(await search("queue/src")).toContain("/home/luke/ExternalProjects/opencode-queue/src")
+})
+
+test("keeps explicit path input on the normal base", async () => {
+  for (const filter of [
+    "~/Projects",
+    "/home/luke/Projects",
+    "C:/Users/luke",
+    "//Server/Share",
+    "./android",
+    "../android",
+  ]) {
+    const calls: string[] = []
+    const search = createDirectorySearch({
+      sdk: treeSdk(calls),
+      home: () => "/home/luke",
+      base: () => "/home/luke",
+      extraRoots: () => projectSearchRoots(SIBLING_PROJECTS),
+    })
+
+    await search(filter)
+
+    expect(calls).not.toContain("find:/home/luke/Projects")
+    expect(calls).not.toContain("find:/home/luke/ExternalProjects")
+  }
+})
+
+test("deduplicates results shared by the normal base and the project parents", async () => {
+  const search = createDirectorySearch({
+    sdk: treeSdk(),
+    home: () => "/home/luke",
+    base: () => "/home/luke",
+    // A project directly under the home directory makes the extra root identical to the base.
+    extraRoots: () => projectSearchRoots(["/home/luke/alpha"]),
+  })
+
+  const results = await search("projects")
+
+  expect(results).toContain("/home/luke/Projects")
+  expect(results.filter((path) => path === "/home/luke/Projects")).toHaveLength(1)
 })

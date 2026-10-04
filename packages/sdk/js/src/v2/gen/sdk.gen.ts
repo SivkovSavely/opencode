@@ -86,6 +86,10 @@ import type {
   GlobalEventResponses,
   GlobalHealthErrors,
   GlobalHealthResponses,
+  GlobalProjectsListErrors,
+  GlobalProjectsListResponses,
+  GlobalProjectsUpdateErrors,
+  GlobalProjectsUpdateResponses,
   GlobalRuntimeErrors,
   GlobalRuntimeResponses,
   GlobalRuntimeRestartErrors,
@@ -1321,6 +1325,65 @@ export class Config extends HeyApiClient {
   }
 }
 
+export class Projects extends HeyApiClient {
+  /**
+   * Get added projects
+   *
+   * Get the ordered list of project directories added to this OpenCode server.
+   */
+  public list<ThrowOnError extends boolean = false>(options?: Options<never, ThrowOnError>) {
+    return (options?.client ?? this.client).get<GlobalProjectsListResponses, GlobalProjectsListErrors, ThrowOnError>({
+      url: "/global/projects",
+      ...options,
+    })
+  }
+
+  /**
+   * Update added projects
+   *
+   * Add, remove, reorder, or merge project directories in the server-wide added project list.
+   */
+  public update<ThrowOnError extends boolean = false>(
+    parameters?: {
+      body?:
+        | {
+            type: "merge"
+            projects: Array<string>
+          }
+        | {
+            type: "add"
+            directory: string
+          }
+        | {
+            type: "remove"
+            directory: string
+          }
+        | {
+            type: "move"
+            directory: string
+            toIndex: number
+          }
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams([parameters], [{ args: [{ key: "body", map: "body" }] }])
+    return (options?.client ?? this.client).patch<
+      GlobalProjectsUpdateResponses,
+      GlobalProjectsUpdateErrors,
+      ThrowOnError
+    >({
+      url: "/global/projects",
+      ...options,
+      ...params,
+      headers: {
+        "Content-Type": "application/json",
+        ...options?.headers,
+        ...params.headers,
+      },
+    })
+  }
+}
+
 export class Runtime extends HeyApiClient {
   /**
    * Restart server when safe
@@ -1425,6 +1488,11 @@ export class Global extends HeyApiClient {
   private _config?: Config
   get config(): Config {
     return (this._config ??= new Config({ client: this.client }))
+  }
+
+  private _projects?: Projects
+  get projects(): Projects {
+    return (this._projects ??= new Projects({ client: this.client }))
   }
 
   private _runtime?: Runtime

@@ -10,6 +10,7 @@ import { Auth } from "../../src/auth"
 import { Config } from "../../src/config/config"
 import { Installation } from "../../src/installation"
 import { ServerAuth } from "../../src/server/auth"
+import { GlobalProjectList } from "../../src/server/global-project-list"
 import { RootHttpApi } from "../../src/server/routes/instance/httpapi/api"
 import { controlHandlers } from "../../src/server/routes/instance/httpapi/handlers/control"
 import { controlPlaneHandlers } from "../../src/server/routes/instance/httpapi/handlers/control-plane"
@@ -44,6 +45,7 @@ const apiLayer = HttpRouter.serve(
       moveSession: (value) => Ref.set(called, value),
     }),
   ),
+  Layer.provide(Layer.mock(GlobalProjectList.Service)({})),
   Layer.provide(ServerAuth.Config.configLayer({ password: Option.none(), username: "opencode" })),
 )
 const it = testEffect(apiLayer)

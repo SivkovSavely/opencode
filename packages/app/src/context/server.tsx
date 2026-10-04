@@ -11,6 +11,9 @@ type ServerProjectState = {
   projects: Record<string, StoredProject[]>
   lastProject: Record<string, string>
   recentlyClosed: Record<string, string[]>
+  // Per server scope: the version of the server-synchronized project list this browser has
+  // already migrated. Absent until the additive merge against the server succeeds.
+  syncedProjects?: Record<string, number>
 }
 const HEALTH_POLL_INTERVAL_MS = 10_000
 // The store retains more history than is displayed. Consumers filter recently closed entries
@@ -135,6 +138,26 @@ export function createServerProjects<T extends ServerProjectState>(input: {
       const [item] = next.splice(fromIndex, 1)
       next.splice(toIndex, 0, item)
       setStore("projects", input.scope(), next)
+    },
+    // Authoritative server snapshot: membership and order are replaced while per-project
+    // local UI state (expansion) survives for projects that are still present. This never
+    // records recently closed entries; those only come from an explicit user close().
+    replace(directories: string[]) {
+      const previous = new Map(current().map((project) => [pathKey(project.worktree), project]))
+      setStore(
+        "projects",
+        input.scope(),
+        directories.map((directory) => ({
+          worktree: directory,
+          expanded: previous.get(pathKey(directory))?.expanded ?? true,
+        })),
+      )
+    },
+    migrated(version: number) {
+      return input.store.syncedProjects?.[input.scope()] === version
+    },
+    markMigrated(version: number) {
+      setStore("syncedProjects", input.scope(), version)
     },
     last() {
       return input.store.lastProject[input.scope()]
@@ -270,6 +293,7 @@ export const { use: useServer, provider: ServerProvider } = createSimpleContext(
         projects: {} as Record<string, StoredProject[]>,
         lastProject: {} as Record<string, string>,
         recentlyClosed: {} as Record<string, string[]>,
+        syncedProjects: {} as Record<string, number>,
       }),
     )
 

@@ -104,6 +104,22 @@ const scenarios: Scenario[] = [
         }),
       "status",
     ),
+  http.protected.get("/global/projects", "global.projects.list").global().json(200, (body) => {
+    object(body)
+    array(body.projects)
+  }),
+  http.protected
+    .patch("/global/projects", "global.projects.update")
+    .global()
+    .mutating()
+    .at(() => ({ path: "/global/projects", body: { type: "merge", projects: ["/httpapi-project"] } }))
+    .json(200, (body) => {
+      object(body)
+      check(
+        Array.isArray(body.projects) && body.projects.includes("/httpapi-project"),
+        "project list update should return the merged authoritative list",
+      )
+    }),
   http.protected
     .post("/global/dispose", "global.dispose")
     .global()
