@@ -260,7 +260,10 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
     const selected = () => {
       const state = scope()
       if (state?.variant !== undefined) return state.variant
-      return childSession()?.model?.variant
+      const model = childSession()?.model
+      if (!model) return
+      if (!model.variant || model.variant === "default") return null
+      return model.variant
     }
 
     const snapshot = () => {
@@ -336,9 +339,11 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
         configured,
         selected,
         current() {
+          const selected = this.selected()
+          if (childSession() && selected === null) return
           const resolved = resolveModelVariant({
             variants: this.list(),
-            selected: this.selected(),
+            selected,
             configured: this.configured(),
           })
           if (resolved) return resolved

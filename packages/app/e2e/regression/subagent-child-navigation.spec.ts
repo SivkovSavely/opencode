@@ -100,6 +100,37 @@ test("sends an immediate prompt to the child session", async ({ page }) => {
   })
 })
 
+test("omits the default sentinel child variant despite a configured agent variant", async ({ page }) => {
+  await setup(page, {
+    childModel: { id: modelID, providerID: "opencode", variant: "default" },
+    childAgent: { modelID, variant: "high" },
+  })
+  await openChildFromParent(page)
+
+  const submitted = await submitPrompt(page, childID, "Use the child's default variant")
+  expect(submitted).toMatchObject({
+    agent: "explore",
+    model: { modelID, providerID: "opencode" },
+  })
+  expect(submitted).not.toHaveProperty("variant")
+})
+
+test("omits a remembered variant when the child has no recorded variant", async ({ page }) => {
+  await setup(page, {
+    childModel: { id: modelID, providerID: "opencode" },
+    childAgent: { modelID, variant: "high" },
+    rememberedVariants: { [`opencode/${modelID}`]: "high" },
+  })
+  await openChildFromParent(page)
+
+  const submitted = await submitPrompt(page, childID, "Use the child's default variant")
+  expect(submitted).toMatchObject({
+    agent: "explore",
+    model: { modelID, providerID: "opencode" },
+  })
+  expect(submitted).not.toHaveProperty("variant")
+})
+
 test("does not fall back when the child's recorded model is unavailable", async ({ page }) => {
   await setup(page, {
     childModel: { id: "missing-model", providerID: "missing-provider", variant: "high" },
@@ -193,27 +224,33 @@ test("allows explicit child-local model and variant overrides", async ({ page })
 })
 
 test("preserves root-session model fallback behavior", async ({ page }) => {
-  await setup(page, { rootHistory: false })
+  await setup(page, {
+    rootHistory: false,
+    rememberedVariants: { [`opencode/${defaultModelID}`]: "high" },
+  })
   await page.goto(sessionHref(rootID))
   await expectSessionTitle(page, rootTitle)
 
-  await page.route(
-    (url) =>
-      url.pathname === `/session/${rootID}/prompt_async` &&
-      url.port === (process.env.PLAYWRIGHT_SERVER_PORT ?? "4096"),
-    (route) => route.fulfill({ status: 204, headers: { "access-control-allow-origin": "*" } }),
-  )
-  const editor = page.locator('[data-component="prompt-input"]')
-  await expect(editor).toBeEditable()
-  await editor.fill("Use the root model fallback")
-  const request = page.waitForRequest(
-    (request) => request.method() === "POST" && new URL(request.url()).pathname === `/session/${rootID}/prompt_async`,
-  )
-  await page.locator('[data-action="prompt-submit"]').click()
-
-  expect((await request).postDataJSON()).toMatchObject({
+  expect(await submitPrompt(page, rootID, "Use the root model fallback")).toMatchObject({
     agent: "build",
     model: { modelID: defaultModelID, providerID: "opencode" },
+    variant: "high",
+  })
+})
+
+test("preserves the configured root agent variant over a remembered variant", async ({ page }) => {
+  await setup(page, {
+    rootHistory: false,
+    rootAgent: { modelID, variant: "high" },
+    rememberedVariants: { [`opencode/${modelID}`]: "low" },
+  })
+  await page.goto(sessionHref(rootID))
+  await expectSessionTitle(page, rootTitle)
+
+  expect(await submitPrompt(page, rootID, "Use the configured root agent variant")).toMatchObject({
+    agent: "build",
+    model: { modelID, providerID: "opencode" },
+    variant: "high",
   })
 })
 
@@ -273,12 +310,16 @@ async function setup(
     events?: () => EventPayload[]
     sessionTab?: string | null
     childModel?: { id: string; providerID: string; variant?: string }
+    childAgent?: { modelID: string; variant?: string }
+    rootAgent?: { modelID: string; variant?: string }
+    rememberedVariants?: Record<string, string>
     rootHistory?: boolean
     questions?: unknown[]
     permissions?: unknown[]
   } = {},
 ) {
   const childModel = options.childModel ?? { id: modelID, providerID: "opencode", variant: "high" }
+  const childAgent = options.childAgent ?? { modelID: alternateModelID }
   await mockOpenCodeServer(page, {
     directory,
     project: {
@@ -311,6 +352,7 @@ async function setup(
               id: defaultModelID,
               name: "Default Model",
               limit: { context: 200_000 },
+              variants: { low: {}, high: {} },
             },
           },
         },
@@ -363,13 +405,25 @@ async function setup(
         body: JSON.stringify({
           location: { directory, project: { id: projectID, directory } },
           data: [
-            { id: "build", name: "Build", mode: "primary", hidden: false, request: { settings: {} }, permissions: [] },
+            {
+              id: "build",
+              name: "Build",
+              mode: "primary",
+              hidden: false,
+              ...(options.rootAgent && {
+                model: { providerID: "opencode", modelID: options.rootAgent.modelID },
+                variant: options.rootAgent.variant,
+              }),
+              request: { settings: {} },
+              permissions: [],
+            },
             {
               id: "explore",
               name: "Explore",
               mode: "subagent",
               hidden: false,
-              model: { providerID: "opencode", modelID: alternateModelID },
+              model: { providerID: "opencode", modelID: childAgent.modelID },
+              variant: childAgent.variant,
               request: { settings: {} },
               permissions: [],
             },
@@ -385,12 +439,24 @@ async function setup(
         contentType: "application/json",
         headers: { "access-control-allow-origin": "*" },
         body: JSON.stringify([
-          { name: "build", mode: "primary" },
-          { name: "explore", mode: "subagent" },
+          {
+            name: "build",
+            mode: "primary",
+            ...(options.rootAgent && {
+              model: { providerID: "opencode", modelID: options.rootAgent.modelID },
+              variant: options.rootAgent.variant,
+            }),
+          },
+          {
+            name: "explore",
+            mode: "subagent",
+            model: { providerID: "opencode", modelID: childAgent.modelID },
+            variant: childAgent.variant,
+          },
         ]),
       }),
   )
-  await configurePage(page, options.sessionTab === undefined ? rootID : options.sessionTab)
+  await configurePage(page, options.sessionTab === undefined ? rootID : options.sessionTab, options.rememberedVariants)
 }
 
 async function openChildFromParent(page: Page) {
@@ -408,6 +474,23 @@ async function openChildFromParent(page: Page) {
   await card.click()
 
   await expect(page).toHaveURL(new RegExp(`/server/.+/session/${childID}$`), { timeout: 15_000 })
+}
+
+async function submitPrompt(page: Page, sessionID: string, text: string) {
+  await page.route(
+    (url) =>
+      url.pathname === `/session/${sessionID}/prompt_async` &&
+      url.port === (process.env.PLAYWRIGHT_SERVER_PORT ?? "4096"),
+    (route) => route.fulfill({ status: 204, headers: { "access-control-allow-origin": "*" } }),
+  )
+  const editor = page.locator('[data-component="prompt-input"]')
+  await expect(editor).toBeEditable()
+  await editor.fill(text)
+  const request = page.waitForRequest(
+    (request) => request.method() === "POST" && new URL(request.url()).pathname === `/session/${sessionID}/prompt_async`,
+  )
+  await page.locator('[data-action="prompt-submit"]').click()
+  return (await request).postDataJSON()
 }
 
 function session(id: string, title: string, created: number, extra?: Record<string, unknown>) {
@@ -500,10 +583,10 @@ function taskMessages(parentSessionID: string, childSessionID: string, descripti
   ]
 }
 
-async function configurePage(page: Page, sessionID?: string | null) {
+async function configurePage(page: Page, sessionID?: string | null, rememberedVariants?: Record<string, string>) {
   const server = `http://${process.env.PLAYWRIGHT_SERVER_HOST ?? "127.0.0.1"}:${process.env.PLAYWRIGHT_SERVER_PORT ?? "4096"}`
   await page.addInitScript(
-    ({ directory, server, sessionId }) => {
+    ({ directory, server, sessionId, rememberedVariants }) => {
       localStorage.setItem("settings.v3", JSON.stringify({ general: { newLayoutDesigns: true } }))
       localStorage.setItem(
         "opencode.global.dat:server",
@@ -516,8 +599,11 @@ async function configurePage(page: Page, sessionID?: string | null) {
         "opencode.window.browser.dat:tabs",
         JSON.stringify(sessionId ? [{ type: "session", server, sessionId }] : []),
       )
+      if (rememberedVariants) {
+        localStorage.setItem("opencode.global.dat:model", JSON.stringify({ variant: rememberedVariants }))
+      }
     },
-    { directory, server, sessionId: sessionID },
+    { directory, server, sessionId: sessionID, rememberedVariants },
   )
 }
 
