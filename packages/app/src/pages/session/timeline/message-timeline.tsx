@@ -311,7 +311,11 @@ export function MessageTimeline(props: {
     if (!id) return emptyMessages
     return sync().data.message[id] ?? emptyMessages
   })
-  const parentTitle = createMemo(() => sessionTitle(parent()?.title) ?? language.t("command.session.new"))
+  const ancestors = createMemo(() => {
+    const id = sessionID()
+    if (!id || !parentID()) return []
+    return sync().session.lineage.peek(id)?.ancestors ?? []
+  })
   const getMsgParts = (msgId: string) => sync().data.part[msgId] ?? emptyParts
   const getMsgPart = (messageID: string, partID: string) => getMsgParts(messageID).find((part) => part.id === partID)
   const childTaskDescription = createMemo(() => {
@@ -878,9 +882,7 @@ export function MessageTimeline(props: {
     return true
   }
 
-  const navigateParent = () => {
-    const id = parentID()
-    if (!id) return
+  const navigateAncestor = (id: string) => {
     navigate(
       params.serverKey ? sessionHref(requireServerKey(params.serverKey), id) : legacySessionHref(sdk().directory, id),
     )
@@ -1392,23 +1394,28 @@ export function MessageTimeline(props: {
                 }}
               >
                 <div class="flex items-center min-w-0 flex-1 w-full">
-                  <Show when={parentID()}>
-                    <button
-                      type="button"
-                      data-slot="session-title-parent"
-                      class="min-w-0 max-w-[40%] truncate pl-2 text-[13px] font-[530] leading-4 tracking-[-0.04px] text-v2-text-text-faint transition-colors hover:text-v2-text-text-muted"
-                      onClick={navigateParent}
-                    >
-                      {parentTitle()}
-                    </button>
-                    <span
-                      data-slot="session-title-separator"
-                      class="-translate-y-[0.5px] pl-2 pr-1 text-[11px] font-medium text-v2-text-text-faint"
-                      aria-hidden="true"
-                    >
-                      /
-                    </span>
-                  </Show>
+                  <For each={ancestors()}>
+                    {(ancestor) => (
+                      <>
+                        <button
+                          type="button"
+                          data-slot="session-title-parent"
+                          data-session-id={ancestor.id}
+                          class="min-w-0 max-w-[40%] truncate pl-2 text-[13px] font-[530] leading-4 tracking-[-0.04px] text-v2-text-text-faint transition-colors hover:text-v2-text-text-muted"
+                          onClick={() => navigateAncestor(ancestor.id)}
+                        >
+                          {sessionTitle(ancestor.title) ?? language.t("command.session.new")}
+                        </button>
+                        <span
+                          data-slot="session-title-separator"
+                          class="-translate-y-[0.5px] pl-2 pr-1 text-[11px] font-medium text-v2-text-text-faint"
+                          aria-hidden="true"
+                        >
+                          /
+                        </span>
+                      </>
+                    )}
+                  </For>
                   <Show when={childTitle() || title.editing}>
                     <Show
                       when={title.editing}

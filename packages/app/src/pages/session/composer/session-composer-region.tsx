@@ -140,7 +140,7 @@ export function SessionComposerRegion(props: {
                 />
               </Show>
               <Show
-                when={controller.child()}
+                when={controller.child() && controller.state.blocked()}
                 fallback={<Show when={!controller.state.blocked()}>{props.promptInput}</Show>}
               >
                 <div

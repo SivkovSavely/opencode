@@ -8,7 +8,7 @@ import { useSettings } from "@/context/settings"
 import { useProviders } from "@/hooks/use-providers"
 import { resolveDefaultModel } from "@/hooks/provider-catalog"
 import { Persist, persisted } from "@/utils/persist"
-import { hasCustomAgent, resolveAgent } from "./local-agent"
+import { hasCustomAgent, resolveAgent, resolveChildAgent, resolveChildModel } from "./local-agent"
 import { cycleModelVariant, getConfiguredAgentVariant, resolveModelVariant } from "./model-variant"
 import { useSDK } from "./sdk"
 import { useSync } from "./sync"
@@ -71,6 +71,12 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
     const list = createMemo(() => sync().data.agent.filter((item) => item.mode !== "subagent" && !item.hidden))
     const agentsVisible = createMemo(() => settings.visibility.customAgents() || hasCustomAgent(list()))
     const connected = createMemo(() => new Set(providers.connected().map((item) => item.id)))
+    const childSession = createMemo(() => {
+      const session = id()
+      if (!session) return
+      const info = sync().session.get(session)
+      if (info?.parentID) return info
+    })
 
     const [saved, setSaved, , savedReady] = persisted(
       {
@@ -183,6 +189,8 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
       list,
       visible: agentsVisible,
       current() {
+        const child = childSession()
+        if (child) return resolveChildAgent(sync().data.agent, scope()?.agent ?? child.agent)
         return pickAgent(agentsVisible() ? (scope()?.agent ?? store.current) : "build")
       },
       set(name: string | undefined) {
@@ -233,6 +241,7 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
     const current = () => {
       const item = firstModel(
         () => scope()?.model,
+        () => resolveChildModel(childSession()?.model),
         () => agent.current()?.model,
         fallback,
       )

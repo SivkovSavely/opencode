@@ -5,10 +5,13 @@ import { expectSessionTitle } from "../utils/waits"
 
 const directory = "C:/OpenCode/SubagentNavigation"
 const projectID = "proj_subagent_navigation"
+const rootID = "ses_subagent_root"
 const parentID = "ses_subagent_parent"
 const childID = "ses_subagent_child"
+const rootTitle = "Root session"
 const parentTitle = "Parent session"
 const childTitle = "Subagent child session"
+const parentTaskDescription = "Delegate to a parent subagent"
 // Child session pages derive their heading from the task part that spawned them.
 const taskDescription = "Inspect child navigation"
 
@@ -16,15 +19,77 @@ type EventPayload = { directory: string; payload: Record<string, unknown> }
 
 test.use({ viewport: { width: 1440, height: 900 } })
 
-test("navigates to a subagent child session missing from the session list", async ({ page }) => {
+test("navigates to a deep subagent session through its root tab and ancestors", async ({ page }) => {
   await setup(page)
   await openChildFromParent(page)
 
   await expectSessionTitle(page, taskDescription)
   await expect(page.getByRole("heading", { name: parentTitle })).toHaveCount(0)
 
+  const ancestors = page.locator('[data-slot="session-title-parent"]')
+  await expect(ancestors).toHaveCount(2)
+  await expect(ancestors.nth(0)).toHaveText(rootTitle)
+  await expect(ancestors.nth(0)).toHaveAttribute("data-session-id", rootID)
+  await expect(ancestors.nth(1)).toHaveText(parentTitle)
+  await expect(ancestors.nth(1)).toHaveAttribute("data-session-id", parentID)
+
+  const tabs = page.locator('[data-slot="titlebar-tabs"] a')
+  await expect(tabs).toHaveCount(1)
+  await expect(tabs).toHaveAttribute("href", sessionHref(rootID))
+  const activeTab = page.locator('[data-titlebar-tab-slot][data-active="true"]')
+  await expect(activeTab).toHaveCount(1)
+  await expect(activeTab).toContainText(rootTitle)
+  await ancestors.nth(0).click()
+  await expect(page).toHaveURL(new RegExp(`/server/.+/session/${rootID}$`))
+  await expectSessionTitle(page, rootTitle)
+
   const titlebarRight = page.locator("#opencode-titlebar-right")
   await expect(titlebarRight.getByRole("button", { name: "Toggle review" })).toHaveCount(1)
+})
+
+test("creates the root tab when opening a deep child directly", async ({ page }) => {
+  await setup(page, undefined, null)
+  await page.goto(sessionHref(childID))
+
+  await expectSessionTitle(page, childTitle)
+  const ancestors = page.locator('[data-slot="session-title-parent"]')
+  await expect(ancestors).toHaveCount(2)
+  await expect(ancestors.nth(0)).toHaveAttribute("data-session-id", rootID)
+  await expect(ancestors.nth(1)).toHaveAttribute("data-session-id", parentID)
+
+  const tabs = page.locator('[data-slot="titlebar-tabs"] a')
+  await expect(tabs).toHaveCount(1)
+  await expect(tabs).toHaveAttribute("href", sessionHref(rootID))
+  const activeTab = page.locator('[data-titlebar-tab-slot][data-active="true"]')
+  await expect(activeTab).toHaveCount(1)
+  await expect(activeTab).toContainText(rootTitle)
+})
+
+test("sends an immediate prompt to the child session", async ({ page }) => {
+  await setup(page)
+  await openChildFromParent(page)
+
+  await page.route(
+    (url) =>
+      url.pathname === `/session/${childID}/prompt_async` &&
+      url.port === (process.env.PLAYWRIGHT_SERVER_PORT ?? "4096"),
+    (route) => route.fulfill({ status: 204, headers: { "access-control-allow-origin": "*" } }),
+  )
+  const editor = page.locator('[data-component="prompt-input"]')
+  await expect(editor).toBeEditable()
+  await editor.fill("Send this child prompt now")
+  const request = page.waitForRequest(
+    (request) => request.method() === "POST" && new URL(request.url()).pathname === `/session/${childID}/prompt_async`,
+  )
+  await page.locator('[data-action="prompt-submit"]').click()
+
+  const submitted = await request
+  expect(submitted.url()).toContain(`/session/${childID}/prompt_async`)
+  expect(submitted.postDataJSON()).toMatchObject({
+    agent: "explore",
+    model: { modelID: "claude-opus-4-6", providerID: "opencode" },
+    parts: [{ type: "text", text: "Send this child prompt now" }],
+  })
 })
 
 test("shows the not found fallback when the viewed session is deleted", async ({ page }) => {
@@ -43,7 +108,7 @@ test("shows the not found fallback when the viewed session is deleted", async ({
   await expect(page.getByRole("heading", { name: taskDescription })).toHaveCount(0)
 })
 
-async function setup(page: Page, events?: () => EventPayload[]) {
+async function setup(page: Page, events?: () => EventPayload[], sessionTab: string | null = rootID) {
   await mockOpenCodeServer(page, {
     directory,
     project: {
@@ -67,8 +132,14 @@ async function setup(page: Page, events?: () => EventPayload[]) {
       connected: ["opencode"],
       default: { providerID: "opencode", modelID: "claude-opus-4-6" },
     },
-    sessions: [session(parentID, parentTitle, 1700000000000), childSession()],
-    pageMessages: (sessionID) => ({ items: sessionID === parentID ? parentMessages() : [] }),
+    sessions: [
+      session(rootID, rootTitle, 1700000000000),
+      session(parentID, parentTitle, 1700000000000, { parentID: rootID }),
+      childSession(),
+    ],
+    pageMessages: (sessionID) => ({
+      items: sessionID === rootID ? rootMessages() : sessionID === parentID ? parentMessages() : [],
+    }),
     events,
     eventRetry: events ? 16 : undefined,
   })
@@ -82,17 +153,59 @@ async function setup(page: Page, events?: () => EventPayload[]) {
         contentType: "application/json",
         headers: { "access-control-allow-origin": "*" },
         body: JSON.stringify({
-          data: [currentSession(session(parentID, parentTitle, 1700000000000))],
+          data: [currentSession(session(rootID, rootTitle, 1700000000000))],
           cursor: {},
         }),
       }),
   )
-  await configurePage(page)
+  await page.route(
+    (url) => url.pathname === "/api/agent" && url.port === (process.env.PLAYWRIGHT_SERVER_PORT ?? "4096"),
+    (route) =>
+      route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        headers: { "access-control-allow-origin": "*" },
+        body: JSON.stringify({
+          location: { directory, project: { id: projectID, directory } },
+          data: [
+            { id: "build", name: "Build", mode: "primary", hidden: false, request: { settings: {} }, permissions: [] },
+            {
+              id: "explore",
+              name: "Explore",
+              mode: "subagent",
+              hidden: false,
+              request: { settings: {} },
+              permissions: [],
+            },
+          ],
+        }),
+      }),
+  )
+  await page.route(
+    (url) => url.pathname === "/agent" && url.port === (process.env.PLAYWRIGHT_SERVER_PORT ?? "4096"),
+    (route) =>
+      route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        headers: { "access-control-allow-origin": "*" },
+        body: JSON.stringify([
+          { name: "build", mode: "primary" },
+          { name: "explore", mode: "subagent" },
+        ]),
+      }),
+  )
+  await configurePage(page, sessionTab)
 }
 
 async function openChildFromParent(page: Page) {
-  await page.goto(sessionHref(parentID))
-  await expectSessionTitle(page, parentTitle)
+  await page.goto(sessionHref(rootID))
+  await expectSessionTitle(page, rootTitle)
+
+  const parentCard = page.locator(`a[href="${sessionHref(parentID)}"]`)
+  await expect(parentCard).toBeVisible()
+  await parentCard.click()
+  await expect(page).toHaveURL(new RegExp(`/server/.+/session/${parentID}$`), { timeout: 15_000 })
+  await expectSessionTitle(page, parentTaskDescription)
 
   const card = page.locator(`a[href="${sessionHref(childID)}"]`)
   await expect(card).toBeVisible()
@@ -115,17 +228,29 @@ function session(id: string, title: string, created: number, extra?: Record<stri
 }
 
 function childSession() {
-  return session(childID, childTitle, 1700000001000, { parentID })
+  return session(childID, childTitle, 1700000001000, {
+    parentID,
+    agent: "explore",
+    model: { id: "claude-opus-4-6", providerID: "opencode" },
+  })
+}
+
+function rootMessages() {
+  return taskMessages(rootID, parentID, parentTaskDescription, "root")
 }
 
 function parentMessages() {
-  const userID = "msg_user_0001"
-  const assistantID = "msg_assistant_0001"
+  return taskMessages(parentID, childID, taskDescription, "parent")
+}
+
+function taskMessages(parentSessionID: string, childSessionID: string, description: string, key: string) {
+  const userID = `msg_${key}_user_0001`
+  const assistantID = `msg_${key}_assistant_0001`
   return [
     {
       info: {
         id: userID,
-        sessionID: parentID,
+        sessionID: parentSessionID,
         role: "user",
         time: { created: 1700000000000 },
         agent: "build",
@@ -134,7 +259,7 @@ function parentMessages() {
       parts: [
         {
           id: "prt_user_text_0001",
-          sessionID: parentID,
+          sessionID: parentSessionID,
           messageID: userID,
           type: "text",
           text: "Delegate work to a subagent",
@@ -144,7 +269,7 @@ function parentMessages() {
     {
       info: {
         id: assistantID,
-        sessionID: parentID,
+        sessionID: parentSessionID,
         role: "assistant",
         time: { created: 1700000001000, completed: 1700000002000 },
         parentID: userID,
@@ -160,17 +285,17 @@ function parentMessages() {
       parts: [
         {
           id: "prt_tool_task_0001",
-          sessionID: parentID,
+          sessionID: parentSessionID,
           messageID: assistantID,
           type: "tool",
           callID: "call_task_0001",
           tool: "task",
           state: {
             status: "completed",
-            input: { description: taskDescription, subagent_type: "explore" },
+            input: { description, subagent_type: "explore" },
             output: "Subagent finished",
-            title: taskDescription,
-            metadata: { sessionId: childID },
+            title: description,
+            metadata: { sessionId: childSessionID },
             time: { start: 1700000001000, end: 1700000002000 },
           },
         },
@@ -179,7 +304,7 @@ function parentMessages() {
   ]
 }
 
-async function configurePage(page: Page) {
+async function configurePage(page: Page, sessionID?: string | null) {
   const server = `http://${process.env.PLAYWRIGHT_SERVER_HOST ?? "127.0.0.1"}:${process.env.PLAYWRIGHT_SERVER_PORT ?? "4096"}`
   await page.addInitScript(
     ({ directory, server, sessionId }) => {
@@ -191,9 +316,12 @@ async function configurePage(page: Page) {
           lastProject: { local: directory },
         }),
       )
-      localStorage.setItem("opencode.window.browser.dat:tabs", JSON.stringify([{ type: "session", server, sessionId }]))
+      localStorage.setItem(
+        "opencode.window.browser.dat:tabs",
+        JSON.stringify(sessionId ? [{ type: "session", server, sessionId }] : []),
+      )
     },
-    { directory, server, sessionId: parentID },
+    { directory, server, sessionId: sessionID },
   )
 }
 

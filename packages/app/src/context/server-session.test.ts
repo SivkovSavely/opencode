@@ -213,14 +213,27 @@ describe("server session", () => {
     expect(ctx.store.data.part.msg_2_assistant).toMatchObject([{ type: "text", text: "world" }])
   })
 
-  test("resolves lineage by session ID without directory", async () => {
-    const ctx = setup({ child: session("child", "root"), root: session("root") })
+  test("resolves ordered ancestors by session ID without directory", async () => {
+    const ctx = setup({
+      child: session("child", "parent"),
+      parent: session("parent", "root"),
+      root: session("root"),
+    })
 
     const result = await ctx.store.lineage.resolve("child")
 
     expect(result.root.id).toBe("root")
-    expect(ctx.get).toEqual([{ sessionID: "child" }, { sessionID: "root" }])
+    expect(result.ancestors.map((item) => item.id)).toEqual(["root", "parent"])
+    expect(ctx.get).toEqual([{ sessionID: "child" }, { sessionID: "parent" }, { sessionID: "root" }])
     expect(ctx.store.lineage.peek("child")).toEqual(result)
+  })
+
+  test("omits cached ancestry with a parent cycle", () => {
+    const ctx = setup({})
+    ctx.store.remember(session("child", "parent"))
+    ctx.store.remember(session("parent", "child"))
+
+    expect(ctx.store.lineage.peek("child")).toBeUndefined()
   })
 
   test("loads session content through the server client", async () => {

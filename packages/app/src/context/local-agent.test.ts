@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { hasCustomAgent, resolveAgent } from "./local-agent"
+import { hasCustomAgent, resolveAgent, resolveChildAgent, resolveChildModel } from "./local-agent"
 
 describe("hasCustomAgent", () => {
   test("detects explicitly custom agents", () => {
@@ -25,5 +25,24 @@ describe("resolveAgent", () => {
 
   test("uses the first agent when build is unavailable", () => {
     expect(resolveAgent([{ name: "custom" }], "missing")?.name).toBe("custom")
+  })
+})
+
+describe("child session selection", () => {
+  const agents = [{ name: "build", mode: "primary" }, { name: "explore", mode: "subagent" }]
+
+  test("resolves the child agent exactly without the root-picker fallback", () => {
+    expect(resolveChildAgent(agents, "explore")).toBe(agents[1])
+    expect(resolveChildAgent(agents, "missing")).toBeUndefined()
+    expect(resolveAgent(agents.filter((item) => item.mode !== "subagent"), "explore")?.name).toBe("build")
+  })
+
+  test("uses the model recorded on the child session", () => {
+    expect(resolveChildModel({ id: "claude-opus-4-6", providerID: "opencode", variant: "high" })).toEqual({
+      modelID: "claude-opus-4-6",
+      providerID: "opencode",
+      variant: "high",
+    })
+    expect(resolveChildModel()).toBeUndefined()
   })
 })

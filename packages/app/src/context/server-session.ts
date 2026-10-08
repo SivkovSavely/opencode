@@ -338,15 +338,17 @@ export function createServerSession(
     const session = data.info[sessionID]
     if (!session) return
     const seen = new Set([session.id])
+    const ancestors = []
     let root = session
     while (root.parentID) {
-      if (seen.has(root.parentID)) throw new Error(`Session parent cycle: ${root.parentID}`)
+      if (seen.has(root.parentID)) return
       seen.add(root.parentID)
       const parent = data.info[root.parentID]
       if (!parent) return
+      ancestors.unshift(parent)
       root = parent
     }
-    return { session, root }
+    return { session, root, ancestors }
   }
 
   const clearOptimistic = (sessionID: string, messageID?: string) => {
@@ -1304,7 +1306,10 @@ export function createServerSession(
       peek: peekLineage,
       async resolve(sessionID: string) {
         const session = await resolve(sessionID)
-        return { session, root: await rootSession(session, resolve) }
+        const root = await rootSession(session, resolve)
+        const lineage = peekLineage(sessionID)
+        if (!lineage) throw sessionNotFoundError(sessionID)
+        return { ...lineage, root }
       },
     },
     sync,
