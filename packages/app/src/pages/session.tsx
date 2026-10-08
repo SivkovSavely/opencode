@@ -99,7 +99,7 @@ import { diffs as list } from "@/utils/diffs"
 import { Persist, persisted } from "@/utils/persist"
 import { extractPromptFromParts } from "@/utils/prompt"
 import { formatServerError, isLocalSessionNotFoundError, isSessionNotFoundError } from "@/utils/server-errors"
-import { legacySessionHref, requireServerKey, sessionHref } from "@/utils/session-route"
+import { requireServerKey } from "@/utils/session-route"
 import { useUsageExceededDialogs } from "./session/usage-exceeded-dialogs"
 import { createSessionOwnership } from "./session/session-ownership"
 import { createSessionLineage } from "./session/session-lineage"
@@ -2133,7 +2133,6 @@ export default function Page() {
           const controller = createSessionComposerRegionController({
             state: composer,
             sessionKey,
-            sessionID: () => params.id,
             prompt,
             ready: () => !store.deferRender && messagesReady(),
             centered,
@@ -2160,18 +2159,6 @@ export default function Page() {
                   }
                 : undefined,
             onResponseSubmit: resumeScroll,
-            openParent: () => {
-              const id = info()?.parentID
-              if (!id) return
-              navigate(
-                params.serverKey
-                  ? sessionHref(requireServerKey(params.serverKey), id)
-                  : legacySessionHref(sdk().directory, id),
-              )
-            },
-            setPromptRef: (el) => {
-              inputRef = el
-            },
             setDockRef: (el) => {
               promptDock = el
             },

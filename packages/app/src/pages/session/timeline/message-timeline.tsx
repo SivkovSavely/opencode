@@ -333,6 +333,15 @@ export function MessageTimeline(props: {
     if (value) return value
     return language.t("command.session.new")
   })
+  const ancestorTitle = (ancestor: { id: string; parentID?: string; title?: string }) => {
+    const title = sessionTitle(ancestor.title)
+    if (!ancestor.parentID) return title ?? language.t("command.session.new")
+    const description = (sync().data.message[ancestor.parentID] ?? emptyMessages)
+      .flatMap((message) => getMsgParts(message.id))
+      .map((part) => taskDescription(part, ancestor.id))
+      .findLast((value): value is string => !!value)
+    return description ?? title?.replace(/\s+\(@[^)]+ subagent\)$/, "") ?? language.t("command.session.new")
+  }
   const showHeader = createMemo(() => !!(titleValue() || parentID()))
   const projection = createTimelineProjection({
     messages: sessionMessages,
@@ -1404,7 +1413,7 @@ export function MessageTimeline(props: {
                           class="min-w-0 max-w-[40%] truncate pl-2 text-[13px] font-[530] leading-4 tracking-[-0.04px] text-v2-text-text-faint transition-colors hover:text-v2-text-text-muted"
                           onClick={() => navigateAncestor(ancestor.id)}
                         >
-                          {sessionTitle(ancestor.title) ?? language.t("command.session.new")}
+                          {ancestorTitle(ancestor)}
                         </button>
                         <span
                           data-slot="session-title-separator"

@@ -288,7 +288,6 @@ export const Playground = {
                     controller={createSessionComposerRegionController({
                       state,
                       sessionKey: () => "story-session",
-                      sessionID: () => "story-session",
                       prompt,
                       ready: () => true,
                       centered: () => false,
@@ -296,8 +295,6 @@ export const Playground = {
                       followup: () => undefined,
                       revert: () => undefined,
                       onResponseSubmit: pin,
-                      openParent: () => {},
-                      setPromptRef: () => {},
                       setDockRef: () => {},
                     })}
                     promptInput={

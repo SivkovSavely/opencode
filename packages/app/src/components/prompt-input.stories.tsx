@@ -170,7 +170,6 @@ function PromptInputWithOpenDock() {
       controller={createSessionComposerRegionController({
         state,
         sessionKey: () => "story-session",
-        sessionID: () => "story-session",
         prompt: input.state,
         ready: () => true,
         centered: () => false,
@@ -181,8 +180,6 @@ function PromptInputWithOpenDock() {
         followup: () => undefined,
         revert: () => undefined,
         onResponseSubmit: () => {},
-        openParent: () => {},
-        setPromptRef: () => {},
         setDockRef: () => {},
       })}
       promptInput={

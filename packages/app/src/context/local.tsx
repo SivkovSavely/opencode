@@ -239,12 +239,10 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
     }
 
     const current = () => {
-      const item = firstModel(
-        () => scope()?.model,
-        () => resolveChildModel(childSession()?.model),
-        () => agent.current()?.model,
-        fallback,
-      )
+      const child = childSession()
+      const item = child
+        ? firstModel(() => scope()?.model, () => resolveChildModel(child.model))
+        : firstModel(() => scope()?.model, () => agent.current()?.model, fallback)
       if (!item) return
       return models.find(item)
     }
@@ -259,7 +257,11 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
       })
     }
 
-    const selected = () => scope()?.variant
+    const selected = () => {
+      const state = scope()
+      if (state?.variant !== undefined) return state.variant
+      return childSession()?.model?.variant
+    }
 
     const snapshot = () => {
       const model = current()
