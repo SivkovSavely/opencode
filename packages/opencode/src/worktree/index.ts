@@ -120,6 +120,7 @@ export interface Interface {
   readonly makeWorktreeInfo: (options?: { name?: string; detached?: boolean }) => Effect.Effect<Info, Error>
   readonly createFromInfo: (info: Info, startCommand?: string) => Effect.Effect<void, Error>
   readonly create: (input?: CreateInput) => Effect.Effect<Info, Error>
+  readonly canonical: (directory: string) => Effect.Effect<string>
   readonly list: () => Effect.Effect<(Omit<Info, "branch"> & { branch?: string })[], Error>
   readonly remove: (input: RemoveInput) => Effect.Effect<boolean, Error>
   readonly reset: (input: ResetInput) => Effect.Effect<boolean, Error>
@@ -303,7 +304,7 @@ const layer: Layer.Layer<
       return text
         .split("\n")
         .map((line) => line.trim())
-        .reduce<{ path?: string; branch?: string }[]>((acc, line) => {
+        .reduce<{ path?: string; branch?: string; prunable?: boolean }[]>((acc, line) => {
           if (!line) return acc
           if (line.startsWith("worktree ")) {
             acc.push({ path: line.slice("worktree ".length).trim() })
@@ -314,6 +315,7 @@ const layer: Layer.Layer<
           if (line.startsWith("branch ")) {
             current.branch = line.slice("branch ".length).trim()
           }
+          if (line.startsWith("prunable")) current.prunable = true
           return acc
         }, [])
     }
@@ -345,7 +347,14 @@ const layer: Layer.Layer<
       const primaryName = pathSvc.basename(primary).toLowerCase()
       return yield* Effect.forEach(parseWorktreeList(result.text), (entry) =>
         Effect.gen(function* () {
-          if (!entry.path) return undefined
+          if (!entry.path || entry.prunable) return undefined
+          const directoryExists = yield* fs.isDir(entry.path).pipe(Effect.catch(() => Effect.succeed(false)))
+          if (!directoryExists) return undefined
+          const directoryAccessible = yield* fs.readDirectoryEntries(entry.path).pipe(
+            Effect.as(true),
+            Effect.orElseSucceed(() => false),
+          )
+          if (!directoryAccessible) return undefined
           const directory = yield* canonical(entry.path)
           if (directory === primary) return undefined
           const name = pathSvc.basename(directory).toLowerCase()
@@ -610,7 +619,7 @@ const layer: Layer.Layer<
       return true
     })
 
-    return Service.of({ makeWorktreeInfo, createFromInfo, create, list, remove, reset })
+    return Service.of({ makeWorktreeInfo, createFromInfo, create, canonical, list, remove, reset })
   }),
 )
 

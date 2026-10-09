@@ -12,6 +12,7 @@ export function PromptWorkspaceSelector(props: {
   workspaces: string[]
   branch?: string
   onChange: (value: string) => void
+  onOpen: () => void
   onDone: () => void
 }) {
   const language = useLanguage()
@@ -26,7 +27,10 @@ export function PromptWorkspaceSelector(props: {
     pending = value
   }
   const onOpenChange = (open: boolean) => {
-    if (open) return
+    if (open) {
+      props.onOpen()
+      return
+    }
     const value = pending
     pending = undefined
     if (value) props.onChange(value)

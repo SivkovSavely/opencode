@@ -1,4 +1,7 @@
 import { afterEach, describe, expect } from "bun:test"
+import { $ } from "bun"
+import { mkdir, rm } from "node:fs/promises"
+import path from "path"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { Deferred, Effect, Fiber, Layer } from "effect"
 import { HttpClient, HttpClientResponse } from "effect/unstable/http"
@@ -11,12 +14,15 @@ import { Database } from "@opencode-ai/core/database/database"
 import { AccountV2 } from "@opencode-ai/core/account"
 import { AccountTable } from "@opencode-ai/core/account/sql"
 import { Worktree } from "../../src/worktree"
+import { Project } from "@/project/project"
 import { resetDatabase } from "../fixture/db"
 import { disposeAllInstances, TestInstance } from "../fixture/fixture"
 import { testEffect } from "../lib/effect"
 import { httpApiLayer, requestInDirectory } from "./httpapi-layer"
 
-const it = testEffect(Layer.mergeAll(LayerNode.compile(LayerNode.group([Session.node, Database.node])), httpApiLayer))
+const it = testEffect(
+  Layer.mergeAll(LayerNode.compile(LayerNode.group([Session.node, Project.node, Database.node])), httpApiLayer),
+)
 const testWorktreeMutations = process.platform === "win32" ? it.instance.skip : it.instance
 
 function request(path: string, directory: string, init: RequestInit = {}) {
@@ -29,6 +35,10 @@ function createSession(input?: Session.CreateInput) {
 
 function json<T>(response: HttpClientResponse.HttpClientResponse) {
   return response.json.pipe(Effect.map((value) => value as T))
+}
+
+function git(cwd: string, args: string[]) {
+  return Effect.promise(async () => (await $`git ${args}`.cwd(cwd).quiet()).text())
 }
 
 function waitReady(input: { directory?: string; name?: string }) {
@@ -292,6 +302,46 @@ describe("experimental HttpApi", () => {
         const afterRemove = yield* request(ExperimentalPaths.worktree, tmp.directory)
         expect(afterRemove.status).toBe(200)
         expect(yield* json(afterRemove)).toEqual([])
+      }),
+    { git: true, config: { formatter: false, lsp: false } },
+  )
+
+  it.instance(
+    "lists external worktrees and merges registered workspaces without duplicates",
+    () =>
+      Effect.gen(function* () {
+        const tmp = yield* TestInstance
+        const external = path.join(
+          path.dirname(tmp.directory),
+          `${path.basename(tmp.directory)}-external-${Date.now()}`,
+        )
+        const registered = path.join(tmp.directory, "registered-sandbox")
+        const project = yield* Project.use.fromDirectory(tmp.directory)
+
+        yield* Effect.acquireUseRelease(
+          git(tmp.directory, ["worktree", "add", "--detach", external, "HEAD"]).pipe(Effect.as(external)),
+          (directory) =>
+            Effect.gen(function* () {
+              yield* Effect.promise(() => mkdir(registered, { recursive: true }))
+              const unregistered = yield* request(ExperimentalPaths.worktree, tmp.directory)
+              expect(unregistered.status).toBe(200)
+              expect(yield* json<string[]>(unregistered)).toEqual([directory])
+
+              yield* Project.use.addSandbox(project.project.id, registered)
+              yield* Project.use.addSandbox(project.project.id, directory)
+              yield* Project.use.addSandbox(project.project.id, tmp.directory)
+
+              const registeredAndDiscovered = yield* request(ExperimentalPaths.worktree, tmp.directory)
+              expect(registeredAndDiscovered.status).toBe(200)
+              expect(yield* json<string[]>(registeredAndDiscovered)).toEqual([registered, directory])
+
+              yield* git(tmp.directory, ["worktree", "remove", "--force", directory])
+              const afterRemove = yield* request(ExperimentalPaths.worktree, tmp.directory)
+              expect(afterRemove.status).toBe(200)
+              expect(yield* json<string[]>(afterRemove)).toEqual([registered])
+            }),
+          (directory) => Effect.promise(() => rm(directory, { recursive: true, force: true })),
+        )
       }),
     { git: true, config: { formatter: false, lsp: false } },
   )

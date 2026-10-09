@@ -11,6 +11,7 @@ import type { SessionID } from "@/session/schema"
 import { ToolJsonSchema } from "@/tool/json-schema"
 import { ToolRegistry } from "@/tool/registry"
 import { Worktree } from "@/worktree"
+import { FSUtil } from "@opencode-ai/core/fs-util"
 import { Effect, Option } from "effect"
 import * as HttpServerResponse from "effect/unstable/http/HttpServerResponse"
 import { HttpApiBuilder, HttpApiError } from "effect/unstable/httpapi"
@@ -30,6 +31,7 @@ export const experimentalHandlers = HttpApiBuilder.group(InstanceHttpApi, "exper
     const config = yield* Config.Service
     const mcp = yield* MCP.Service
     const project = yield* Project.Service
+    const fs = yield* FSUtil.Service
     const registry = yield* ToolRegistry.Service
     const worktreeSvc = yield* Worktree.Service
     const sessions = yield* Session.Service
@@ -110,7 +112,36 @@ export const experimentalHandlers = HttpApiBuilder.group(InstanceHttpApi, "exper
 
     const worktree = Effect.fn("ExperimentalHttpApi.worktree")(function* () {
       const ctx = yield* InstanceState.context
-      return yield* project.sandboxes(ctx.project.id)
+      const [registered, discovered] = yield* Effect.all([
+        project.sandboxes(ctx.project.id),
+        mapWorktreeError(worktreeSvc.list()),
+      ])
+      const accessible = yield* Effect.forEach(
+        registered,
+        (directory) =>
+          fs.readDirectoryEntries(directory).pipe(
+            Effect.as(directory),
+            Effect.orElseSucceed(() => undefined),
+          ),
+        { concurrency: 1 },
+      )
+      const primary = yield* worktreeSvc.canonical(ctx.project.worktree)
+      const seen = new Set<string>()
+      const directories = [
+        ...accessible.filter((directory): directory is string => directory !== undefined),
+        ...discovered.map((item) => item.directory),
+      ]
+      return yield* Effect.forEach(
+        directories,
+        (directory) =>
+          Effect.gen(function* () {
+            const key = yield* worktreeSvc.canonical(directory)
+            if (key === primary || seen.has(key)) return undefined
+            seen.add(key)
+            return directory
+          }),
+        { concurrency: 1 },
+      ).pipe(Effect.map((items) => items.filter((item): item is string => item !== undefined)))
     })
 
     const worktreeCreate = Effect.fn("ExperimentalHttpApi.worktreeCreate")(function* (ctx: {

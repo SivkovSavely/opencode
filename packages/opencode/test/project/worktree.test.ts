@@ -1,5 +1,6 @@
 import { afterEach, describe, expect } from "bun:test"
 import path from "path"
+import { chmod } from "node:fs/promises"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import { Cause, Deferred, Effect, Exit, Fiber } from "effect"
@@ -17,6 +18,7 @@ const it = testEffect(
   ]),
 )
 const wintest = process.platform !== "win32" ? it.instance : it.instance.skip
+const permissionTest = process.platform !== "win32" && process.getuid?.() !== 0 ? it.instance : it.instance.skip
 
 function normalize(input: string) {
   return input.replace(/\\/g, "/").toLowerCase()
@@ -74,6 +76,25 @@ const gitResult = Effect.fn("WorktreeTest.gitResult")(function* (cwd: string, ar
   const service = yield* Git.Service
   return yield* service.run(args, { cwd })
 })
+
+const withExternalWorktree = <A, E, R>(
+  directory: string,
+  name: string,
+  use: (target: string) => Effect.Effect<A, E, R>,
+) =>
+  Effect.acquireUseRelease(
+    Effect.gen(function* () {
+      const target = path.join(path.dirname(directory), `${path.basename(directory)}-${name}-${Date.now()}`)
+      yield* git(directory, ["worktree", "add", "--detach", target, "HEAD"])
+      return target
+    }),
+    use,
+    (target) =>
+      Effect.gen(function* () {
+        const fs = yield* FSUtil.Service
+        yield* fs.remove(target, { recursive: true }).pipe(Effect.ignore)
+      }),
+  )
 
 describe("Worktree", () => {
   afterEach(() => disposeAllInstances())
@@ -264,6 +285,114 @@ describe("Worktree", () => {
   })
 
   describe("list", () => {
+    it.instance(
+      "discovers external worktrees and reflects Git removals",
+      () =>
+        Effect.gen(function* () {
+          const test = yield* TestInstance
+          const svc = yield* Worktree.Service
+
+          yield* withExternalWorktree(test.directory, "external", (target) =>
+            Effect.gen(function* () {
+              const list = yield* svc.list()
+              expect(list.map((item) => normalize(item.directory))).toContain(normalize(target))
+              expect(list.map((item) => normalize(item.directory))).not.toContain(normalize(test.directory))
+
+              yield* git(test.directory, ["worktree", "remove", "--force", target])
+              const afterRemove = yield* svc.list()
+              expect(afterRemove.map((item) => normalize(item.directory))).not.toContain(normalize(target))
+            }),
+          )
+        }),
+      { git: true },
+    )
+
+    it.instance(
+      "includes detached and locked worktrees",
+      () =>
+        Effect.gen(function* () {
+          const test = yield* TestInstance
+          const svc = yield* Worktree.Service
+
+          yield* withExternalWorktree(test.directory, "locked", (target) =>
+            Effect.gen(function* () {
+              yield* git(test.directory, ["worktree", "lock", target])
+              const list = yield* svc.list()
+              expect(list.map((item) => normalize(item.directory))).toContain(normalize(target))
+              expect(list.find((item) => normalize(item.directory) === normalize(target))?.branch).toBeUndefined()
+              yield* git(test.directory, ["worktree", "unlock", target])
+            }),
+          )
+        }),
+      { git: true },
+    )
+
+    it.instance(
+      "excludes prunable and missing worktrees",
+      () =>
+        Effect.gen(function* () {
+          const test = yield* TestInstance
+          const fs = yield* FSUtil.Service
+          const svc = yield* Worktree.Service
+
+          yield* withExternalWorktree(test.directory, "prunable", (target) =>
+            Effect.gen(function* () {
+              yield* fs.remove(target, { recursive: true })
+              const porcelain = yield* git(test.directory, ["worktree", "list", "--porcelain"])
+              expect(porcelain).toContain("prunable")
+              expect(yield* svc.list()).toEqual([])
+            }),
+          )
+        }),
+      { git: true },
+    )
+
+    permissionTest(
+      "excludes inaccessible worktrees",
+      () =>
+        Effect.gen(function* () {
+          const test = yield* TestInstance
+          const svc = yield* Worktree.Service
+
+          yield* withExternalWorktree(test.directory, "inaccessible", (target) =>
+            Effect.acquireUseRelease(
+              Effect.promise(() => chmod(target, 0)),
+              () =>
+                Effect.gen(function* () {
+                  expect(yield* svc.list()).toEqual([])
+                }),
+              () => Effect.promise(() => chmod(target, 0o755)),
+            ),
+          )
+        }),
+      { git: true },
+    )
+
+    it.instance("returns no worktrees for non-git projects", () =>
+      Effect.gen(function* () {
+        const svc = yield* Worktree.Service
+        expect(yield* svc.list()).toEqual([])
+      }),
+    )
+
+    it.instance(
+      "reports Git listing failures",
+      () =>
+        Effect.gen(function* () {
+          const test = yield* TestInstance
+          const fs = yield* FSUtil.Service
+          const svc = yield* Worktree.Service
+          yield* fs.remove(path.join(test.directory, ".git"), { recursive: true })
+
+          const exit = yield* Effect.exit(svc.list())
+          expect(Exit.isFailure(exit)).toBe(true)
+          if (!Exit.isFailure(exit)) return
+          const error = Cause.squash(exit.cause)
+          expect(error).toBeInstanceOf(Worktree.ListFailedError)
+        }),
+      { git: true },
+    )
+
     it.instance(
       "uses parent folder name when worktree basename matches the primary worktree",
       () =>
