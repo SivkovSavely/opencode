@@ -274,6 +274,39 @@ test("sends the default sentinel for an explicit child-local default variant", a
   })
 })
 
+test("restores the default variant from fresh child history", async ({ page }) => {
+  await setup(page, {
+    childHistoryVariant: "default",
+    childAgent: { modelID, variant: "high" },
+  })
+  await openChildFromParent(page)
+
+  const variant = page.getByRole("button", { name: "Choose model variant" })
+  await expect(variant).toContainText("default")
+  expect(await submitPrompt(page, childID, "Keep the restored default variant")).toMatchObject({
+    agent: "explore",
+    model: { modelID, providerID: "opencode" },
+    variant: "default",
+  })
+})
+
+test("restores a real variant from fresh child history", async ({ page }) => {
+  await setup(page, {
+    childModel: { id: modelID, providerID: "opencode", variant: "low" },
+    childHistoryVariant: "high",
+    childAgent: { modelID, variant: "high" },
+  })
+  await openChildFromParent(page)
+
+  const variant = page.getByRole("button", { name: "Choose model variant" })
+  await expect(variant).toContainText("high")
+  expect(await submitPrompt(page, childID, "Keep the restored high variant")).toMatchObject({
+    agent: "explore",
+    model: { modelID, providerID: "opencode" },
+    variant: "high",
+  })
+})
+
 test("preserves root-session model fallback behavior", async ({ page }) => {
   await setup(page, {
     rootHistory: false,
@@ -363,6 +396,7 @@ async function setup(
     childModel?: { id: string; providerID: string; variant?: string }
     childAgent?: { modelID: string; variant?: string }
     rootAgent?: { modelID: string; variant?: string }
+    childHistoryVariant?: string
     rememberedVariants?: Record<string, string>
     rootHistory?: boolean
     questions?: unknown[]
@@ -424,6 +458,8 @@ async function setup(
             : rootMessages()
           : sessionID === parentID
             ? parentMessages()
+            : sessionID === childID && options.childHistoryVariant
+              ? childMessages(options.childHistoryVariant)
             : [],
     }),
     events: options.events,
@@ -571,6 +607,31 @@ function rootMessages() {
 
 function parentMessages() {
   return taskMessages(parentID, childID, taskDescription, "parent")
+}
+
+function childMessages(variant: string) {
+  const userID = "msg_child_user_0001"
+  return [
+    {
+      info: {
+        id: userID,
+        sessionID: childID,
+        role: "user",
+        time: { created: 1700000002000 },
+        agent: "explore",
+        model: { providerID: "opencode", modelID, variant },
+      },
+      parts: [
+        {
+          id: "prt_child_user_text_0001",
+          sessionID: childID,
+          messageID: userID,
+          type: "text",
+          text: "An earlier child prompt",
+        },
+      ],
+    },
+  ]
 }
 
 function taskMessages(parentSessionID: string, childSessionID: string, description: string, key: string) {
