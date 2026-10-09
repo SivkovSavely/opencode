@@ -88,6 +88,7 @@ export async function setupTimeline(
   page: Page,
   input: {
     messages?: TimelineMessage[]
+    pageMessages?: (sessionId: string, limit: number, before?: string) => { items: TimelineMessage[]; cursor?: string }
     settings?: Record<string, boolean>
     sessions?: Session[]
     cpuRate?: number
@@ -121,9 +122,7 @@ export async function setupTimeline(
     provider: provider(),
     sessions,
     sessionStatus: { [sessionID]: initialStatus },
-    pageMessages: () => ({
-      items: messages,
-    }),
+    pageMessages: input.pageMessages ?? (() => ({ items: messages })),
   })
   await page.addInitScript((settings) => {
     localStorage.setItem(

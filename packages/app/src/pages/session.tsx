@@ -391,6 +391,8 @@ export default function Page() {
     pendingMessage: undefined as string | undefined,
     reviewSnap: false,
     scrollGesture: 0,
+    jumpToMessageOpen: false,
+    jumpToMessageHistoryLoading: false,
     scroll: {
       overflow: false,
       bottom: true,
@@ -1500,6 +1502,16 @@ export default function Page() {
     working: () => true,
     overflowAnchor: "none",
   })
+  let jumpToMessageDialogSessionKey: string | undefined
+  let jumpToMessageWasFollowing = false
+  let jumpToMessageHadHistory = false
+  const [restoreJumpToMessageFollow, setRestoreJumpToMessageFollow] = createSignal<string>()
+  createEffect(() => {
+    const key = restoreJumpToMessageFollow()
+    if (!key || ui.jumpToMessageOpen || historyLoading() || ui.jumpToMessageHistoryLoading) return
+    setRestoreJumpToMessageFollow(undefined)
+    if (sessionKey() === key) autoScroll.resume()
+  })
   createEffect(
     on(
       () => params.id,
@@ -1593,10 +1605,13 @@ export default function Page() {
   let restoreHistoryAnchor = (_done: boolean) => {}
   const historyRequests = new Set<string>()
   let historyContinuationFrame: number | undefined
-  const loadOlder = async () => {
+  const loadOlder = async (expectedSessionID?: string, expectedSessionKey?: string) => {
     const owner = sessionOwnership.capture()
+    if (expectedSessionID && params.id !== expectedSessionID) return
+    if (expectedSessionKey && sessionKey() !== expectedSessionKey) return
     if (historyLoading() || historyRequests.has(owner.key)) return
     historyRequests.add(owner.key)
+    if (expectedSessionKey) setUi("jumpToMessageHistoryLoading", true)
     const before = timeline.messages().length
     try {
       await timeline.history.loadOlder({
@@ -1605,7 +1620,12 @@ export default function Page() {
       })
     } finally {
       historyRequests.delete(owner.key)
+      if (expectedSessionKey) {
+        if (owner.current() && ui.jumpToMessageOpen) autoScroll.pause()
+        setUi("jumpToMessageHistoryLoading", false)
+      }
     }
+    if (expectedSessionKey) return
     if (!owner.current() || timeline.messages().length <= before) return
     if (!autoScroll.userScrolled() || !scroller || scroller.scrollTop >= 200 || !historyMore()) return
     if (historyContinuationFrame !== undefined) cancelAnimationFrame(historyContinuationFrame)
@@ -2096,7 +2116,12 @@ export default function Page() {
                   onHistoryScroll={onHistoryScroll}
                   onAutoScrollInteraction={autoScroll.handleInteraction}
                   shouldAnchorBottom={() =>
-                    !location.hash && !store.messageId && !ui.pendingMessage && !autoScroll.userScrolled()
+                    !location.hash &&
+                    !store.messageId &&
+                    !ui.pendingMessage &&
+                    !ui.jumpToMessageOpen &&
+                    !ui.jumpToMessageHistoryLoading &&
+                    !autoScroll.userScrolled()
                   }
                   centered={centered()}
                   setContentRef={(el) => {
@@ -2107,6 +2132,44 @@ export default function Page() {
                     if (root) scheduleScrollState(root)
                   }}
                   userMessages={visibleUserMessages()}
+                  historyMore={() => historyMore()}
+                  historyLoading={() => historyLoading() || ui.jumpToMessageHistoryLoading}
+                  historyMessageCount={() => timeline.messages().length}
+                  loadOlder={loadOlder}
+                  onPauseAutoScroll={autoScroll.pause}
+                  onJumpDialogOpen={(open, key, selected) => {
+                    if (open) {
+                      if (jumpToMessageDialogSessionKey !== key && restoreJumpToMessageFollow() !== key) {
+                        jumpToMessageWasFollowing = !autoScroll.userScrolled()
+                      }
+                      jumpToMessageDialogSessionKey = key
+                      jumpToMessageHadHistory = historyMore() || historyLoading()
+                      setUi("jumpToMessageOpen", true)
+                      return
+                    }
+                    if (jumpToMessageDialogSessionKey !== key) return
+                    jumpToMessageDialogSessionKey = undefined
+                    if (
+                      !selected &&
+                      jumpToMessageWasFollowing &&
+                      jumpToMessageHadHistory &&
+                      sessionKey() === key
+                    ) {
+                      setRestoreJumpToMessageFollow(key)
+                    } else {
+                      setRestoreJumpToMessageFollow(undefined)
+                    }
+                    jumpToMessageWasFollowing = false
+                    jumpToMessageHadHistory = false
+                    setUi("jumpToMessageOpen", false)
+                  }}
+                  onJumpToMessage={(messageID, key) => {
+                    if (sessionKey() !== key) return
+                    const message = visibleUserMessages().find((item) => item.id === messageID)
+                    if (!message) return
+                    autoScroll.pause()
+                    scrollToMessage(message)
+                  }}
                   setHistoryAnchor={(handlers) => {
                     captureHistoryAnchor = handlers.capture
                     restoreHistoryAnchor = handlers.restore

@@ -77,6 +77,7 @@ import { observeElementOffsetReconnectAware } from "./observe-element-offset"
 import { createTimelineProjection } from "./projection"
 import { MessageComment, SummaryDiff, TimelineRow, TimelineRowMap } from "./rows"
 import { filterVirtualIndexes } from "./virtual-items"
+import { DialogJumpToMessage } from "./dialog-jump-to-message"
 
 const emptyMessages: MessageType[] = []
 const emptyParts: PartType[] = []
@@ -251,6 +252,13 @@ export function MessageTimeline(props: {
   centered: boolean
   setContentRef: (el: HTMLDivElement) => void
   userMessages: UserMessage[]
+  historyMore: (sessionID: string) => boolean
+  historyLoading: (sessionID: string) => boolean
+  historyMessageCount: (sessionID: string) => number
+  loadOlder: (sessionID: string, sessionKey: string) => Promise<void>
+  onJumpToMessage: (messageID: string, sessionKey: string) => void
+  onPauseAutoScroll: () => void
+  onJumpDialogOpen: (open: boolean, sessionKey: string, selected?: boolean) => void
   anchor: (id: string) => string
   setRevealMessage?: (fn: (id: string) => void) => void
   setScrollToEnd?: (fn: () => void) => void
@@ -275,6 +283,30 @@ export function MessageTimeline(props: {
 
   const [listRoot, setListRoot] = createSignal<HTMLDivElement>()
   const sessionID = createMemo(() => params.id)
+  const openJumpToMessage = (id: string) => {
+    const key = sessionKey()
+    let selected = false
+    props.onJumpDialogOpen(true, key)
+    if (props.historyMore(id) || props.historyLoading(id)) props.onPauseAutoScroll()
+    dialog.show(() => (
+      <DialogJumpToMessage
+        sessionID={id}
+        isCurrentSession={() => sessionKey() === key}
+        messages={() => props.userMessages}
+        parts={getMsgParts}
+        historyMore={() => props.historyMore(id)}
+        historyLoading={() => props.historyLoading(id)}
+        historyMessageCount={() => props.historyMessageCount(id)}
+        loadOlder={() => props.loadOlder(id, key)}
+        select={(messageID) => {
+          selected = true
+          dialog.close()
+          props.onJumpToMessage(messageID, key)
+        }}
+        onClose={() => props.onJumpDialogOpen(false, key, selected)}
+      />
+    ))
+  }
   const sessionStatus = createMemo(() => {
     const id = sessionID()
     if (!id) return idle
@@ -1562,6 +1594,9 @@ export function MessageTimeline(props: {
                                 <DropdownMenu.Item onSelect={() => exportSession(id)}>
                                   <DropdownMenu.ItemLabel>{language.t("common.export")}</DropdownMenu.ItemLabel>
                                 </DropdownMenu.Item>
+                                <DropdownMenu.Item onSelect={() => openJumpToMessage(id)}>
+                                  <DropdownMenu.ItemLabel>{language.t("common.search.placeholder")}</DropdownMenu.ItemLabel>
+                                </DropdownMenu.Item>
                                 <DropdownMenu.Item onSelect={() => void sessionArchive.archive(id)}>
                                   <DropdownMenu.ItemLabel>{language.t("common.archive")}</DropdownMenu.ItemLabel>
                                 </DropdownMenu.Item>
@@ -1635,6 +1670,9 @@ export function MessageTimeline(props: {
                               </Show>
                               <MenuV2.Item onSelect={() => exportSession(id)}>
                                 {language.t("common.export")}...
+                              </MenuV2.Item>
+                              <MenuV2.Item onSelect={() => openJumpToMessage(id)}>
+                                {language.t("common.search.placeholder")}
                               </MenuV2.Item>
                               <MenuV2.Item onSelect={() => void sessionArchive.archive(id)}>
                                 {language.t("common.archive")}

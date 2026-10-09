@@ -1,0 +1,166 @@
+.dialog-jump-to-message {
+  overflow: hidden;
+}
+
+[data-component="dialog-v2"]:has(.dialog-jump-to-message) [data-slot="dialog-container"] {
+  width: min(calc(100vw - 24px), 680px);
+  height: min(600px, calc(100dvh - 48px));
+  max-height: calc(100dvh - 48px);
+  border-radius: 12px;
+  background: var(--v2-background-bg-base);
+  box-shadow: var(--v2-elevation-floating);
+}
+
+.dialog-jump-to-message [data-slot="dialog-header"] {
+  flex-shrink: 0;
+}
+
+.dialog-jump-to-message-body {
+  display: flex;
+  min-height: 0;
+  flex: 1;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.dialog-jump-to-message-search {
+  display: flex;
+  flex-shrink: 0;
+  align-items: center;
+  gap: 6px;
+}
+
+.dialog-jump-to-message-search [data-component="text-input-v2"] {
+  min-width: 0;
+  flex: 1;
+}
+
+.dialog-jump-to-message-regex {
+  display: grid;
+  width: 36px;
+  height: 36px;
+  flex-shrink: 0;
+  place-items: center;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--v2-text-text-muted);
+  font-family: var(--font-mono);
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.dialog-jump-to-message-regex:hover,
+.dialog-jump-to-message-regex[aria-pressed="true"] {
+  background: var(--v2-overlay-simple-overlay-hover);
+  color: var(--v2-text-text-base);
+}
+
+.dialog-jump-to-message-regex:focus-visible,
+.dialog-jump-to-message-retry:focus-visible {
+  outline: 2px solid var(--v2-border-border-focus);
+  outline-offset: 2px;
+}
+
+.dialog-jump-to-message-scroll {
+  min-height: 0;
+  flex: 1;
+}
+
+.dialog-jump-to-message-results {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 2px;
+}
+
+.dialog-jump-to-message-row {
+  display: flex;
+  width: 100%;
+  min-width: 0;
+  flex-shrink: 0;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 4px;
+  padding: 8px 10px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--v2-text-text-base);
+  text-align: left;
+  cursor: pointer;
+  scroll-margin: 6px 0;
+}
+
+.dialog-jump-to-message-row[data-active],
+.dialog-jump-to-message-row:hover,
+.dialog-jump-to-message-row:focus-visible {
+  background: var(--v2-overlay-simple-overlay-hover);
+}
+
+.dialog-jump-to-message-row:focus-visible {
+  outline: none;
+}
+
+.dialog-jump-to-message-meta {
+  display: flex;
+  min-width: 0;
+  justify-content: space-between;
+  gap: 8px;
+  color: var(--v2-text-text-muted);
+  font-size: 11px;
+  line-height: 14px;
+}
+
+.dialog-jump-to-message-preview {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  white-space: normal;
+  color: var(--v2-text-text-base);
+  font-size: 13px;
+  line-height: 18px;
+}
+
+.dialog-jump-to-message-preview mark {
+  border-radius: 2px;
+  background: var(--v2-background-bg-layer-04);
+  color: inherit;
+}
+
+.dialog-jump-to-message-empty,
+.dialog-jump-to-message-status {
+  display: flex;
+  min-height: 120px;
+  flex: 1;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  color: var(--v2-text-text-muted);
+  font-size: 13px;
+  line-height: 18px;
+  text-align: center;
+}
+
+.dialog-jump-to-message-status progress {
+  width: 88px;
+  height: 2px;
+  accent-color: var(--v2-text-text-muted);
+}
+
+.dialog-jump-to-message-retry {
+  border: 0;
+  background: transparent;
+  color: var(--v2-text-text-base);
+  text-decoration: underline;
+  text-underline-offset: 3px;
+  cursor: pointer;
+}
+
+@media (max-width: 640px) {
+  [data-component="dialog-v2"]:has(.dialog-jump-to-message) [data-slot="dialog-container"] {
+    width: calc(100vw - 16px);
+    height: min(620px, calc(100dvh - 24px));
+    max-height: calc(100dvh - 24px);
+  }
+}
