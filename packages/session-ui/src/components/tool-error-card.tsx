@@ -156,10 +156,10 @@ export function ToolErrorCard(props: ToolErrorCardProps) {
                 </Tooltip>
               </div>
             </Show>
-            <Show when={body()}>{(value) => <CardDescription>{value()}</CardDescription>}</Show>
             <Show when={open() && !!split.rawDetails}>
               <DeferredToolDetails render={split.rawDetails!} />
             </Show>
+            <Show when={body()}>{(value) => <CardDescription>{value()}</CardDescription>}</Show>
           </div>
         </Collapsible.Content>
       </Collapsible>

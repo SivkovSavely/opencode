@@ -44,6 +44,8 @@ export interface BasicToolProps {
   triggerHref?: string
   triggerAsLink?: boolean
   clickable?: boolean
+  separateDetailsTrigger?: boolean
+  detailsTriggerLabel?: string
 }
 
 export function DeferredToolDetails(props: { render: () => JSX.Element }) {
@@ -193,6 +195,7 @@ export function BasicTool(props: BasicToolProps) {
     <div
       data-component="tool-trigger"
       data-clickable={props.clickable ? "true" : undefined}
+      data-separate-details-trigger={props.separateDetailsTrigger ? "true" : undefined}
       data-hide-details={props.hideDetails ? "true" : undefined}
     >
       <div data-slot="basic-tool-tool-trigger-content">
@@ -258,6 +261,7 @@ export function BasicTool(props: BasicToolProps) {
       <Show
         when={
           hasChildren() &&
+          !props.separateDetailsTrigger &&
           !props.hideDetails &&
           !props.locked &&
           (!pending() || props.allowOpenWhilePending || props.rawDetails)
@@ -268,30 +272,64 @@ export function BasicTool(props: BasicToolProps) {
     </div>
   )
 
-  return (
-    <Collapsible open={open()} onOpenChange={handleOpenChange} class="tool-collapsible">
-      <Show
-        when={props.triggerAsLink || props.triggerHref}
-        fallback={
-          <Collapsible.Trigger
-            data-hide-details={props.hideDetails ? "true" : undefined}
-            onClick={props.onTriggerClick}
-          >
-            {trigger()}
-          </Collapsible.Trigger>
-        }
-      >
+  const standardTrigger = () => (
+    <Show
+      when={props.triggerAsLink || props.triggerHref}
+      fallback={
         <Collapsible.Trigger
-          as="a"
-          href={props.triggerHref}
-          role={!props.triggerHref && props.clickable ? "button" : undefined}
-          tabIndex={!props.triggerHref && props.clickable ? 0 : undefined}
           data-hide-details={props.hideDetails ? "true" : undefined}
           onClick={props.onTriggerClick}
-          onKeyDown={props.onTriggerKeyDown}
         >
           {trigger()}
         </Collapsible.Trigger>
+      }
+    >
+      <Collapsible.Trigger
+        as="a"
+        href={props.triggerHref}
+        role={!props.triggerHref && props.clickable ? "button" : undefined}
+        tabIndex={!props.triggerHref && props.clickable ? 0 : undefined}
+        data-hide-details={props.hideDetails ? "true" : undefined}
+        onClick={props.onTriggerClick}
+        onKeyDown={props.onTriggerKeyDown}
+      >
+        {trigger()}
+      </Collapsible.Trigger>
+    </Show>
+  )
+
+  return (
+    <Collapsible open={open()} onOpenChange={handleOpenChange} class="tool-collapsible">
+      <Show when={props.separateDetailsTrigger} fallback={standardTrigger()}>
+        <div data-component="tool-separate-trigger-row">
+          <Show
+            when={props.clickable || props.triggerHref}
+            fallback={<div data-slot="tool-navigation-link">{trigger()}</div>}
+          >
+            <a
+              data-slot="tool-navigation-link"
+              href={props.triggerHref}
+              role={!props.triggerHref && props.clickable ? "button" : undefined}
+              tabIndex={!props.triggerHref && props.clickable ? 0 : undefined}
+              onClick={props.onTriggerClick}
+              onKeyDown={props.onTriggerKeyDown}
+            >
+              {trigger()}
+            </a>
+          </Show>
+          <Show
+            when={
+              hasChildren() &&
+              !props.hideDetails &&
+              !props.locked &&
+              (!pending() || props.allowOpenWhilePending || props.rawDetails)
+            }
+          >
+            <Collapsible.Trigger class="tool-separate-details-trigger" aria-label={props.detailsTriggerLabel}>
+              <Collapsible.Arrow />
+            </Collapsible.Trigger>
+          </Show>
+        </div>
       </Show>
       <Show when={props.animated && hasChildren() && !props.hideDetails}>
         <div
@@ -304,20 +342,20 @@ export function BasicTool(props: BasicToolProps) {
           }}
         >
           <Show when={!defer() || ready()}>
+            {props.children}
             <Show when={!!props.rawDetails}>
               <DeferredToolDetails render={props.rawDetails!} />
             </Show>
-            {props.children}
           </Show>
         </div>
       </Show>
       <Show when={!props.animated && hasChildren() && !props.hideDetails}>
         <Collapsible.Content>
           <Show when={!defer() || ready()}>
+            {props.children}
             <Show when={!!props.rawDetails}>
               <DeferredToolDetails render={props.rawDetails!} />
             </Show>
-            {props.children}
           </Show>
         </Collapsible.Content>
       </Show>

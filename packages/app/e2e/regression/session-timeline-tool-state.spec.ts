@@ -17,7 +17,7 @@ test("updates expanded web search links without resetting expansion", async ({ p
     ],
   })
   const wrapper = page.locator(`[data-timeline-part-id="${searchID}"]`)
-  const trigger = wrapper.locator('[data-slot="collapsible-trigger"]')
+  const trigger = wrapper.locator('[data-slot="collapsible-trigger"]').first()
   await trigger.click()
   await expect(trigger).toHaveAttribute("aria-expanded", "true")
   await timeline.send(
@@ -37,7 +37,7 @@ test("preserves an expanded tool error card across duplicate delivery", async ({
   const failed = toolPart(toolID, "bash", "error", { command: "exit 1" }, { error: "Command failed visibly" })
   const timeline = await setupTimeline(page, { messages: [userMessage(), assistantMessage([failed])] })
   const wrapper = page.locator(`[data-timeline-part-id="${toolID}"]`)
-  const trigger = wrapper.locator('[data-slot="collapsible-trigger"]')
+  const trigger = wrapper.locator('[data-slot="collapsible-trigger"]').first()
   await trigger.click()
   await expect(trigger).toHaveAttribute("aria-expanded", "true")
   await timeline.send(partUpdated(failed), 150)
@@ -63,7 +63,7 @@ test("renders multiple question answers and preserves open state on answer updat
     ],
   })
   const wrapper = page.locator(`[data-timeline-part-id="${questionID}"]`)
-  const trigger = wrapper.locator('[data-slot="collapsible-trigger"]')
+  const trigger = wrapper.locator('[data-slot="collapsible-trigger"]').first()
   await expect(trigger).toHaveAttribute("aria-expanded", "true")
   await timeline.send(
     partUpdated(
