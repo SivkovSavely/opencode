@@ -46,6 +46,7 @@ type FollowupSendInput = {
   serverSync: ServerSync
   sync: DirectorySync
   draft: FollowupDraft
+  forceDefaultVariant?: boolean
   messageID?: string
   optimisticBusy?: boolean
   before?: () => Promise<boolean> | boolean
@@ -56,6 +57,7 @@ const draftText = (prompt: Prompt) => prompt.map((part) => ("content" in part ? 
 const draftImages = (prompt: Prompt) => prompt.filter((part): part is ImageAttachmentPart => part.type === "image")
 
 export async function sendFollowupDraft(input: FollowupSendInput) {
+  const variant = input.forceDefaultVariant ? "default" : input.draft.variant
   const text = draftText(input.draft.prompt)
   const images = draftImages(input.draft.prompt)
   const setBusy = () => {
@@ -94,7 +96,7 @@ export async function sendFollowupDraft(input: FollowupSendInput) {
         model: {
           id: input.draft.model.modelID,
           providerID: input.draft.model.providerID,
-          variant: input.draft.variant,
+          variant,
         },
         files: await Promise.all(
           images.map(async (attachment) => ({
@@ -170,7 +172,7 @@ export async function sendFollowupDraft(input: FollowupSendInput) {
       id: messageID,
       agent: input.draft.agent,
       model: input.draft.model,
-      variant: input.draft.variant,
+      variant,
       legacyParts: requestParts,
       text: requestParts.flatMap((part) => (part.type === "text" ? [part.text] : [])).join("\n"),
       files: requestParts.flatMap((part) => {
@@ -446,6 +448,7 @@ export function createPromptSubmit(input: PromptSubmitInput) {
       providerID: currentModel.provider.id,
     }
     const agent = currentAgent.name
+    const forceDefaultVariant = !!sync().session.get(session.id)?.parentID && variant === undefined
     const draft: FollowupDraft = {
       sessionID: session.id,
       sessionDirectory,
@@ -524,7 +527,7 @@ export function createPromptSubmit(input: PromptSubmitInput) {
             command: commandName,
             arguments: args.join(" "),
             agent,
-            model: { id: model.modelID, providerID: model.providerID, variant },
+            model: { id: model.modelID, providerID: model.providerID, variant: forceDefaultVariant ? "default" : variant },
             files: await Promise.all(
               images.map(async (attachment) => ({
                 uri: await blobDataUrl(attachment.blob, attachment.mime),
@@ -621,6 +624,7 @@ export function createPromptSubmit(input: PromptSubmitInput) {
       sync: sync(),
       serverSync: serverSync(),
       draft,
+      forceDefaultVariant,
       messageID,
       optimisticBusy: sessionDirectory === projectDirectory,
       before: waitForWorktree,

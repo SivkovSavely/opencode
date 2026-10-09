@@ -100,7 +100,7 @@ test("sends an immediate prompt to the child session", async ({ page }) => {
   })
 })
 
-test("omits the default sentinel child variant despite a configured agent variant", async ({ page }) => {
+test("sends the default sentinel child variant despite a configured agent variant", async ({ page }) => {
   await setup(page, {
     childModel: { id: modelID, providerID: "opencode", variant: "default" },
     childAgent: { modelID, variant: "high" },
@@ -111,11 +111,11 @@ test("omits the default sentinel child variant despite a configured agent varian
   expect(submitted).toMatchObject({
     agent: "explore",
     model: { modelID, providerID: "opencode" },
+    variant: "default",
   })
-  expect(submitted).not.toHaveProperty("variant")
 })
 
-test("omits a remembered variant when the child has no recorded variant", async ({ page }) => {
+test("sends the default sentinel when the child has no recorded variant", async ({ page }) => {
   await setup(page, {
     childModel: { id: modelID, providerID: "opencode" },
     childAgent: { modelID, variant: "high" },
@@ -127,8 +127,41 @@ test("omits a remembered variant when the child has no recorded variant", async 
   expect(submitted).toMatchObject({
     agent: "explore",
     model: { modelID, providerID: "opencode" },
+    variant: "default",
   })
-  expect(submitted).not.toHaveProperty("variant")
+})
+
+test("sends the default sentinel for child commands without a selected variant", async ({ page }) => {
+  await setup(page, {
+    childModel: { id: modelID, providerID: "opencode" },
+    childAgent: { modelID, variant: "high" },
+  })
+  await page.route(
+    (url) => url.pathname === "/command" && url.port === (process.env.PLAYWRIGHT_SERVER_PORT ?? "4096"),
+    (route) =>
+      route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        headers: { "access-control-allow-origin": "*" },
+        body: JSON.stringify([{ name: "review", template: "Review this change" }]),
+      }),
+  )
+  await openChildFromParent(page)
+
+  const editor = page.locator('[data-component="prompt-input"]')
+  await expect(editor).toBeEditable()
+  await editor.fill("/review")
+  const request = page.waitForRequest(
+    (request) => request.method() === "POST" && new URL(request.url()).pathname === `/session/${childID}/command`,
+  )
+  await page.locator('[data-action="prompt-submit"]').click()
+
+  expect((await request).postDataJSON()).toMatchObject({
+    command: "review",
+    agent: "explore",
+    model: `opencode/${modelID}`,
+    variant: "default",
+  })
 })
 
 test("does not fall back when the child's recorded model is unavailable", async ({ page }) => {
@@ -220,6 +253,24 @@ test("allows explicit child-local model and variant overrides", async ({ page })
     agent: "explore",
     model: { modelID: alternateModelID, providerID: "opencode" },
     variant: "low",
+  })
+})
+
+test("sends the default sentinel for an explicit child-local default variant", async ({ page }) => {
+  await setup(page, { childAgent: { modelID, variant: "high" } })
+  await openChildFromParent(page)
+
+  const variant = page.getByRole("button", { name: "Choose model variant" })
+  await expect(variant).toBeVisible()
+  await variant.click()
+  const defaultVariant = page.getByRole("menuitemradio", { name: "default", exact: true })
+  await expect(defaultVariant).toBeVisible()
+  await defaultVariant.click()
+
+  expect(await submitPrompt(page, childID, "Use the explicitly selected default variant")).toMatchObject({
+    agent: "explore",
+    model: { modelID, providerID: "opencode" },
+    variant: "default",
   })
 })
 

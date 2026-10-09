@@ -50,7 +50,7 @@ import { Truncate } from "@/tool/truncate"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { Ripgrep } from "@opencode-ai/core/ripgrep"
 import { Format } from "../../src/format"
-import { TestInstance } from "../fixture/fixture"
+import { provideTmpdirServer, TestInstance } from "../fixture/fixture"
 import { awaitWithTimeout, pollWithTimeout, testEffect } from "../lib/effect"
 import { reply, TestLLMServer } from "../lib/llm-server"
 import { RuntimeFlags } from "@/effect/runtime-flags"
@@ -2379,6 +2379,75 @@ noLLMServer.instance(
       },
     },
   },
+)
+
+it.live("explicit default suppresses the configured agent variant", () =>
+  provideTmpdirServer(
+    ({ llm }) =>
+      Effect.gen(function* () {
+        const prompt = yield* SessionPrompt.Service
+        const sessions = yield* Session.Service
+        const session = yield* sessions.create({})
+        const model = { providerID: ProviderV2.ID.make("openai"), modelID: ModelV2.ID.make("test-model") }
+
+        yield* llm.text("configured agent variant")
+        const configured = yield* prompt.prompt({
+          sessionID: session.id,
+          agent: "build",
+          model,
+          parts: [{ type: "text", text: "Use the configured variant" }],
+        })
+        if (configured.info.role !== "assistant" || !configured.info.parentID)
+          throw new Error("expected assistant reply")
+        const configuredUser = yield* MessageV2.get({
+          sessionID: session.id,
+          messageID: configured.info.parentID,
+        })
+        if (configuredUser.info.role !== "user") throw new Error("expected persisted user message")
+        expect(configuredUser.info.model.variant).toBe("high")
+
+        yield* llm.text("default variant")
+        const result = yield* prompt.prompt({
+          sessionID: session.id,
+          agent: "build",
+          model,
+          variant: "default",
+          parts: [{ type: "text", text: "Use the default variant" }],
+        })
+        if (result.info.role !== "assistant" || !result.info.parentID) throw new Error("expected assistant reply")
+        const stored = yield* MessageV2.get({ sessionID: session.id, messageID: result.info.parentID })
+        if (stored.info.role !== "user") throw new Error("expected persisted user message")
+        expect(stored.info.model.variant).toBe("default")
+
+        const inputs = yield* llm.inputs
+        const request = (text: string) =>
+          inputs.find((input) => input.model === "test-model" && JSON.stringify(input.messages).includes(text))
+        expect(request("Use the configured variant")).toHaveProperty("reasoning_effort", "high")
+        const defaultRequest = request("Use the default variant")
+        expect(defaultRequest).toBeDefined()
+        expect(defaultRequest).not.toHaveProperty("reasoning_effort")
+
+        yield* sessions.remove(session.id)
+      }),
+    {
+      config: (url) => ({
+        enabled_providers: ["openai"],
+        provider: {
+          openai: {
+            npm: "@ai-sdk/openai-compatible",
+            options: { apiKey: "test-key", baseURL: url },
+            models: {
+              "test-model": {
+                ...cfg.provider.test.models["test-model"],
+                variants: { high: { reasoningEffort: "high" } },
+              },
+            },
+          },
+        },
+        agent: { build: { model: "openai/test-model", variant: "high" } },
+      }),
+    },
+  ),
 )
 
 // Agent / command resolution errors
