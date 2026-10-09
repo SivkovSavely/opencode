@@ -43,13 +43,14 @@ function setup(
     { preconnect: globalThis.fetch.preconnect },
   )
   const server = { url: "http://localhost:4096" }
-  const api = createCompatibleApi({
-    protocol: typeof protocol === "string" ? Promise.resolve(protocol) : protocol,
-    current: createApiForServer({ server, fetch: fetcher }),
-    legacy: (directory) => createSdkForServer({ server, fetch: fetcher, directory, throwOnError: true }),
-    directory: "/repo",
-  })
-  return { api, requests }
+  const createApi = (directory: string) =>
+    createCompatibleApi({
+      protocol: typeof protocol === "string" ? Promise.resolve(protocol) : protocol,
+      current: createApiForServer({ server, fetch: fetcher }),
+      legacy: (directory) => createSdkForServer({ server, fetch: fetcher, directory, throwOnError: true }),
+      directory,
+    })
+  return { api: createApi("/repo"), apiForDirectory: createApi, requests }
 }
 
 describe("createCompatibleApi", () => {
@@ -127,6 +128,30 @@ describe("createCompatibleApi", () => {
       { id: "prt_text", type: "text", text: "look" },
       { id: "prt_image", type: "file", mime: "image/png", url: "data:image/png;base64,AAAA", filename: "image.png" },
     ])
+  })
+
+  test("uses the requested directory for V1 session prompts", async () => {
+    const { apiForDirectory, requests } = setup("v1")
+    await apiForDirectory("/repo/worktree").session.prompt({
+      sessionID: "ses_1",
+      id: "msg_1",
+      text: "write a file",
+    })
+
+    expect(new URL(requests[0]!.url).pathname).toBe("/session/ses_1/prompt_async")
+    expect(requests[0]!.headers.get("x-opencode-directory")).toBe("%2Frepo%2Fworktree")
+  })
+
+  test("keeps V2 prompts on the current session route", async () => {
+    const { apiForDirectory, requests } = setup("v2")
+    await apiForDirectory("/repo/worktree").session.prompt({
+      sessionID: "ses_1",
+      id: "msg_1",
+      text: "hello",
+    })
+
+    expect(new URL(requests[0]!.url).pathname).toBe("/api/session/ses_1/prompt")
+    expect(requests[0]!.headers.get("x-opencode-directory")).toBeNull()
   })
 
   test("resolves protocol detection once across implementation methods", async () => {

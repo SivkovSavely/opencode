@@ -2,7 +2,7 @@ import type { Message, Session } from "@opencode-ai/sdk/v2/client"
 import { showToast } from "@/utils/toast"
 import { base64Encode } from "@opencode-ai/core/util/encode"
 import { Binary } from "@opencode-ai/core/util/binary"
-import { useNavigate, useParams, useSearchParams } from "@solidjs/router"
+import { useLocation, useNavigate, useParams, useSearchParams } from "@solidjs/router"
 import { batch, startTransition, type Accessor } from "solid-js"
 import { useTabs } from "@/context/tabs"
 import { useServerSync, type ServerSync } from "@/context/server-sync"
@@ -29,6 +29,11 @@ type PendingPrompt = {
   cleanup: VoidFunction
 }
 
+type ActiveSubmission = {
+  abort?: AbortController
+  session?: { sessionID: string; api: DirectorySDK["api"]["session"] }
+}
+
 const pending = new Map<string, PendingPrompt>()
 
 export type FollowupDraft = {
@@ -49,6 +54,8 @@ type FollowupSendInput = {
   forceDefaultVariant?: boolean
   messageID?: string
   optimisticBusy?: boolean
+  optimisticAfterSend?: boolean
+  signal?: AbortSignal
   before?: () => Promise<boolean> | boolean
 }
 
@@ -71,8 +78,9 @@ export async function sendFollowupDraft(input: FollowupSendInput) {
   }
 
   const wait = async () => {
+    if (input.signal?.aborted) return false
     const ok = await input.before?.()
-    if (ok === false) return false
+    if (ok === false || input.signal?.aborted) return false
     return true
   }
 
@@ -86,8 +94,19 @@ export async function sendFollowupDraft(input: FollowupSendInput) {
         return false
       }
 
-      const messageID = Identifier.ascending("message")
-      await input.api.command({
+        const files = await Promise.all(
+          images.map(async (attachment) => ({
+            uri: await blobDataUrl(attachment.blob, attachment.mime),
+            name: attachment.filename,
+          })),
+        )
+        if (input.signal?.aborted) {
+          setIdle()
+          return false
+        }
+
+        const messageID = Identifier.ascending("message")
+        await input.api.command({
         sessionID: input.draft.sessionID,
         id: messageID,
         command: cmd,
@@ -98,12 +117,7 @@ export async function sendFollowupDraft(input: FollowupSendInput) {
           providerID: input.draft.model.providerID,
           variant,
         },
-        files: await Promise.all(
-          images.map(async (attachment) => ({
-            uri: await blobDataUrl(attachment.blob, attachment.mime),
-            name: attachment.filename,
-          })),
-        ),
+          files,
       })
       return true
     } catch (err) {
@@ -119,6 +133,7 @@ export async function sendFollowupDraft(input: FollowupSendInput) {
       dataUrl: await blobDataUrl(attachment.blob, attachment.mime),
     })),
   )
+  if (input.signal?.aborted) return false
   const { requestParts, optimisticParts } = buildRequestParts({
     prompt: input.draft.prompt,
     context: input.draft.context,
@@ -155,7 +170,7 @@ export async function sendFollowupDraft(input: FollowupSendInput) {
 
   batch(() => {
     setBusy()
-    add()
+    if (!input.optimisticAfterSend) add()
   })
 
   try {
@@ -199,6 +214,7 @@ export async function sendFollowupDraft(input: FollowupSendInput) {
           : [],
       ),
     })
+    if (input.optimisticAfterSend) add()
     return true
   } catch (err) {
     batch(() => {
@@ -230,11 +246,13 @@ type PromptSubmitInput = {
   onQueue?: (draft: FollowupDraft) => void
   onAbort?: () => void
   onSubmit?: () => void
+  onPreparing?: (value: boolean) => void
   model?: ModelSelection
 }
 
 export function createPromptSubmit(input: PromptSubmitInput) {
   const navigate = useNavigate()
+  const location = useLocation()
   const sdk = useSDK()
   const sync = useSync()
   const serverSync = useServerSync()
@@ -246,7 +264,19 @@ export function createPromptSubmit(input: PromptSubmitInput) {
   const params = useParams()
   const [search] = useSearchParams<{ draftId?: string }>()
   const tabs = useTabs()
-  const pendingKey = (sessionID: string) => ScopedKey.from(sdk().scope, sessionID)
+  const pendingKey = (scope: DirectorySDK["scope"], sessionID: string) => ScopedKey.from(scope, sessionID)
+  const submitting = new Set<string>()
+  const activeSubmissions = new Map<string, ActiveSubmission>()
+  let pendingNewSession:
+    | {
+        projectDirectory: string
+        selection: string
+        sourcePath: string
+        directory: string
+        ready?: boolean
+        session?: Session
+      }
+    | undefined
 
   const errorMessage = (err: unknown) => {
     if (err && typeof err === "object" && "message" in err && typeof err.message === "string") return err.message
@@ -258,15 +288,59 @@ export function createPromptSubmit(input: PromptSubmitInput) {
     return language.t("common.requestFailed")
   }
 
+  const waitForCreatedWorktree = async (scope: DirectorySDK["scope"], directory: string, signal: AbortSignal) => {
+    const status = WorktreeState.get(scope, directory)
+    if (status?.status === "ready") return true
+    if (status?.status === "failed") throw new Error(status.message)
+
+    WorktreeState.pending(scope, directory)
+    let abortListener: () => void = () => {}
+    const aborted = new Promise<Awaited<ReturnType<typeof WorktreeState.wait>>>((resolve) => {
+      abortListener = () => resolve({ status: "failed", message: "aborted" })
+      if (signal.aborted) abortListener()
+      else signal.addEventListener("abort", abortListener, { once: true })
+    })
+    const timeoutMs = 5 * 60 * 1000
+    const timer = { id: undefined as number | undefined }
+    const timeout = new Promise<Awaited<ReturnType<typeof WorktreeState.wait>>>((resolve) => {
+      timer.id = window.setTimeout(
+        () => resolve({ status: "failed", message: language.t("workspace.error.stillPreparing") }),
+        timeoutMs,
+      )
+    })
+    const result = await Promise.race([WorktreeState.wait(scope, directory), aborted, timeout]).finally(() => {
+      if (timer.id !== undefined) window.clearTimeout(timer.id)
+      signal.removeEventListener("abort", abortListener)
+    })
+    if (signal.aborted) return false
+    if (result.status === "failed") throw new Error(result.message)
+    return true
+  }
+
   const abort = async () => {
     const sessionID = params.id
-    if (!sessionID) return Promise.resolve()
+    if (!sessionID) {
+      const active = activeSubmissions.get(location.pathname)
+      if (active?.abort) {
+        active.abort.abort()
+        input.onAbort?.()
+        if (active.session) {
+          return active.session.api.interrupt({ sessionID: active.session.sessionID }).catch(() => {})
+        }
+        return Promise.resolve()
+      }
+      if (active?.session) {
+        input.onAbort?.()
+        return active.session.api.interrupt({ sessionID: active.session.sessionID }).catch(() => {})
+      }
+      return Promise.resolve()
+    }
 
     serverSync().session.set("todo", sessionID, [])
 
     input.onAbort?.()
 
-    const key = pendingKey(sessionID)
+    const key = pendingKey(sdk().scope, sessionID)
     const queued = pending.get(key)
     if (queued) {
       queued.abort.abort()
@@ -317,9 +391,22 @@ export function createPromptSubmit(input: PromptSubmitInput) {
     })
   }
 
-  const handleSubmit = async (event: Event) => {
+  const handleSubmit = (event: Event) => {
     event.preventDefault()
+    const sourcePath = location.pathname
+    if (submitting.has(sourcePath)) return
+    submitting.add(sourcePath)
+    const active: ActiveSubmission = {}
+    activeSubmissions.set(sourcePath, active)
+    return handleSubmitBody(sourcePath, active).finally(() => {
+      submitting.delete(sourcePath)
+      if (activeSubmissions.get(sourcePath) === active) activeSubmissions.delete(sourcePath)
+      if (location.pathname === sourcePath || !activeSubmissions.has(location.pathname)) input.onPreparing?.(false)
+    })
+  }
 
+  const handleSubmitBody = async (initialPathname: string, active: ActiveSubmission) => {
+    const sourceSDK = sdk()
     const target = prompt.capture()
     const submission = createPromptSubmissionState({
       target,
@@ -349,31 +436,65 @@ export function createPromptSubmit(input: PromptSubmitInput) {
       return
     }
 
+    input.onPreparing?.(true)
+
     input.addToHistory(currentPrompt, mode)
     input.resetHistoryNavigation()
 
-    const projectDirectory = sdk().directory
+    const projectDirectory = sourceSDK.directory
     const permissionState = permission.currentServerState()
     const isNewSession = !params.id
     const shouldAutoAccept = isNewSession && input.autoAccept()
     const worktreeSelection = input.newSessionWorktree?.() || "main"
+    const controller = worktreeSelection === "create" ? new AbortController() : undefined
+    if (controller) active.abort = controller
+    const reuse =
+      isNewSession &&
+      worktreeSelection === "create" &&
+      pendingNewSession?.projectDirectory === projectDirectory &&
+      pendingNewSession.selection === worktreeSelection &&
+      pendingNewSession.sourcePath === initialPathname
+        ? pendingNewSession
+        : undefined
+    if (!reuse) pendingNewSession = undefined
 
-    let sessionDirectory = projectDirectory
-    let client = sdk().client
+    let sessionDirectory = reuse?.directory ?? projectDirectory
+    let worktreeReady = reuse?.ready === true
 
     if (isNewSession) {
-      if (worktreeSelection === "create") {
-        const createdWorktree = await client.worktree
-          .create({ directory: projectDirectory })
+      if (worktreeSelection === "create" && !reuse) {
+        const createdWorktree = await sourceSDK
+          .client.worktree.create(
+            { directory: projectDirectory, worktreeCreateInput: { waitUntilReady: true } },
+            { signal: controller?.signal },
+          )
           .then((x) => x.data)
           .catch((err) => {
+            if (controller?.signal.aborted) return undefined
             showToast({
               title: language.t("prompt.toast.worktreeCreateFailed.title"),
               description: errorMessage(err),
             })
-            return undefined
+            return null
           })
 
+        if (controller?.signal.aborted) {
+          if (createdWorktree?.directory) {
+            await sourceSDK.client.worktree
+              .remove({
+                directory: projectDirectory,
+                worktreeRemoveInput: { directory: createdWorktree.directory },
+              })
+              .catch((err) =>
+                showToast({
+                  title: language.t("workspace.delete.failed.title"),
+                  description: errorMessage(err),
+                }),
+              )
+          }
+          return
+        }
+        if (createdWorktree === null) return
         if (!createdWorktree?.directory) {
           showToast({
             title: language.t("prompt.toast.worktreeCreateFailed.title"),
@@ -381,8 +502,37 @@ export function createPromptSubmit(input: PromptSubmitInput) {
           })
           return
         }
-        WorktreeState.pending(sdk().scope, createdWorktree.directory)
         sessionDirectory = createdWorktree.directory
+        worktreeReady = createdWorktree.ready === true
+        pendingNewSession = {
+          projectDirectory,
+          selection: worktreeSelection,
+          sourcePath: initialPathname,
+          directory: sessionDirectory,
+          ready: worktreeReady,
+        }
+      }
+
+      if (worktreeSelection === "create" && !worktreeReady) {
+        try {
+          if (!(await waitForCreatedWorktree(sourceSDK.scope, sessionDirectory, controller!.signal))) return
+          worktreeReady = true
+          pendingNewSession = {
+            projectDirectory,
+            selection: worktreeSelection,
+            sourcePath: initialPathname,
+            directory: sessionDirectory,
+            ready: true,
+            session: reuse?.session,
+          }
+        } catch (err) {
+          if (WorktreeState.get(sourceSDK.scope, sessionDirectory)?.status === "failed") pendingNewSession = undefined
+          showToast({
+            title: language.t("prompt.toast.worktreeCreateFailed.title"),
+            description: errorMessage(err),
+          })
+          return
+        }
       }
 
       if (worktreeSelection !== "main" && worktreeSelection !== "create") {
@@ -390,20 +540,16 @@ export function createPromptSubmit(input: PromptSubmitInput) {
       }
 
       if (sessionDirectory !== projectDirectory) {
-        client = sdk().createClient({
-          directory: sessionDirectory,
-          throwOnError: true,
-        })
         serverSync().child(sessionDirectory)
       }
-
-      input.onNewSessionWorktreeReset?.()
     }
 
-    let session = input.info()
+    const sessionApi = sourceSDK.apiForDirectory(sessionDirectory).session
+    let session = input.info() ?? reuse?.session
+    let createdNewSession = false
     if (!session && isNewSession) {
-      const created = await sdk()
-        .api.session.create({
+      const created = await sessionApi
+        .create({
           agent: currentAgent.name,
           model: { id: currentModel.id, providerID: currentModel.provider.id, variant },
           location: { directory: sessionDirectory },
@@ -419,21 +565,30 @@ export function createPromptSubmit(input: PromptSubmitInput) {
       if (created) {
         seed(sessionDirectory, created)
         session = created
-        await startTransition(() => {
-          if (!session) return
-          if (shouldAutoAccept) permissionState.enableAutoAccept(session.id, sessionDirectory)
-          local.session.promote(sessionDirectory, session.id, {
-            agent: currentAgent.name,
-            model: { providerID: currentModel.provider.id, modelID: currentModel.id },
-            variant: variant ?? null,
-          })
-          layout.handoff.setTabs(base64Encode(sessionDirectory), session.id)
-          const draftID = search.draftId
-          if (draftID) tabs.promoteDraft(draftID, { server: tabs.draft(draftID).server, sessionId: session.id })
-          else navigate(`/${base64Encode(sessionDirectory)}/session/${session.id}`)
-          submission.retarget(prompt.capture({ dir: base64Encode(sessionDirectory), id: session.id }))
-        })
+        createdNewSession = true
+        if (worktreeSelection === "create") {
+          pendingNewSession = {
+            projectDirectory,
+            selection: worktreeSelection,
+            sourcePath: initialPathname,
+            directory: sessionDirectory,
+            ready: worktreeReady,
+            session: created,
+          }
+        }
       }
+    }
+    if (controller?.signal.aborted) {
+      if (createdNewSession && session) {
+        await sessionApi.remove({ sessionID: session.id, directory: sessionDirectory }).catch(() => {})
+        pendingNewSession = {
+          projectDirectory,
+          selection: worktreeSelection,
+          sourcePath: initialPathname,
+          directory: sessionDirectory,
+        }
+      }
+      return
     }
     if (!session) {
       showToast({
@@ -449,6 +604,8 @@ export function createPromptSubmit(input: PromptSubmitInput) {
     }
     const agent = currentAgent.name
     const forceDefaultVariant = !!sync().session.get(session.id)?.parentID && variant === undefined
+    const deferNewWorktreeNavigation = isNewSession && worktreeSelection === "create"
+    const commentItems = context.filter((item) => item.type === "file" && !!item.comment?.trim())
     const draft: FollowupDraft = {
       sessionID: session.id,
       sessionDirectory,
@@ -459,10 +616,11 @@ export function createPromptSubmit(input: PromptSubmitInput) {
       variant,
     }
 
-    const clearInput = () => {
-      submission.clear()
+    const clearInput = (preserveChanges = false) => {
+      if (!submission.clear(preserveChanges)) return false
       input.setMode("normal")
       input.setPopover(null)
+      return true
     }
 
     const restoreInput = () => {
@@ -482,6 +640,45 @@ export function createPromptSubmit(input: PromptSubmitInput) {
       return true
     }
 
+    const promoteSession = async () => {
+      if (!isNewSession) return
+      if (deferNewWorktreeNavigation) {
+        if (location.pathname !== initialPathname) {
+          local.session.promote(sessionDirectory, session.id, {
+            agent: currentAgent.name,
+            model: { providerID: currentModel.provider.id, modelID: currentModel.id },
+            variant: variant ?? null,
+          })
+          clearInput(true)
+          if (pendingNewSession?.session?.id === session.id) pendingNewSession = undefined
+          return
+        }
+        submission.retarget(prompt.capture({ dir: base64Encode(sessionDirectory), id: session.id }))
+        for (const item of commentItems) submission.target().context.remove(item.key)
+        clearInput(true)
+      } else {
+        submission.retarget(prompt.capture({ dir: base64Encode(sessionDirectory), id: session.id }))
+      }
+
+      await startTransition(() => {
+        if (shouldAutoAccept) permissionState.enableAutoAccept(session.id, sessionDirectory)
+        local.session.promote(sessionDirectory, session.id, {
+          agent: currentAgent.name,
+          model: { providerID: currentModel.provider.id, modelID: currentModel.id },
+          variant: variant ?? null,
+        })
+        if (deferNewWorktreeNavigation && location.pathname !== initialPathname) return
+        layout.handoff.setTabs(base64Encode(sessionDirectory), session.id)
+        const draftID = search.draftId
+        if (draftID) tabs.promoteDraft(draftID, { server: tabs.draft(draftID).server, sessionId: session.id })
+        else navigate(`/${base64Encode(sessionDirectory)}/session/${session.id}`)
+      })
+      input.onNewSessionWorktreeReset?.()
+      if (pendingNewSession?.session?.id === session.id) pendingNewSession = undefined
+    }
+
+    if (isNewSession && !deferNewWorktreeNavigation) await promoteSession()
+
     if (!isNewSession && mode === "normal" && input.shouldQueue?.()) {
       input.onQueue?.(draft)
       clearContext(submission.target())
@@ -492,23 +689,26 @@ export function createPromptSubmit(input: PromptSubmitInput) {
     input.onSubmit?.()
 
     if (mode === "shell") {
-      clearInput()
+      if (!deferNewWorktreeNavigation) clearInput()
       const eventID = Event.ID.create()
-      sdk()
-        .api.session.shell({
+      if (deferNewWorktreeNavigation) active.session = { sessionID: session.id, api: sessionApi }
+      try {
+        if (active.abort?.signal.aborted) return
+        await sessionApi.shell({
           sessionID: session.id,
           id: eventID,
           command: text,
           agent,
           model,
         })
-        .catch((err) => {
-          showToast({
-            title: language.t("prompt.toast.shellSendFailed.title"),
-            description: errorMessage(err),
-          })
-          restoreInput()
+        if (deferNewWorktreeNavigation) await promoteSession()
+      } catch (err) {
+        showToast({
+          title: language.t("prompt.toast.shellSendFailed.title"),
+          description: errorMessage(err),
         })
+        if (!deferNewWorktreeNavigation) restoreInput()
+      }
       return
     }
 
@@ -517,37 +717,44 @@ export function createPromptSubmit(input: PromptSubmitInput) {
       const commandName = cmdName.slice(1)
       const customCommand = sync().data.command.find((c) => c.name === commandName)
       if (customCommand) {
-        clearInput()
+        if (!deferNewWorktreeNavigation) clearInput()
         const messageID = Identifier.ascending("message")
         serverSync().session.set("session_status", session.id, { type: "busy" })
-        sdk()
-          .api.session.command({
+        if (deferNewWorktreeNavigation) active.session = { sessionID: session.id, api: sessionApi }
+        try {
+          const files = await Promise.all(
+            images.map(async (attachment) => ({
+              uri: await blobDataUrl(attachment.blob, attachment.mime),
+              name: attachment.filename,
+            })),
+          )
+          if (active.abort?.signal.aborted) return
+          await sessionApi.command({
             sessionID: session.id,
             id: messageID,
             command: commandName,
             arguments: args.join(" "),
             agent,
-            model: { id: model.modelID, providerID: model.providerID, variant: forceDefaultVariant ? "default" : variant },
-            files: await Promise.all(
-              images.map(async (attachment) => ({
-                uri: await blobDataUrl(attachment.blob, attachment.mime),
-                name: attachment.filename,
-              })),
-            ),
+            model: {
+              id: model.modelID,
+              providerID: model.providerID,
+              variant: forceDefaultVariant ? "default" : variant,
+            },
+            files,
           })
-          .catch((err) => {
-            serverSync().session.set("session_status", session.id, { type: "idle" })
-            showToast({
-              title: language.t("prompt.toast.commandSendFailed.title"),
-              description: formatServerError(err, language.t, language.t("common.requestFailed")),
-            })
-            restoreInput()
+          if (deferNewWorktreeNavigation) await promoteSession()
+        } catch (err) {
+          serverSync().session.set("session_status", session.id, { type: "idle" })
+          showToast({
+            title: language.t("prompt.toast.commandSendFailed.title"),
+            description: formatServerError(err, language.t, language.t("common.requestFailed")),
           })
+          if (!deferNewWorktreeNavigation) restoreInput()
+        }
         return
       }
     }
 
-    const commentItems = context.filter((item) => item.type === "file" && !!item.comment?.trim())
     const messageID = Identifier.ascending("message")
 
     const removeOptimisticMessage = () => {
@@ -558,11 +765,13 @@ export function createPromptSubmit(input: PromptSubmitInput) {
       })
     }
 
-    for (const item of commentItems) submission.target().context.remove(item.key)
-    clearInput()
+    if (!deferNewWorktreeNavigation) {
+      for (const item of commentItems) submission.target().context.remove(item.key)
+      clearInput()
+    }
 
     const waitForWorktree = async () => {
-      const worktree = WorktreeState.get(sdk().scope, sessionDirectory)
+      const worktree = WorktreeState.get(sourceSDK.scope, sessionDirectory)
       if (!worktree || worktree.status !== "pending") return true
 
       if (sessionDirectory === projectDirectory) {
@@ -575,10 +784,10 @@ export function createPromptSubmit(input: PromptSubmitInput) {
           sync().set("session_status", session.id, { type: "idle" })
         }
         removeOptimisticMessage()
-        if (restoreInput()) restoreCommentItems(submission.target(), commentItems)
+        if (restoreInput() && !deferNewWorktreeNavigation) restoreCommentItems(submission.target(), commentItems)
       }
 
-      pending.set(pendingKey(session.id), { abort: controller, cleanup })
+      pending.set(pendingKey(sourceSDK.scope, session.id), { abort: controller, cleanup })
 
       const abortWait = new Promise<Awaited<ReturnType<typeof WorktreeState.wait>>>((resolve) => {
         if (controller.signal.aborted) {
@@ -606,30 +815,37 @@ export function createPromptSubmit(input: PromptSubmitInput) {
       })
 
       const result = await Promise.race([
-        WorktreeState.wait(sdk().scope, sessionDirectory),
+        WorktreeState.wait(sourceSDK.scope, sessionDirectory),
         abortWait,
         timeout,
       ]).finally(() => {
         if (timer.id === undefined) return
         clearTimeout(timer.id)
       })
-      pending.delete(pendingKey(session.id))
+      pending.delete(pendingKey(sourceSDK.scope, session.id))
       if (controller.signal.aborted) return false
       if (result.status === "failed") throw new Error(result.message)
       return true
     }
 
-    void sendFollowupDraft({
-      api: sdk().api.session,
-      sync: sync(),
-      serverSync: serverSync(),
-      draft,
-      forceDefaultVariant,
-      messageID,
-      optimisticBusy: sessionDirectory === projectDirectory,
-      before: waitForWorktree,
-    }).catch((err) => {
-      pending.delete(pendingKey(session.id))
+    if (deferNewWorktreeNavigation) active.session = { sessionID: session.id, api: sessionApi }
+    try {
+      const sent = await sendFollowupDraft({
+        api: sessionApi,
+        sync: sync(),
+        serverSync: serverSync(),
+        draft,
+        forceDefaultVariant,
+        messageID,
+        optimisticBusy: sessionDirectory === projectDirectory || deferNewWorktreeNavigation,
+        optimisticAfterSend: deferNewWorktreeNavigation,
+        signal: active.abort?.signal,
+        before: deferNewWorktreeNavigation ? undefined : waitForWorktree,
+      })
+      if (!sent) return
+      if (deferNewWorktreeNavigation) await promoteSession()
+    } catch (err) {
+      pending.delete(pendingKey(sourceSDK.scope, session.id))
       if (sessionDirectory === projectDirectory) {
         sync().set("session_status", session.id, { type: "idle" })
       }
@@ -638,8 +854,8 @@ export function createPromptSubmit(input: PromptSubmitInput) {
         description: errorMessage(err),
       })
       removeOptimisticMessage()
-      if (restoreInput()) restoreCommentItems(submission.target(), commentItems)
-    })
+      if (!deferNewWorktreeNavigation && restoreInput()) restoreCommentItems(submission.target(), commentItems)
+    }
   }
 
   return {

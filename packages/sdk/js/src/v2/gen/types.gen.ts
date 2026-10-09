@@ -2178,6 +2178,10 @@ export type WorktreeError = {
 export type WorktreeCreateInput = {
   name?: string
   /**
+   * Wait for worktree checkout and instance bootstrap before returning
+   */
+  waitUntilReady?: boolean
+  /**
    * Additional startup script to run after the project's start command
    */
   startCommand?: string
@@ -2187,6 +2191,10 @@ export type Worktree = {
   name: string
   branch?: string
   directory: string
+  /**
+   * Whether worktree checkout and instance bootstrap completed
+   */
+  ready?: boolean
 }
 
 export type WorktreeRemoveInput = {

@@ -254,7 +254,7 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
     return paths
   })
   const info = createMemo(() => (props.controls.session.id ? sync().session.get(props.controls.session.id) : undefined))
-  const working = createMemo(() => sync().data.session_working(props.controls.session.id ?? ""))
+  const working = createMemo(() => store.preparing || sync().data.session_working(props.controls.session.id ?? ""))
   const imageAttachments = createMemo(() =>
     prompt.current().filter((part): part is ImageAttachmentPart => part.type === "image"),
   )
@@ -285,7 +285,7 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
       .join("")
     return text.trim().length === 0 && imageAttachments().length === 0 && commentCount() === 0
   })
-  const stopping = createMemo(() => working() && blank())
+  const stopping = createMemo(() => store.preparing || (working() && blank()))
   const tip = () => {
     if (stopping()) {
       return (
@@ -1228,6 +1228,10 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
       onQueue: props.onQueue,
       onAbort: props.onAbort,
       onSubmit: props.onSubmit,
+      onPreparing: (value) => {
+        setStore("preparing", value)
+        props.onPreparing?.(value)
+      },
       model: props.controls.model.selection,
     })
 
@@ -1581,6 +1585,11 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
                 <IconButton
                   data-action="prompt-submit"
                   type="submit"
+                  onClick={(event) => {
+                    if (!store.preparing) return
+                    event.preventDefault()
+                    void abort()
+                  }}
                   disabled={!working() && blank()}
                   tabIndex={store.mode === "normal" ? undefined : -1}
                   icon={stopping() ? "stop" : store.mode === "shell" ? "arrow-undo-down" : "arrow-up"}

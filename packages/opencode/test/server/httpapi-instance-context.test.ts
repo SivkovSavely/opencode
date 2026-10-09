@@ -13,6 +13,7 @@ import { Workspace } from "../../src/control-plane/workspace"
 import { InstanceRef, WorkspaceRef } from "../../src/effect/instance-ref"
 import { Project } from "../../src/project/project"
 import { Session } from "../../src/session/session"
+import { SessionID } from "../../src/session/schema"
 import { disposeMiddleware, markInstanceForDisposal } from "../../src/server/routes/instance/httpapi/lifecycle"
 import {
   InstanceContextMiddleware,
@@ -100,6 +101,11 @@ const ProbeApi = HttpApi.make("instance-context-probe").add(
     .add(
       HttpApiEndpoint.get("get", "/probe", { query: WorkspaceRoutingQuery, success: ProbeResult }),
       HttpApiEndpoint.get("session", "/session", { query: WorkspaceRoutingQuery, success: ProbeResult }),
+      HttpApiEndpoint.get("promptAsync", "/session/:sessionID/prompt_async", {
+        params: { sessionID: Schema.String },
+        query: WorkspaceRoutingQuery,
+        success: ProbeResult,
+      }),
       HttpApiEndpoint.post("dispose", "/dispose-probe", {
         query: WorkspaceRoutingQuery,
         success: Schema.Boolean,
@@ -113,6 +119,7 @@ const probeHandlers = HttpApiBuilder.group(ProbeApi, "probe", (handlers) =>
   handlers
     .handle("get", () => probeInstanceContext)
     .handle("session", () => probeInstanceContext)
+    .handle("promptAsync", () => probeInstanceContext)
     .handle(
       "dispose",
       Effect.fn("InstanceContextProbe.dispose")(function* () {
@@ -131,6 +138,15 @@ const probeRoutes = HttpApiBuilder.layer(ProbeApi).pipe(
 )
 
 const serveProbe = () => probeRoutes.pipe(HttpRouter.serve, Layer.build)
+
+const serveSessionProbe = (session: Session.Info) =>
+  HttpApiBuilder.layer(ProbeApi).pipe(
+    Layer.provide(probeHandlers),
+    Layer.provide(instanceContextTestLayer),
+    Layer.provide(Layer.mock(Session.Service)({ get: () => Effect.succeed(session) })),
+    HttpRouter.serve,
+    Layer.build,
+  )
 
 const waitDisposedEvent = waitGlobalBusEvent({
   message: "timed out waiting for instance disposal",
@@ -158,6 +174,28 @@ describe("HttpApi instance context middleware", () => {
         projectID: project.project.id,
         workspaceID: null,
       })
+    }),
+  )
+
+  it.live("routes legacy session prompts using the persisted worktree directory", () =>
+    Effect.gen(function* () {
+      const root = yield* tmpdirScoped({ git: true })
+      const worktree = path.join(path.dirname(root), `instance-context-worktree-${crypto.randomUUID()}`)
+      const added = Bun.spawnSync(["git", "worktree", "add", "--detach", worktree, "HEAD"], { cwd: root })
+      if (added.exitCode !== 0) throw new Error(added.stderr.toString())
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => Bun.spawnSync(["git", "worktree", "remove", "--force", worktree], { cwd: root })),
+      )
+
+      const session = { id: SessionID.create(), directory: worktree } as Session.Info
+      yield* serveSessionProbe(session)
+
+      const response = yield* HttpClient.get(
+        `/session/${session.id}/prompt_async?directory=${encodeURIComponent(root)}`,
+      )
+
+      expect(response.status).toBe(200)
+      expect(yield* response.json).toMatchObject({ directory: worktree, worktree })
     }),
   )
 

@@ -4,6 +4,7 @@ import { Database } from "@opencode-ai/core/database/database"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { Cause, Deferred, Effect, Exit, Fiber, Layer } from "effect"
+import path from "path"
 import { Agent } from "../../src/agent/agent"
 import { BackgroundJob } from "@/background/job"
 import { EventV2Bridge } from "@/event-v2-bridge"
@@ -11,16 +12,20 @@ import { Config } from "@/config/config"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { Ripgrep } from "@opencode-ai/core/ripgrep"
 import { Session } from "@/session/session"
+import { Format } from "../../src/format"
+import { LSP } from "@/lsp/lsp"
+import { FSUtil } from "@opencode-ai/core/fs-util"
 import type { SessionPrompt } from "../../src/session/prompt"
 import { MessageID, PartID, SessionID } from "../../src/session/schema"
 import { SessionRunState } from "@/session/run-state"
 import { SessionStatus } from "@/session/status"
 
 import { TaskTool, type TaskPromptOps } from "../../src/tool/task"
+import { ApplyPatchTool } from "../../src/tool/apply_patch"
 import { Truncate } from "@/tool/truncate"
 import { ToolRegistry } from "@/tool/registry"
 import { RuntimeFlags } from "@/effect/runtime-flags"
-import { disposeAllInstances } from "../fixture/fixture"
+import { disposeAllInstances, provideInstance, TestInstance, tmpdirScoped } from "../fixture/fixture"
 import { testEffect } from "../lib/effect"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
@@ -41,6 +46,9 @@ const layer = (flags: Partial<RuntimeFlags.Info> = {}) =>
       BackgroundJob.node,
       EventV2Bridge.node,
       Config.node,
+      FSUtil.node,
+      Format.node,
+      LSP.node,
       CrossSpawnSpawner.node,
       Session.node,
       SessionProjector.node,
@@ -98,6 +106,7 @@ const seed = Effect.fn("TaskToolTest.seed")(function* (title = "Pinned") {
 
 function stubOps(opts?: {
   onPrompt?: (input: SessionPrompt.PromptInput) => void
+  onPromptEffect?: (input: SessionPrompt.PromptInput) => Effect.Effect<void>
   text?: string
   error?: NonNullable<SessionV1.Assistant["error"]>
   toolError?: string
@@ -106,8 +115,9 @@ function stubOps(opts?: {
     cancel: () => Effect.void,
     resolvePromptParts: (template) => Effect.succeed([{ type: "text" as const, text: template }]),
     prompt: (input) =>
-      Effect.sync(() => {
+      Effect.gen(function* () {
         opts?.onPrompt?.(input)
+        yield* opts?.onPromptEffect?.(input) ?? Effect.void
         return reply(input, opts?.text ?? "done", opts?.error, opts?.toolError)
       }),
   }
@@ -282,6 +292,136 @@ describe("tool.task", () => {
       expect(seen?.sessionID).toBe(child.id)
       expect(seen?.variant).toBe("xhigh")
     }),
+  )
+
+  it.instance("rejects a task_id owned by another parent", () =>
+    Effect.gen(function* () {
+      const sessions = yield* Session.Service
+      const { chat, assistant } = yield* seed()
+      const otherParent = yield* sessions.create({ title: "Other parent" })
+      const child = yield* sessions.create({ parentID: otherParent.id, title: "Foreign child" })
+      const otherDirectory = yield* tmpdirScoped({ git: true })
+      const foreignChild = yield* sessions
+        .create({ parentID: otherParent.id, title: "Foreign child in another directory" })
+        .pipe(provideInstance(otherDirectory))
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+      let promptCalls = 0
+      const ctx = {
+        sessionID: chat.id,
+        messageID: assistant.id,
+        agent: "build",
+        abort: new AbortController().signal,
+        extra: { promptOps: stubOps({ onPrompt: () => promptCalls++ }) },
+        messages: [],
+        metadata: () => Effect.void,
+        ask: () => Effect.void,
+      }
+      const exits = yield* Effect.forEach([child, foreignChild], (session) =>
+        def
+          .execute(
+            {
+              description: "resume foreign task",
+              prompt: "write a relative file",
+              subagent_type: "general",
+              task_id: session.id,
+            },
+            ctx,
+          )
+          .pipe(Effect.exit),
+      )
+
+      expect(exits.every((exit) => Exit.isFailure(exit))).toBe(true)
+      expect(promptCalls).toBe(0)
+      expect((yield* sessions.get(child.id)).parentID).toBe(otherParent.id)
+      expect((yield* sessions.get(foreignChild.id)).directory).toBe(otherDirectory)
+    }),
+  )
+
+  it.instance(
+    "runs a subagent relative patch inside the parent worktree",
+    () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        const directory = path.join(path.dirname(test.directory), `task-isolation-${crypto.randomUUID()}`)
+        const runGit = (args: string[]) => {
+          const result = Bun.spawnSync(["git", ...args], { cwd: test.directory })
+          if (result.exitCode !== 0) throw new Error(result.stderr.toString())
+          return result.stdout.toString()
+        }
+
+        yield* Effect.acquireUseRelease(
+          Effect.sync(() => {
+            runGit(["worktree", "add", "--detach", directory, "HEAD"])
+            return directory
+          }),
+          (worktree) =>
+            Effect.gen(function* () {
+              const sessions = yield* Session.Service
+              const { chat, assistant } = yield* seed().pipe(provideInstance(worktree))
+              const info = yield* ApplyPatchTool
+              const patch = yield* info.init()
+              const tool = yield* TaskTool
+              const def = yield* tool.init()
+              const promptOps = stubOps({
+                onPromptEffect: (input) =>
+                  patch
+                    .execute(
+                      {
+                        patchText: "*** Begin Patch\n*** Add File: subagent-relative.txt\n+child\n*** End Patch",
+                      },
+                      {
+                        sessionID: input.sessionID,
+                        messageID: input.messageID ?? MessageID.ascending(),
+                        callID: "task-tool",
+                        agent: "general",
+                        abort: new AbortController().signal,
+                        messages: [],
+                        metadata: () => Effect.void,
+                        ask: () => Effect.void,
+                      },
+                    )
+                    .pipe(Effect.asVoid),
+              })
+              const result = yield* def
+                .execute(
+                  {
+                    description: "write in worktree",
+                    prompt: "create a relative file",
+                    subagent_type: "general",
+                  },
+                  {
+                    sessionID: chat.id,
+                    messageID: assistant.id,
+                    agent: "build",
+                    abort: new AbortController().signal,
+                    extra: { promptOps },
+                    messages: [],
+                    metadata: () => Effect.void,
+                    ask: () => Effect.void,
+                  },
+                )
+                .pipe(provideInstance(worktree))
+
+              expect(
+                (yield* sessions.get(SessionID.make(result.metadata.sessionId)).pipe(provideInstance(worktree)))
+                  .directory,
+              ).toBe(worktree)
+              expect(yield* Effect.promise(() => Bun.file(path.join(worktree, "subagent-relative.txt")).text())).toBe(
+                "child\n",
+              )
+              expect(
+                yield* Effect.promise(() => Bun.file(path.join(test.directory, "subagent-relative.txt")).exists()),
+              ).toBe(false)
+              expect(runGit(["status", "--porcelain=v1", "--untracked-files=all"]).trim()).toBe("")
+            }),
+          (worktree) =>
+            Effect.sync(() => {
+              runGit(["worktree", "remove", "--force", worktree])
+            }),
+        )
+      }),
+    { git: true },
   )
 
   it.instance("execute surfaces child errors with a resumable task_id", () =>

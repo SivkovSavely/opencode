@@ -11,7 +11,7 @@ import { Slug } from "@opencode-ai/core/util/slug"
 import { errorMessage } from "../util/error"
 import { GlobalBus } from "@/bus/global"
 import { Git } from "@/git"
-import { Effect, Layer, Path, Schema, Scope, Context } from "effect"
+import { Effect, Exit, Layer, Path, Schema, Scope, Context } from "effect"
 import { ChildProcess } from "effect/unstable/process"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import { AppProcess } from "@opencode-ai/core/process"
@@ -24,11 +24,17 @@ export const Info = Schema.Struct({
   name: Schema.String,
   branch: Schema.optional(Schema.String),
   directory: Schema.String,
+  ready: Schema.optional(
+    Schema.Boolean.annotate({ description: "Whether worktree checkout and instance bootstrap completed" }),
+  ),
 }).annotate({ identifier: "Worktree" })
 export type Info = Schema.Schema.Type<typeof Info>
 
 export const CreateInput = Schema.Struct({
   name: Schema.optional(Schema.String),
+  waitUntilReady: Schema.optional(
+    Schema.Boolean.annotate({ description: "Wait for worktree checkout and instance bootstrap before returning" }),
+  ),
   startCommand: Schema.optional(
     Schema.String.annotate({ description: "Additional startup script to run after the project's start command" }),
   ),
@@ -118,7 +124,11 @@ function failedRemoves(...chunks: string[]) {
 
 export interface Interface {
   readonly makeWorktreeInfo: (options?: { name?: string; detached?: boolean }) => Effect.Effect<Info, Error>
-  readonly createFromInfo: (info: Info, startCommand?: string) => Effect.Effect<void, Error>
+  readonly createFromInfo: (
+    info: Info,
+    startCommand?: string,
+    options?: { waitUntilReady?: boolean },
+  ) => Effect.Effect<void, Error>
   readonly create: (input?: CreateInput) => Effect.Effect<Info, Error>
   readonly canonical: (directory: string) => Effect.Effect<string>
   readonly list: () => Effect.Effect<(Omit<Info, "branch"> & { branch?: string })[], Error>
@@ -212,7 +222,7 @@ const layer: Layer.Layer<
       return yield* candidate({ root, name: input?.name ? slugify(input.name) : "", detached: input?.detached })
     })
 
-    const setup = Effect.fnUntraced(function* (info: Info) {
+    const setup = Effect.fnUntraced(function* (info: Info, onCreated: () => void) {
       const ctx = yield* InstanceState.context
       const created = yield* git(
         info.branch
@@ -226,14 +236,13 @@ const layer: Layer.Layer<
         })
       }
 
+      onCreated()
       yield* project.addSandbox(ctx.project.id, info.directory).pipe(Effect.catch(() => Effect.void))
     })
 
-    const boot = Effect.fnUntraced(function* (info: Info, startCommand?: string) {
+    const initialize = Effect.fnUntraced(function* (info: Info) {
       const ctx = yield* InstanceState.context
       const workspaceID = yield* InstanceState.workspaceID
-      const projectID = ctx.project.id
-      const extra = startCommand?.trim()
 
       const populated = yield* git(["reset", "--hard"], { cwd: info.directory })
       if (populated.code !== 0) {
@@ -245,11 +254,11 @@ const layer: Layer.Layer<
           workspace: workspaceID,
           payload: { type: Event.Failed.type, properties: { message } },
         })
-        return
+        return message
       }
 
       const booted = yield* store.load({ directory: info.directory }).pipe(
-        Effect.as(true),
+        Effect.as({ ok: true as const }),
         Effect.catch((error) =>
           Effect.gen(function* () {
             const message = errorMessage(error)
@@ -260,11 +269,11 @@ const layer: Layer.Layer<
               workspace: workspaceID,
               payload: { type: Event.Failed.type, properties: { message } },
             })
-            return false
+            return { ok: false as const, message }
           }),
         ),
       )
-      if (!booted) return
+      if (!booted.ok) return booted.message
 
       GlobalBus.emit("event", {
         directory: info.directory,
@@ -276,21 +285,63 @@ const layer: Layer.Layer<
         },
       })
 
-      yield* runStartScripts(info.directory, { projectID, extra })
+      return undefined
     })
 
-    const createFromInfo = Effect.fn("Worktree.createFromInfo")(function* (info: Info, startCommand?: string) {
-      yield* setup(info)
-      yield* boot(info, startCommand).pipe(
-        Effect.catchCause((cause) => Effect.logError("worktree bootstrap failed", { cause })),
-        Effect.forkIn(scope),
+    const boot = Effect.fnUntraced(function* (info: Info, startCommand?: string) {
+      const failure = yield* initialize(info)
+      if (failure) return failure
+      const ctx = yield* InstanceState.context
+      yield* runStartScripts(info.directory, { projectID: ctx.project.id, extra: startCommand?.trim() })
+      return undefined
+    })
+
+    const createFromInfo = Effect.fn("Worktree.createFromInfo")(function* (
+      info: Info,
+      startCommand?: string,
+      options?: { waitUntilReady?: boolean },
+    ) {
+      let setupComplete = false
+      yield* Effect.acquireUseRelease(
+        Effect.succeed(info),
+        () =>
+          Effect.gen(function* () {
+            yield* setup(info, () => (setupComplete = true))
+            if (options?.waitUntilReady) {
+              const failure = yield* initialize(info)
+              if (failure) return yield* new CreateFailedError({ message: failure })
+              const ctx = yield* InstanceState.context
+              yield* runStartScripts(info.directory, { projectID: ctx.project.id, extra: startCommand?.trim() }).pipe(
+                Effect.catchCause((cause) =>
+                  Effect.logError("worktree start scripts failed", { directory: info.directory, cause }),
+                ),
+                Effect.forkIn(scope),
+              )
+              return
+            }
+            yield* boot(info, startCommand).pipe(
+              Effect.catchCause((cause) => Effect.logError("worktree bootstrap failed", { cause })),
+              Effect.forkIn(scope),
+            )
+          }),
+        (_, exit) => {
+          if (!options?.waitUntilReady || !setupComplete || Exit.isSuccess(exit)) return Effect.void
+          return remove({ directory: info.directory }).pipe(
+            Effect.catchCause((cause) =>
+              Effect.logError("failed to remove worktree after initialization failure", {
+                directory: info.directory,
+                cause,
+              }),
+            ),
+          )
+        },
       )
     })
 
     const create = Effect.fn("Worktree.create")(function* (input?: CreateInput) {
       const info = yield* makeWorktreeInfo({ name: input?.name })
-      yield* createFromInfo(info, input?.startCommand)
-      return info
+      yield* createFromInfo(info, input?.startCommand, { waitUntilReady: input?.waitUntilReady })
+      return input?.waitUntilReady ? { ...info, ready: true } : info
     })
 
     const canonical = Effect.fnUntraced(function* (input: string) {
@@ -419,6 +470,7 @@ const layer: Layer.Layer<
           yield* stopFsmonitor(directory)
           yield* cleanDirectory(directory)
         }
+        yield* project.removeSandbox(ctx.project.id, input.directory)
         return true
       }
 
@@ -443,6 +495,7 @@ const layer: Layer.Layer<
       }
 
       yield* cleanDirectory(entry.path)
+      yield* project.removeSandbox(ctx.project.id, input.directory)
 
       const branch = entry.branch?.replace(/^refs\/heads\//, "")
       if (branch) {

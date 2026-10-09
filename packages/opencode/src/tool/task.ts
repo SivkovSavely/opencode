@@ -136,6 +136,12 @@ export const TaskTool = Tool.define(
       const session = params.task_id
         ? yield* sessions.get(SessionID.make(params.task_id)).pipe(Effect.catchCause(() => Effect.succeed(undefined)))
         : undefined
+      if (
+        session &&
+        (session.parentID !== parent.id || session.directory !== parent.directory || session.workspaceID !== parent.workspaceID)
+      ) {
+        return yield* Effect.fail(new Error("Cannot resume a task session from another parent or workspace"))
+      }
       const childPermission = deriveSubagentSessionPermission({
         parentSessionPermission: parent.permission ?? [],
         subagent: next,

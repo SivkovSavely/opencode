@@ -9,7 +9,7 @@ import { Config } from "@/config/config"
 import { Shell } from "@opencode-ai/core/shell"
 import { ShellTool } from "../../src/tool/shell"
 import { Filesystem } from "@/util/filesystem"
-import { provideInstance, testInstanceStoreLayer, tmpdirScoped } from "../fixture/fixture"
+import { provideInstance, testInstanceStoreLayer, tmpdirScoped, TestInstance } from "../fixture/fixture"
 import type { Permission } from "../../src/permission"
 import { Agent } from "../../src/agent/agent"
 import { Truncate } from "@/tool/truncate"
@@ -37,6 +37,7 @@ const shellLayer = Layer.mergeAll(
   testInstanceStoreLayer,
 )
 const it = testEffect(shellLayer)
+const wintest = process.platform !== "win32" ? it.instance : it.instance.skip
 type ShellTestServices =
   | (typeof shellLayer extends Layer.Layer<infer ROut, infer _E, infer _RIn> ? ROut : never)
   | InstanceStore.Service
@@ -181,6 +182,47 @@ const mustTruncate = (result: {
 }
 
 describe("tool.shell", () => {
+  wintest(
+    "defaults to the linked worktree for pwd and git commands",
+    () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        const worktrees = [
+          path.join(path.dirname(test.directory), `shell-isolation-a-${crypto.randomUUID()}`),
+          path.join(path.dirname(test.directory), `shell-isolation-b-${crypto.randomUUID()}`),
+        ]
+        const runGit = (args: string[]) => {
+          const result = Bun.spawnSync(["git", ...args], { cwd: test.directory })
+          if (result.exitCode !== 0) throw new Error(result.stderr.toString())
+        }
+
+        yield* Effect.acquireUseRelease(
+          Effect.sync(() => {
+            worktrees.forEach((directory) => runGit(["worktree", "add", "--detach", directory, "HEAD"]))
+            return worktrees
+          }),
+          (directories) =>
+            Effect.gen(function* () {
+              const results = yield* Effect.all(
+                directories.map((directory) =>
+                  run({ command: "pwd -P && git rev-parse --show-toplevel" }).pipe(provideInstance(directory)),
+                ),
+                { concurrency: "unbounded" },
+              )
+              directories.forEach((directory, index) => {
+                const output = results[index]?.output.replaceAll("\\", "/")
+                expect(output).toContain(directory.replaceAll("\\", "/"))
+              })
+            }),
+          (directories) =>
+            Effect.sync(() => {
+              directories.forEach((directory) => runGit(["worktree", "remove", "--force", directory]))
+            }),
+        )
+      }),
+    { git: true },
+  )
+
   each("basic", () =>
     runIn(
       projectRoot,

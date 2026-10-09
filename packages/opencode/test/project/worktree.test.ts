@@ -4,18 +4,40 @@ import { chmod } from "node:fs/promises"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import { Cause, Deferred, Effect, Exit, Fiber } from "effect"
+import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
+import { Agent } from "../../src/agent/agent"
 import { GlobalBus, type GlobalEvent } from "../../src/bus/global"
+import { EventV2Bridge } from "../../src/event-v2-bridge"
+import { Format } from "../../src/format"
 import { Git } from "../../src/git"
+import { LSP } from "@/lsp/lsp"
 import { InstanceBootstrap } from "../../src/project/bootstrap"
 import { InstanceStore } from "../../src/project/instance-store"
+import { MessageID, SessionID } from "../../src/session/schema"
+import { ApplyPatchTool } from "../../src/tool/apply_patch"
+import { EditTool } from "../../src/tool/edit"
+import { Tool } from "@/tool/tool"
+import { Truncate } from "@/tool/truncate"
+import { WriteTool } from "../../src/tool/write"
 import { Worktree } from "../../src/worktree"
 import { disposeAllInstances, provideInstance, TestInstance } from "../fixture/fixture"
 import { testEffect } from "../lib/effect"
 
 const it = testEffect(
-  LayerNode.compile(LayerNode.group([Worktree.node, FSUtil.node, Git.node]), [
-    [InstanceStore.bootstrapNode, InstanceBootstrap.node],
-  ]),
+  LayerNode.compile(
+    LayerNode.group([
+      Worktree.node,
+      FSUtil.node,
+      Git.node,
+      LSP.node,
+      Format.node,
+      EventV2Bridge.node,
+      Truncate.node,
+      Agent.node,
+      CrossSpawnSpawner.node,
+    ]),
+    [[InstanceStore.bootstrapNode, InstanceBootstrap.node]],
+  ),
 )
 const wintest = process.platform !== "win32" ? it.instance : it.instance.skip
 const permissionTest = process.platform !== "win32" && process.getuid?.() !== 0 ? it.instance : it.instance.skip
@@ -229,6 +251,108 @@ describe("Worktree", () => {
             expect(list).toContainEqual(expect.objectContaining({ name: info.name, branch: info.branch }))
           }),
         ),
+      { git: true },
+    )
+
+    it.instance(
+      "waits for bootstrap before returning when requested",
+      () =>
+        Effect.gen(function* () {
+          const svc = yield* Worktree.Service
+          const readyDirectories = new Set<string>()
+          const on = (event: GlobalEvent) => {
+            if (event.payload.type === Worktree.Event.Ready.type && event.directory) {
+              readyDirectories.add(event.directory)
+            }
+          }
+          GlobalBus.on("event", on)
+          yield* Effect.addFinalizer(() => Effect.sync(() => GlobalBus.off("event", on)))
+
+          const info = yield* svc.create({ waitUntilReady: true })
+          yield* Effect.addFinalizer(() => removeCreatedWorktree(info.directory).pipe(Effect.ignore))
+
+          expect(info.ready).toBe(true)
+          expect(readyDirectories.has(info.directory)).toBe(true)
+          expect(yield* Effect.promise(() => Bun.file(path.join(info.directory, ".git")).exists())).toBe(true)
+        }),
+      { git: true },
+    )
+
+    it.instance(
+      "isolates concurrent relative patches across real worktrees",
+      () =>
+        Effect.gen(function* () {
+          const test = yield* TestInstance
+          const info = yield* ApplyPatchTool
+          const tool = yield* info.init()
+          const writeInfo = yield* WriteTool
+          const write = yield* writeInfo.init()
+          const editInfo = yield* EditTool
+          const edit = yield* editInfo.init()
+          const context = {
+            sessionID: SessionID.make("ses_worktree_isolation"),
+            messageID: MessageID.make("msg_worktree_isolation"),
+            callID: "",
+            agent: "build",
+            abort: new AbortController().signal,
+            messages: [],
+            metadata: () => Effect.void,
+            ask: () => Effect.void,
+          } satisfies Tool.Context
+
+          yield* withCreatedWorktree({ name: "isolation-a" }, ({ info: a }) =>
+            withCreatedWorktree({ name: "isolation-b" }, ({ info: b }) =>
+              Effect.gen(function* () {
+                const patch = (content: string) =>
+                  tool.execute(
+                    { patchText: `*** Begin Patch\n*** Add File: isolation.txt\n+${content}\n*** End Patch` },
+                    context,
+                  )
+                yield* Effect.all(
+                  [
+                    patch("worktree-a").pipe(provideInstance(a.directory)),
+                    patch("worktree-b").pipe(provideInstance(b.directory)),
+                  ],
+                  { concurrency: "unbounded" },
+                )
+                yield* write
+                  .execute({ filePath: "relative-write.txt", content: "before edit" }, context)
+                  .pipe(provideInstance(b.directory))
+                yield* edit
+                  .execute(
+                    { filePath: "relative-write.txt", oldString: "before edit", newString: "after edit" },
+                    context,
+                  )
+                  .pipe(provideInstance(b.directory))
+
+                expect(yield* Effect.promise(() => Bun.file(path.join(a.directory, "isolation.txt")).text())).toBe(
+                  "worktree-a\n",
+                )
+                expect(yield* Effect.promise(() => Bun.file(path.join(b.directory, "isolation.txt")).text())).toBe(
+                  "worktree-b\n",
+                )
+                expect(yield* Effect.promise(() => Bun.file(path.join(test.directory, "isolation.txt")).exists())).toBe(
+                  false,
+                )
+                expect(yield* Effect.promise(() => Bun.file(path.join(b.directory, "relative-write.txt")).text())).toBe(
+                  "after edit",
+                )
+                expect(
+                  yield* Effect.promise(() => Bun.file(path.join(test.directory, "relative-write.txt")).exists()),
+                ).toBe(false)
+                expect((yield* git(a.directory, ["status", "--porcelain=v1", "--untracked-files=all"])).trim()).toBe(
+                  "?? isolation.txt",
+                )
+                expect((yield* git(b.directory, ["status", "--porcelain=v1", "--untracked-files=all"])).trim()).toBe(
+                  "?? isolation.txt\n?? relative-write.txt",
+                )
+                expect((yield* git(test.directory, ["status", "--porcelain=v1", "--untracked-files=all"])).trim()).toBe(
+                  "",
+                )
+              }),
+            ),
+          )
+        }),
       { git: true },
     )
 

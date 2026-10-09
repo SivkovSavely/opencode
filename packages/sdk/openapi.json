@@ -21970,6 +21970,10 @@
           "name": {
             "type": "string"
           },
+          "waitUntilReady": {
+            "type": "boolean",
+            "description": "Wait for worktree checkout and instance bootstrap before returning"
+          },
           "startCommand": {
             "type": "string",
             "description": "Additional startup script to run after the project's start command"
@@ -21988,6 +21992,10 @@
           },
           "directory": {
             "type": "string"
+          },
+          "ready": {
+            "type": "boolean",
+            "description": "Whether worktree checkout and instance bootstrap completed"
           }
         },
         "required": ["name", "directory"],

@@ -173,6 +173,7 @@ type ServerSDKBase = {
   url: string
   client: ReturnType<typeof createSdkForServer>
   api: CompatibleApi
+  apiForDirectory: (directory: string) => CompatibleApi
   currentApi: ServerApi
   event: {
     on: ServerEventEmitter["on"]
@@ -347,6 +348,8 @@ function createServerSdkContextBase(server: ServerConnection.Any, scope: ServerS
       directory,
     })
   const api = createCompatibleApi({ protocol, current: currentApi, legacy })
+  const apiForDirectory = (directory: string) =>
+    createCompatibleApi({ protocol, current: currentApi, legacy, directory })
 
   return {
     server,
@@ -356,6 +359,7 @@ function createServerSdkContextBase(server: ServerConnection.Any, scope: ServerS
     url: server.http.url,
     client: sdk,
     api,
+    apiForDirectory,
     currentApi,
     event: {
       on: emitter.on.bind(emitter),
@@ -427,12 +431,8 @@ function createDirSdkContext(directory: string, serverSDK: ServerSDKBase) {
     protocol: serverSDK.protocol,
     directory,
     client,
-    api: createCompatibleApi({
-      protocol: serverSDK.protocol,
-      current: serverSDK.currentApi,
-      legacy: (next) => serverSDK.createClient({ directory: next ?? directory, throwOnError: true }),
-      directory,
-    }),
+    api: serverSDK.apiForDirectory(directory),
+    apiForDirectory: serverSDK.apiForDirectory,
     event: emitter,
     get url() {
       return serverSDK.url

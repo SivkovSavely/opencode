@@ -428,6 +428,114 @@ describe("session HttpApi", () => {
   )
 
   it.instance(
+    "persists the first no-reply prompt for a worktree session",
+    () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        const directory = path.join(path.dirname(test.directory), `session-worktree-${crypto.randomUUID()}`)
+        const added = Bun.spawnSync(["git", "worktree", "add", "--detach", directory, "HEAD"], {
+          cwd: test.directory,
+        })
+        if (added.exitCode !== 0) throw new Error(added.stderr.toString())
+        yield* Effect.addFinalizer(() =>
+          Effect.sync(() =>
+            Bun.spawnSync(["git", "worktree", "remove", "--force", directory], { cwd: test.directory }),
+          ),
+        )
+
+        const session = yield* createSession({ title: "initial worktree prompt" }).pipe(
+          provideInstanceEffect(directory),
+        )
+        const response = yield* request(
+          `${pathFor(SessionPaths.prompt, { sessionID: session.id })}?directory=${encodeURIComponent(test.directory)}`,
+          {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({
+              agent: "build",
+              model: { providerID: "test", modelID: "test-model" },
+              noReply: true,
+              parts: [{ type: "text", text: "first worktree prompt" }],
+            }),
+          },
+        )
+
+        expect(response.status).toBe(200)
+        yield* responseJson(response)
+        const messages = yield* Session.use
+          .messages({ sessionID: session.id })
+          .pipe(provideInstanceEffect(directory), Effect.orDie)
+        expect(
+          messages.some(
+            (message) =>
+              message.info.role === "user" &&
+              message.parts.some((part) => part.type === "text" && part.text === "first worktree prompt"),
+          ),
+        ).toBe(true)
+        expect(
+          (yield* Session.use.get(session.id).pipe(provideInstanceEffect(directory), Effect.orDie)).directory,
+        ).toBe(directory)
+      }),
+    { git: true, config: { formatter: false, lsp: false } },
+  )
+
+  it.instance(
+    "keeps v2 session prompt admission in its persisted worktree",
+    () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        const directory = path.join(path.dirname(test.directory), `session-v2-worktree-${crypto.randomUUID()}`)
+        const added = Bun.spawnSync(["git", "worktree", "add", "--detach", directory, "HEAD"], {
+          cwd: test.directory,
+        })
+        if (added.exitCode !== 0) throw new Error(added.stderr.toString())
+        yield* Effect.addFinalizer(() =>
+          Effect.sync(() =>
+            Bun.spawnSync(["git", "worktree", "remove", "--force", directory], { cwd: test.directory }),
+          ),
+        )
+
+        const headers = { "x-opencode-directory": test.directory }
+        const created = yield* request("/api/session", {
+          method: "POST",
+          headers: { ...headers, "content-type": "application/json" },
+          body: JSON.stringify({ agent: "build", location: { directory } }),
+        })
+        const session = yield* json<{ data: { id: string; location: { directory: string } } }>(created)
+        expect(session.data.location.directory).toBe(directory)
+
+        const fetched = yield* requestJson<{ data: { location: { directory: string } } }>(
+          `/api/session/${session.data.id}`,
+          { headers },
+        )
+        expect(fetched.data.location.directory).toBe(directory)
+
+        const id = "msg_v2_worktree_first_prompt"
+        const prompt = yield* request(`/api/session/${session.data.id}/prompt`, {
+          method: "POST",
+          headers: { ...headers, "content-type": "application/json" },
+          body: JSON.stringify({ id, prompt: { text: "first worktree prompt" }, resume: false }),
+        })
+        const admitted = yield* json<{ data: { id: string; prompt: { text: string }; delivery: string } }>(prompt)
+        expect(admitted.data).toMatchObject({
+          id,
+          prompt: { text: "first worktree prompt" },
+          delivery: "steer",
+        })
+        const stored = yield* Database.Service.use(({ db }) =>
+          db
+            .select()
+            .from(SessionInputTable)
+            .where(eq(SessionInputTable.id, SessionMessage.ID.make(id)))
+            .get()
+            .pipe(Effect.orDie),
+        )
+        expect(stored).toMatchObject({ session_id: session.data.id, promoted_seq: null })
+      }),
+    { git: true, config: { formatter: false, lsp: false } },
+  )
+
+  it.instance(
     "returns v2 public request errors for cursor and workspace query failures",
     () =>
       Effect.gen(function* () {

@@ -12,6 +12,7 @@ export type PromptInputTransientState = {
   draggingType: "image" | "@mention" | null
   mode: "normal" | "shell"
   applyingHistory: boolean
+  preparing: boolean
 }
 
 function resetPromptInputTransientState(setStore: SetStoreFunction<PromptInputTransientState>) {
@@ -24,6 +25,7 @@ function resetPromptInputTransientState(setStore: SetStoreFunction<PromptInputTr
     draggingType: null,
     mode: "normal",
     applyingHistory: false,
+    preparing: false,
   })
 }
 
@@ -38,6 +40,7 @@ export function createPromptInputTransientState(identity: Accessor<unknown>, pla
     draggingType: null,
     mode: "normal",
     applyingHistory: false,
+    preparing: false,
   })
 
   createComputed(on(identity, () => resetPromptInputTransientState(setStore), { defer: true }))

@@ -7,6 +7,7 @@ import { KeybindV2 } from "@opencode-ai/ui/v2/keybind-v2"
 import { TooltipV2 } from "@opencode-ai/ui/v2/tooltip-v2"
 import type { ReferenceInfo } from "@opencode-ai/sdk/v2/client"
 import { createEffect, createMemo, on, Show } from "solid-js"
+import { createStore } from "solid-js/store"
 import { ModelSelectorPopoverV2 } from "@/components/dialog-select-model"
 import { DialogSelectModelUnpaidV2 } from "@/components/dialog-select-model-unpaid-v2"
 import type { PromptInputProps } from "@/components/prompt-input/contracts"
@@ -93,6 +94,7 @@ export function usePromptInputV2Controller(props: PromptInputV2ControllerProps):
   const language = useLanguage()
   const platform = usePlatform()
   const prompt = props.state ?? usePrompt()
+  const [submitState, setSubmitState] = createStore({ preparing: false })
   let editor: HTMLDivElement | undefined
 
   const interaction = createPromptInputV2State()
@@ -115,7 +117,9 @@ export function usePromptInputV2Controller(props: PromptInputV2ControllerProps):
     }, [])
   })
   const info = createMemo(() => (props.controls.session.id ? sync().session.get(props.controls.session.id) : undefined))
-  const working = createMemo(() => sync().data.session_working(props.controls.session.id ?? ""))
+  const working = createMemo(
+    () => submitState.preparing || sync().data.session_working(props.controls.session.id ?? ""),
+  )
   const attachments = createMemo(() =>
     prompt.current().filter((part): part is ImageAttachmentPart => part.type === "image"),
   )
@@ -130,7 +134,7 @@ export function usePromptInputV2Controller(props: PromptInputV2ControllerProps):
       .join("")
     return text.trim().length === 0 && attachments().length === 0 && commentCount() === 0
   })
-  const stopping = createMemo(() => working() && blank())
+  const stopping = createMemo(() => submitState.preparing || (working() && blank()))
   const placeholder = createMemo(() =>
     promptPlaceholder({
       mode: mode(),
@@ -221,6 +225,10 @@ export function usePromptInputV2Controller(props: PromptInputV2ControllerProps):
     onQueue: props.onQueue,
     onAbort: props.onAbort,
     onSubmit: props.onSubmit,
+    onPreparing: (value) => {
+      setSubmitState("preparing", value)
+      props.onPreparing?.(value)
+    },
     model: props.controls.model.selection,
   })
 
