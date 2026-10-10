@@ -278,9 +278,17 @@ function formatXML(value: string) {
   if (typeof DOMParser === "undefined" || typeof XMLSerializer === "undefined" || typeof Node === "undefined") return
 
   try {
-    const document = new DOMParser().parseFromString(value, "application/xml")
+    const validatedSource = renameParserErrorTags(value)
+    const validationDocument = new DOMParser().parseFromString(validatedSource, "application/xml")
+    const validationRoot = validationDocument.documentElement
+    if (!validationRoot || xmlParseError(validationRoot)) return
+
+    const document =
+      validatedSource === value
+        ? validationDocument
+        : new DOMParser().parseFromString(value, "application/xml")
     const root = document.documentElement
-    if (!root || xmlParseError(root, value) || !safeXML(root)) return
+    if (!root || !safeXML(root)) return
 
     const serializer = new XMLSerializer()
     const declaration = value.match(/^\uFEFF?<\?xml\s[^?]*\?>/)?.[0]
@@ -290,35 +298,46 @@ function formatXML(value: string) {
       .filter(Boolean)
       .join("\n")
     const output = declaration ? `${declaration}\n${formatted}` : formatted
-    const formattedDocument = new DOMParser().parseFromString(output, "application/xml")
+    const formattedSource = renameParserErrorTags(output)
+    const formattedDocument = new DOMParser().parseFromString(formattedSource, "application/xml")
     const formattedRoot = formattedDocument.documentElement
-    if (!formattedRoot || xmlParseError(formattedRoot, output)) return
+    if (!formattedRoot || xmlParseError(formattedRoot)) return
     return output
   } catch {
     return
   }
 }
 
-function xmlParseError(root: Element, source: string) {
-  const hasSourceParserError = /<((?:[\w.-]+:)?parsererror)(?=[\s/>])[^>]*>[\s\S]*?<\/\1\s*>/.test(
-    source.replace(/<!--[\s\S]*?-->|<!\[CDATA\[[\s\S]*?\]\]|<\?[\s\S]*?\?>/g, ""),
+function renameParserErrorTags(source: string) {
+  // Validate with authored parsererror tags renamed so they cannot mimic parser diagnostics.
+  return source.replace(
+    /<!--[\s\S]*?-->|<!\[CDATA\[[\s\S]*?\]\]>|<\?[\s\S]*?\?>|<(\/?)((?:[^:/\s<>]+:)?parsererror)(?=[\s/>])/g,
+    (match, close: string | undefined, name: string | undefined) =>
+      close === undefined || name === undefined
+        ? match
+        : `<${close}${name.replace(/parsererror$/, "opencode-parsererror")}`,
   )
+}
+
+function xmlParseError(root: Element) {
   if (
     root.localName === "parsererror" &&
-    root.namespaceURI === "http://www.mozilla.org/newlayout/xml/parsererror.xml" &&
-    !hasSourceParserError
+    root.namespaceURI === "http://www.mozilla.org/newlayout/xml/parsererror.xml"
   ) {
-    return true
+    return (root.textContent ?? "").startsWith("XML Parsing Error:")
   }
   const error = root.firstElementChild
   if (error?.localName !== "parsererror" || error.namespaceURI !== "http://www.w3.org/1999/xhtml") return false
   const children = Array.from(error.children)
   return (
-    !hasSourceParserError &&
+    error.getAttribute("style")?.includes("display: block") &&
+    error.getAttribute("style")?.includes("white-space: pre") &&
     children.length === 3 &&
     children[0]?.localName === "h3" &&
     children[0]?.textContent === "This page contains the following errors:" &&
     children[1]?.localName === "div" &&
+    children[1]?.getAttribute("style")?.includes("font-family:monospace") &&
+    children[1]?.getAttribute("style")?.includes("font-size:12px") &&
     /^error on line \d+ at column \d+:/.test(children[1]?.textContent ?? "") &&
     children[2]?.localName === "h3" &&
     children[2]?.textContent === "Below is a rendering of the page up to the first error."

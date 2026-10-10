@@ -300,8 +300,14 @@ test("formats structured raw strings only on request and keeps request and respo
   const skillResultsID = "prt_raw_format_skill_results"
   const parserErrorID = "prt_raw_format_parsererror"
   const namespacedParserErrorID = "prt_raw_format_namespaced_parsererror"
+  const mozillaParserErrorID = "prt_raw_format_mozilla_parsererror"
+  const simpleParserErrorID = "prt_raw_format_simple_parsererror"
   const invalidXMLID = "prt_raw_format_invalid_xml"
+  const commentedInvalidXMLID = "prt_raw_format_commented_invalid_xml"
   const invalidParserErrorXMLID = "prt_raw_format_invalid_parsererror_xml"
+  const invalidParserErrorChildXMLID = "prt_raw_format_invalid_parsererror_child_xml"
+  const invalidParserErrorBadXMLID = "prt_raw_format_invalid_parsererror_bad_xml"
+  const invalidParserErrorTrailingXMLID = "prt_raw_format_invalid_parsererror_trailing_xml"
   const svgTextID = "prt_raw_format_svg_text"
   const xhtmlTextID = "prt_raw_format_xhtml_text"
   const runningID = "prt_raw_format_running_request"
@@ -313,6 +319,12 @@ test("formats structured raw strings only on request and keeps request and respo
   const nested = "<root><item>foo</item><item>bar</item></root>"
   const skillResults =
     "<SkillSearchResults><query>code review</query><skills><skill>foo</skill></skills></SkillSearchResults>"
+  const parserErrorText = await page.evaluate(() => {
+    const parsed = new DOMParser().parseFromString("\n<root><child></root>", "application/xml")
+    return parsed.getElementsByTagNameNS("*", "parsererror")[0]?.textContent
+  })
+  if (!parserErrorText) throw new Error("Expected browser XML parser diagnostic")
+  const commentedInvalidXML = `<!--${parserErrorText}-->\n<root><child></root>`
   const timeline = await setupTimeline(page, {
     messages: [
       userMessage(),
@@ -336,16 +348,47 @@ test("formats structured raw strings only on request and keeps request and respo
           {},
           {
             output:
-              '<root><parsererror xmlns="http://www.w3.org/1999/xhtml"><h3>This page contains the following errors:</h3><div>error on line 1 at column 42: intentional diagnostic</div><h3>Below is a rendering of the page up to the first error.</h3></parsererror></root>',
+              '<root><parsererror xmlns="http://www.w3.org/1999/xhtml" style="display: block; white-space: pre"><h3>This page contains the following errors:</h3><div style="font-family:monospace;font-size:12px">error on line 1 at column 42: intentional &amp; diagnostic</div><h3>Below is a rendering of the page up to the first error.</h3></parsererror><parsererror/></root>',
           },
         ),
+        toolPart(mozillaParserErrorID, "mcp_mozilla_parsererror", "completed", {}, {
+          output:
+            '<parsererror xmlns="http://www.mozilla.org/newlayout/xml/parsererror.xml">XML Parsing Error: application &#38; diagnostic</parsererror>',
+        }),
+        toolPart(simpleParserErrorID, "mcp_simple_parsererror", "completed", {}, {
+          output: "<root><parsererror/></root>",
+        }),
         toolPart(invalidXMLID, "mcp_invalid_xml", "completed", {}, { output: "<root><child></root>" }),
+        toolPart(commentedInvalidXMLID, "mcp_commented_invalid_xml", "completed", {}, {
+          output: commentedInvalidXML,
+        }),
         toolPart(
           invalidParserErrorXMLID,
           "mcp_invalid_parsererror_xml",
           "completed",
           {},
           { output: "<root><parsererror></root>" },
+        ),
+        toolPart(
+          invalidParserErrorChildXMLID,
+          "mcp_invalid_parsererror_child_xml",
+          "completed",
+          {},
+          { output: "<root><parsererror></parsererror><child></root>" },
+        ),
+        toolPart(
+          invalidParserErrorBadXMLID,
+          "mcp_invalid_parsererror_bad_xml",
+          "completed",
+          {},
+          { output: "<root><parsererror></parsererror><bad></root>" },
+        ),
+        toolPart(
+          invalidParserErrorTrailingXMLID,
+          "mcp_invalid_parsererror_trailing_xml",
+          "completed",
+          {},
+          { output: "<root><child></root><parsererror>authored</parsererror>" },
         ),
         toolPart(
           svgTextID,
@@ -485,8 +528,32 @@ test("formats structured raw strings only on request and keeps request and respo
   )
   await namespacedParserErrorRaw.getByRole("button", { name: "Format XML" }).click()
   await expect(namespacedParserErrorBody).toHaveText(
-    '<root>\n  <parsererror xmlns="http://www.w3.org/1999/xhtml">\n    <h3 xmlns="http://www.w3.org/1999/xhtml">This page contains the following errors:</h3>\n    <div xmlns="http://www.w3.org/1999/xhtml">error on line 1 at column 42: intentional diagnostic</div>\n    <h3 xmlns="http://www.w3.org/1999/xhtml">Below is a rendering of the page up to the first error.</h3>\n  </parsererror>\n</root>',
+    '<root>\n  <parsererror xmlns="http://www.w3.org/1999/xhtml" style="display: block; white-space: pre">\n    <h3 xmlns="http://www.w3.org/1999/xhtml">This page contains the following errors:</h3>\n    <div xmlns="http://www.w3.org/1999/xhtml" style="font-family:monospace;font-size:12px">error on line 1 at column 42: intentional &amp; diagnostic</div>\n    <h3 xmlns="http://www.w3.org/1999/xhtml">Below is a rendering of the page up to the first error.</h3>\n  </parsererror>\n  <parsererror/>\n</root>',
   )
+
+  const mozillaParserErrorTool = page.locator(`[data-timeline-part-id="${mozillaParserErrorID}"]`)
+  await mozillaParserErrorTool.locator('[data-slot="collapsible-trigger"]').first().click()
+  const mozillaParserErrorRaw = mozillaParserErrorTool.locator('[data-component="raw-tool-details"]')
+  await mozillaParserErrorRaw.getByRole("button", { name: "Response" }).click()
+  const mozillaParserErrorBody = mozillaParserErrorRaw.locator(
+    '[aria-label="Response"][data-slot="raw-tool-details-body"]',
+  )
+  await expect(mozillaParserErrorRaw.getByRole("button", { name: "Format XML" })).toBeVisible()
+  await mozillaParserErrorRaw.getByRole("button", { name: "Format XML" }).click()
+  await expect(mozillaParserErrorBody).toHaveText(
+    '<parsererror xmlns="http://www.mozilla.org/newlayout/xml/parsererror.xml">XML Parsing Error: application &amp; diagnostic</parsererror>',
+  )
+
+  const simpleParserErrorTool = page.locator(`[data-timeline-part-id="${simpleParserErrorID}"]`)
+  await simpleParserErrorTool.locator('[data-slot="collapsible-trigger"]').first().click()
+  const simpleParserErrorRaw = simpleParserErrorTool.locator('[data-component="raw-tool-details"]')
+  await simpleParserErrorRaw.getByRole("button", { name: "Response" }).click()
+  const simpleParserErrorBody = simpleParserErrorRaw.locator(
+    '[aria-label="Response"][data-slot="raw-tool-details-body"]',
+  )
+  await expect(simpleParserErrorRaw.getByRole("button", { name: "Format XML" })).toBeVisible()
+  await simpleParserErrorRaw.getByRole("button", { name: "Format XML" }).click()
+  await expect(simpleParserErrorBody).toHaveText("<root>\n  <parsererror/>\n</root>")
 
   const svgTextTool = page.locator(`[data-timeline-part-id="${svgTextID}"]`)
   await svgTextTool.locator('[data-slot="collapsible-trigger"]').first().click()
@@ -509,6 +576,15 @@ test("formats structured raw strings only on request and keeps request and respo
   )
   await expect(invalidXMLRaw.getByRole("button", { name: /Format (JSON|XML)/ })).toHaveCount(0)
 
+  const commentedInvalidXMLTool = page.locator(`[data-timeline-part-id="${commentedInvalidXMLID}"]`)
+  await commentedInvalidXMLTool.locator('[data-slot="collapsible-trigger"]').first().click()
+  const commentedInvalidXMLRaw = commentedInvalidXMLTool.locator('[data-component="raw-tool-details"]')
+  await commentedInvalidXMLRaw.getByRole("button", { name: "Response" }).click()
+  await expect(
+    commentedInvalidXMLRaw.locator('[aria-label="Response"][data-slot="raw-tool-details-body"]'),
+  ).toHaveText(commentedInvalidXML)
+  await expect(commentedInvalidXMLRaw.getByRole("button", { name: /Format (JSON|XML)/ })).toHaveCount(0)
+
   const invalidParserErrorXMLTool = page.locator(`[data-timeline-part-id="${invalidParserErrorXMLID}"]`)
   await invalidParserErrorXMLTool.locator('[data-slot="collapsible-trigger"]').first().click()
   const invalidParserErrorXMLRaw = invalidParserErrorXMLTool.locator('[data-component="raw-tool-details"]')
@@ -517,6 +593,19 @@ test("formats structured raw strings only on request and keeps request and respo
     invalidParserErrorXMLRaw.locator('[aria-label="Response"][data-slot="raw-tool-details-body"]'),
   ).toHaveText("<root><parsererror></root>")
   await expect(invalidParserErrorXMLRaw.getByRole("button", { name: /Format (JSON|XML)/ })).toHaveCount(0)
+
+  for (const [id, source] of [
+    [invalidParserErrorChildXMLID, "<root><parsererror></parsererror><child></root>"],
+    [invalidParserErrorBadXMLID, "<root><parsererror></parsererror><bad></root>"],
+    [invalidParserErrorTrailingXMLID, "<root><child></root><parsererror>authored</parsererror>"],
+  ]) {
+    const tool = page.locator(`[data-timeline-part-id="${id}"]`)
+    await tool.locator('[data-slot="collapsible-trigger"]').first().click()
+    const raw = tool.locator('[data-component="raw-tool-details"]')
+    await raw.getByRole("button", { name: "Response" }).click()
+    await expect(raw.locator('[aria-label="Response"][data-slot="raw-tool-details-body"]')).toHaveText(source)
+    await expect(raw.getByRole("button", { name: /Format (JSON|XML)/ })).toHaveCount(0)
+  }
 
   const runningTool = page.locator(`[data-timeline-part-id="${runningID}"]`)
   await runningTool.locator('[data-slot="collapsible-trigger"]').first().click()
