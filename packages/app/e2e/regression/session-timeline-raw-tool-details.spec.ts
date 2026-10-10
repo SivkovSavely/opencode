@@ -296,12 +296,23 @@ test("formats structured raw strings only on request and keeps request and respo
   const mixedID = "prt_raw_format_mixed"
   const whitespaceID = "prt_raw_format_whitespace"
   const elementOnlyID = "prt_raw_format_element_only"
+  const nestedID = "prt_raw_format_nested"
+  const skillResultsID = "prt_raw_format_skill_results"
   const parserErrorID = "prt_raw_format_parsererror"
+  const namespacedParserErrorID = "prt_raw_format_namespaced_parsererror"
   const invalidXMLID = "prt_raw_format_invalid_xml"
+  const invalidParserErrorXMLID = "prt_raw_format_invalid_parsererror_xml"
+  const svgTextID = "prt_raw_format_svg_text"
+  const xhtmlTextID = "prt_raw_format_xhtml_text"
+  const runningID = "prt_raw_format_running_request"
+  const pendingID = "prt_raw_format_pending_request"
   const request = '{"query":"raw request","count":2}'
   const xml = '<?xml version="1.0"?><!--response--><response status="ok"/>'
   const json = '{"name":"example","count":2}'
   const mixed = "<p>Hello <b>world</b>!</p>"
+  const nested = "<root><item>foo</item><item>bar</item></root>"
+  const skillResults =
+    "<SkillSearchResults><query>code review</query><skills><skill>foo</skill></skills></SkillSearchResults>"
   const timeline = await setupTimeline(page, {
     messages: [
       userMessage(),
@@ -315,8 +326,53 @@ test("formats structured raw strings only on request and keeps request and respo
         toolPart(mixedID, "mcp_mixed", "completed", {}, { output: mixed }),
         toolPart(whitespaceID, "mcp_whitespace", "completed", {}, { output: "<p> <b>x</b> </p>" }),
         toolPart(elementOnlyID, "mcp_element_only", "completed", {}, { output: "<p><a/><b/></p>" }),
+        toolPart(nestedID, "mcp_nested", "completed", {}, { output: nested }),
+        toolPart(skillResultsID, "mcp_skill_results", "completed", {}, { output: skillResults }),
         toolPart(parserErrorID, "mcp_parsererror", "completed", {}, { output: "<!--valid--><parsererror/>" }),
+        toolPart(
+          namespacedParserErrorID,
+          "mcp_namespaced_parsererror",
+          "completed",
+          {},
+          {
+            output:
+              '<root><parsererror xmlns="http://www.w3.org/1999/xhtml"><h3>This page contains the following errors:</h3><div>error on line 1 at column 42: intentional diagnostic</div><h3>Below is a rendering of the page up to the first error.</h3></parsererror></root>',
+          },
+        ),
         toolPart(invalidXMLID, "mcp_invalid_xml", "completed", {}, { output: "<root><child></root>" }),
+        toolPart(
+          invalidParserErrorXMLID,
+          "mcp_invalid_parsererror_xml",
+          "completed",
+          {},
+          { output: "<root><parsererror></root>" },
+        ),
+        toolPart(
+          svgTextID,
+          "mcp_svg_text",
+          "completed",
+          {},
+          {
+            output:
+              '<svg xmlns="http://www.w3.org/2000/svg"><text><tspan>foo</tspan><tspan>bar</tspan></text></svg>',
+          },
+        ),
+        toolPart(
+          xhtmlTextID,
+          "mcp_xhtml_text",
+          "completed",
+          {},
+          {
+            output:
+              '<p xmlns="http://www.w3.org/1999/xhtml"><span>foo</span><span>bar</span></p>',
+          },
+        ),
+        toolPart(runningID, "mcp_running_request", "running", {}, {
+          metadata: { __opencode_raw_tool_details: { input: request } },
+        }),
+        toolPart(pendingID, "mcp_pending_request", "pending", {}, {
+          metadata: { __opencode_raw_tool_details: { input: '{"query":' } },
+        }),
       ]),
     ],
   })
@@ -388,16 +444,61 @@ test("formats structured raw strings only on request and keeps request and respo
   await elementOnlyTool.locator('[data-slot="collapsible-trigger"]').first().click()
   const elementOnlyRaw = elementOnlyTool.locator('[data-component="raw-tool-details"]')
   await elementOnlyRaw.getByRole("button", { name: "Response" }).click()
-  await expect(elementOnlyRaw.locator('[aria-label="Response"][data-slot="raw-tool-details-body"]')).toHaveText(
-    "<p><a/><b/></p>",
+  const elementOnlyBody = elementOnlyRaw.locator('[aria-label="Response"][data-slot="raw-tool-details-body"]')
+  await expect(elementOnlyBody).toHaveText("<p><a/><b/></p>")
+  await expect(elementOnlyRaw.getByRole("button", { name: "Format XML" })).toBeVisible()
+  await elementOnlyRaw.getByRole("button", { name: "Format XML" }).click()
+  await expect(elementOnlyBody).toHaveText("<p>\n  <a/>\n  <b/>\n</p>")
+
+  const nestedTool = page.locator(`[data-timeline-part-id="${nestedID}"]`)
+  await nestedTool.locator('[data-slot="collapsible-trigger"]').first().click()
+  const nestedRaw = nestedTool.locator('[data-component="raw-tool-details"]')
+  await nestedRaw.getByRole("button", { name: "Response" }).click()
+  const nestedBody = nestedRaw.locator('[aria-label="Response"][data-slot="raw-tool-details-body"]')
+  await expect(nestedRaw.getByRole("button", { name: "Format XML" })).toBeVisible()
+  await nestedRaw.getByRole("button", { name: "Format XML" }).click()
+  await expect(nestedBody).toHaveText("<root>\n  <item>foo</item>\n  <item>bar</item>\n</root>")
+
+  const skillResultsTool = page.locator(`[data-timeline-part-id="${skillResultsID}"]`)
+  await skillResultsTool.locator('[data-slot="collapsible-trigger"]').first().click()
+  const skillResultsRaw = skillResultsTool.locator('[data-component="raw-tool-details"]')
+  await skillResultsRaw.getByRole("button", { name: "Response" }).click()
+  const skillResultsBody = skillResultsRaw.locator('[aria-label="Response"][data-slot="raw-tool-details-body"]')
+  await expect(skillResultsRaw.getByRole("button", { name: "Format XML" })).toBeVisible()
+  await skillResultsRaw.getByRole("button", { name: "Format XML" }).click()
+  await expect(skillResultsBody).toHaveText(
+    "<SkillSearchResults>\n  <query>code review</query>\n  <skills>\n    <skill>foo</skill>\n  </skills>\n</SkillSearchResults>",
   )
-  await expect(elementOnlyRaw.getByRole("button", { name: /Format (JSON|XML)/ })).toHaveCount(0)
 
   const parserErrorTool = page.locator(`[data-timeline-part-id="${parserErrorID}"]`)
   await parserErrorTool.locator('[data-slot="collapsible-trigger"]').first().click()
   const parserErrorRaw = parserErrorTool.locator('[data-component="raw-tool-details"]')
   await parserErrorRaw.getByRole("button", { name: "Response" }).click()
   await expect(parserErrorRaw.getByRole("button", { name: "Format XML" })).toBeVisible()
+
+  const namespacedParserErrorTool = page.locator(`[data-timeline-part-id="${namespacedParserErrorID}"]`)
+  await namespacedParserErrorTool.locator('[data-slot="collapsible-trigger"]').first().click()
+  const namespacedParserErrorRaw = namespacedParserErrorTool.locator('[data-component="raw-tool-details"]')
+  await namespacedParserErrorRaw.getByRole("button", { name: "Response" }).click()
+  const namespacedParserErrorBody = namespacedParserErrorRaw.locator(
+    '[aria-label="Response"][data-slot="raw-tool-details-body"]',
+  )
+  await namespacedParserErrorRaw.getByRole("button", { name: "Format XML" }).click()
+  await expect(namespacedParserErrorBody).toHaveText(
+    '<root>\n  <parsererror xmlns="http://www.w3.org/1999/xhtml">\n    <h3 xmlns="http://www.w3.org/1999/xhtml">This page contains the following errors:</h3>\n    <div xmlns="http://www.w3.org/1999/xhtml">error on line 1 at column 42: intentional diagnostic</div>\n    <h3 xmlns="http://www.w3.org/1999/xhtml">Below is a rendering of the page up to the first error.</h3>\n  </parsererror>\n</root>',
+  )
+
+  const svgTextTool = page.locator(`[data-timeline-part-id="${svgTextID}"]`)
+  await svgTextTool.locator('[data-slot="collapsible-trigger"]').first().click()
+  const svgTextRaw = svgTextTool.locator('[data-component="raw-tool-details"]')
+  await svgTextRaw.getByRole("button", { name: "Response" }).click()
+  await expect(svgTextRaw.getByRole("button", { name: /Format (JSON|XML)/ })).toHaveCount(0)
+
+  const xhtmlTextTool = page.locator(`[data-timeline-part-id="${xhtmlTextID}"]`)
+  await xhtmlTextTool.locator('[data-slot="collapsible-trigger"]').first().click()
+  const xhtmlTextRaw = xhtmlTextTool.locator('[data-component="raw-tool-details"]')
+  await xhtmlTextRaw.getByRole("button", { name: "Response" }).click()
+  await expect(xhtmlTextRaw.getByRole("button", { name: /Format (JSON|XML)/ })).toHaveCount(0)
 
   const invalidXMLTool = page.locator(`[data-timeline-part-id="${invalidXMLID}"]`)
   await invalidXMLTool.locator('[data-slot="collapsible-trigger"]').first().click()
@@ -407,6 +508,27 @@ test("formats structured raw strings only on request and keeps request and respo
     "<root><child></root>",
   )
   await expect(invalidXMLRaw.getByRole("button", { name: /Format (JSON|XML)/ })).toHaveCount(0)
+
+  const invalidParserErrorXMLTool = page.locator(`[data-timeline-part-id="${invalidParserErrorXMLID}"]`)
+  await invalidParserErrorXMLTool.locator('[data-slot="collapsible-trigger"]').first().click()
+  const invalidParserErrorXMLRaw = invalidParserErrorXMLTool.locator('[data-component="raw-tool-details"]')
+  await invalidParserErrorXMLRaw.getByRole("button", { name: "Response" }).click()
+  await expect(
+    invalidParserErrorXMLRaw.locator('[aria-label="Response"][data-slot="raw-tool-details-body"]'),
+  ).toHaveText("<root><parsererror></root>")
+  await expect(invalidParserErrorXMLRaw.getByRole("button", { name: /Format (JSON|XML)/ })).toHaveCount(0)
+
+  const runningTool = page.locator(`[data-timeline-part-id="${runningID}"]`)
+  await runningTool.locator('[data-slot="collapsible-trigger"]').first().click()
+  const runningRaw = runningTool.locator('[data-component="raw-tool-details"]')
+  await runningRaw.getByRole("button", { name: "Request" }).click()
+  await expect(runningRaw.getByRole("button", { name: "Format JSON" })).toBeVisible()
+
+  const pendingTool = page.locator(`[data-timeline-part-id="${pendingID}"]`)
+  await pendingTool.locator('[data-slot="collapsible-trigger"]').first().click()
+  const pendingRaw = pendingTool.locator('[data-component="raw-tool-details"]')
+  await pendingRaw.getByRole("button", { name: "Request" }).click()
+  await expect(pendingRaw.getByRole("button", { name: /Format (JSON|XML)/ })).toHaveCount(0)
   await timeline.settle()
 })
 

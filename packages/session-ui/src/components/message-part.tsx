@@ -1129,9 +1129,7 @@ export function ContextToolGroup(props: {
                           <RawToolDetails
                             request={() => rawToolRequest(partAccessor())}
                             response={() => rawToolResponse(partAccessor())}
-                            streaming={() =>
-                              partAccessor().state.status === "pending" || partAccessor().state.status === "running"
-                            }
+                            requestIncomplete={() => partAccessor().state.status === "pending"}
                           />
                         )}
                         deferContent
@@ -1572,7 +1570,7 @@ PART_MAPPING["tool"] = function ToolPartDisplay(props) {
       <RawToolDetails
         request={() => rawToolRequest(part())}
         response={() => rawToolResponse(part())}
-        streaming={() => part().state.status === "pending" || part().state.status === "running"}
+        requestIncomplete={() => part().state.status === "pending"}
       />
     ),
   )

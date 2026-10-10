@@ -280,7 +280,7 @@ function formatXML(value: string) {
   try {
     const document = new DOMParser().parseFromString(value, "application/xml")
     const root = document.documentElement
-    if (!root || xmlParseError(root) || !safeXML(root)) return
+    if (!root || xmlParseError(root, value) || !safeXML(root)) return
 
     const serializer = new XMLSerializer()
     const declaration = value.match(/^\uFEFF?<\?xml\s[^?]*\?>/)?.[0]
@@ -292,16 +292,37 @@ function formatXML(value: string) {
     const output = declaration ? `${declaration}\n${formatted}` : formatted
     const formattedDocument = new DOMParser().parseFromString(output, "application/xml")
     const formattedRoot = formattedDocument.documentElement
-    if (!formattedRoot || xmlParseError(formattedRoot)) return
-    if (formattedRoot.textContent !== root.textContent) return
+    if (!formattedRoot || xmlParseError(formattedRoot, output)) return
     return output
   } catch {
     return
   }
 }
 
-function xmlParseError(root: Element) {
-  return root.localName === "parsererror" && root.namespaceURI === "http://www.mozilla.org/newlayout/xml/parsererror.xml"
+function xmlParseError(root: Element, source: string) {
+  const hasSourceParserError = /<((?:[\w.-]+:)?parsererror)(?=[\s/>])[^>]*>[\s\S]*?<\/\1\s*>/.test(
+    source.replace(/<!--[\s\S]*?-->|<!\[CDATA\[[\s\S]*?\]\]|<\?[\s\S]*?\?>/g, ""),
+  )
+  if (
+    root.localName === "parsererror" &&
+    root.namespaceURI === "http://www.mozilla.org/newlayout/xml/parsererror.xml" &&
+    !hasSourceParserError
+  ) {
+    return true
+  }
+  const error = root.firstElementChild
+  if (error?.localName !== "parsererror" || error.namespaceURI !== "http://www.w3.org/1999/xhtml") return false
+  const children = Array.from(error.children)
+  return (
+    !hasSourceParserError &&
+    children.length === 3 &&
+    children[0]?.localName === "h3" &&
+    children[0]?.textContent === "This page contains the following errors:" &&
+    children[1]?.localName === "div" &&
+    /^error on line \d+ at column \d+:/.test(children[1]?.textContent ?? "") &&
+    children[2]?.localName === "h3" &&
+    children[2]?.textContent === "Below is a rendering of the page up to the first error."
+  )
 }
 
 function safeXML(node: Node, preserve = false): boolean {
@@ -314,6 +335,20 @@ function safeXML(node: Node, preserve = false): boolean {
 
   const children = Array.from(element.childNodes)
   const hasElements = children.some((child) => child.nodeType === Node.ELEMENT_NODE)
+  if (
+    hasElements &&
+    element.namespaceURI === "http://www.w3.org/1999/xhtml" &&
+    element.localName !== "parsererror"
+  ) {
+    return false
+  }
+  if (
+    hasElements &&
+    element.namespaceURI === "http://www.w3.org/2000/svg" &&
+    ["text", "tspan", "textPath"].includes(element.localName)
+  ) {
+    return false
+  }
   if (
     hasElements &&
     children.some(
@@ -344,7 +379,9 @@ function formatXMLNode(node: Node, depth: number, serializer: XMLSerializer, doc
     return indent + serializer.serializeToString(element)
   }
 
-  const opening = serializer.serializeToString(element.cloneNode(false) as Element).replace(/\s*\/>$/, ">")
+  const serialized = serializer.serializeToString(element.cloneNode(false) as Element)
+  const end = serialized.indexOf(">")
+  const opening = `${serialized.slice(0, end).replace(/\/$/, "")}>`
   const content = children
     .map((child) => formatXMLNode(child, depth + 1, serializer))
     .filter(Boolean)
@@ -432,7 +469,7 @@ function RawSection(props: { label: string; ariaLabel: string; content: () => JS
 function RawValue(props: {
   value: () => unknown
   label: string
-  streaming: () => boolean
+  incomplete?: () => boolean
   formatted: () => FormattedRawValue | undefined
   onFormat: (value: FormattedRawValue) => void
   onRaw: () => void
@@ -441,7 +478,7 @@ function RawValue(props: {
   const value = createMemo(props.value)
   const format = createMemo(() => {
     const current = value()
-    return !props.streaming() && typeof current === "string" ? formatRawToolString(current) : undefined
+    return !props.incomplete?.() && typeof current === "string" ? formatRawToolString(current) : undefined
   })
   const formatted = () => {
     const current = value()
@@ -494,7 +531,7 @@ function RawValue(props: {
 export function RawToolDetails(props: {
   request: () => unknown
   response: () => RawToolResponse | undefined
-  streaming: () => boolean
+  requestIncomplete: () => boolean
 }) {
   const i18n = useI18n()
   const [formattedRequest, setFormattedRequest] = createSignal<FormattedRawValue>()
@@ -511,7 +548,7 @@ export function RawToolDetails(props: {
             <RawValue
               value={request}
               label={i18n.t("ui.tool.rawDetails.request")}
-              streaming={props.streaming}
+              incomplete={props.requestIncomplete}
               formatted={formattedRequest}
               onFormat={setFormattedRequest}
               onRaw={() => setFormattedRequest(undefined)}
@@ -534,7 +571,6 @@ export function RawToolDetails(props: {
                   <RawValue
                     value={() => value().value}
                     label={i18n.t("ui.tool.rawDetails.response")}
-                    streaming={props.streaming}
                     formatted={formattedResponse}
                     onFormat={setFormattedResponse}
                     onRaw={() => setFormattedResponse(undefined)}
