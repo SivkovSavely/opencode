@@ -54,7 +54,12 @@ const cacheDir = path.join(dir, "cache", "opencode")
 await fs.mkdir(cacheDir, { recursive: true })
 await fs.writeFile(path.join(cacheDir, "version"), "14")
 
-// Clear provider and server auth env vars to ensure clean test state
+// Clear user config overrides, provider, and server auth env vars to ensure clean test state
+delete process.env["OPENCODE_CONFIG"]
+delete process.env["OPENCODE_CONFIG_DIR"]
+delete process.env["OPENCODE_CONFIG_CONTENT"]
+delete process.env["OPENCODE_DISABLE_PROJECT_CONFIG"]
+delete process.env["OPENCODE_AUTH_CONTENT"]
 delete process.env["ANTHROPIC_API_KEY"]
 delete process.env["OPENAI_API_KEY"]
 delete process.env["GOOGLE_API_KEY"]

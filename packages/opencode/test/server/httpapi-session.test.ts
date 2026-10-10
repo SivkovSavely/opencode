@@ -396,6 +396,7 @@ describe("session HttpApi", () => {
       const config = testProviderConfig(llm.url)
       const sessionDirectory = yield* tmpdirScoped({ git: true, config })
       const requestDirectory = yield* tmpdirScoped({ git: true, config })
+      expect(requestDirectory).not.toBe(sessionDirectory)
       const session = yield* createSession({ title: "directory regression" }).pipe(
         provideInstanceEffect(sessionDirectory),
       )
@@ -404,7 +405,10 @@ describe("session HttpApi", () => {
         `${pathFor(SessionPaths.prompt, { sessionID: session.id })}?directory=${encodeURIComponent(requestDirectory)}`,
         {
           method: "POST",
-          headers: { "content-type": "application/json" },
+          headers: {
+            "content-type": "application/json",
+            "x-opencode-directory": requestDirectory,
+          },
           body: JSON.stringify({
             agent: "build",
             model: { providerID: "test", modelID: "test-model" },
@@ -414,16 +418,25 @@ describe("session HttpApi", () => {
       )
 
       expect(response.status).toBe(200)
-      yield* responseJson(response)
+      const promptMessage = (yield* responseJson(response)) as SessionV1.WithParts
+      expect(promptMessage.info.role).toBe("assistant")
+      expect(promptMessage.parts.some((part) => part.type === "text" && part.text === "ok")).toBe(true)
+      const inputs = yield* llm.inputs
+      expect(inputs).toHaveLength(1)
+      expect(JSON.stringify(inputs[0])).toContain("which directory?")
 
       const messages = yield* Session.use
         .messages({ sessionID: session.id })
         .pipe(provideInstanceEffect(sessionDirectory), Effect.orDie)
+      const user = messages.find((message) => message.info.role === "user")
       const assistant = messages.find((message) => message.info.role === "assistant")
+      expect(user?.parts.some((part) => part.type === "text" && part.text === "which directory?")).toBe(true)
+      expect(assistant?.parts.some((part) => part.type === "text" && part.text === "ok")).toBe(true)
       expect(assistant?.info.role === "assistant" ? assistant.info.path : undefined).toEqual({
         cwd: sessionDirectory,
         root: sessionDirectory,
       })
+      expect(assistant?.info.role === "assistant" ? assistant.info.path?.cwd : undefined).not.toBe(requestDirectory)
     }).pipe(Effect.provide(TestLLMServer.layer), Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node))),
   )
 
