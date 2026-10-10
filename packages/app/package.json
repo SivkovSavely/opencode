@@ -25,6 +25,8 @@
     "test:unit:watch": "bun test --conditions=solid --watch --preload ./happydom.ts ./src",
     "test:e2e": "playwright test",
     "test:e2e:local": "playwright test",
+    "test:e2e:worktree": "bun e2e/fullstack/run.ts",
+    "test:e2e:worktree:recover": "bun e2e/fullstack/run.ts --recover-stale",
     "test:e2e:ui": "playwright test --ui",
     "test:e2e:report": "playwright show-report e2e/playwright-report",
     "test:stability": "bun test ./e2e/performance/unit/visual-stability.test.ts && playwright test --config e2e/performance/timeline-stability/playwright.config.ts",

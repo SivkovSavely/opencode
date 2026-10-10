@@ -1,6 +1,6 @@
 import { beforeAll, beforeEach, describe, expect, mock, test } from "bun:test"
 import { createStore } from "solid-js/store"
-import type { ImageAttachmentPart, Prompt, PromptScope, PromptStore } from "@/context/prompt"
+import type { ContextItem, ImageAttachmentPart, Prompt, PromptScope, PromptStore } from "@/context/prompt"
 import type { ModelSelection } from "@/context/local"
 import { ServerScope } from "@/utils/server-scope"
 import { Worktree as WorktreeState } from "@/utils/worktree"
@@ -53,15 +53,19 @@ let createSessionGate: Promise<void> | undefined
 let createWorktreeGate: Promise<void> | undefined
 let promptGate: Promise<void> | undefined
 let promptError: Error | undefined
+let promptErrorDirectory: string | undefined
 let sessionCreateError: Error | undefined
 let worktreeCreateError: Error | undefined
 let worktreeCreateReady: boolean | undefined
 let onPromptStarted: () => void = () => undefined
 let onImageEncodingStarted: () => void = () => undefined
 let imageGate: Promise<void> | undefined
+let promptGateDirectory: string | undefined
 let newWorktreeDirectory = "/repo/main/new"
 let promptResets = 0
 let currentPathname = "/repo/main/session"
+let promptContextItems: (ContextItem & { key: string })[] = []
+let sessionContextItems: (ContextItem & { key: string })[] = []
 
 let promptValue: Prompt = [{ type: "text", content: "ls", start: 0, end: 2 }]
 let sessionPromptValue: Prompt = [{ type: "text", content: "", start: 0, end: 0 }]
@@ -69,6 +73,30 @@ const [promptStore, setPromptStore] = createStore<PromptStore>({
   prompt: promptValue,
   cursor: 0,
   context: { items: [] },
+})
+const contextFor = (items: (ContextItem & { key: string })[]) => ({
+  items: () => items,
+  add: (item: ContextItem) => {
+    const key = `${item.path}:${item.commentID ?? ""}`
+    if (items.some((current) => current.key === key)) return
+    items.push({ key, ...item })
+  },
+  remove: (key: string) => {
+    const index = items.findIndex((item) => item.key === key)
+    if (index !== -1) items.splice(index, 1)
+  },
+  removeComment: (path: string, commentID: string) => {
+    const index = items.findIndex((item) => item.type === "file" && item.path === path && item.commentID === commentID)
+    if (index !== -1) items.splice(index, 1)
+  },
+  updateComment: (path: string, commentID: string, next: Partial<ContextItem> & { comment?: string }) => {
+    const index = items.findIndex((item) => item.type === "file" && item.path === path && item.commentID === commentID)
+    if (index === -1) return
+    items[index] = { ...items[index]!, ...next, key: items[index]!.key } as ContextItem & { key: string }
+  },
+  replaceComments: (values: ContextItem[]) => {
+    items.splice(0, items.length, ...values.map((item) => ({ key: `${item.path}:${item.commentID ?? ""}`, ...item })))
+  },
 })
 const prompt = {
   store: [() => promptStore, setPromptStore] as [() => PromptStore, typeof setPromptStore],
@@ -87,20 +115,14 @@ const prompt = {
   set: (value: Prompt) => {
     promptValue = value
   },
-  context: {
-    add: () => undefined,
-    remove: () => undefined,
-    removeComment: () => undefined,
-    updateComment: () => undefined,
-    replaceComments: () => undefined,
-    items: () => [],
-  },
+  context: contextFor(promptContextItems),
   capture: (scope?: PromptScope) => (scope && "id" in scope && scope.id ? (sessionPrompt ?? prompt) : prompt),
 }
 
 let sessionPrompt: typeof prompt | undefined
 sessionPrompt = {
   ...prompt,
+  context: contextFor(sessionContextItems),
   current: () => sessionPromptValue,
   cursor: () => sessionPromptValue.reduce((sum, part) => sum + ("content" in part ? part.content.length : 0), 0),
   reset: () => {
@@ -140,8 +162,8 @@ const clientFor = (directory: string) => {
           sentPrompts.push(directory)
           promptInputs.push(input)
           onPromptStarted()
-          await promptGate
-          if (promptError) throw promptError
+          if (!promptGateDirectory || promptGateDirectory === directory) await promptGate
+          if (promptError && (!promptErrorDirectory || promptErrorDirectory === directory)) throw promptError
           return { data: undefined }
         },
         command: async (input: unknown) => {
@@ -403,12 +425,16 @@ beforeEach(() => {
   createWorktreeGate = undefined
   promptGate = undefined
   promptError = undefined
+  promptErrorDirectory = undefined
   sessionCreateError = undefined
   worktreeCreateError = undefined
   worktreeCreateReady = true
   onPromptStarted = () => undefined
   onImageEncodingStarted = () => undefined
   imageGate = undefined
+  promptGateDirectory = undefined
+  promptContextItems.length = 0
+  sessionContextItems.length = 0
   newWorktreeDirectory = `/tmp/opencode-submit-${crypto.randomUUID()}`
   currentPathname = "/repo/main/session"
   promptResets = 0
@@ -637,6 +663,12 @@ describe("prompt submit worktree selection", () => {
     WorktreeState.ready(ServerScope.local, newWorktreeDirectory)
     await request
 
+    expect(removedWorktrees).toEqual([
+      {
+        directory: "/repo/main",
+        worktreeRemoveInput: { directory: newWorktreeDirectory },
+      },
+    ])
     expect(sessionCreateInputs).toHaveLength(0)
     expect(sentPrompts).toHaveLength(0)
     expect(promptValue).toEqual([{ type: "text", content: "ls", start: 0, end: 2 }])
@@ -725,6 +757,215 @@ describe("prompt submit worktree selection", () => {
     expect(sentPrompts).toEqual([newWorktreeDirectory, "/repo/main"])
     releasePrompt()
     await Promise.all([first, second])
+  })
+
+  test("keeps a prepared worktree retry when another route submits", async () => {
+    selected = "create"
+    promptGateDirectory = newWorktreeDirectory
+    promptError = new Error("temporary prompt failure")
+    promptErrorDirectory = newWorktreeDirectory
+    let releasePrompt = () => {}
+    promptGate = new Promise<void>((resolve) => {
+      releasePrompt = resolve
+    })
+    let releaseStarted = () => {}
+    const firstPromptStarted = new Promise<void>((resolve) => {
+      releaseStarted = resolve
+    })
+    onPromptStarted = () => {
+      if (sentPrompts.length === 1) releaseStarted()
+    }
+    const submit = createSubmit()
+    const first = submit.handleSubmit({ preventDefault: () => undefined } as unknown as Event)
+    await firstPromptStarted
+
+    currentPathname = "/repo/main/session/session-2"
+    params = { id: "session-2" }
+    selected = "main"
+    sessionPrompt!.set([{ type: "text", content: "pwd", start: 0, end: 3 }])
+    await submit.handleSubmit({ preventDefault: () => undefined } as unknown as Event)
+    releasePrompt()
+    await first
+
+    expect(toasts).toContainEqual(expect.objectContaining({ title: "prompt.toast.promptSendFailed.title" }))
+
+    promptError = undefined
+    currentPathname = "/repo/main/session"
+    params = {}
+    selected = "create"
+    promptValue = [{ type: "text", content: "ls", start: 0, end: 2 }]
+    await submit.handleSubmit({ preventDefault: () => undefined } as unknown as Event)
+
+    expect(createdWorktrees).toHaveLength(1)
+    expect(sessionCreateInputs).toHaveLength(1)
+    expect(sentPrompts).toEqual([newWorktreeDirectory, "/repo/main", newWorktreeDirectory])
+    expect(promptInputs.map((value) => (value as { sessionID: string }).sessionID)).toEqual([
+      "session-1",
+      "session-2",
+      "session-1",
+    ])
+  })
+
+  test("stops the current session instead of a preparing worktree after navigation", async () => {
+    selected = "create"
+    promptGateDirectory = newWorktreeDirectory
+    let releasePrompt = () => {}
+    promptGate = new Promise<void>((resolve) => {
+      releasePrompt = resolve
+    })
+    const promptStarted = new Promise<void>((resolve) => {
+      onPromptStarted = resolve
+    })
+    const submit = createSubmit()
+    const request = submit.handleSubmit({ preventDefault: () => undefined } as unknown as Event)
+    await promptStarted
+
+    currentPathname = "/repo/main/session/session-2"
+    params.id = "session-2"
+    await submit.abort()
+    releasePrompt()
+    await request
+
+    expect(interrupted).toEqual(["session-2"])
+    expect(sentPrompts).toEqual([newWorktreeDirectory])
+    expect(navigated).toHaveLength(0)
+  })
+
+  test("keeps an admitted prompt sent when Stop races its response", async () => {
+    selected = "create"
+    promptGateDirectory = newWorktreeDirectory
+    let releasePrompt = () => {}
+    promptGate = new Promise<void>((resolve) => {
+      releasePrompt = resolve
+    })
+    const promptStarted = new Promise<void>((resolve) => {
+      onPromptStarted = resolve
+    })
+    const submit = createSubmit()
+    const request = submit.handleSubmit({ preventDefault: () => undefined } as unknown as Event)
+    await promptStarted
+
+    await submit.abort()
+    releasePrompt()
+    await request
+
+    expect(interrupted).toEqual(["session-1", "session-1"])
+    expect(sentPrompts).toEqual([newWorktreeDirectory])
+    expect(promptValue).toEqual([{ type: "text", content: "", start: 0, end: 0 }])
+    expect(navigated).toEqual([`/${newWorktreeDirectory}/session/session-1`])
+  })
+
+  test("interrupts the current session when its worktree selection is stale", async () => {
+    params = { id: "session-1" }
+    selected = "create"
+    promptGateDirectory = "/repo/main"
+    let releasePrompt = () => {}
+    promptGate = new Promise<void>((resolve) => {
+      releasePrompt = resolve
+    })
+    const promptStarted = new Promise<void>((resolve) => {
+      onPromptStarted = resolve
+    })
+    const submit = createSubmit()
+    const request = submit.handleSubmit({ preventDefault: () => undefined } as unknown as Event)
+    await promptStarted
+
+    await submit.abort()
+    releasePrompt()
+    await request
+
+    expect(createdWorktrees).toHaveLength(0)
+    expect(interrupted).toEqual(["session-1"])
+  })
+
+  test("cleans up a failed worktree reused after a readiness timeout", async () => {
+    selected = "create"
+    worktreeCreateReady = false
+    const failedDirectory = newWorktreeDirectory
+    const submit = createSubmit({ worktreeReadyTimeoutMs: 0 })
+    const event = { preventDefault: () => undefined } as unknown as Event
+
+    await submit.handleSubmit(event)
+    expect(createdWorktrees).toHaveLength(1)
+    expect(createdSessions).toHaveLength(0)
+
+    WorktreeState.failed(ServerScope.local, failedDirectory, "late bootstrap failure")
+    await submit.handleSubmit(event)
+
+    expect(removedWorktrees).toContainEqual(
+      expect.objectContaining({ worktreeRemoveInput: { directory: failedDirectory } }),
+    )
+    expect(createdWorktrees).toHaveLength(1)
+
+    newWorktreeDirectory = `${failedDirectory}-retry`
+    worktreeCreateReady = true
+    promptValue = [{ type: "text", content: "retry", start: 0, end: 5 }]
+    await submit.handleSubmit(event)
+
+    expect(createdWorktrees).toHaveLength(2)
+    expect(createdSessions).toEqual([newWorktreeDirectory])
+    expect(sentPrompts).toEqual([newWorktreeDirectory])
+  })
+
+  test("cleans up a reused worktree when Stop cancels its readiness wait", async () => {
+    selected = "create"
+    worktreeCreateReady = false
+    const cancelledDirectory = newWorktreeDirectory
+    const submit = createSubmit({ worktreeReadyTimeoutMs: 0 })
+    const event = { preventDefault: () => undefined } as unknown as Event
+
+    await submit.handleSubmit(event)
+    const retry = submit.handleSubmit(event)
+    const stop = submit.abort()
+    await Promise.all([retry, stop])
+
+    expect(createdWorktrees).toHaveLength(1)
+    expect(removedWorktrees).toContainEqual(
+      expect.objectContaining({ worktreeRemoveInput: { directory: cancelledDirectory } }),
+    )
+    expect(createdSessions).toHaveLength(0)
+
+    newWorktreeDirectory = `${cancelledDirectory}-retry`
+    worktreeCreateReady = true
+    promptValue = [{ type: "text", content: "retry", start: 0, end: 5 }]
+    await submit.handleSubmit(event)
+
+    expect(createdWorktrees).toHaveLength(2)
+    expect(createdSessions).toEqual([newWorktreeDirectory])
+    expect(sentPrompts).toEqual([newWorktreeDirectory])
+  })
+
+  test("preserves an edited comment while promoting a worktree prompt", async () => {
+    selected = "create"
+    const comment: ContextItem & { key: string } = {
+      key: "/repo/main/notes.md:comment-1",
+      type: "file",
+      path: "/repo/main/notes.md",
+      comment: "submitted comment",
+      commentID: "comment-1",
+    }
+    promptContextItems.push(comment)
+    promptGateDirectory = newWorktreeDirectory
+    let releasePrompt = () => {}
+    promptGate = new Promise<void>((resolve) => {
+      releasePrompt = resolve
+    })
+    const promptStarted = new Promise<void>((resolve) => {
+      onPromptStarted = resolve
+    })
+    const submit = createSubmit({ commentCount: () => promptContextItems.length })
+    const request = submit.handleSubmit({ preventDefault: () => undefined } as unknown as Event)
+    await promptStarted
+
+    prompt.context.updateComment(comment.path, comment.commentID!, { comment: "edited while sending" })
+    releasePrompt()
+    await request
+
+    expect(sessionContextItems).toContainEqual(expect.objectContaining({
+      key: comment.key,
+      comment: "edited while sending",
+      commentID: comment.commentID,
+    }))
   })
 
   test("does not navigate back if the user changes routes during initial prompt submission", async () => {
