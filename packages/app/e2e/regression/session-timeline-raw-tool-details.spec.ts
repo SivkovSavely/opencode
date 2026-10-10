@@ -289,6 +289,127 @@ test("exposes raw request and response for generic MCP tools", async ({ page }) 
   await timeline.settle()
 })
 
+test("formats structured raw strings only on request and keeps request and response independent", async ({ page }) => {
+  const xmlID = "prt_raw_format_xml"
+  const jsonID = "prt_raw_format_json"
+  const textID = "prt_raw_format_text"
+  const mixedID = "prt_raw_format_mixed"
+  const whitespaceID = "prt_raw_format_whitespace"
+  const elementOnlyID = "prt_raw_format_element_only"
+  const parserErrorID = "prt_raw_format_parsererror"
+  const invalidXMLID = "prt_raw_format_invalid_xml"
+  const request = '{"query":"raw request","count":2}'
+  const xml = '<?xml version="1.0"?><!--response--><response status="ok"/>'
+  const json = '{"name":"example","count":2}'
+  const mixed = "<p>Hello <b>world</b>!</p>"
+  const timeline = await setupTimeline(page, {
+    messages: [
+      userMessage(),
+      assistantMessage([
+        toolPart(xmlID, "mcp_xml", "completed", {}, {
+          output: xml,
+          metadata: { __opencode_raw_tool_details: { input: request } },
+        }),
+        toolPart(jsonID, "mcp_json", "completed", {}, { output: json }),
+        toolPart(textID, "mcp_text", "completed", {}, { output: "plain text response" }),
+        toolPart(mixedID, "mcp_mixed", "completed", {}, { output: mixed }),
+        toolPart(whitespaceID, "mcp_whitespace", "completed", {}, { output: "<p> <b>x</b> </p>" }),
+        toolPart(elementOnlyID, "mcp_element_only", "completed", {}, { output: "<p><a/><b/></p>" }),
+        toolPart(parserErrorID, "mcp_parsererror", "completed", {}, { output: "<!--valid--><parsererror/>" }),
+        toolPart(invalidXMLID, "mcp_invalid_xml", "completed", {}, { output: "<root><child></root>" }),
+      ]),
+    ],
+  })
+
+  const xmlTool = page.locator(`[data-timeline-part-id="${xmlID}"]`)
+  await xmlTool.locator('[data-slot="collapsible-trigger"]').first().click()
+  const xmlRaw = xmlTool.locator('[data-component="raw-tool-details"]')
+  await xmlRaw.getByRole("button", { name: "Request" }).click()
+  const requestBody = xmlRaw.locator('[aria-label="Request"][data-slot="raw-tool-details-body"]')
+  await expect(requestBody).toHaveText(request)
+  await xmlRaw.getByRole("button", { name: "Format JSON" }).click()
+  await expect(requestBody).toHaveText('{\n  "query": "raw request",\n  "count": 2\n}')
+
+  await xmlRaw.getByRole("button", { name: "Response" }).click()
+  const xmlBody = xmlRaw.locator('[aria-label="Response"][data-slot="raw-tool-details-body"]')
+  const xmlValue = xmlRaw.locator('[data-slot="raw-tool-details-value"]').nth(1)
+  await expect(xmlBody).toHaveText(xml)
+  await expect(xmlRaw.getByRole("button", { name: "Format XML" })).toBeVisible()
+  await xmlRaw.getByRole("button", { name: "Format XML" }).click()
+  await expect(xmlValue.getByRole("button", { name: "Show raw" })).toBeFocused()
+  await expect(xmlBody).toHaveText('<?xml version="1.0"?>\n<!--response-->\n<response status="ok"/>')
+  await expect(requestBody).toHaveText('{\n  "query": "raw request",\n  "count": 2\n}')
+  await xmlRaw.getByRole("button", { name: "Response" }).click()
+  await xmlRaw.getByRole("button", { name: "Response" }).click()
+  await expect(xmlBody).toContainText("\n<!--response-->")
+  await expect(xmlValue.getByRole("button", { name: "Show raw" })).toBeVisible()
+
+  const jsonTool = page.locator(`[data-timeline-part-id="${jsonID}"]`)
+  await jsonTool.locator('[data-slot="collapsible-trigger"]').first().click()
+  const jsonRaw = jsonTool.locator('[data-component="raw-tool-details"]')
+  await jsonRaw.getByRole("button", { name: "Response" }).click()
+  const jsonBody = jsonRaw.locator('[aria-label="Response"][data-slot="raw-tool-details-body"]')
+  const jsonValue = jsonRaw.locator('[data-slot="raw-tool-details-value"]')
+  await expect(jsonBody).toHaveText(json)
+  await jsonRaw.getByRole("button", { name: "Format JSON" }).click()
+  await expect(jsonValue.getByRole("button", { name: "Show raw" })).toBeFocused()
+  await expect(jsonBody).toHaveText('{\n  "name": "example",\n  "count": 2\n}')
+  await jsonValue.getByRole("button", { name: "Show raw" }).click()
+  await expect(jsonBody).toHaveText(json)
+  await jsonRaw.getByRole("button", { name: "Format JSON" }).click()
+  await expect(jsonBody).toHaveText('{\n  "name": "example",\n  "count": 2\n}')
+
+  const textTool = page.locator(`[data-timeline-part-id="${textID}"]`)
+  await textTool.locator('[data-slot="collapsible-trigger"]').first().click()
+  const textRaw = textTool.locator('[data-component="raw-tool-details"]')
+  await textRaw.getByRole("button", { name: "Response" }).click()
+  await expect(textRaw.locator('[aria-label="Response"][data-slot="raw-tool-details-body"]')).toHaveText(
+    "plain text response",
+  )
+  await expect(textRaw.getByRole("button", { name: /Format (JSON|XML)/ })).toHaveCount(0)
+
+  const mixedTool = page.locator(`[data-timeline-part-id="${mixedID}"]`)
+  await mixedTool.locator('[data-slot="collapsible-trigger"]').first().click()
+  const mixedRaw = mixedTool.locator('[data-component="raw-tool-details"]')
+  await mixedRaw.getByRole("button", { name: "Response" }).click()
+  await expect(mixedRaw.locator('[aria-label="Response"][data-slot="raw-tool-details-body"]')).toHaveText(mixed)
+  await expect(mixedRaw.getByRole("button", { name: /Format (JSON|XML)/ })).toHaveCount(0)
+
+  const whitespaceTool = page.locator(`[data-timeline-part-id="${whitespaceID}"]`)
+  await whitespaceTool.locator('[data-slot="collapsible-trigger"]').first().click()
+  const whitespaceRaw = whitespaceTool.locator('[data-component="raw-tool-details"]')
+  await whitespaceRaw.getByRole("button", { name: "Response" }).click()
+  await expect(whitespaceRaw.locator('[aria-label="Response"][data-slot="raw-tool-details-body"]')).toHaveText(
+    "<p> <b>x</b> </p>",
+  )
+  await expect(whitespaceRaw.getByRole("button", { name: /Format (JSON|XML)/ })).toHaveCount(0)
+
+  const elementOnlyTool = page.locator(`[data-timeline-part-id="${elementOnlyID}"]`)
+  await elementOnlyTool.locator('[data-slot="collapsible-trigger"]').first().click()
+  const elementOnlyRaw = elementOnlyTool.locator('[data-component="raw-tool-details"]')
+  await elementOnlyRaw.getByRole("button", { name: "Response" }).click()
+  await expect(elementOnlyRaw.locator('[aria-label="Response"][data-slot="raw-tool-details-body"]')).toHaveText(
+    "<p><a/><b/></p>",
+  )
+  await expect(elementOnlyRaw.getByRole("button", { name: /Format (JSON|XML)/ })).toHaveCount(0)
+
+  const parserErrorTool = page.locator(`[data-timeline-part-id="${parserErrorID}"]`)
+  await parserErrorTool.locator('[data-slot="collapsible-trigger"]').first().click()
+  const parserErrorRaw = parserErrorTool.locator('[data-component="raw-tool-details"]')
+  await parserErrorRaw.getByRole("button", { name: "Response" }).click()
+  await expect(parserErrorRaw.getByRole("button", { name: "Format XML" })).toBeVisible()
+
+  const invalidXMLTool = page.locator(`[data-timeline-part-id="${invalidXMLID}"]`)
+  await invalidXMLTool.locator('[data-slot="collapsible-trigger"]').first().click()
+  const invalidXMLRaw = invalidXMLTool.locator('[data-component="raw-tool-details"]')
+  await invalidXMLRaw.getByRole("button", { name: "Response" }).click()
+  await expect(invalidXMLRaw.locator('[aria-label="Response"][data-slot="raw-tool-details-body"]')).toHaveText(
+    "<root><child></root>",
+  )
+  await expect(invalidXMLRaw.getByRole("button", { name: /Format (JSON|XML)/ })).toHaveCount(0)
+  await timeline.settle()
+})
+
 test("keeps raw details available for WebSearch, Skill, Question, and grouped context tools", async ({ page }) => {
   const searchID = "prt_websearch_raw"
   const skillID = "prt_skill_raw"

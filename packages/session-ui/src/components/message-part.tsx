@@ -1129,6 +1129,9 @@ export function ContextToolGroup(props: {
                           <RawToolDetails
                             request={() => rawToolRequest(partAccessor())}
                             response={() => rawToolResponse(partAccessor())}
+                            streaming={() =>
+                              partAccessor().state.status === "pending" || partAccessor().state.status === "running"
+                            }
                           />
                         )}
                         deferContent
@@ -1565,7 +1568,13 @@ PART_MAPPING["tool"] = function ToolPartDisplay(props) {
 
   const render = createMemo(() => ToolRegistry.render(part().tool) ?? GenericTool)
   const rawDetails = createMemo(
-    () => () => <RawToolDetails request={() => rawToolRequest(part())} response={() => rawToolResponse(part())} />,
+    () => () => (
+      <RawToolDetails
+        request={() => rawToolRequest(part())}
+        response={() => rawToolResponse(part())}
+        streaming={() => part().state.status === "pending" || part().state.status === "running"}
+      />
+    ),
   )
   const controlledOpen = () => (props.onToolOpenChange ? (props.toolOpen ?? props.defaultOpen) : undefined)
   const handleToolOpenChange = (open: boolean) => props.onToolOpenChange?.(open)

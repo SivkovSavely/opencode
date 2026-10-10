@@ -1,8 +1,9 @@
-import { createMemo, Show, type JSX } from "solid-js"
+import { createMemo, createSignal, Show, type JSX } from "solid-js"
 import { createStore } from "solid-js/store"
 import type { ToolPart } from "@opencode-ai/sdk/v2"
 import { useI18n } from "@opencode-ai/ui/context/i18n"
 import { Collapsible } from "@opencode-ai/ui/collapsible"
+import { Button } from "@opencode-ai/ui/button"
 import { RAW_TOOL_DETAILS_KEY } from "./raw-tool-details-key"
 
 type RawRecord = Record<string, unknown>
@@ -18,6 +19,19 @@ export type RawToolResponse = {
   attachments?: AttachmentInfo[]
   outputPaths?: string[]
 }
+
+type RawStringFormat = {
+  format: "json" | "xml"
+  value: string
+}
+
+type FormattedRawValue = {
+  source: string
+  value: string
+}
+
+const MAX_JSON_FORMAT_SIZE = 1_000_000
+const MAX_JSON_FORMAT_DEPTH = 100
 
 function record(value: unknown): value is RawRecord {
   return !!value && typeof value === "object" && !Array.isArray(value)
@@ -182,6 +196,211 @@ export function formatRawToolValue(value: unknown) {
   }
 }
 
+export function formatRawToolString(value: string): RawStringFormat | undefined {
+  const trimmed = value.trimStart()
+  if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+    const formatted = formatJSON(value)
+    if (formatted && formatted !== value) return { format: "json", value: formatted }
+  }
+
+  if (!trimmed.startsWith("<")) return
+  const formatted = formatXML(value)
+  if (formatted && formatted !== value) return { format: "xml", value: formatted }
+}
+
+function formatJSON(value: string) {
+  if (value.length > MAX_JSON_FORMAT_SIZE) return
+
+  try {
+    JSON.parse(value)
+  } catch {
+    return
+  }
+
+  const output: string[] = []
+  const containers: boolean[] = []
+  let outputLength = 0
+  let depth = 0
+  let string = false
+  let escaped = false
+  const append = (part: string) => {
+    if (outputLength + part.length > MAX_JSON_FORMAT_SIZE) return false
+    output.push(part)
+    outputLength += part.length
+    return true
+  }
+
+  for (let index = 0; index < value.length; index++) {
+    const character = value[index]
+    if (string) {
+      if (!append(character)) return
+      if (escaped) escaped = false
+      else if (character === "\\") escaped = true
+      else if (character === '"') string = false
+      continue
+    }
+
+    if (character === '"') {
+      string = true
+      if (!append(character)) return
+      continue
+    }
+    if (character === " " || character === "\t" || character === "\n" || character === "\r") continue
+    if (character === "{" || character === "[") {
+      let next = index + 1
+      while (value[next] === " " || value[next] === "\t" || value[next] === "\n" || value[next] === "\r") next++
+      const multiline = value[next] !== (character === "{" ? "}" : "]")
+      containers.push(multiline)
+      if (multiline && ++depth > MAX_JSON_FORMAT_DEPTH) return
+      if (!append(character + (multiline ? `\n${"  ".repeat(depth)}` : ""))) return
+      continue
+    }
+    if (character === "}" || character === "]") {
+      if (containers.pop() && !append(`\n${"  ".repeat(--depth)}`)) return
+      if (!append(character)) return
+      continue
+    }
+    if (character === ",") {
+      if (!append(`,\n${"  ".repeat(depth)}`)) return
+      continue
+    }
+    if (character === ":") {
+      if (!append(": ")) return
+      continue
+    }
+    if (!append(character)) return
+  }
+
+  return output.join("")
+}
+
+function formatXML(value: string) {
+  if (typeof DOMParser === "undefined" || typeof XMLSerializer === "undefined" || typeof Node === "undefined") return
+
+  try {
+    const document = new DOMParser().parseFromString(value, "application/xml")
+    const root = document.documentElement
+    if (!root || xmlParseError(root) || !safeXML(root)) return
+
+    const serializer = new XMLSerializer()
+    const declaration = value.match(/^\uFEFF?<\?xml\s[^?]*\?>/)?.[0]
+    const doctype = xmlDoctype(value)
+    const formatted = Array.from(document.childNodes)
+      .map((node) => formatXMLNode(node, 0, serializer, doctype))
+      .filter(Boolean)
+      .join("\n")
+    const output = declaration ? `${declaration}\n${formatted}` : formatted
+    const formattedDocument = new DOMParser().parseFromString(output, "application/xml")
+    const formattedRoot = formattedDocument.documentElement
+    if (!formattedRoot || xmlParseError(formattedRoot)) return
+    if (formattedRoot.textContent !== root.textContent) return
+    return output
+  } catch {
+    return
+  }
+}
+
+function xmlParseError(root: Element) {
+  return root.localName === "parsererror" && root.namespaceURI === "http://www.mozilla.org/newlayout/xml/parsererror.xml"
+}
+
+function safeXML(node: Node, preserve = false): boolean {
+  if (node.nodeType !== Node.ELEMENT_NODE) return true
+
+  const element = node as Element
+  const space = element.getAttributeNS("http://www.w3.org/XML/1998/namespace", "space")
+  const preserveSpace = space === "preserve" || (space !== "default" && preserve)
+  if (preserveSpace) return true
+
+  const children = Array.from(element.childNodes)
+  const hasElements = children.some((child) => child.nodeType === Node.ELEMENT_NODE)
+  if (
+    hasElements &&
+    children.some(
+      (child) =>
+        child.nodeType === Node.TEXT_NODE || child.nodeType === Node.CDATA_SECTION_NODE,
+    )
+  ) {
+    return false
+  }
+
+  return children.every((child) => safeXML(child, preserveSpace))
+}
+
+function formatXMLNode(node: Node, depth: number, serializer: XMLSerializer, doctype?: string): string {
+  const indent = "  ".repeat(depth)
+  if (node.nodeType === Node.DOCUMENT_TYPE_NODE) return indent + (doctype ?? serializer.serializeToString(node))
+  if (node.nodeType !== Node.ELEMENT_NODE) {
+    if (node.nodeType === Node.TEXT_NODE && !node.textContent?.trim()) return ""
+    return indent + serializer.serializeToString(node)
+  }
+
+  const element = node as Element
+  const space = element.getAttributeNS("http://www.w3.org/XML/1998/namespace", "space")
+  if (space === "preserve") return indent + serializer.serializeToString(element)
+
+  const children = Array.from(element.childNodes)
+  if (!children.some((child) => child.nodeType === Node.ELEMENT_NODE)) {
+    return indent + serializer.serializeToString(element)
+  }
+
+  const opening = serializer.serializeToString(element.cloneNode(false) as Element).replace(/\s*\/>$/, ">")
+  const content = children
+    .map((child) => formatXMLNode(child, depth + 1, serializer))
+    .filter(Boolean)
+    .join("\n")
+  return `${indent}${opening}\n${content}\n${indent}</${element.tagName}>`
+}
+
+function xmlDoctype(value: string) {
+  let index = value.charCodeAt(0) === 0xfeff ? 1 : 0
+  while (index < value.length) {
+    while (/\s/.test(value[index] ?? "")) index++
+    if (value.startsWith("<?", index)) {
+      const end = value.indexOf("?>", index + 2)
+      if (end < 0) return
+      index = end + 2
+      continue
+    }
+    if (value.startsWith("<!--", index)) {
+      const end = value.indexOf("-->", index + 4)
+      if (end < 0) return
+      index = end + 3
+      continue
+    }
+    if (!value.startsWith("<!DOCTYPE", index)) return
+
+    const start = index
+    let brackets = 0
+    let quote = ""
+    index += "<!DOCTYPE".length
+    while (index < value.length) {
+      if (!quote && value.startsWith("<!--", index)) {
+        const end = value.indexOf("-->", index + 4)
+        if (end < 0) return
+        index = end + 3
+        continue
+      }
+      if (!quote && value.startsWith("<?", index)) {
+        const end = value.indexOf("?>", index + 2)
+        if (end < 0) return
+        index = end + 2
+        continue
+      }
+
+      const character = value[index]
+      if (quote) {
+        if (character === quote) quote = ""
+      } else if (character === "'" || character === '"') quote = character
+      else if (character === "[") brackets++
+      else if (character === "]") brackets--
+      else if (character === ">" && brackets === 0) return value.slice(start, index + 1)
+      index++
+    }
+    return
+  }
+}
+
 function DeferredRawDetails(props: { render: () => JSX.Element }) {
   return props.render()
 }
@@ -210,8 +429,76 @@ function RawSection(props: { label: string; ariaLabel: string; content: () => JS
   )
 }
 
-export function RawToolDetails(props: { request: () => unknown; response: () => RawToolResponse | undefined }) {
+function RawValue(props: {
+  value: () => unknown
+  label: string
+  streaming: () => boolean
+  formatted: () => FormattedRawValue | undefined
+  onFormat: (value: FormattedRawValue) => void
+  onRaw: () => void
+}) {
   const i18n = useI18n()
+  const value = createMemo(props.value)
+  const format = createMemo(() => {
+    const current = value()
+    return !props.streaming() && typeof current === "string" ? formatRawToolString(current) : undefined
+  })
+  const formatted = () => {
+    const current = value()
+    const stored = props.formatted()
+    return typeof current === "string" && stored?.source === current ? stored.value : undefined
+  }
+  const action = createMemo(() => formatted() ?? format())
+  const label = () => {
+    const current = action()
+    if (typeof current === "string") return i18n.t("ui.tool.rawDetails.showRaw")
+    if (!current) return ""
+    return i18n.t(current.format === "json" ? "ui.tool.rawDetails.formatJSON" : "ui.tool.rawDetails.formatXML")
+  }
+
+  return (
+    <div data-slot="raw-tool-details-value">
+      <Show when={action()}>
+        {(action) => (
+          <div data-slot="raw-tool-details-format">
+            <Button
+              size="small"
+              variant="ghost"
+              onClick={() => {
+                const current = action()
+                if (typeof current === "string") {
+                  props.onRaw()
+                  return
+                }
+                const source = value()
+                if (typeof source === "string") props.onFormat({ source, value: current.value })
+              }}
+            >
+              {label()}
+            </Button>
+          </div>
+        )}
+      </Show>
+      <pre
+        data-slot="raw-tool-details-body"
+        tabIndex={0}
+        role="region"
+        aria-label={props.label}
+      >
+        {formatted() ?? formatRawToolValue(value())}
+      </pre>
+    </div>
+  )
+}
+
+export function RawToolDetails(props: {
+  request: () => unknown
+  response: () => RawToolResponse | undefined
+  streaming: () => boolean
+}) {
+  const i18n = useI18n()
+  const [formattedRequest, setFormattedRequest] = createSignal<FormattedRawValue>()
+  const [formattedResponse, setFormattedResponse] = createSignal<FormattedRawValue>()
 
   return (
     <div data-component="raw-tool-details">
@@ -221,14 +508,14 @@ export function RawToolDetails(props: { request: () => unknown; response: () => 
         content={() => {
           const request = createMemo(props.request)
           return (
-            <pre
-              data-slot="raw-tool-details-body"
-              tabIndex={0}
-              role="region"
-              aria-label={i18n.t("ui.tool.rawDetails.request")}
-            >
-              {formatRawToolValue(request())}
-            </pre>
+            <RawValue
+              value={request}
+              label={i18n.t("ui.tool.rawDetails.request")}
+              streaming={props.streaming}
+              formatted={formattedRequest}
+              onFormat={setFormattedRequest}
+              onRaw={() => setFormattedRequest(undefined)}
+            />
           )
         }}
       />
@@ -244,14 +531,14 @@ export function RawToolDetails(props: { request: () => unknown; response: () => 
             >
               {(value) => (
                 <>
-                  <pre
-                    data-slot="raw-tool-details-body"
-                    tabIndex={0}
-                    role="region"
-                    aria-label={i18n.t("ui.tool.rawDetails.response")}
-                  >
-                    {formatRawToolValue(value().value)}
-                  </pre>
+                  <RawValue
+                    value={() => value().value}
+                    label={i18n.t("ui.tool.rawDetails.response")}
+                    streaming={props.streaming}
+                    formatted={formattedResponse}
+                    onFormat={setFormattedResponse}
+                    onRaw={() => setFormattedResponse(undefined)}
+                  />
                   <Show when={value().attachments?.length || value().outputPaths?.length}>
                     <pre
                       data-slot="raw-tool-details-body"

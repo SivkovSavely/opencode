@@ -173,6 +173,9 @@ export const dict: Record<string, string> = {
   "ui.tool.rawDetails.request": "Request",
   "ui.tool.rawDetails.response": "Response",
   "ui.tool.rawDetails.noResponse": "No response yet",
+  "ui.tool.rawDetails.formatJSON": "Format JSON",
+  "ui.tool.rawDetails.formatXML": "Format XML",
+  "ui.tool.rawDetails.showRaw": "Show raw",
 
   "ui.common.file.one": "file",
   "ui.common.file.other": "files",

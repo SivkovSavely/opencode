@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test"
 import type { ToolPart } from "@opencode-ai/sdk/v2"
-import { formatRawToolValue, rawToolRequest, rawToolResponse } from "./raw-tool-details"
+import { formatRawToolString, formatRawToolValue, rawToolRequest, rawToolResponse } from "./raw-tool-details"
 
 function part(state: unknown, tool = "custom") {
   return {
@@ -19,6 +19,29 @@ describe("raw tool details", () => {
     expect(formatRawToolValue({ path: "/repo", pattern: "*.ts", include: "src/**" })).toBe(
       '{\n  "path": "/repo",\n  "pattern": "*.ts",\n  "include": "src/**"\n}',
     )
+  })
+
+  test("offers opt-in formatting only for compact JSON objects and arrays", () => {
+    expect(formatRawToolString('{"query":"foo","count":2}')).toEqual({
+      format: "json",
+      value: '{\n  "query": "foo",\n  "count": 2\n}',
+    })
+    expect(formatRawToolString('[{"name":"foo"}]')).toEqual({
+      format: "json",
+      value: '[\n  {\n    "name": "foo"\n  }\n]',
+    })
+    expect(formatRawToolString('{"amount":1e400,"id":9007199254740993}')).toEqual({
+      format: "json",
+      value: '{\n  "amount": 1e400,\n  "id": 9007199254740993\n}',
+    })
+    expect(formatRawToolString(`${"[".repeat(101)}0${"]".repeat(101)}`)).toBeUndefined()
+    expect(formatRawToolString(`[${"0,".repeat(260_000)}0]`)).toBeUndefined()
+    expect(formatRawToolString('{"query":')).toBeUndefined()
+    expect(formatRawToolString("ordinary prose")).toBeUndefined()
+    for (const value of ["123", "true", '"foo"']) {
+      expect(formatRawToolString(value)).toBeUndefined()
+    }
+    expect(formatRawToolString('{\n  "query": "foo",\n  "count": 2\n}')).toBeUndefined()
   })
 
   test("preserves strings verbatim and handles pending calls", () => {
