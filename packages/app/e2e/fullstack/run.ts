@@ -678,22 +678,38 @@ async function run() {
   const children: ManagedProcess[] = []
   let interrupted = false
   let interruptError: unknown
+  let interruptTask: Promise<void> | undefined
+  let resolveInterrupted: () => void = () => {}
+  const interruptedPromise = new Promise<void>((resolve) => (resolveInterrupted = resolve))
+  const interruptible = <T>(promise: Promise<T>) =>
+    Promise.race([
+      promise,
+      interruptedPromise.then(() => {
+        throw new Error("Full-stack E2E run was interrupted")
+      }),
+    ])
   let exitCode = 0
-  let preserveArtifacts = false
   const interrupt = (signal: "SIGINT" | "SIGTERM" | "SIGHUP") => {
     if (interrupted) return
     interrupted = true
+    resolveInterrupted()
     exitCode = signal === "SIGINT" ? 130 : signal === "SIGTERM" ? 143 : 129
-    if (children.some((child) => child.name === "Playwright full-stack tests")) preserveArtifacts = true
-    void (async () => {
-      if (process.platform === "linux") return signalOwnedProcesses(root, runID, "SIGTERM", new Set(), owner.sid)
-      await Promise.all(
-        children.map(async (child) => {
-          if (child.exited || child.child.exitCode !== null || child.child.signalCode !== null) return
-          child.child.kill("SIGTERM")
-        }),
-      )
-    })().catch((error) => (interruptError = error))
+    interruptTask = (async () => {
+      try {
+        if (process.platform === "linux") {
+          await signalOwnedProcesses(root, runID, "SIGTERM", new Set(), owner.sid)
+          return
+        }
+        await Promise.all(
+          children.map(async (child) => {
+            if (child.exited || child.child.exitCode !== null || child.child.signalCode !== null) return
+            child.child.kill("SIGTERM")
+          }),
+        )
+      } catch (error) {
+        interruptError = error
+      }
+    })()
   }
   const onSigInt = () => interrupt("SIGINT")
   const onSigTerm = () => interrupt("SIGTERM")
@@ -858,7 +874,9 @@ async function run() {
       cwd: project,
       env: baseEnv,
     })
-    const serverURL = await waitForOutput(server, /opencode server listening on (http:\/\/127\.0\.0\.1:\d+)/)
+    const serverURL = await interruptible(
+      waitForOutput(server, /opencode server listening on (http:\/\/127\.0\.0\.1:\d+)/),
+    )
     const serverPort = new URL(serverURL).port
 
     assertActive()
@@ -914,7 +932,7 @@ async function run() {
         cwd: appRoot,
         env: playwrightEnv,
       })
-      const installCode = await waitForExit(install)
+      const installCode = await interruptible(Promise.resolve(waitForExit(install)))
       if (installCode !== 0) throw new Error(`Playwright Chromium installation exited with ${installCode}`)
     }
 
@@ -930,25 +948,19 @@ async function run() {
       cwd: appRoot,
       env: playwrightEnv,
     })
-    let result: number
-    try {
-      result = await waitForExit(tests)
-    } catch (error) {
-      if (tests.exited?.signal || tests.child.signalCode) preserveArtifacts = true
-      throw error
-    }
+    const result = await interruptible(Promise.resolve(waitForExit(tests)))
     console.log(`Playwright full-stack tests exited with ${result}`)
-    if (!interrupted) {
-      exitCode = result
-      preserveArtifacts = result !== 0
-    }
+    if (!interrupted) exitCode = result
   } catch (error) {
     if (!interrupted) {
       console.error("Full-stack E2E runner failed", error)
-      throw error
+      exitCode ||= 1
+    } else {
+      console.error("Full-stack E2E run interrupted", error)
     }
   } finally {
     const cleanupErrors: string[] = []
+    if (interruptTask) await interruptTask
     try {
       if (process.platform === "linux") {
         const identities = (await Promise.all(children.map((child) => child.identity))).filter(
@@ -983,26 +995,37 @@ async function run() {
     } catch (error) {
       cleanupErrors.push(`fake LLM server: ${String(error)}`)
     }
-    if (interruptError) cleanupErrors.push(String(interruptError))
+    if (interruptError) console.error(`Initial interrupt signal failed; verified teardown will retry: ${String(interruptError)}`)
     for (const key of Object.keys(process.env)) delete process.env[key]
     Object.assign(process.env, originalEnvironment)
     if (cleanupErrors.length > 0) {
       console.error(`Full-stack E2E cleanup failed; exact leftover path: ${root}`)
       cleanupErrors.forEach((error) => console.error(error))
-      throw new Error(`Refusing to delete ${root} while test-owned processes may still be using it`)
-    }
-    try {
-      const manifest = JSON.parse(await readFile(path.join(root, "owner.json"), "utf8")) as Manifest
-      if (manifest.root !== root || manifest.runID !== runID) throw new Error("test ownership marker changed")
-      if (!inside(root, path.join(root, "database", "opencode.sqlite"))) throw new Error("database escaped test root")
-      if (preserveArtifacts) {
-        console.error(`Full-stack E2E failed; preserving Playwright artifacts under ${path.join(root, "playwright")}`)
-      } else {
-        await rm(root, { recursive: true })
+      for (const child of children) {
+        if (child.exited || child.child.exitCode !== null || child.child.signalCode !== null) continue
+        child.child.stdout?.destroy()
+        child.child.stderr?.destroy()
+        child.child.unref()
       }
-    } catch (error) {
-      console.error(`Full-stack E2E cleanup failed; exact leftover path: ${root}`)
-      throw error
+      exitCode ||= 1
+    } else {
+      try {
+        const ownerMarker = JSON.parse(await readFile(path.join(root, "owner.json"), "utf8")) as Manifest
+        if (
+          ownerMarker.kind !== "opencode-fullstack-worktree-e2e" ||
+          ownerMarker.root !== root ||
+          ownerMarker.runID !== runID
+        ) {
+          throw new Error("test ownership marker changed")
+        }
+        if (!inside(root, path.join(root, "database", "opencode.sqlite"))) throw new Error("database escaped test root")
+        await rm(root, { recursive: true })
+        console.log(`Full-stack E2E cleanup succeeded; removed ${root}`)
+      } catch (error) {
+        console.error(`Full-stack E2E cleanup failed; exact leftover path: ${root}`)
+        console.error(error)
+        exitCode ||= 1
+      }
     }
   }
   console.log(`Full-stack runner exit code: ${exitCode}`)
