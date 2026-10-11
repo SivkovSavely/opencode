@@ -5,7 +5,7 @@ import { Dialog, DialogBody, DialogHeader, DialogTitle } from "@opencode-ai/ui/v
 import { Icon } from "@opencode-ai/ui/v2/icon"
 import { TextInputV2 } from "@opencode-ai/ui/v2/text-input-v2"
 import { useDialog } from "@opencode-ai/ui/context/dialog"
-import { createEffect, createMemo, For, onCleanup, Show } from "solid-js"
+import { createEffect, createMemo, For, on, onCleanup, Show } from "solid-js"
 import { createStore } from "solid-js/store"
 import { useLanguage } from "@/context/language"
 import { chronologicalUserMessages, messagePreview, normalizePromptText, parseMessageSearch, searchMessages } from "./message-search"
@@ -18,8 +18,9 @@ export function DialogJumpToMessage(props: {
   parts: (messageID: string) => Part[]
   historyMore: () => boolean
   historyLoading: () => boolean
+  historyCursor: () => string | undefined
   historyRecordCount: () => number
-  loadOlder: (sessionID: string) => Promise<void>
+  loadOlder: (sessionID: string) => Promise<boolean>
   select: (messageID: string) => void
   onClose: () => void
 }) {
@@ -47,6 +48,7 @@ export function DialogJumpToMessage(props: {
   let font = ""
   let letterSpacing = 0
   let closed = false
+  const requestedCursors = new Map<string, { count: number; attempts: number }>()
 
   const messages = createMemo(() =>
     chronologicalUserMessages(props.messages()).map((message) => {
@@ -156,10 +158,16 @@ export function DialogJumpToMessage(props: {
     onCleanup(() => observer.disconnect())
   })
 
-  createEffect(() => {
-    state.query
-    setState("activeID", undefined)
-  })
+  createEffect(
+    on(
+      () => state.query,
+      () => {
+        setState("activeID", undefined)
+        const viewport = state.resultsViewport
+        if (viewport?.isConnected) virtualizer.scrollToOffset(0)
+      },
+    ),
+  )
 
   createEffect(() => {
     const id = state.activeID
@@ -172,16 +180,30 @@ export function DialogJumpToMessage(props: {
 
   createEffect(() => {
     if (!props.isCurrentSession() || state.failed || state.loadingOlder || !props.historyMore() || props.historyLoading()) return
-    setState("loadingOlder", true)
+    const cursor = props.historyCursor()
+    if (!cursor) return
     const before = props.historyRecordCount()
+    const previous = requestedCursors.get(cursor)
+    if (previous && (before <= previous.count || previous.attempts >= 2)) {
+      setState("failed", true)
+      return
+    }
+    setState("loadingOlder", true)
+    requestedCursors.set(cursor, { count: before, attempts: (previous?.attempts ?? 0) + 1 })
     void props.loadOlder(props.sessionID).then(
-      () => {
+      (loaded) => {
         if (closed) return
+        if (!loaded) {
+          if (previous) requestedCursors.set(cursor, previous)
+          else requestedCursors.delete(cursor)
+        }
         if (
+          loaded &&
           props.isCurrentSession() &&
           props.historyMore() &&
           !props.historyLoading() &&
-          props.historyRecordCount() <= before
+          props.historyRecordCount() <= before &&
+          props.historyCursor() === cursor
         ) {
           setState("failed", true)
         }
@@ -189,6 +211,8 @@ export function DialogJumpToMessage(props: {
       },
       () => {
         if (closed) return
+        if (previous) requestedCursors.set(cursor, previous)
+        else requestedCursors.delete(cursor)
         setState("failed", true)
         setState("loadingOlder", false)
       },
@@ -317,7 +341,14 @@ export function DialogJumpToMessage(props: {
               <span>{language.t("session.messages.loadingEarlier")}</span>
             </>}>
               <span role="alert">{language.t("common.requestFailed")}</span>
-              <button type="button" class="dialog-jump-to-message-retry" onClick={() => setState("failed", false)}>
+              <button
+                type="button"
+                class="dialog-jump-to-message-retry"
+                onClick={() => {
+                  requestedCursors.clear()
+                  setState("failed", false)
+                }}
+              >
                 {language.t("common.loadMore")}
               </button>
             </Show>

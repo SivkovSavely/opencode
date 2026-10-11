@@ -1608,32 +1608,32 @@ export default function Page() {
   let historyContinuationFrame: number | undefined
   const loadOlder = async (expectedSessionID?: string, expectedSessionKey?: string) => {
     const owner = sessionOwnership.capture()
-    if (expectedSessionID && params.id !== expectedSessionID) return
-    if (expectedSessionKey && sessionKey() !== expectedSessionKey) return
-    if (historyLoading() || historyRequests.has(owner.key)) return
+    if (expectedSessionID && params.id !== expectedSessionID) return false
+    if (expectedSessionKey && sessionKey() !== expectedSessionKey) return false
+    if (historyLoading() || historyRequests.has(owner.key)) return false
     historyRequests.add(owner.key)
     if (expectedSessionKey) setUi("jumpToMessageHistoryLoading", true)
     const before = timeline.messages().length
-    try {
-      await timeline.history.loadOlder({
-        before: () => owner.run(captureHistoryAnchor),
-        after: (done) => owner.run(() => restoreHistoryAnchor(done)),
-      })
-    } finally {
+    const loaded = await timeline.history.loadOlder({
+      before: () => owner.run(captureHistoryAnchor),
+      after: (done) => owner.run(() => restoreHistoryAnchor(done)),
+    }).finally(() => {
       historyRequests.delete(owner.key)
       if (expectedSessionKey) {
         if (owner.current() && ui.jumpToMessageOpen) autoScroll.pause()
         setUi("jumpToMessageHistoryLoading", false)
       }
-    }
-    if (expectedSessionKey) return
-    if (!owner.current() || timeline.messages().length <= before) return
-    if (!autoScroll.userScrolled() || !scroller || scroller.scrollTop >= 200 || !historyMore()) return
+    })
+    if (!loaded || !owner.current()) return false
+    if (expectedSessionKey) return true
+    if (timeline.messages().length <= before) return true
+    if (!autoScroll.userScrolled() || !scroller || scroller.scrollTop >= 200 || !historyMore()) return true
     if (historyContinuationFrame !== undefined) cancelAnimationFrame(historyContinuationFrame)
     historyContinuationFrame = requestAnimationFrame(() => {
       historyContinuationFrame = undefined
       owner.run(onHistoryScroll)
     })
+    return true
   }
   const onHistoryScroll = () => {
     if (
@@ -1991,7 +1991,9 @@ export default function Page() {
     visibleUserMessages,
     historyMore,
     historyLoading,
-    loadMore: (sessionID) => sync().session.history.loadMore(sessionID),
+    loadMore: async (sessionID) => {
+      await sync().session.history.loadMore(sessionID)
+    },
     currentMessageId: () => store.messageId,
     pendingMessage: () => ui.pendingMessage,
     setPendingMessage: (value) => setUi("pendingMessage", value),

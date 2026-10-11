@@ -255,7 +255,7 @@ export function MessageTimeline(props: {
   userMessages: UserMessage[]
   historyMore: (sessionID: string) => boolean
   historyLoading: (sessionID: string) => boolean
-  loadOlder: (sessionID: string, sessionKey: string) => Promise<void>
+  loadOlder: (sessionID: string, sessionKey: string) => Promise<boolean>
   onJumpToMessage: (messageID: string, sessionKey: string) => void
   onPauseAutoScroll: () => void
   onJumpDialogOpen: (open: boolean, sessionKey: string, selected?: boolean) => void
@@ -300,6 +300,7 @@ export function MessageTimeline(props: {
         parts={getMsgParts}
         historyMore={() => props.historyMore(id)}
         historyLoading={() => props.historyLoading(id)}
+        historyCursor={() => sync().session.history.cursor(id)}
         historyRecordCount={() => sync().data.session_message[id]?.length ?? 0}
         loadOlder={() => props.loadOlder(id, key)}
         select={(messageID) => {

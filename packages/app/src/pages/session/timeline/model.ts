@@ -112,18 +112,19 @@ export async function loadOlderTimeline(input: {
   sessionID: Accessor<string | undefined>
   more: Accessor<boolean>
   loading: Accessor<boolean>
-  loadMore: (sessionID: string) => Promise<void>
+  loadMore: (sessionID: string) => Promise<void | boolean>
   before?: () => void
   after?: (done: boolean) => void
 }) {
   const id = input.sessionID()
-  if (!id || !input.more() || input.loading()) return
+  if (!id || !input.more() || input.loading()) return false
 
   input.before?.()
-  await input.loadMore(id).catch((error) => {
+  const loaded = await input.loadMore(id).catch((error) => {
     if (input.sessionID() === id) input.after?.(true)
     throw error
   })
-  if (input.sessionID() !== id) return
+  if (input.sessionID() !== id) return false
   input.after?.(true)
+  return loaded !== false
 }

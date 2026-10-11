@@ -545,8 +545,12 @@ export function createServerSession(
         })
       const first = await request(before)
       const pages = [first]
+      const visited = new Set(before ? [before] : [])
       while (pages.at(-1)?.cursor.next && needsOlderTurnRoot(pages.flatMap((page) => page.data).toReversed())) {
-        const response = await request(pages.at(-1)!.cursor.next ?? undefined)
+        const cursor = pages.at(-1)?.cursor.next
+        if (!cursor || visited.has(cursor)) break
+        visited.add(cursor)
+        const response = await request(cursor)
         pages.push(response)
         if (!response.data.length) break
       }
@@ -1404,10 +1408,12 @@ export function createServerSession(
         !meta.complete[sessionID] &&
         !!meta.cursor[sessionID],
       loading: (sessionID: string) => meta.loading[sessionID] ?? false,
+      cursor: (sessionID: string) => meta.cursor[sessionID],
       async loadMore(sessionID: string, count = historyMessagePageSize) {
         touch(sessionID)
-        if (meta.loading[sessionID] || meta.complete[sessionID] || !meta.cursor[sessionID]) return
+        if (meta.loading[sessionID] || meta.complete[sessionID] || !meta.cursor[sessionID]) return false
         await loadMessages(sessionID, count, meta.cursor[sessionID], "prepend")
+        return true
       },
     },
     evict(sessionID: string) {

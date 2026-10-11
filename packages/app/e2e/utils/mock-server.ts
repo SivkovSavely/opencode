@@ -32,6 +32,7 @@ export interface MockServerConfig {
 
 export async function mockOpenCodeServer(page: Page, config: MockServerConfig) {
   const cursors = new Map<string, string>()
+  const cursorTokens = new Map<string, string>()
   let nextCursor = 0
   const staticRoutes: Record<string, unknown> = {
     "/path": {
@@ -284,8 +285,11 @@ export async function mockOpenCodeServer(page: Page, config: MockServerConfig) {
       if (config.messageDelay !== undefined) await new Promise((resolve) => setTimeout(resolve, config.messageDelay))
       const pageData = config.pageMessages(currentMessagesMatch[1], Number(url.searchParams.get("limit") ?? 50), before)
       config.onMessages?.({ sessionID: currentMessagesMatch[1], before, phase: "end" })
-      const cursor = pageData.cursor ? `cursor_${++nextCursor}` : undefined
-      if (cursor) cursors.set(cursor, pageData.cursor!)
+      const cursor = pageData.cursor ? (cursorTokens.get(pageData.cursor) ?? `cursor_${++nextCursor}`) : undefined
+      if (cursor) {
+        cursors.set(cursor, pageData.cursor!)
+        cursorTokens.set(pageData.cursor!, cursor)
+      }
       return json(route, {
         data: pageData.items.map(currentMessage).reverse(),
         cursor: { next: cursor },
@@ -304,8 +308,9 @@ export async function mockOpenCodeServer(page: Page, config: MockServerConfig) {
       const pageData = config.pageMessages(messagesMatch[1], limit, before)
       config.onMessages?.({ sessionID: messagesMatch[1], before, phase: "end" })
       if (!pageData.cursor) return json(route, pageData.items)
-      const cursor = `cursor_${++nextCursor}`
+      const cursor = cursorTokens.get(pageData.cursor) ?? `cursor_${++nextCursor}`
       cursors.set(cursor, pageData.cursor)
+      cursorTokens.set(pageData.cursor, cursor)
       return json(route, pageData.items, { "x-next-cursor": cursor })
     }
 

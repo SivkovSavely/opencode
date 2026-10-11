@@ -51,6 +51,13 @@ const pagedTimeline = [
     ]
   }).flat(),
 ]
+const manySearchMessages = Array.from({ length: 200 }, (_, index) => {
+  const id = `msg_4000_jump_search_${String(index).padStart(4, "0")}`
+  return userMessage([userText(`Search prompt ${index}`, { id: `prt_${id}_text` })], {
+    id,
+    created: 1_700_100_000_000 + index * 1_000,
+  })
+})
 
 for (const newLayoutDesigns of [false, true]) {
   test(`uses the approved Jump to message dialog from the ${newLayoutDesigns ? "V2" : "legacy"} menu`, async ({ page }) => {
@@ -158,6 +165,75 @@ test("updates searchable text when a message part is reconciled in place", async
   const updated = dialog.getByRole("option").filter({ hasText: "Updated earlier prompt" })
   await expect(updated).toHaveCount(1)
   await expect(updated.locator("mark")).toHaveText("Updated")
+})
+
+test("resets the virtualized results to the first match whenever the query changes", async ({ page }) => {
+  await setupTimeline(page, {
+    messages: manySearchMessages,
+    pageMessages: () => ({ items: manySearchMessages }),
+    settings: { newLayoutDesigns: true },
+  })
+  await openJumpToMessage(page)
+
+  const dialog = page.getByRole("dialog")
+  const search = dialog.getByRole("textbox", { name: "Search user messages..." })
+  const viewport = dialog.locator(".dialog-jump-to-message-scroll .scroll-view__viewport")
+  const firstID = manySearchMessages[0].info.id
+  const first = dialog.getByRole("option").filter({ hasText: "Search prompt 0" })
+
+  await search.fill("/prompt/i")
+  await expect(dialog.getByText("200 of 200 messages · Regex mode", { exact: true })).toBeVisible()
+  await viewport.evaluate((element) => {
+    element.scrollTop = element.scrollHeight
+  })
+  await expect.poll(() => viewport.evaluate((element) => element.scrollTop)).toBeGreaterThan(0)
+
+  await search.fill("prompt")
+  await expect(dialog.getByText("200 of 200 messages", { exact: true })).toBeVisible()
+  await expect.poll(() => viewport.evaluate((element) => element.scrollTop)).toBe(0)
+  await expect(first).toBeInViewport()
+  await search.press("Enter")
+  await expect(page).toHaveURL(new RegExp(`#message-${firstID}$`))
+
+  await openJumpToMessage(page)
+  const reopened = page.getByRole("dialog")
+  const reopenedSearch = reopened.getByRole("textbox", { name: "Search user messages..." })
+  const reopenedViewport = reopened.locator(".dialog-jump-to-message-scroll .scroll-view__viewport")
+  const reopenedFirst = reopened.getByRole("option").filter({ hasText: "Search prompt 0" })
+
+  await reopenedSearch.fill("prompt")
+  await reopenedViewport.evaluate((element) => {
+    element.scrollTop = element.scrollHeight
+  })
+  await expect.poll(() => reopenedViewport.evaluate((element) => element.scrollTop)).toBeGreaterThan(0)
+  await reopened.getByRole("button", { name: "Clear", exact: true }).click()
+  await expect(reopenedSearch).toHaveValue("")
+  await expect.poll(() => reopenedViewport.evaluate((element) => element.scrollTop)).toBe(0)
+  await expect(reopenedFirst).toBeInViewport()
+
+  await reopenedSearch.fill("no matching message")
+  await expect(reopened.getByRole("option")).toHaveCount(0)
+  await reopenedSearch.fill("prompt")
+  await expect(reopenedFirst).toBeInViewport()
+  await expect.poll(() => reopenedViewport.evaluate((element) => element.scrollTop)).toBe(0)
+  await reopenedViewport.evaluate((element) => {
+    element.scrollTop = element.scrollHeight
+  })
+  await expect.poll(() => reopenedViewport.evaluate((element) => element.scrollTop)).toBeGreaterThan(0)
+  await reopenedSearch.press("Escape")
+  await expect(reopenedSearch).toHaveValue("")
+  await expect.poll(() => reopenedViewport.evaluate((element) => element.scrollTop)).toBe(0)
+  await expect(reopenedFirst).toBeInViewport()
+
+  await reopenedSearch.fill("/prompt/i")
+  await reopenedSearch.evaluate((element: HTMLInputElement) => {
+    element.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowUp", bubbles: true, cancelable: true }))
+    element.value = "Search prompt 0"
+    element.dispatchEvent(new InputEvent("input", { bubbles: true }))
+  })
+  await expect(reopened.getByText("1 of 200 messages", { exact: true })).toBeVisible()
+  await expect(reopenedFirst).toBeInViewport()
+  await expect.poll(() => reopenedViewport.evaluate((element) => element.scrollTop)).toBe(0)
 })
 
 test("continues paging across V2 history pages with only metadata records", async ({ page }) => {
@@ -272,6 +348,93 @@ test("searches loaded messages while older pages load, then jumps to an unloaded
   await dialog.getByRole("option").filter({ hasText: "Earlier prompt" }).click()
   await expect(page).toHaveURL(new RegExp(`#message-${earlierID}$`))
   await expect(page.locator(`#message-${earlierID}`)).toBeInViewport()
+})
+
+test("keeps the results scroll position when an older page adds matches", async ({ page }) => {
+  let holdNextHistoryPage = false
+  let releaseHistoryPage!: () => void
+  const historyGate = new Promise<void>((resolve) => (releaseHistoryPage = resolve))
+  await setupTimeline(page, {
+    messages: pagedTimeline,
+    pageMessages: (_sessionID, limit, before) => {
+      const end = before ? Number(before) : pagedTimeline.length
+      const start = Math.max(0, end - (before ? limit : 120))
+      return { items: pagedTimeline.slice(start, end), cursor: start ? String(start) : undefined }
+    },
+    settings: { newLayoutDesigns: true },
+    viewport: { width: 390, height: 500 },
+  })
+  await page.route("**/session/*/message**", async (route) => {
+    const url = new URL(route.request().url())
+    if (holdNextHistoryPage && (url.searchParams.has("before") || url.searchParams.has("cursor"))) {
+      holdNextHistoryPage = false
+      await historyGate
+    }
+    await route.fallback()
+  })
+
+  holdNextHistoryPage = true
+  const historyRequest = page.waitForRequest((request) => {
+    const url = new URL(request.url())
+    return url.pathname.includes("/message") && (url.searchParams.has("before") || url.searchParams.has("cursor"))
+  })
+  await openJumpToMessage(page)
+  await historyRequest
+
+  const dialog = page.getByRole("dialog")
+  const search = dialog.getByRole("textbox", { name: "Search user messages..." })
+  const viewport = dialog.locator(".dialog-jump-to-message-scroll .scroll-view__viewport")
+  await search.fill("/./g")
+  await expect(dialog.locator(".dialog-jump-to-message-count")).toHaveText("60 of 60 loaded messages · Regex mode")
+  await viewport.evaluate((element) => {
+    element.scrollTop = element.scrollHeight
+  })
+  await expect.poll(() => viewport.evaluate((element) => element.scrollTop)).toBeGreaterThan(0)
+
+  releaseHistoryPage()
+  await expect(dialog.locator(".dialog-jump-to-message-count")).toHaveText("1003 of 1003 messages · Regex mode")
+  await expect.poll(() => viewport.evaluate((element) => element.scrollTop)).toBeGreaterThan(0)
+})
+
+test("continues through overlapping history pages with advancing cursors", async ({ page }) => {
+  const older = userMessage([userText("Older overlapping prompt", { id: "prt_msg_0500_jump_overlap_text" })], {
+    id: "msg_0500_jump_overlap_older",
+    created: 1_699_999_000_000,
+  })
+  const olderAssistant = assistantMessage([], {
+    id: "msg_0501_jump_overlap_assistant",
+    parentID: older.info.id,
+    created: 1_699_999_001_000,
+  })
+  const cursors: Array<string | undefined> = []
+  await setupTimeline(page, {
+    protocol: "v2",
+    messages: timeline,
+    pageMessages: (_sessionID, _limit, before) => {
+      cursors.push(before)
+      if (!before) return { items: timeline, cursor: "cursor-A" }
+      if (before === "cursor-A") return { items: timeline, cursor: "cursor-B" }
+      if (before === "cursor-B") return { items: [older, olderAssistant] }
+      throw new Error(`Unexpected cursor: ${before}`)
+    },
+    settings: { newLayoutDesigns: true },
+  })
+
+  await openJumpToMessage(page)
+  const dialog = page.getByRole("dialog")
+  await expect(dialog.getByText("3 of 3 messages", { exact: true })).toBeVisible()
+  await expect(dialog.locator(".dialog-jump-to-message-status")).toHaveCount(0)
+  await expect(dialog.getByRole("option")).toHaveCount(3)
+  const optionIDs = await dialog.getByRole("option").evaluateAll((items) => items.map((item) => item.id))
+  expect(new Set(optionIDs).size).toBe(3)
+  expect(cursors.filter((cursor) => cursor !== undefined)).toEqual(["cursor-A", "cursor-B"])
+
+  const search = dialog.getByRole("textbox", { name: "Search user messages..." })
+  await search.fill("Older overlapping prompt")
+  await expect(dialog.getByRole("option")).toHaveCount(1)
+  await search.press("Enter")
+  await expect(page).toHaveURL(/#message-msg_0500_jump_overlap_older$/)
+  await expect(page.locator("#message-msg_0500_jump_overlap_older")).toBeInViewport()
 })
 
 test("keeps a selected result visible when an older page finishes afterward", async ({ page }) => {

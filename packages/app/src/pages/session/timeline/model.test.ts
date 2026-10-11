@@ -40,6 +40,23 @@ describe("timeline model", () => {
     expect(anchors).toEqual(["before", "after", true])
   })
 
+  test("reports when history loading is skipped", async () => {
+    let calls = 0
+
+    const loaded = await loadOlderTimeline({
+      sessionID: () => "ses_test",
+      more: () => true,
+      loading: () => false,
+      loadMore: async () => {
+        calls += 1
+        return false
+      },
+    })
+
+    expect(loaded).toBe(false)
+    expect(calls).toBe(1)
+  })
+
   test("stops when a page adds no raw messages", async () => {
     let calls = 0
     await loadOlderTimeline({

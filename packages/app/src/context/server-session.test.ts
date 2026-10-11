@@ -280,6 +280,40 @@ describe("server session", () => {
     expect(store.data.message.root.map((message) => message.id)).toEqual([user.id, assistant.id])
   })
 
+  test("stops current-message root pagination when cursors cycle", async () => {
+    const assistant = (id: string, created: number) => ({
+      id,
+      type: "assistant" as const,
+      time: { created, completed: created },
+      agent: "build",
+      model: { id: "model", providerID: "provider" },
+      content: [],
+    })
+    const requests: unknown[] = []
+    const pages = [
+      { data: [assistant("message-3", 3)], cursor: { previous: null, next: "cycle-A" } },
+      { data: [assistant("message-2", 2)], cursor: { previous: null, next: "cycle-B" } },
+      { data: [assistant("message-1", 1)], cursor: { previous: null, next: "cycle-A" } },
+    ]
+    const messageApi = {
+      list: async (input: unknown) => {
+        requests.push(input)
+        return pages.shift()!
+      },
+    } as unknown as MessageApi
+    const store = createServerSession({} as OpencodeClient, {} as SessionApi, messageApi)
+    store.remember(session("root"))
+
+    await store.sync("root")
+
+    expect(requests).toEqual([
+      { sessionID: "root", limit: 20, order: "desc" },
+      { sessionID: "root", limit: 20, cursor: "cycle-A" },
+      { sessionID: "root", limit: 20, cursor: "cycle-B" },
+    ])
+    expect(store.history.cursor("root")).toBe("cycle-A")
+  })
+
   test("extends a current page to include the user for split assistant turns", async () => {
     const user = { id: "msg_1_user", type: "user", text: "hello", time: { created: 1 } } as const
     const assistant = (id: string, created: number) => ({
