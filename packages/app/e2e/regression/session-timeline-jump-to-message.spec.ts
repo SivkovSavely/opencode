@@ -1,24 +1,27 @@
-import { expect, test } from "@playwright/test"
+import { base64Encode } from "@opencode-ai/core/util/encode"
+import { expect, test, type Page } from "@playwright/test"
 import {
   assistantMessage,
-  completedAssistantInfo,
-  messageUpdated,
-  partUpdated,
+  directory,
+  event,
   setupTimeline,
-  status,
-  textPart,
+  session,
+  sessionID,
   userMessage,
   userText,
 } from "../performance/timeline-stability/fixture"
 
 const earlierID = "msg_1000_jump_earlier"
 const laterID = "msg_2000_jump_later"
+const otherSessionID = "ses_jump_other_session"
+const server = `http://${process.env.PLAYWRIGHT_SERVER_HOST ?? "127.0.0.1"}:${process.env.PLAYWRIGHT_SERVER_PORT ?? "4096"}`
+const lastPaddingIndex = 1_000
 const timeline = [
   userMessage([userText("Earlier prompt", { id: `prt_${earlierID}_text` })], {
     id: earlierID,
     created: 1_700_000_000_000,
   }),
-  assistantMessage([textPart("prt_jump_earlier_response", "Earlier response")], {
+  assistantMessage([], {
     id: "msg_1001_jump_earlier_assistant",
     parentID: earlierID,
     created: 1_700_000_001_000,
@@ -27,7 +30,7 @@ const timeline = [
     id: laterID,
     created: 1_700_000_002_000,
   }),
-  assistantMessage([textPart("prt_jump_later_response", "Later response")], {
+  assistantMessage([], {
     id: "msg_2001_jump_later_assistant",
     parentID: laterID,
     created: 1_700_000_003_000,
@@ -35,12 +38,12 @@ const timeline = [
 ]
 const pagedTimeline = [
   ...timeline,
-  ...Array.from({ length: 151 }, (_, index) => {
+  ...Array.from({ length: lastPaddingIndex + 1 }, (_, index) => {
     const id = `msg_3000_jump_padding_${index}`
     const created = 1_700_000_010_000 + index * 2_000
     return [
-      userMessage([userText("Padding prompt", { id: `prt_${id}_text` })], { id, created }),
-      assistantMessage([textPart(`prt_${id}_response`, "Padding response")], {
+      userMessage([userText(`Padding prompt ${index}`, { id: `prt_${id}_text` })], { id, created }),
+      assistantMessage([], {
         id: `${id}_assistant`,
         parentID: id,
         created: created + 1_000,
@@ -50,88 +53,449 @@ const pagedTimeline = [
 ]
 
 for (const newLayoutDesigns of [false, true]) {
-  test(`searches and jumps to a user message in the ${newLayoutDesigns ? "V2" : "legacy"} menu`, async ({ page }) => {
-    let failNextHistoryPage = false
-    const app = await setupTimeline(page, {
-      messages: pagedTimeline,
-      pageMessages: (_sessionID, limit, before) => {
-        const end = before ? Number(before) : pagedTimeline.length
-        const start = Math.max(0, end - limit)
-        return { items: pagedTimeline.slice(start, end), cursor: start ? String(start) : undefined }
-      },
+  test(`uses the approved Jump to message dialog from the ${newLayoutDesigns ? "V2" : "legacy"} menu`, async ({ page }) => {
+    await setupTimeline(page, {
+      messages: timeline,
       settings: { newLayoutDesigns },
       viewport: newLayoutDesigns ? { width: 390, height: 844 } : undefined,
     })
-    await page.route("**/session/*/message**", async (route) => {
-      const url = new URL(route.request().url())
-      if (
-        failNextHistoryPage &&
-        (url.searchParams.has("before") || url.searchParams.has("cursor"))
-      ) {
-        failNextHistoryPage = false
-        await route.fulfill({ status: 500, contentType: "application/json", body: JSON.stringify({ error: "temporary" }) })
-        return
-      }
-      await route.fallback()
-    })
+
     await page.getByRole("button", { name: "More options", exact: true }).click()
-    if (!newLayoutDesigns) failNextHistoryPage = true
-    await page.getByRole("menuitem", { name: "Search", exact: true }).click()
-    const search = page.locator(".dialog-jump-to-message input")
-    if (!newLayoutDesigns) {
-      await expect(page.getByRole("alert")).toBeVisible()
-      await expect(search).toBeFocused()
-      await page.waitForTimeout(250)
-      await expect(page.getByRole("alert")).toBeVisible()
-      await page.locator(".dialog-jump-to-message-retry").click()
-      await search.focus()
-    }
-    if (newLayoutDesigns) {
-      await expect(page.locator(".dialog-jump-to-message-status")).toHaveCount(0)
-      await page.keyboard.press("Escape")
-      await expect(page.locator(".dialog-jump-to-message")).toHaveCount(0)
-      const assistant = assistantMessage([], {
-        id: "msg_jump_after_cancel",
-        parentID: pagedTimeline.at(-2)!.info.id,
-        completed: false,
-        created: 1_700_000_500_000,
-      })
-      await app.sendAll([
-        { event: status("busy"), delay: 50 },
-        { event: messageUpdated(assistant.info), delay: 50 },
-        {
-          event: partUpdated(
-            textPart("prt_jump_after_cancel", Array.from({ length: 100 }, (_, index) => `Follow line ${index}`).join("\n")),
-            assistant.info.id,
-          ),
-          delay: 50,
-        },
-        { event: messageUpdated(completedAssistantInfo(assistant.info)), delay: 50 },
-        { event: status("idle"), delay: 50 },
-      ])
-      const scroller = page.locator(".scroll-view__viewport", { has: page.locator("[data-timeline-row]") })
-      await expect
-        .poll(() => scroller.evaluate((element) => element.scrollHeight - element.clientHeight - element.scrollTop))
-        .toBeLessThanOrEqual(1)
-      await page.getByRole("button", { name: "More options", exact: true }).click()
-      await page.getByRole("menuitem", { name: "Search", exact: true }).click()
-      await expect(page.locator(".dialog-jump-to-message-status")).toHaveCount(0)
-    }
+    const menuItems = page.getByRole("menuitem")
+    const labels = (await menuItems.allTextContents()).map((label) => label.trim())
+    const jumpIndex = labels.indexOf("Jump to message...")
+    expect(labels[jumpIndex - 1]).toBe("Export...")
+    expect(labels[jumpIndex + 1]).toBe("Archive")
+    await page.getByRole("menuitem", { name: "Jump to message...", exact: true }).click()
 
+    const dialog = page.getByRole("dialog")
+    const search = dialog.getByRole("textbox", { name: "Search user messages..." })
+    await expect(dialog.getByRole("heading", { name: "Jump to message" })).toBeVisible()
     await expect(search).toBeFocused()
+    await expect(search).toHaveAttribute("placeholder", "Search user messages...")
+    await expect(dialog.getByText("2 of 2 messages", { exact: true })).toBeVisible()
+    await expect(dialog.getByText("· / regex", { exact: true })).toBeVisible()
+
+    const earlier = dialog.getByRole("option").filter({ hasText: "Earlier prompt" })
+    await expect(earlier).toHaveCount(1)
+    await expect(earlier.locator("time")).toHaveText(/\d{2}:\d{2}:\d{2}/)
+    await earlier.locator("time").hover()
+    await expect(earlier.locator("time")).toHaveAttribute("title", /2023.*\d{2}:\d{2}:\d{2}/)
+    await expect(earlier).toHaveCSS("height", "34px")
+    await expect(earlier.locator(".dialog-jump-to-message-preview")).toHaveCSS("white-space", "nowrap")
+    expect(await earlier.evaluate((element) => element.scrollWidth <= element.clientWidth)).toBe(true)
+
     await search.fill("Earlier")
-    await expect(page.getByRole("option")).toHaveCount(1)
-    await expect(page.locator(".dialog-jump-to-message-preview mark")).toHaveText("Earlier")
+    const clear = dialog.getByRole("button", { name: "Clear", exact: true })
+    await expect(clear).toBeVisible()
+    await clear.click()
+    await expect(search).toHaveValue("")
+    await expect(search).toBeFocused()
 
-    await search.fill("EARLIER\\s+PROMPT")
-    await expect(page.getByRole("option")).toHaveCount(0)
-    await page.locator(".dialog-jump-to-message-regex").click()
-    await expect(page.getByRole("option")).toHaveCount(1)
-    await expect(page.locator(".dialog-jump-to-message-preview mark")).toHaveText("Earlier prompt")
-    await search.press("ArrowDown")
-    await search.press("Enter")
+    await search.fill("/[")
+    await expect(dialog.getByRole("alert")).toHaveText("Invalid regular expression")
+    await expect(dialog.getByText("Regex mode", { exact: false })).toBeVisible()
+    await search.press("Escape")
+    await expect(search).toHaveValue("")
+    await expect(dialog).toBeVisible()
+    await search.press("Escape")
+    await expect(dialog).toHaveCount(0)
 
+    await openJumpToMessage(page)
+    await page.getByRole("dialog").getByRole("button", { name: "Close", exact: true }).click()
+    await expect(page.getByRole("dialog")).toHaveCount(0)
+    await openJumpToMessage(page)
+    const reopened = page.getByRole("dialog")
+    const reopenedSearch = reopened.getByRole("textbox", { name: "Search user messages..." })
+    await reopenedSearch.fill("/Earlier/i")
+    const match = reopened.getByRole("option").filter({ hasText: "Earlier prompt" })
+    await expect(match.locator("mark")).toHaveText("Earlier")
+    await expect(reopened.getByText("1 of 2 messages · Regex mode", { exact: true })).toBeVisible()
+
+    if (newLayoutDesigns) {
+      await match.click()
+    } else {
+      await reopenedSearch.fill("/prompt/i")
+      const later = reopened.getByRole("option").filter({ hasText: "Later prompt" })
+      await expect(reopened.getByRole("option")).toHaveCount(2)
+      await reopenedSearch.press("ArrowDown")
+      await expect(match).toHaveAttribute("aria-selected", "true")
+      await reopenedSearch.press("ArrowDown")
+      await expect(later).toHaveAttribute("aria-selected", "true")
+      await reopenedSearch.press("ArrowUp")
+      await expect(match).toHaveAttribute("aria-selected", "true")
+      await reopenedSearch.press("Enter")
+    }
     await expect(page).toHaveURL(new RegExp(`#message-${earlierID}$`))
     await expect(page.locator(`#message-${earlierID}`)).toBeInViewport()
   })
+}
+
+test("updates searchable text when a message part is reconciled in place", async ({ page }) => {
+  const fixture = await setupTimeline(page, {
+    messages: timeline,
+    settings: { newLayoutDesigns: true },
+  })
+  await openJumpToMessage(page)
+
+  const dialog = page.getByRole("dialog")
+  const search = dialog.getByRole("textbox", { name: "Search user messages..." })
+  await search.fill("Updated")
+  await expect(dialog.getByRole("option")).toHaveCount(0)
+
+  await fixture.send(
+    event("message.part.updated", {
+      sessionID,
+      part: {
+        ...userText("Updated earlier prompt", { id: `prt_${earlierID}_text` }),
+        sessionID,
+        messageID: earlierID,
+      },
+      time: 1_700_000_004_000,
+    }),
+  )
+
+  const updated = dialog.getByRole("option").filter({ hasText: "Updated earlier prompt" })
+  await expect(updated).toHaveCount(1)
+  await expect(updated.locator("mark")).toHaveText("Updated")
+})
+
+test("continues paging across V2 history pages with only metadata records", async ({ page }) => {
+  const older = userMessage([userText("Older metadata prompt", { id: "prt_msg_0500_jump_metadata_text" })], {
+    id: "msg_0500_jump_metadata_older",
+    created: 1_699_999_000_000,
+  })
+  const olderAssistant = assistantMessage([], {
+    id: "msg_0501_jump_metadata_assistant",
+    parentID: older.info.id,
+    created: 1_699_999_001_000,
+  })
+  await setupTimeline(page, {
+    protocol: "v2",
+    messages: timeline,
+    pageMessages: (_sessionID, _limit, before) => {
+      if (!before) return { items: timeline, cursor: "metadata" }
+      if (before === "metadata") {
+        return {
+          items: [
+            { id: "msg_0900_jump_agent", type: "agent-switched", agent: "build", time: { created: 1_699_998_000_000 } },
+            {
+              id: "msg_0901_jump_model",
+              type: "model-switched",
+              model: { id: "model", providerID: "provider" },
+              time: { created: 1_699_998_001_000 },
+            },
+          ],
+          cursor: "older",
+        }
+      }
+      return { items: [older, olderAssistant] }
+    },
+    settings: { newLayoutDesigns: true },
+  })
+
+  await openJumpToMessage(page)
+  const dialog = page.getByRole("dialog")
+  await expect(dialog.getByRole("option").filter({ hasText: "Older metadata prompt" })).toHaveCount(1)
+  await expect(dialog.getByText("3 of 3 messages", { exact: true })).toBeVisible()
+  await expect(dialog.locator(".dialog-jump-to-message-status")).toHaveCount(0)
+})
+
+test("searches loaded messages while older pages load, then jumps to an unloaded result", async ({ page }) => {
+  let holdNextHistoryPage = false
+  let releaseHistoryPage!: () => void
+  const historyGate = new Promise<void>((resolve) => (releaseHistoryPage = resolve))
+  await setupTimeline(page, {
+    messages: pagedTimeline,
+    pageMessages: (_sessionID, limit, before) => {
+      const end = before ? Number(before) : pagedTimeline.length
+      const start = Math.max(0, end - limit)
+      return { items: pagedTimeline.slice(start, end), cursor: start ? String(start) : undefined }
+    },
+    settings: { newLayoutDesigns: true },
+    viewport: { width: 390, height: 844 },
+  })
+  await page.route("**/session/*/message**", async (route) => {
+    const url = new URL(route.request().url())
+    if (holdNextHistoryPage && (url.searchParams.has("before") || url.searchParams.has("cursor"))) {
+      holdNextHistoryPage = false
+      await historyGate
+    }
+    await route.fallback()
+  })
+
+  holdNextHistoryPage = true
+  const historyRequest = page.waitForRequest((request) => {
+    const url = new URL(request.url())
+    return url.pathname.includes("/message") && (url.searchParams.has("before") || url.searchParams.has("cursor"))
+  })
+  await openJumpToMessage(page)
+  await historyRequest
+
+  const dialog = page.getByRole("dialog")
+  const search = dialog.getByRole("textbox", { name: "Search user messages..." })
+  await expect(dialog.locator(".dialog-jump-to-message-status")).toBeVisible()
+  await expect(dialog.locator(".dialog-jump-to-message-count")).toHaveText(/\d+ of \d+ loaded messages/)
+  await search.fill(`Padding prompt ${lastPaddingIndex}`)
+  await expect(dialog.getByRole("option")).toHaveCount(1)
+  const mobileRow = dialog.getByRole("option")
+  await expect(mobileRow.locator(".dialog-jump-to-message-preview")).toHaveCSS("white-space", "nowrap")
+  expect(await mobileRow.evaluate((element) => element.scrollWidth <= element.clientWidth)).toBe(true)
+
+  await search.fill("Earlier")
+  await expect(dialog.getByRole("option")).toHaveCount(0)
+  releaseHistoryPage()
+  await expect(dialog.getByRole("option")).toHaveCount(1)
+  await expect(dialog.locator(".dialog-jump-to-message-status")).toHaveCount(0)
+  await expect(dialog.getByText("1 of 1003 messages", { exact: true })).toBeVisible()
+
+  await search.fill("/./g")
+  await expect(dialog.getByText("Regex mode", { exact: false })).toBeVisible()
+  await expect.poll(() => dialog.getByRole("option").count()).toBeGreaterThan(0)
+  expect(await dialog.getByRole("option").count()).toBeLessThan(50)
+  expect(await dialog.locator("mark").count()).toBe(await dialog.getByRole("option").count())
+
+  await search.press("ArrowDown")
+  const activeID = await search.getAttribute("aria-activedescendant")
+  expect(activeID).not.toBeNull()
+  if (!activeID) throw new Error("Arrow navigation should activate a result")
+  const activeOption = dialog.locator(`#${activeID}`)
+  const resultViewport = dialog.locator(".dialog-jump-to-message-scroll .scroll-view__viewport")
+  await expect(activeOption).toHaveAttribute("aria-selected", "true")
+  await resultViewport.evaluate((element) => {
+    element.scrollTop = element.scrollHeight
+  })
+  await expect(activeOption).toHaveAttribute("aria-selected", "true")
+  await expect(search).toHaveAttribute("aria-activedescendant", activeID)
+
+  await search.fill("Earlier")
+  await dialog.getByRole("option").filter({ hasText: "Earlier prompt" }).click()
+  await expect(page).toHaveURL(new RegExp(`#message-${earlierID}$`))
+  await expect(page.locator(`#message-${earlierID}`)).toBeInViewport()
+})
+
+test("keeps a selected result visible when an older page finishes afterward", async ({ page }) => {
+  let holdNextHistoryPage = false
+  let releaseHistoryPage!: () => void
+  const historyGate = new Promise<void>((resolve) => (releaseHistoryPage = resolve))
+  await setupTimeline(page, {
+    messages: pagedTimeline,
+    pageMessages: (_sessionID, limit, before) => {
+      const end = before ? Number(before) : pagedTimeline.length
+      const start = Math.max(0, end - limit)
+      return { items: pagedTimeline.slice(start, end), cursor: before ? undefined : String(start) }
+    },
+    settings: { newLayoutDesigns: true },
+    reducedMotion: true,
+  })
+  await page.route("**/session/*/message**", async (route) => {
+    const url = new URL(route.request().url())
+    if (holdNextHistoryPage && (url.searchParams.has("before") || url.searchParams.has("cursor"))) {
+      holdNextHistoryPage = false
+      await historyGate
+    }
+    await route.fallback()
+  })
+
+  holdNextHistoryPage = true
+  const isHistoryPage = (url: URL) => url.pathname.includes("/message") && (url.searchParams.has("before") || url.searchParams.has("cursor"))
+  const historyRequest = page.waitForRequest((request) => isHistoryPage(new URL(request.url())))
+  const historyResponse = page.waitForResponse((response) => isHistoryPage(new URL(response.url())))
+  await openJumpToMessage(page)
+  await historyRequest
+
+  const dialog = page.getByRole("dialog")
+  const search = dialog.getByRole("textbox", { name: "Search user messages..." })
+  const targetID = "msg_3000_jump_padding_991"
+  await search.fill("Padding prompt 991")
+  await dialog.getByRole("option").filter({ hasText: "Padding prompt 991" }).click()
+  await expect(page).toHaveURL(new RegExp(`#message-${targetID}$`))
+  const target = page.locator(`#message-${targetID}`)
+  await expect(target).toBeInViewport()
+
+  releaseHistoryPage()
+  await historyResponse
+  await openJumpToMessage(page)
+  const loadedDialog = page.getByRole("dialog")
+  await expect(loadedDialog.getByText("110 of 110 messages", { exact: true })).toBeVisible()
+  await loadedDialog.getByRole("button", { name: "Close", exact: true }).click()
+  await expect(target).toBeInViewport()
+})
+
+test("switching sessions during history loading discards the old dialog results", async ({ page }) => {
+  let holdNextHistoryPage = false
+  let releaseHistoryPage!: () => void
+  const historyGate = new Promise<void>((resolve) => (releaseHistoryPage = resolve))
+  const pageErrors: Error[] = []
+  await page.addInitScript(({ directory, dirBase64, server, sessionIDs }) => {
+    localStorage.setItem("opencode.global.dat:server", JSON.stringify({
+      projects: { local: [{ worktree: directory, expanded: true }] },
+      lastProject: { local: directory },
+    }))
+    localStorage.setItem(
+      "opencode.window.browser.dat:tabs",
+      JSON.stringify(sessionIDs.map((id) => ({ type: "session", server, dirBase64, sessionId: id }))),
+    )
+  }, {
+    directory,
+    dirBase64: base64Encode(directory),
+    server,
+    sessionIDs: [sessionID, otherSessionID],
+  })
+  await setupTimeline(page, {
+    messages: pagedTimeline,
+    sessions: [session(), session({ id: otherSessionID, title: "Other session" })],
+    pageMessages: (id, limit, before) => {
+      if (id !== sessionID) return { items: [] }
+      const end = before ? Number(before) : pagedTimeline.length
+      const start = Math.max(0, end - limit)
+      return { items: pagedTimeline.slice(start, end), cursor: start ? String(start) : undefined }
+    },
+    settings: { newLayoutDesigns: true },
+    viewport: { width: 390, height: 844 },
+  })
+  const sourceTab = page.locator('[data-slot="titlebar-tabs"] a').filter({ hasText: "Timeline visual stability" })
+  const otherTab = page.locator('[data-slot="titlebar-tabs"] a').filter({ hasText: "Other session" })
+  await expect(otherTab).toBeVisible()
+  await otherTab.click()
+  await expect(page.getByRole("heading", { name: "Other session", exact: true })).toBeVisible()
+  await sourceTab.click()
+  await expect(page.getByRole("heading", { name: "Timeline visual stability", exact: true })).toBeVisible()
+
+  page.on("pageerror", (error) => pageErrors.push(error))
+  await page.route("**/session/*/message**", async (route) => {
+    const url = new URL(route.request().url())
+    if (holdNextHistoryPage && (url.searchParams.has("before") || url.searchParams.has("cursor"))) {
+      holdNextHistoryPage = false
+      await historyGate
+    }
+    await route.fallback()
+  })
+
+  holdNextHistoryPage = true
+  const historyRequest = page.waitForRequest((request) => {
+    const url = new URL(request.url())
+    return url.pathname.includes("/message") && (url.searchParams.has("before") || url.searchParams.has("cursor"))
+  })
+  await openJumpToMessage(page)
+  await historyRequest
+  await expect(page.getByRole("dialog")).toBeVisible()
+  await page.goBack()
+  await expect(page.getByRole("heading", { name: "Other session", exact: true })).toBeVisible()
+  await expect(page.getByRole("dialog")).toHaveCount(0)
+  releaseHistoryPage()
+  await expect(page).toHaveURL(new RegExp(`/session/${otherSessionID}$`))
+  expect(pageErrors).toEqual([])
+})
+
+test("keeps partial results after history failure and retries older pages", async ({ page }) => {
+  let failNextHistoryPage = true
+  await setupTimeline(page, {
+    messages: pagedTimeline,
+    pageMessages: (_sessionID, limit, before) => {
+      const end = before ? Number(before) : pagedTimeline.length
+      const start = Math.max(0, end - limit)
+      return { items: pagedTimeline.slice(start, end), cursor: start ? String(start) : undefined }
+    },
+    settings: { newLayoutDesigns: true },
+  })
+  await page.route("**/session/*/message**", async (route) => {
+    const url = new URL(route.request().url())
+    if (failNextHistoryPage && (url.searchParams.has("before") || url.searchParams.has("cursor"))) {
+      failNextHistoryPage = false
+      await route.fulfill({ status: 500, contentType: "application/json", body: JSON.stringify({ error: "temporary" }) })
+      return
+    }
+    await route.fallback()
+  })
+
+  await openJumpToMessage(page)
+  const dialog = page.getByRole("dialog")
+  const search = dialog.getByRole("textbox", { name: "Search user messages..." })
+  await expect(dialog.getByRole("alert")).toHaveText("Request failed")
+  await expect(dialog.locator(".dialog-jump-to-message-count")).toHaveText(/\d+ of \d+ loaded messages/)
+  await search.fill(`Padding prompt ${lastPaddingIndex}`)
+  await expect(dialog.getByRole("option")).toHaveCount(1)
+  await search.fill("Earlier")
+  await expect(dialog.getByRole("option")).toHaveCount(0)
+
+  await dialog.getByRole("button", { name: "Load more", exact: true }).click()
+  await expect(dialog.getByRole("option")).toHaveCount(1)
+  await expect(dialog.getByText("1 of 1003 messages", { exact: true })).toBeVisible()
+})
+
+test("closes during history loading without losing follow state or reporting late failures", async ({ page }) => {
+  let holdNextHistoryPage = false
+  let releaseHistoryPage!: () => void
+  const historyGate = new Promise<void>((resolve) => (releaseHistoryPage = resolve))
+  const pageErrors: Error[] = []
+  await setupTimeline(page, {
+    messages: pagedTimeline,
+    pageMessages: (_sessionID, limit, before) => {
+      const end = before ? Number(before) : pagedTimeline.length
+      const start = Math.max(0, end - limit)
+      return { items: pagedTimeline.slice(start, end), cursor: start ? String(start) : undefined }
+    },
+    settings: { newLayoutDesigns: true },
+  })
+  page.on("pageerror", (error) => pageErrors.push(error))
+  await page.route("**/session/*/message**", async (route) => {
+    const url = new URL(route.request().url())
+    if (holdNextHistoryPage && (url.searchParams.has("before") || url.searchParams.has("cursor"))) {
+      holdNextHistoryPage = false
+      await historyGate
+    }
+    await route.fallback()
+  })
+
+  holdNextHistoryPage = true
+  const isHistoryRequest = (url: URL) => url.pathname.includes("/message") && (url.searchParams.has("before") || url.searchParams.has("cursor"))
+  const historyRequest = page.waitForRequest((request) => isHistoryRequest(new URL(request.url())))
+  const historyResponse = page.waitForResponse((response) => isHistoryRequest(new URL(response.url())))
+  await openJumpToMessage(page)
+  await historyRequest
+  const dialog = page.getByRole("dialog")
+  await expect(dialog.locator(".dialog-jump-to-message-status")).toBeVisible()
+  await dialog.getByRole("button", { name: "Close", exact: true }).click()
+  await expect(dialog).toHaveCount(0)
+  releaseHistoryPage()
+  await historyResponse
+
+  const timelineScroller = page.locator(".scroll-view__viewport", { has: page.locator("[data-timeline-row]") })
+  await expect
+    .poll(() => timelineScroller.evaluate((element) => element.scrollHeight - element.clientHeight - element.scrollTop))
+    .toBeLessThanOrEqual(1)
+  expect(pageErrors).toEqual([])
+})
+
+test("stops automatic pagination when an older page makes no progress", async ({ page }) => {
+  let historyRequests = 0
+  await setupTimeline(page, {
+    messages: pagedTimeline,
+    pageMessages: (_sessionID, limit, before) => {
+      const end = before ? Number(before) : pagedTimeline.length
+      const start = Math.max(0, end - limit)
+      if (before) return { items: pagedTimeline.slice(-limit), cursor: before }
+      return { items: pagedTimeline.slice(start, end), cursor: start ? String(start) : undefined }
+    },
+    settings: { newLayoutDesigns: true },
+  })
+  await page.route("**/session/*/message**", async (route) => {
+    const url = new URL(route.request().url())
+    if (url.searchParams.has("before") || url.searchParams.has("cursor")) {
+      historyRequests++
+    }
+    await route.fallback()
+  })
+
+  await openJumpToMessage(page)
+  const dialog = page.getByRole("dialog")
+  await expect(dialog.getByRole("alert")).toBeVisible()
+  await expect.poll(() => historyRequests).toBe(2)
+  await expect(dialog.locator(".dialog-jump-to-message-count")).toHaveText(/\d+ of \d+ loaded messages/)
+})
+
+async function openJumpToMessage(page: Page) {
+  await page.getByRole("button", { name: "More options", exact: true }).click()
+  await page.getByRole("menuitem", { name: "Jump to message...", exact: true }).click()
 }

@@ -365,6 +365,7 @@ export function currentSession(session: { id: string } & Record<string, unknown>
 }
 
 function currentMessage(value: unknown) {
+  if (typeof value === "object" && value !== null && "type" in value && "id" in value) return value
   const item = value as {
     info: Record<string, unknown> & { id: string; role: "user" | "assistant"; time: { created: number } }
     parts: Array<Record<string, unknown> & { type: string }>

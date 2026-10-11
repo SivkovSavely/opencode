@@ -11,144 +11,67 @@
   box-shadow: var(--v2-elevation-floating);
 }
 
+.dialog-jump-to-message [data-slot="dialog-content"] {
+  min-height: 0;
+  overflow: hidden;
+}
+
 .dialog-jump-to-message [data-slot="dialog-header"] {
   flex-shrink: 0;
 }
 
 .dialog-jump-to-message-body {
+  box-sizing: border-box;
   display: flex;
+  min-width: 0;
   min-height: 0;
   flex: 1;
   flex-direction: column;
   gap: 8px;
+  padding: 0 16px 12px;
+  overflow: hidden;
 }
 
 .dialog-jump-to-message-search {
   display: flex;
+  min-width: 0;
   flex-shrink: 0;
   align-items: center;
-  gap: 6px;
 }
 
 .dialog-jump-to-message-search [data-component="text-input-v2"] {
-  min-width: 0;
-  flex: 1;
-}
-
-.dialog-jump-to-message-regex {
-  display: grid;
-  width: 36px;
-  height: 36px;
-  flex-shrink: 0;
-  place-items: center;
-  border: 0;
-  border-radius: 6px;
-  background: transparent;
-  color: var(--v2-text-text-muted);
-  font-family: var(--font-mono);
-  font-size: 13px;
-  cursor: pointer;
-}
-
-.dialog-jump-to-message-regex:hover,
-.dialog-jump-to-message-regex[aria-pressed="true"] {
-  background: var(--v2-overlay-simple-overlay-hover);
-  color: var(--v2-text-text-base);
-}
-
-.dialog-jump-to-message-regex:focus-visible,
-.dialog-jump-to-message-retry:focus-visible {
-  outline: 2px solid var(--v2-border-border-focus);
-  outline-offset: 2px;
-}
-
-.dialog-jump-to-message-scroll {
-  min-height: 0;
-  flex: 1;
-}
-
-.dialog-jump-to-message-results {
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-  padding: 2px;
-}
-
-.dialog-jump-to-message-row {
-  display: flex;
   width: 100%;
   min-width: 0;
+  flex: 1;
+}
+
+.dialog-jump-to-message-error {
   flex-shrink: 0;
-  flex-direction: column;
-  align-items: stretch;
-  gap: 4px;
-  padding: 8px 10px;
-  border: 0;
-  border-radius: 6px;
-  background: transparent;
-  color: var(--v2-text-text-base);
-  text-align: left;
-  cursor: pointer;
-  scroll-margin: 6px 0;
-}
-
-.dialog-jump-to-message-row[data-active],
-.dialog-jump-to-message-row:hover,
-.dialog-jump-to-message-row:focus-visible {
-  background: var(--v2-overlay-simple-overlay-hover);
-}
-
-.dialog-jump-to-message-row:focus-visible {
-  outline: none;
-}
-
-.dialog-jump-to-message-meta {
-  display: flex;
-  min-width: 0;
-  justify-content: space-between;
-  gap: 8px;
-  color: var(--v2-text-text-muted);
+  color: var(--v2-state-fg-danger);
   font-size: 11px;
   line-height: 14px;
 }
 
-.dialog-jump-to-message-preview {
-  min-width: 0;
-  overflow-wrap: anywhere;
-  white-space: normal;
-  color: var(--v2-text-text-base);
-  font-size: 13px;
-  line-height: 18px;
-}
-
-.dialog-jump-to-message-preview mark {
-  border-radius: 2px;
-  background: var(--v2-background-bg-layer-04);
-  color: inherit;
-}
-
-.dialog-jump-to-message-empty,
 .dialog-jump-to-message-status {
   display: flex;
-  min-height: 120px;
-  flex: 1;
-  flex-direction: column;
+  min-height: 20px;
+  flex-shrink: 0;
   align-items: center;
-  justify-content: center;
   gap: 8px;
   color: var(--v2-text-text-muted);
-  font-size: 13px;
-  line-height: 18px;
-  text-align: center;
+  font-size: 11px;
+  line-height: 16px;
 }
 
 .dialog-jump-to-message-status progress {
-  width: 88px;
+  width: 64px;
   height: 2px;
+  flex-shrink: 0;
   accent-color: var(--v2-text-text-muted);
 }
 
 .dialog-jump-to-message-retry {
+  padding: 0;
   border: 0;
   background: transparent;
   color: var(--v2-text-text-base);
@@ -157,10 +80,179 @@
   cursor: pointer;
 }
 
+.dialog-jump-to-message-retry:focus-visible {
+  outline: 2px solid var(--v2-border-border-focus);
+  outline-offset: 2px;
+}
+
+.dialog-jump-to-message-scroll {
+  min-width: 0;
+  min-height: 0;
+  flex: 1;
+}
+
+.dialog-jump-to-message-results {
+  position: relative;
+  width: 100%;
+  min-width: 0;
+  overflow: hidden;
+}
+
+.dialog-jump-to-message-options {
+  position: absolute;
+  inset: 0;
+  min-width: 0;
+}
+
+.dialog-jump-to-message-measure-row,
+.dialog-jump-to-message-row {
+  box-sizing: border-box;
+  display: flex;
+  width: 100%;
+  min-width: 0;
+  align-items: center;
+  gap: 10px;
+  padding: 0 10px;
+}
+
+.dialog-jump-to-message-measure-row {
+  position: absolute;
+  inset: 0 0 auto;
+  height: 0;
+  overflow: hidden;
+  visibility: hidden;
+  pointer-events: none;
+}
+
+.dialog-jump-to-message-row {
+  position: absolute;
+  inset-inline-start: 0;
+  flex-shrink: 0;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--v2-text-text-base);
+  text-align: left;
+  cursor: pointer;
+  scroll-margin: 4px 0;
+}
+
+.dialog-jump-to-message-row[data-active],
+.dialog-jump-to-message-row:hover {
+  background: var(--v2-overlay-simple-overlay-hover);
+}
+
+.dialog-jump-to-message-row:focus-visible {
+  outline: 2px solid var(--v2-border-border-focus);
+  outline-offset: -2px;
+}
+
+.dialog-jump-to-message-meta {
+  display: block;
+  width: 72px;
+  min-width: 72px;
+  flex: 0 0 72px;
+  overflow: hidden;
+  color: var(--v2-text-text-muted);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  line-height: 16px;
+  white-space: nowrap;
+}
+
+.dialog-jump-to-message-meta time {
+  font-variant-numeric: tabular-nums;
+}
+
+.dialog-jump-to-message-preview {
+  display: block;
+  min-width: 0;
+  flex: 1 1 auto;
+  overflow: hidden;
+  color: var(--v2-text-text-base);
+  font-size: 13px;
+  line-height: 18px;
+  white-space: nowrap;
+}
+
+.dialog-jump-to-message-preview mark {
+  border-radius: 2px;
+  background: var(--v2-background-bg-layer-04);
+  color: inherit;
+}
+
+.dialog-jump-to-message-empty {
+  display: flex;
+  min-height: 120px;
+  flex: 1;
+  align-items: center;
+  justify-content: center;
+  color: var(--v2-text-text-muted);
+  font-size: 13px;
+  line-height: 18px;
+  text-align: center;
+}
+
+.dialog-jump-to-message-footer {
+  display: flex;
+  min-width: 0;
+  flex-shrink: 0;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  border-top: 1px solid var(--v2-border-border-muted);
+  padding-top: 8px;
+  color: var(--v2-text-text-muted);
+  font-size: 11px;
+  line-height: 16px;
+}
+
+.dialog-jump-to-message-count {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.dialog-jump-to-message-hints {
+  display: flex;
+  flex-shrink: 0;
+  align-items: center;
+  gap: 6px;
+  white-space: nowrap;
+}
+
+.dialog-jump-to-message-hints code {
+  color: var(--v2-text-text-base);
+  font-family: var(--font-mono);
+  font-size: inherit;
+}
+
 @media (max-width: 640px) {
   [data-component="dialog-v2"]:has(.dialog-jump-to-message) [data-slot="dialog-container"] {
     width: calc(100vw - 16px);
     height: min(620px, calc(100dvh - 24px));
     max-height: calc(100dvh - 24px);
+  }
+
+  .dialog-jump-to-message-body {
+    gap: 6px;
+    padding: 0 12px 10px;
+  }
+
+  .dialog-jump-to-message-measure-row,
+  .dialog-jump-to-message-row {
+    gap: 8px;
+    padding-inline: 6px;
+  }
+
+  .dialog-jump-to-message-meta {
+    width: 68px;
+    min-width: 68px;
+    flex-basis: 68px;
+  }
+
+  .dialog-jump-to-message-keyboard-hints {
+    display: none;
   }
 }

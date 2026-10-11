@@ -62,6 +62,7 @@ import { shouldMarkBoundaryGesture, normalizeWheelDelta } from "@/pages/session/
 import { SessionContextUsage } from "@/components/session-context-usage"
 import { useDialog } from "@opencode-ai/ui/context/dialog"
 import { useLanguage } from "@/context/language"
+import { useLayout } from "@/context/layout"
 import { useSessionKey } from "@/pages/session/session-layout"
 import { useSessionArchive } from "@/pages/session/session-archive"
 import { useServerSDK } from "@/context/server-sdk"
@@ -254,7 +255,6 @@ export function MessageTimeline(props: {
   userMessages: UserMessage[]
   historyMore: (sessionID: string) => boolean
   historyLoading: (sessionID: string) => boolean
-  historyMessageCount: (sessionID: string) => number
   loadOlder: (sessionID: string, sessionKey: string) => Promise<void>
   onJumpToMessage: (messageID: string, sessionKey: string) => void
   onPauseAutoScroll: () => void
@@ -262,7 +262,7 @@ export function MessageTimeline(props: {
   anchor: (id: string) => string
   setRevealMessage?: (fn: (id: string) => void) => void
   setScrollToEnd?: (fn: () => void) => void
-  setHistoryAnchor?: (handlers: { capture: () => void; restore: (done: boolean) => void }) => void
+  setHistoryAnchor?: (handlers: { capture: () => void; restore: (done: boolean) => void; cancel: () => void }) => void
 }) {
   let touchGesture: number | undefined
 
@@ -274,6 +274,7 @@ export function MessageTimeline(props: {
   const dialog = useDialog()
   const sessionArchive = useSessionArchive()
   const language = useLanguage()
+  const layout = useLayout()
   const { params, sessionKey } = useSessionKey()
   const ownerSessionKey = sessionKey()
   const cached = timelineCache.get(ownerSessionKey)
@@ -291,12 +292,15 @@ export function MessageTimeline(props: {
     dialog.show(() => (
       <DialogJumpToMessage
         sessionID={id}
-        isCurrentSession={() => sessionKey() === key}
+        isCurrentSession={() => {
+          const route = layout.route()
+          return sessionKey() === key && route.type === "session" && route.sessionId === id
+        }}
         messages={() => props.userMessages}
         parts={getMsgParts}
         historyMore={() => props.historyMore(id)}
         historyLoading={() => props.historyLoading(id)}
-        historyMessageCount={() => props.historyMessageCount(id)}
+        historyRecordCount={() => sync().data.session_message[id]?.length ?? 0}
         loadOlder={() => props.loadOlder(id, key)}
         select={(messageID) => {
           selected = true
@@ -549,7 +553,7 @@ export function MessageTimeline(props: {
       virtualizer.scrollToIndex(index, { align: "center" })
     })
     props.setScrollToEnd?.(() => virtualizer.scrollToEnd())
-    props.setHistoryAnchor?.({ capture: capturePrependAnchor, restore: restorePrependAnchor })
+    props.setHistoryAnchor?.({ capture: capturePrependAnchor, restore: restorePrependAnchor, cancel: clearPrependAnchor })
   })
 
   let overscanFrame: number | undefined
@@ -593,7 +597,7 @@ export function MessageTimeline(props: {
     if (overscanFrame !== undefined) cancelAnimationFrame(overscanFrame)
     props.setRevealMessage?.(() => {})
     props.setScrollToEnd?.(() => {})
-    props.setHistoryAnchor?.({ capture: () => {}, restore: () => {} })
+    props.setHistoryAnchor?.({ capture: () => {}, restore: () => {}, cancel: () => {} })
   })
 
   const [title, setTitle] = createStore({
@@ -1592,10 +1596,10 @@ export function MessageTimeline(props: {
                                   </DropdownMenu.Item>
                                 </Show>
                                 <DropdownMenu.Item onSelect={() => exportSession(id)}>
-                                  <DropdownMenu.ItemLabel>{language.t("common.export")}</DropdownMenu.ItemLabel>
+                                  <DropdownMenu.ItemLabel>{language.t("common.export")}...</DropdownMenu.ItemLabel>
                                 </DropdownMenu.Item>
                                 <DropdownMenu.Item onSelect={() => openJumpToMessage(id)}>
-                                  <DropdownMenu.ItemLabel>{language.t("common.search.placeholder")}</DropdownMenu.ItemLabel>
+                                  <DropdownMenu.ItemLabel>{language.t("session.jumpToMessage.menu")}</DropdownMenu.ItemLabel>
                                 </DropdownMenu.Item>
                                 <DropdownMenu.Item onSelect={() => void sessionArchive.archive(id)}>
                                   <DropdownMenu.ItemLabel>{language.t("common.archive")}</DropdownMenu.ItemLabel>
@@ -1672,7 +1676,7 @@ export function MessageTimeline(props: {
                                 {language.t("common.export")}...
                               </MenuV2.Item>
                               <MenuV2.Item onSelect={() => openJumpToMessage(id)}>
-                                {language.t("common.search.placeholder")}
+                                {language.t("session.jumpToMessage.menu")}
                               </MenuV2.Item>
                               <MenuV2.Item onSelect={() => void sessionArchive.archive(id)}>
                                 {language.t("common.archive")}

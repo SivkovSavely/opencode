@@ -1,4 +1,5 @@
 import { base64Encode } from "@opencode-ai/core/util/encode"
+import type { SessionMessageInfo } from "@opencode-ai/client/promise"
 import { Event } from "@opencode-ai/schema/event"
 import { SessionStatusEvent } from "@opencode-ai/schema/session-status-event"
 import { SessionV1 } from "@opencode-ai/schema/session-v1"
@@ -88,7 +89,10 @@ export async function setupTimeline(
   page: Page,
   input: {
     messages?: TimelineMessage[]
-    pageMessages?: (sessionId: string, limit: number, before?: string) => { items: TimelineMessage[]; cursor?: string }
+    pageMessages?: (sessionId: string, limit: number, before?: string) => {
+      items: (TimelineMessage | SessionMessageInfo)[]
+      cursor?: string
+    }
     settings?: Record<string, boolean>
     sessions?: Session[]
     cpuRate?: number

@@ -1603,6 +1603,7 @@ export default function Page() {
 
   let captureHistoryAnchor = () => {}
   let restoreHistoryAnchor = (_done: boolean) => {}
+  let cancelHistoryAnchor = () => {}
   const historyRequests = new Set<string>()
   let historyContinuationFrame: number | undefined
   const loadOlder = async (expectedSessionID?: string, expectedSessionKey?: string) => {
@@ -2134,7 +2135,6 @@ export default function Page() {
                   userMessages={visibleUserMessages()}
                   historyMore={() => historyMore()}
                   historyLoading={() => historyLoading() || ui.jumpToMessageHistoryLoading}
-                  historyMessageCount={() => timeline.messages().length}
                   loadOlder={loadOlder}
                   onPauseAutoScroll={autoScroll.pause}
                   onJumpDialogOpen={(open, key, selected) => {
@@ -2167,12 +2167,14 @@ export default function Page() {
                     if (sessionKey() !== key) return
                     const message = visibleUserMessages().find((item) => item.id === messageID)
                     if (!message) return
+                    cancelHistoryAnchor()
                     autoScroll.pause()
                     scrollToMessage(message)
                   }}
                   setHistoryAnchor={(handlers) => {
                     captureHistoryAnchor = handlers.capture
                     restoreHistoryAnchor = handlers.restore
+                    cancelHistoryAnchor = handlers.cancel
                   }}
                   anchor={anchor}
                   setRevealMessage={(fn) => {

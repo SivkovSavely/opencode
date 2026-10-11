@@ -33,6 +33,8 @@ type PluralKey =
   | "session.question.pending"
   | "session.followupDock.summary"
   | "session.revertDock.summary"
+  | "session.jumpToMessage.count"
+  | "session.jumpToMessage.loadedCount"
 type Source = { dict: Record<string, string> }
 
 function cookie(locale: Locale) {

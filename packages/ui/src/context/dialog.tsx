@@ -17,6 +17,7 @@ import { Dialog as Kobalte } from "@kobalte/core/dialog"
 import { makeEventListener } from "@solid-primitives/event-listener"
 
 type DialogElement = () => JSX.Element
+type EscapeHandler = (event: KeyboardEvent) => void
 
 type Active = {
   id: string
@@ -24,6 +25,7 @@ type Active = {
   dispose: () => void
   owner: Owner
   onClose?: () => void
+  onEscapeKeyDown?: EscapeHandler
   setClosing: (closing: boolean) => void
 }
 
@@ -67,6 +69,8 @@ function init() {
 
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key !== "Escape") return
+      stack().at(-1)?.onEscapeKeyDown?.(event)
+      if (event.defaultPrevented) return
       close()
       event.preventDefault()
       event.stopPropagation()
@@ -147,11 +151,21 @@ function init() {
     mount(element, owner, onClose, 0)
   }
 
+  const onEscapeKeyDown = (handler: EscapeHandler) => {
+    const current = stack().at(-1)
+    if (!current) return () => {}
+    current.onEscapeKeyDown = handler
+    return () => {
+      if (current.onEscapeKeyDown === handler) current.onEscapeKeyDown = undefined
+    }
+  }
+
   return {
     stack,
     close,
     show,
     push,
+    onEscapeKeyDown,
   }
 }
 
@@ -192,6 +206,9 @@ export function useDialog() {
     },
     close() {
       ctx.close()
+    },
+    onEscapeKeyDown(handler: EscapeHandler) {
+      return ctx.onEscapeKeyDown(handler)
     },
   }
 }
