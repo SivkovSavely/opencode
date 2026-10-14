@@ -3,12 +3,13 @@ import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { Database } from "@opencode-ai/core/database/database"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
-import { eq } from "drizzle-orm"
+import { eq, sql } from "drizzle-orm"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { expect } from "bun:test"
-import { Cause, Deferred, Duration, Effect, Exit, Fiber, Layer } from "effect"
+import { Cause, Deferred, Duration, Effect, Exit, Fiber, Layer, Scope } from "effect"
 import path from "path"
 import { fileURLToPath } from "url"
+import { randomUUID } from "node:crypto"
 import { NamedError } from "@opencode-ai/core/util/error"
 import { Agent as AgentSvc } from "../../src/agent/agent"
 import { BackgroundJob } from "@/background/job"
@@ -54,6 +55,7 @@ import { provideTmpdirServer, TestInstance } from "../fixture/fixture"
 import { awaitWithTimeout, pollWithTimeout, testEffect } from "../lib/effect"
 import { reply, TestLLMServer } from "../lib/llm-server"
 import { RuntimeFlags } from "@/effect/runtime-flags"
+import { RuntimeLifecycle } from "@/server/runtime-lifecycle"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { LocationServiceMap, locationServiceMapLayer } from "@opencode-ai/core/location-services"
@@ -942,6 +944,201 @@ it.instance("loop continues when finish is stop but assistant has tool parts", (
       expect(result.parts.some((part) => part.type === "text" && part.text === "second")).toBe(true)
       expect(result.info.finish).toBe("stop")
     }
+  }),
+)
+
+it.instance("crash recovery preserves completed tools and continues after uncertain tool execution", () =>
+  Effect.gen(function* () {
+    const { dir: directory, llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const session = yield* sessions.create({
+      title: "Pinned",
+      permission: [{ permission: "*", pattern: "*", action: "allow" }],
+    })
+    const { assistant } = yield* seed(session.id, { finish: "stop" })
+    const sideEffect = path.join(directory, "must-not-replay")
+    const running: SessionV1.ToolPart = {
+      id: PartID.ascending(),
+      messageID: assistant.id,
+      sessionID: session.id,
+      type: "tool",
+      callID: "crashed-shell-call",
+      tool: "bash",
+      state: {
+        status: "running",
+        input: { command: `touch ${sideEffect}` },
+        title: `touch ${sideEffect}`,
+        metadata: { output: "partial shell output", outputPath: "/tmp/incomplete-output" },
+        time: { start: Date.now() },
+      },
+    }
+    const completed: SessionV1.ToolPart = {
+      id: PartID.ascending(),
+      messageID: assistant.id,
+      sessionID: session.id,
+      type: "tool",
+      callID: "completed-call",
+      tool: "read",
+      state: {
+        status: "completed",
+        input: { filePath: "/tmp/known" },
+        title: "read known file",
+        output: "durably completed result",
+        metadata: { preserved: true },
+        time: { start: 1, end: 2 },
+      },
+    }
+    const failed: SessionV1.ToolPart = {
+      id: PartID.ascending(),
+      messageID: assistant.id,
+      sessionID: session.id,
+      type: "tool",
+      callID: "failed-call",
+      tool: "edit",
+      state: {
+        status: "error",
+        input: { filePath: "/tmp/failure" },
+        error: "original tool failure",
+        metadata: { failureCode: "EACCES" },
+        time: { start: 3, end: 4 },
+      },
+    }
+    yield* sessions.updatePart(running)
+    yield* sessions.updatePart(completed)
+    yield* sessions.updatePart(failed)
+    yield* llm.push(reply().text("recovered continuation").stop())
+
+    const result = yield* prompt.recover(session.id)
+    const messages = yield* sessions.messages({ sessionID: session.id })
+    const userMessages = messages.filter((message) => message.info.role === "user")
+    const parts = messages.flatMap((message) => message.parts)
+    const restored = parts.find(
+      (part): part is SessionV1.ToolPart => part.type === "tool" && part.callID === running.callID,
+    )
+    const preserved = parts.find(
+      (part): part is SessionV1.ToolPart => part.type === "tool" && part.callID === completed.callID,
+    )
+    const preservedFailure = parts.find(
+      (part): part is SessionV1.ToolPart => part.type === "tool" && part.callID === failed.callID,
+    )
+
+    expect(result.parts.some((part) => part.type === "text" && part.text === "recovered continuation")).toBe(true)
+    expect(userMessages).toHaveLength(1)
+    expect(restored?.state.status).toBe("error")
+    if (restored?.state.status === "error") {
+      expect(restored.state.input).toEqual(running.state.input)
+      expect(restored.state.metadata).toMatchObject({
+        interrupted: true,
+        crashInterrupted: true,
+        output: "partial shell output",
+        outputPath: "/tmp/incomplete-output",
+      })
+      expect(restored.state.error).toContain("Its final outcome is unknown")
+      expect(restored.state.error).toContain("partial shell output")
+      expect(restored.state.error).toContain("/tmp/incomplete-output")
+    }
+    expect(preserved).toEqual(completed)
+    expect(preservedFailure).toEqual(failed)
+    expect(yield* Effect.promise(() => Bun.file(sideEffect).exists())).toBe(false)
+    expect(JSON.stringify(yield* llm.inputs)).toContain("partial shell output")
+    expect(JSON.stringify(yield* llm.inputs)).toContain("unexpected OpenCode shutdown")
+  }),
+)
+
+it.instance("runtime takeover continues persisted history after an abandoned owner", () =>
+  Effect.gen(function* () {
+    const { dir: directory, llm } = yield* useServerConfig(providerCfg)
+    const database = yield* Database.Service
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const scope = yield* Scope.Scope
+    const session = yield* sessions.create({
+      title: "Abrupt runtime death",
+      permission: [{ permission: "*", pattern: "*", action: "allow" }],
+    })
+    const { user: input, assistant } = yield* seed(session.id, { finish: "stop" })
+    const sideEffect = path.join(directory, "must-not-rerun")
+    const call: SessionV1.ToolPart = {
+      id: PartID.ascending(),
+      messageID: assistant.id,
+      sessionID: session.id,
+      type: "tool",
+      callID: "abandoned-shell-call",
+      tool: "bash",
+      state: {
+        status: "running",
+        input: { command: `touch ${sideEffect}` },
+        title: `touch ${sideEffect}`,
+        metadata: { output: "partial" },
+        time: { start: Date.now() },
+      },
+    }
+    yield* sessions.updatePart(call)
+
+    const lineage = randomUUID()
+    const abandoned = RuntimeLifecycle.make({ lineage, instance: randomUUID() }, scope, database)
+    yield* abandoned.admit({ sessionID: session.id, directory: session.directory })
+    yield* database.db.run(sql`
+      UPDATE runtime_execution SET owner_start_time = ${"0"} WHERE session_id = ${session.id}
+    `)
+    yield* llm.push(reply().text("continued from persisted history").stop())
+
+    const recovered = RuntimeLifecycle.make({ lineage, instance: randomUUID() }, scope, database)
+    yield* recovered.recover((record) => prompt.recover(SessionID.make(record.sessionID)))
+    yield* pollWithTimeout(
+      database.db
+        .get<{ state: string }>(
+          sql`
+        SELECT state FROM runtime_execution WHERE session_id = ${session.id}
+      `,
+        )
+        .pipe(Effect.map((row) => (row?.state === "completed" ? (true as const) : undefined))),
+      "recovered execution did not complete",
+    )
+
+    const messages = yield* sessions.messages({ sessionID: session.id })
+    const users = messages.filter((message) => message.info.role === "user")
+    const tool = messages
+      .flatMap((message) => message.parts)
+      .find((part) => part.type === "tool" && part.callID === call.callID)
+    expect(yield* llm.calls).toBe(1)
+    expect(users).toHaveLength(1)
+    expect(tool?.type).toBe("tool")
+    if (tool?.type === "tool" && tool.state.status === "error") {
+      expect(tool.state.metadata?.crashInterrupted).toBe(true)
+      expect(tool.state.error).toContain("final outcome is unknown")
+    }
+    expect(
+      messages
+        .flatMap((message) => message.parts)
+        .some((part) => part.type === "text" && part.text === "continued from persisted history"),
+    ).toBe(true)
+    expect(yield* Effect.promise(() => Bun.file(sideEffect).exists())).toBe(false)
+    expect(JSON.stringify(yield* llm.inputs)).toContain("touch " + sideEffect)
+    expect(JSON.stringify(yield* llm.inputs)).toContain("final outcome is unknown")
+    expect(
+      (yield* database.db.get<{ session_id: string }>(sql`
+      SELECT session_id FROM runtime_execution WHERE session_id = ${session.id}
+    `))?.session_id,
+    ).toBe(session.id)
+    expect(input.id).toBe(users[0]?.info.id)
+  }),
+)
+
+it.instance("crash recovery does not repeat an assistant turn with durable completion", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const session = yield* sessions.create({ title: "Pinned" })
+    const { assistant } = yield* seed(session.id, { finish: "stop" })
+    assistant.time.completed = Date.now()
+    yield* sessions.updateMessage(assistant)
+
+    const result = yield* prompt.recover(session.id)
+    expect(result.info.id).toBe(assistant.id)
+    expect(yield* llm.calls).toBe(0)
   }),
 )
 

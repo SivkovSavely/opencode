@@ -77,6 +77,15 @@ export let url: URL | undefined
 
 export async function listen(opts: ListenOptions): Promise<Listener> {
   const listener = await Effect.runPromise(listenEffect(opts))
+  try {
+    const { ServerRecovery } = await import("./recovery")
+    await Effect.runPromise(ServerRecovery.initialize())
+  } catch (error) {
+    await Effect.runPromiseExit(listener.stop(true))
+    throw error
+  } finally {
+    await Effect.runPromise(listener.lifecycle.finishStartupRecovery())
+  }
   return {
     hostname: listener.hostname,
     port: listener.port,
@@ -93,6 +102,7 @@ const listenEffect: (opts: ListenOptions) => Effect.Effect<EffectListener, unkno
       {
         lineage: process.env.OPENCODE_RUNTIME_LINEAGE ?? runtimeLineage(opts),
         restartSupported: process.env.OPENCODE_RUNTIME_RESTART === "1" || process.env.INVOCATION_ID !== undefined,
+        startupRecovery: true,
       },
       Scope.makeUnsafe(),
     )

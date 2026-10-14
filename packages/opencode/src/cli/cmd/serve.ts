@@ -18,39 +18,7 @@ export const ServeCommand = effectCmd({
     const opts = yield* resolveNetworkOptions(args)
     const server = yield* Effect.promise(() => Server.listen(opts))
     console.log(`opencode server listening on http://${server.hostname}:${server.port}`)
-
     const { AppRuntime } = yield* Effect.promise(() => import("../../effect/app-runtime"))
-    const { InstanceStore } = yield* Effect.promise(() => import("../../project/instance-store"))
-    const { SessionPrompt } = yield* Effect.promise(() => import("../../session/prompt"))
-    const { SessionID } = yield* Effect.promise(() => import("../../session/schema"))
-    const { RuntimeLifecycle } = yield* Effect.promise(() => import("../../server/runtime-lifecycle"))
-    const runtime = RuntimeLifecycle.current()
-    if (runtime) {
-      yield* Effect.logInfo("restart diagnostic recovery invocation beginning", {
-        lineage: runtime.identity.lineage,
-        instance: runtime.identity.instance,
-        restartSupported: runtime.identity.restartSupported,
-      })
-      yield* Effect.promise(() =>
-        AppRuntime.runPromise(
-          Effect.gen(function* () {
-            const store = yield* InstanceStore.Service
-            const prompt = yield* SessionPrompt.Service
-            yield* runtime.recover((record) =>
-              store.provide(
-                { directory: record.directory },
-                prompt.loop({ sessionID: SessionID.make(record.sessionID) }),
-              ),
-            )
-          }),
-        ),
-      )
-      yield* Effect.logInfo("restart diagnostic recovery scheduling complete", {
-        lineage: runtime.identity.lineage,
-        instance: runtime.identity.instance,
-        note: "recover scheduled recovery fibers; asynchronous recovery may still be running",
-      })
-    }
 
     const requestShutdown = () => {
       AppRuntime.runPromise(server.lifecycle.request("shutdown")).catch(() => {})

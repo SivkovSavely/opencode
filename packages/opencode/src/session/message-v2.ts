@@ -323,13 +323,19 @@ export const toModelMessagesEffect = Effect.fnUntraced(function* (
             })
           }
           if (part.state.status === "error") {
-            const output = part.state.metadata?.interrupted === true ? part.state.metadata.output : undefined
+            const crashed = part.state.metadata?.crashInterrupted === true
+            const output =
+              !crashed && part.state.metadata?.interrupted === true ? part.state.metadata.output : undefined
+            const toolInput =
+              crashed && typeof part.state.metadata?.crashRawInput === "string"
+                ? part.state.metadata.crashRawInput
+                : part.state.input
             if (typeof output === "string") {
               assistantMessage.parts.push({
                 type: ("tool-" + part.tool) as `tool-${string}`,
                 state: "output-available",
                 toolCallId: part.callID,
-                input: part.state.input,
+                input: toolInput,
                 output,
                 ...(part.metadata?.providerExecuted ? { providerExecuted: true } : {}),
                 ...(differentModel ? {} : { callProviderMetadata: providerMeta(part.metadata) }),
@@ -339,7 +345,7 @@ export const toModelMessagesEffect = Effect.fnUntraced(function* (
                 type: ("tool-" + part.tool) as `tool-${string}`,
                 state: "output-error",
                 toolCallId: part.callID,
-                input: part.state.input,
+                input: toolInput,
                 errorText: part.state.error,
                 ...(part.metadata?.providerExecuted ? { providerExecuted: true } : {}),
                 ...(differentModel ? {} : { callProviderMetadata: providerMeta(part.metadata) }),

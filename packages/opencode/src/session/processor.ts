@@ -182,6 +182,7 @@ const layer = Layer.effect(
             attachments: output.attachments,
           },
         })
+        yield* runtime.progress(ctx.sessionID)
         yield* settleToolCall(toolCallID)
       })
 
@@ -470,6 +471,7 @@ const layer = Layer.effect(
               cost: usage.cost,
             })
             yield* session.updateMessage(ctx.assistantMessage)
+            yield* runtime.progress(ctx.sessionID)
             if (ctx.snapshot) {
               const patch = yield* snapshot.patch(ctx.snapshot)
               if (patch.files.length) {

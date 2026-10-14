@@ -113,6 +113,43 @@ describe("Runner", () => {
     }),
   )
 
+  it.live(
+    "enqueue runs notification work after the active run instead of joining it",
+    Effect.gen(function* () {
+      const s = yield* Scope.Scope
+      const runner = Runner.make<string>(s)
+      const order = yield* Ref.make<string[]>([])
+      const firstStarted = yield* Deferred.make<void>()
+      const finishFirst = yield* Deferred.make<void>()
+      const first = yield* runner
+        .ensureRunning(
+          Effect.gen(function* () {
+            yield* Ref.update(order, (items) => [...items, "active"])
+            yield* Deferred.succeed(firstStarted, undefined)
+            yield* Deferred.await(finishFirst)
+            return "active"
+          }),
+        )
+        .pipe(Effect.forkChild)
+      yield* Deferred.await(firstStarted)
+      const queued = yield* runner
+        .enqueue(
+          Effect.gen(function* () {
+            yield* Ref.update(order, (items) => [...items, "notification"])
+            return "notification"
+          }),
+        )
+        .pipe(Effect.forkChild)
+
+      yield* Effect.yieldNow
+      expect(yield* Ref.get(order)).toEqual(["active"])
+      yield* Deferred.succeed(finishFirst, undefined)
+      expect(yield* Fiber.join(first)).toBe("active")
+      expect(yield* Fiber.join(queued)).toBe("notification")
+      expect(yield* Ref.get(order)).toEqual(["active", "notification"])
+    }),
+  )
+
   // --- cancel semantics ---
 
   it.live(

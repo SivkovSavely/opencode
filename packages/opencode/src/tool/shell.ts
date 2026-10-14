@@ -509,14 +509,16 @@ export const ShellTool = Tool.define(
                         cut = true
                         sink = createWriteStream(next, { flags: "a" })
                         full = ""
-                      }),
-                    ),
-                    Effect.andThen(
-                      ctx.metadata({
-                        metadata: {
-                          output: last,
-                        },
-                      }),
+                      }).pipe(
+                        Effect.andThen(
+                          ctx.metadata({
+                            metadata: {
+                              output: last,
+                              outputPath: next,
+                            },
+                          }),
+                        ),
+                      ),
                     ),
                   )
                 }
@@ -525,6 +527,7 @@ export const ShellTool = Tool.define(
               return ctx.metadata({
                 metadata: {
                   output: last,
+                  ...(file ? { outputPath: file } : {}),
                 },
               })
             }),

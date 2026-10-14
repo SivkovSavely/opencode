@@ -4,13 +4,13 @@ import { ToolJsonSchema } from "./json-schema"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { BackgroundJob } from "@/background/job"
 import { Session } from "@/session/session"
-import { SessionID, MessageID } from "../session/schema"
+import { SessionID, MessageID, PartID } from "../session/schema"
 import { MessageV2 } from "../session/message-v2"
 import { Agent } from "../agent/agent"
 import { deriveSubagentSessionPermission } from "../agent/subagent-permissions"
 import type { SessionPrompt } from "../session/prompt"
 import { Config } from "@/config/config"
-import { Effect, Exit, Schema, Scope } from "effect"
+import { Cause, Effect, Exit, Schema, Scope } from "effect"
 import { EffectBridge } from "@/effect/bridge"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { Database } from "@opencode-ai/core/database/database"
@@ -18,7 +18,19 @@ import { Database } from "@opencode-ai/core/database/database"
 export interface TaskPromptOps {
   cancel(sessionID: SessionID): Effect.Effect<void>
   resolvePromptParts(template: string): Effect.Effect<SessionPrompt.PromptInput["parts"]>
-  prompt(input: SessionPrompt.PromptInput): Effect.Effect<SessionV1.WithParts>
+  prompt(
+    input: SessionPrompt.PromptInput,
+    parent?: {
+      parentMessageID?: MessageID
+      parentCallID?: string
+      parentMode?: "foreground" | "background"
+      notification?: boolean
+    },
+  ): Effect.Effect<SessionV1.WithParts>
+  claimParentNotification?(sessionID: SessionID, parentCallID?: string): Effect.Effect<boolean>
+  releaseParentNotificationClaim?(sessionID: SessionID, parentCallID?: string): Effect.Effect<void>
+  setParentMode?(sessionID: SessionID, mode: "foreground" | "background"): Effect.Effect<void>
+  acknowledgeParentNotification?(sessionID: SessionID, parentCallID?: string): Effect.Effect<void>
 }
 
 const id = "task"
@@ -61,7 +73,7 @@ export const Parameters = Schema.Struct({
   }),
 })
 
-function renderOutput(input: {
+export function renderOutput(input: {
   sessionID: SessionID
   state: "running" | "completed" | "error"
   summary?: string
@@ -138,7 +150,9 @@ export const TaskTool = Tool.define(
         : undefined
       if (
         session &&
-        (session.parentID !== parent.id || session.directory !== parent.directory || session.workspaceID !== parent.workspaceID)
+        (session.parentID !== parent.id ||
+          session.directory !== parent.directory ||
+          session.workspaceID !== parent.workspaceID)
       ) {
         return yield* Effect.fail(new Error("Cannot resume a task session from another parent or workspace"))
       }
@@ -188,10 +202,14 @@ export const TaskTool = Tool.define(
         modelID: msg.info.modelID,
         providerID: msg.info.providerID,
       }
+      const childMessageID = MessageID.ascending()
       const metadata = {
         parentSessionId: ctx.sessionID,
         sessionId: nextSession.id,
+        messageID: childMessageID,
         model,
+        inheritVariant: next.model === undefined,
+        variant: next.model ? undefined : variant,
         ...(runInBackground ? { background: true } : {}),
       }
 
@@ -217,17 +235,25 @@ export const TaskTool = Tool.define(
       const runTask = Effect.fn("TaskTool.runTask")(function* () {
         yield* taskDiagnostic("runTask started")
         const parts = yield* ops.resolvePromptParts(params.prompt)
-        const result = yield* ops.prompt({
-          messageID: MessageID.ascending(),
-          sessionID: nextSession.id,
-          model: {
-            modelID: model.modelID,
-            providerID: model.providerID,
+        const job = yield* background.get(nextSession.id)
+        const result = yield* ops.prompt(
+          {
+            messageID: childMessageID,
+            sessionID: nextSession.id,
+            model: {
+              modelID: model.modelID,
+              providerID: model.providerID,
+            },
+            variant: next.model ? undefined : variant,
+            agent: next.name,
+            parts,
           },
-          variant: next.model ? undefined : variant,
-          agent: next.name,
-          parts,
-        })
+          {
+            parentMessageID: ctx.messageID,
+            parentCallID: ctx.callID,
+            parentMode: runInBackground || job?.metadata?.background === true ? "background" : "foreground",
+          },
+        )
         const text = result.parts.findLast((item) => item.type === "text")?.text ?? ""
         const assistant = result.info.role === "assistant" ? result.info : undefined
         yield* taskDiagnostic("child prompt returned", {
@@ -257,28 +283,53 @@ export const TaskTool = Tool.define(
         text: string,
       ) {
         const currentParent = yield* sessions.get(ctx.sessionID)
-        yield* ops
-          .prompt({
-            sessionID: ctx.sessionID,
-            agent: currentParent.agent ?? ctx.agent,
-            variant,
-            parts: [
-              {
-                type: "text",
-                synthetic: true,
-                text: renderOutput({
-                  sessionID: nextSession.id,
-                  state,
-                  summary:
-                    state === "completed"
-                      ? `Background task completed: ${params.description}`
-                      : `Background task failed: ${params.description}`,
-                  text,
-                }),
-              },
-            ],
+        const notification = {
+          sessionID: ctx.sessionID,
+          messageID: MessageID.ascending(`msg_task_notification_${nextSession.id}`),
+          agent: currentParent.agent ?? ctx.agent,
+          variant,
+          idempotent: true,
+          parts: [
+            {
+              id: PartID.ascending(`prt_task_notification_${nextSession.id}`),
+              type: "text" as const,
+              synthetic: true,
+              text: renderOutput({
+                sessionID: nextSession.id,
+                state,
+                summary:
+                  state === "completed"
+                    ? `Background task completed: ${params.description}`
+                    : `Background task failed: ${params.description}`,
+                text,
+              }),
+            },
+          ],
+        }
+        for (let attempt = 0; attempt < 3; attempt++) {
+          if (attempt > 0) yield* Effect.sleep(attempt === 1 ? "1 second" : "5 seconds")
+          const claimed = yield* ops.claimParentNotification?.(nextSession.id, ctx.callID) ?? Effect.succeed(true)
+          if (!claimed) {
+            yield* taskDiagnostic("background notification not claimed", {
+              childSessionID: nextSession.id,
+              attempt: attempt + 1,
+            })
+            return
+          }
+          const delivered = yield* Effect.exit(
+            ops
+              .prompt(notification, { notification: true })
+              .pipe(Effect.tap(() => ops.acknowledgeParentNotification?.(nextSession.id, ctx.callID) ?? Effect.void)),
+          )
+          if (Exit.isSuccess(delivered)) return
+          yield* ops.releaseParentNotificationClaim?.(nextSession.id, ctx.callID) ?? Effect.void
+          const error = Cause.squash(delivered.cause)
+          yield* taskDiagnostic("background notification retry scheduled", {
+            childSessionID: nextSession.id,
+            attempt: attempt + 1,
+            errorType: error instanceof Error ? error.name : typeof error,
           })
-          .pipe(Effect.ignore, Effect.forkIn(scope, { startImmediately: true }))
+        }
       })
 
       const notify = Effect.fn("TaskTool.notifyBackgroundResult")(function* (jobID: string) {
@@ -292,7 +343,16 @@ export const TaskTool = Tool.define(
           })
           if (result.info?.status === "completed") yield* inject("completed", result.info.output ?? "")
           if (result.info?.status === "error") yield* inject("error", result.info.error ?? "")
-        }).pipe(Effect.forkIn(scope, { startImmediately: true }))
+        }).pipe(
+          Effect.catchCause((cause) => {
+            const error = Cause.squash(cause)
+            return taskDiagnostic("background notification remains pending", {
+              jobID,
+              errorType: error instanceof Error ? error.name : typeof error,
+            })
+          }),
+          Effect.forkIn(scope, { startImmediately: true }),
+        )
       })
 
       const extended = yield* background.extend({ id: nextSession.id, run: runTask() })
@@ -324,6 +384,7 @@ export const TaskTool = Tool.define(
             title: params.description,
             metadata: { ...metadata, background: true, jobId: nextSession.id },
           }),
+          ops.setParentMode?.(nextSession.id, "background") ?? Effect.void,
           notify(nextSession.id),
         ]),
         run: runTask().pipe(Effect.onInterrupt(() => ops.cancel(nextSession.id))),

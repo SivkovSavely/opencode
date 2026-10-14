@@ -17,6 +17,11 @@ export interface Interface {
     onInterrupt: Effect.Effect<SessionV1.WithParts>,
     work: Effect.Effect<SessionV1.WithParts>,
   ) => Effect.Effect<SessionV1.WithParts>
+  readonly enqueue: (
+    sessionID: SessionID,
+    onInterrupt: Effect.Effect<SessionV1.WithParts>,
+    work: Effect.Effect<SessionV1.WithParts>,
+  ) => Effect.Effect<SessionV1.WithParts>
   readonly startShell: (
     sessionID: SessionID,
     onInterrupt: Effect.Effect<SessionV1.WithParts>,
@@ -31,6 +36,7 @@ const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
     const background = yield* BackgroundJob.Service
+    const sessions = yield* Session.Service
     const status = yield* SessionStatus.Service
     const runtime = RuntimeLifecycle.current() ?? RuntimeLifecycle.unavailable()
 
@@ -81,14 +87,20 @@ const layer = Layer.effect(
     })
 
     const cancel = Effect.fn("SessionRunState.cancel")(function* (sessionID: SessionID) {
-      yield* cancelBackgroundJobs(background, sessionID)
-      const data = yield* InstanceState.get(state)
-      const existing = data.runners.get(sessionID)
-      if (!existing) {
-        yield* status.set(sessionID, { type: "idle" })
-        return
+      const pending = [sessionID]
+      const cancelled = new Set<SessionID>()
+      while (pending.length > 0) {
+        const current = pending.pop()!
+        if (cancelled.has(current)) continue
+        cancelled.add(current)
+        yield* cancelBackgroundJobs(background, current)
+        const data = yield* InstanceState.get(state)
+        const existing = data.runners.get(current)
+        if (existing) yield* existing.cancel
+        else yield* status.set(current, { type: "idle" })
+        const children = yield* sessions.children(current)
+        pending.push(...children.map((child) => child.id))
       }
-      yield* existing.cancel
     })
 
     const ensureRunning = Effect.fn("SessionRunState.ensureRunning")(function* (
@@ -97,6 +109,14 @@ const layer = Layer.effect(
       work: Effect.Effect<SessionV1.WithParts>,
     ) {
       return yield* (yield* runner(sessionID, onInterrupt)).ensureRunning(work)
+    })
+
+    const enqueue = Effect.fn("SessionRunState.enqueue")(function* (
+      sessionID: SessionID,
+      onInterrupt: Effect.Effect<SessionV1.WithParts>,
+      work: Effect.Effect<SessionV1.WithParts>,
+    ) {
+      return yield* (yield* runner(sessionID, onInterrupt)).enqueue(work)
     })
 
     const startShell = Effect.fn("SessionRunState.startShell")(function* (
@@ -110,7 +130,7 @@ const layer = Layer.effect(
         .pipe(Effect.catchTag("RunnerBusy", () => Effect.fail(busyError(sessionID))))
     })
 
-    return Service.of({ assertNotBusy, cancel, ensureRunning, startShell })
+    return Service.of({ assertNotBusy, cancel, ensureRunning, enqueue, startShell })
   }),
 )
 
@@ -155,7 +175,7 @@ function busyError(sessionID: SessionID) {
 export const node = LayerNode.make({
   service: Service,
   layer: layer,
-  deps: [BackgroundJob.node, SessionStatus.node],
+  deps: [BackgroundJob.node, Session.node, SessionStatus.node],
 })
 
 export * as SessionRunState from "./run-state"

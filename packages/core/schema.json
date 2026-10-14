@@ -1,9 +1,9 @@
 {
   "version": "7",
   "dialect": "sqlite",
-  "id": "bd026b59-7af2-43ff-90f6-da18a71448c1",
+  "id": "3dd5ac0c-7df2-472e-b208-3bcb52f09f92",
   "prevIds": [
-    "f14a9b18-8207-487e-a3d3-227e629ba9ad"
+    "ef44f982-728a-4be9-9fe0-731fd1912fb9"
   ],
   "ddl": [
     {
@@ -237,6 +237,66 @@
       "table": "runtime_execution"
     },
     {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "owner_host",
+      "entityType": "columns",
+      "table": "runtime_execution"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "owner_machine_id",
+      "entityType": "columns",
+      "table": "runtime_execution"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "owner_boot_id",
+      "entityType": "columns",
+      "table": "runtime_execution"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "owner_pid_namespace",
+      "entityType": "columns",
+      "table": "runtime_execution"
+    },
+    {
+      "type": "integer",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "owner_pid",
+      "entityType": "columns",
+      "table": "runtime_execution"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "owner_start_time",
+      "entityType": "columns",
+      "table": "runtime_execution"
+    },
+    {
       "type": "integer",
       "notNull": true,
       "autoincrement": false,
@@ -303,6 +363,36 @@
       "default": null,
       "generated": null,
       "name": "parent_call_id",
+      "entityType": "columns",
+      "table": "runtime_execution"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "parent_mode",
+      "entityType": "columns",
+      "table": "runtime_execution"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "parent_notification_state",
+      "entityType": "columns",
+      "table": "runtime_execution"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "0",
+      "generated": null,
+      "name": "recovery_attempts",
       "entityType": "columns",
       "table": "runtime_execution"
     },

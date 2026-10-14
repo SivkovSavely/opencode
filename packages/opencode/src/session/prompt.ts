@@ -97,16 +97,28 @@ function formatMcpResourceBytes(value: number) {
 function isOrphanedInterruptedTool(part: SessionV1.ToolPart) {
   // cleanup() marks abandoned tool_use blocks this way after retries/aborts.
   // They are not pending work and must not trigger an assistant-prefill request.
-  return part.state.status === "error" && part.state.metadata?.interrupted === true
+  return (
+    part.state.status === "error" &&
+    part.state.metadata?.interrupted === true &&
+    part.state.metadata?.crashInterrupted !== true
+  )
 }
 
 export interface Interface {
   readonly cancel: (sessionID: SessionID) => Effect.Effect<void>
-  readonly prompt: (input: PromptInput) => Effect.Effect<SessionV1.WithParts, Image.Error>
+  readonly prompt: (input: PromptInput, task?: TaskAdmission) => Effect.Effect<SessionV1.WithParts, Image.Error>
   readonly loop: (input: LoopInput) => Effect.Effect<SessionV1.WithParts>
+  readonly recover: (sessionID: SessionID) => Effect.Effect<SessionV1.WithParts>
   readonly shell: (input: ShellInput) => Effect.Effect<SessionV1.WithParts, Session.BusyError>
   readonly command: (input: CommandInput) => Effect.Effect<SessionV1.WithParts, Image.Error>
   readonly resolvePromptParts: (template: string) => Effect.Effect<PromptInput["parts"]>
+}
+
+type TaskAdmission = {
+  parentMessageID?: MessageID
+  parentCallID?: string
+  parentMode?: "foreground" | "background"
+  notification?: boolean
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/SessionPrompt") {}
@@ -145,15 +157,31 @@ const layer = Layer.effect(
     const { db } = database
     const ops = Effect.fn("SessionPrompt.ops")(function* () {
       return {
-        cancel: (sessionID: SessionID) => cancel(sessionID),
+        cancel: (sessionID: SessionID) => cancelTask(sessionID),
         resolvePromptParts: (template: string) => resolvePromptParts(template),
-        prompt: (input: PromptInput) => prompt(input).pipe(Effect.catch(Effect.die)),
+        prompt: (input: PromptInput, parent?: TaskAdmission) => prompt(input, parent).pipe(Effect.catch(Effect.die)),
+        claimParentNotification: (sessionID: SessionID, parentCallID?: string) =>
+          runtime.claimParentNotification(sessionID, parentCallID),
+        releaseParentNotificationClaim: (sessionID: SessionID, parentCallID?: string) =>
+          runtime.releaseParentNotificationClaim(sessionID, parentCallID),
+        setParentMode: (sessionID: SessionID, mode: "foreground" | "background") =>
+          runtime.setParentMode(sessionID, mode),
+        acknowledgeParentNotification: (sessionID: SessionID, parentCallID?: string) =>
+          runtime.acknowledgeParentNotification(sessionID, parentCallID),
       } satisfies TaskPromptOps
     })
 
     const cancel = Effect.fn("SessionPrompt.cancel")(function* (sessionID: SessionID) {
       yield* Effect.logInfo("cancel", { "session.id": sessionID })
-      yield* state.cancel(sessionID)
+      const owner = yield* runtime.cancel(sessionID)
+      if (!owner) return yield* runtime.waitCancel(sessionID)
+      yield* state.cancel(sessionID).pipe(Effect.ensuring(runtime.finishCancel(sessionID)))
+    })
+
+    const cancelTask = Effect.fn("SessionPrompt.cancelTask")(function* (sessionID: SessionID) {
+      const owner = yield* runtime.cancel(sessionID)
+      if (!owner) return yield* state.cancel(sessionID)
+      yield* state.cancel(sessionID).pipe(Effect.ensuring(runtime.finishCancel(sessionID)))
     })
 
     const resolvePromptParts = Effect.fn("SessionPrompt.resolvePromptParts")(function* (template: string) {
@@ -1051,48 +1079,71 @@ const layer = Layer.effect(
       return { info, parts }
     }, Effect.scoped)
 
-    const prompt: (input: PromptInput) => Effect.Effect<SessionV1.WithParts, Image.Error> = Effect.fn(
-      "SessionPrompt.prompt",
-    )(function* (input: PromptInput) {
-      const session = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
-      const work = Effect.gen(function* () {
-        yield* revert.cleanup(session)
-        const message = yield* createUserMessage(input)
-        yield* sessions.touch(input.sessionID)
+    const prompt: (input: PromptInput, task?: TaskAdmission) => Effect.Effect<SessionV1.WithParts, Image.Error> =
+      Effect.fn("SessionPrompt.prompt")(function* (input: PromptInput, task?: TaskAdmission) {
+        const session = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
+        const work = Effect.gen(function* () {
+          const existing =
+            input.idempotent && input.messageID
+              ? yield* sessions
+                  .findMessage(input.sessionID, (item) => item.info.id === input.messageID)
+                  .pipe(Effect.orDie)
+              : Option.none<SessionV1.WithParts>()
+          const complete =
+            Option.isSome(existing) &&
+            input.parts.every((part) => part.id && existing.value.parts.some((saved) => saved.id === part.id))
+          const message = complete
+            ? existing.value
+            : yield* Effect.gen(function* () {
+                yield* revert.cleanup(session)
+                return yield* createUserMessage(input)
+              })
+          yield* sessions.touch(input.sessionID)
 
-        const permissions: PermissionV1.Rule[] = []
-        for (const [t, enabled] of Object.entries(input.tools ?? {})) {
-          permissions.push({ permission: t, action: enabled ? "allow" : "deny", pattern: "*" })
-        }
-        if (permissions.length > 0) {
-          session.permission = permissions
-          yield* sessions.setPermission({ sessionID: session.id, permission: permissions })
-        }
-        return message
-      })
+          const permissions: PermissionV1.Rule[] = []
+          for (const [t, enabled] of Object.entries(input.tools ?? {})) {
+            permissions.push({ permission: t, action: enabled ? "allow" : "deny", pattern: "*" })
+          }
+          if (permissions.length > 0) {
+            session.permission = permissions
+            yield* sessions.setPermission({ sessionID: session.id, permission: permissions })
+          }
+          return message
+        })
 
-      if (input.noReply === true) return yield* work
-      yield* Effect.logInfo("restart diagnostic runtime admission requested", {
-        sessionID: input.sessionID,
-        parentSessionID: session.parentID,
-      })
-      yield* runtime
-        .admit({
+        if (input.noReply === true) return yield* work
+        yield* Effect.logInfo("restart diagnostic runtime admission requested", {
           sessionID: input.sessionID,
-          directory: session.directory,
           parentSessionID: session.parentID,
         })
-        .pipe(Effect.orDie)
-      yield* Effect.logInfo("restart diagnostic runtime admission accepted", {
-        sessionID: input.sessionID,
-        parentSessionID: session.parentID,
+        const admission = yield* runtime
+          .admit({
+            sessionID: input.sessionID,
+            directory: session.directory,
+            parentSessionID: session.parentID,
+            parentMessageID: task?.parentMessageID,
+            parentCallID: task?.parentCallID,
+            parentMode: task?.parentMode,
+            rejectCancelled: task?.notification,
+            rejectRecoveryNeeded: task?.notification,
+            manualRecovery: task === undefined,
+          })
+          .pipe(Effect.orDie)
+        yield* Effect.logInfo("restart diagnostic runtime admission accepted", {
+          sessionID: input.sessionID,
+          parentSessionID: session.parentID,
+        })
+        return yield* Effect.acquireUseRelease(
+          work,
+          () =>
+            state.enqueue(
+              input.sessionID,
+              lastAssistant(input.sessionID),
+              runLoop(input.sessionID, admission.manualRecovery, admission.manualRecovery, admission.manualRecovery),
+            ),
+          () => runtime.release(input.sessionID),
+        )
       })
-      return yield* Effect.acquireUseRelease(
-        work,
-        () => loop({ sessionID: input.sessionID }),
-        () => runtime.release(input.sessionID),
-      )
-    })
 
     const lastAssistant = Effect.fnUntraced(function* (sessionID: SessionID) {
       const match = yield* sessions.findMessage(sessionID, (m) => m.info.role !== "user").pipe(Effect.orDie)
@@ -1102,289 +1153,381 @@ const layer = Layer.effect(
       throw new Error("Impossible")
     })
 
-    const runLoop: (sessionID: SessionID) => Effect.Effect<SessionV1.WithParts> = Effect.fn("SessionPrompt.run")(
-      function* (sessionID: SessionID) {
-        const ctx = yield* InstanceState.context
-        let structured: unknown
-        let step = 0
-        const session = yield* sessions.get(sessionID).pipe(Effect.orDie)
-
-        while (true) {
-          const beforeTurn = yield* runtime.beforeTurn(sessionID)
-          if (!beforeTurn) {
-            yield* Effect.logInfo("restart diagnostic loop stopped at beforeTurn", {
-              sessionID,
-              point: "beforeTurn",
-            })
-            yield* runtime.park(sessionID)
-            break
-          }
-          yield* status.set(sessionID, { type: "busy" })
-          yield* Effect.logInfo("loop", { "session.id": sessionID, step })
-
-          let msgs = yield* MessageV2.filterCompactedEffect(sessionID).pipe(
-            Effect.provideService(Database.Service, database),
-          )
-
-          const { user: lastUser, assistant: lastAssistant, finished: lastFinished, tasks } = MessageV2.latest(msgs)
-
-          if (!lastUser) throw new Error("No user message found in stream. This should never happen.")
-
-          const lastAssistantMsg = msgs.findLast(
-            (msg) => msg.info.role === "assistant" && msg.info.id === lastAssistant?.id,
-          )
-          // Some providers return "stop" even when the assistant message contains
-          // tool calls. Keep the loop running so tool results can be sent back to
-          // the model, but ignore cleanup-marked interrupted orphans.
-          const hasToolCalls =
-            lastAssistantMsg?.parts.some(
-              (part) => part.type === "tool" && !part.metadata?.providerExecuted && !isOrphanedInterruptedTool(part),
-            ) ?? false
-
-          if (
-            lastAssistant?.finish &&
-            !["tool-calls", "unknown"].includes(lastAssistant.finish) &&
-            !hasToolCalls &&
-            lastAssistant.parentID === lastUser.id
-          ) {
-            const orphan = lastAssistantMsg?.parts.find(
-              (part): part is SessionV1.ToolPart => part.type === "tool" && isOrphanedInterruptedTool(part),
-            )
-            if (orphan) {
-              yield* Effect.logWarning("loop exit with orphaned interrupted tool", {
-                "session.id": sessionID,
-                messageID: lastAssistant.id,
-                tool: orphan.tool,
-                callID: orphan.callID,
-              })
-            }
-            yield* Effect.logInfo("exiting loop", { "session.id": sessionID })
-            break
-          }
-
-          step++
-          if (step === 1)
-            yield* title({
-              session,
-              modelID: lastUser.model.modelID,
-              providerID: lastUser.model.providerID,
-              history: msgs,
-            }).pipe(Effect.ignore, Effect.forkIn(scope))
-
-          const model = yield* getModel(lastUser.model.providerID, lastUser.model.modelID, sessionID)
-          const task = tasks.pop()
-
-          if (task?.type === "subtask") {
-            yield* handleSubtask({ task, model, lastUser, sessionID, session, msgs })
+    const reconcileCrashTools = Effect.fn("SessionPrompt.reconcileCrashTools")(function* (
+      sessionID: SessionID,
+      manualRecovery = false,
+    ) {
+      const messages = yield* sessions.messages({ sessionID }).pipe(Effect.orDie)
+      const interrupted: Array<{ callID: string; tool: string; outputLength: number }> = []
+      for (const message of messages) {
+        for (const part of message.parts) {
+          if (part.type !== "tool" || (part.state.status !== "pending" && part.state.status !== "running")) continue
+          const stored = yield* sessions
+            .getPart({ sessionID, messageID: message.info.id, partID: part.id })
+            .pipe(Effect.orDie)
+          if (stored?.type !== "tool" || (stored.state.status !== "pending" && stored.state.status !== "running"))
             continue
+          const currentPart = stored
+          const previousMetadata = currentPart.state.status === "running" ? currentPart.state.metadata : undefined
+          const metadata: Record<string, unknown> = {
+            ...(previousMetadata ?? {}),
+            interrupted: true,
+            crashInterrupted: true,
+            ...(currentPart.state.status === "pending" ? { crashRawInput: currentPart.state.raw } : {}),
           }
-
-          if (task?.type === "compaction") {
-            const result = yield* compaction.process({
-              messages: msgs,
-              parentID: lastUser.id,
-              sessionID,
-              auto: task.auto,
-              overflow: task.overflow,
-            })
-            if (result === "stop") break
-            continue
-          }
-
-          if (
-            lastFinished &&
-            lastFinished.summary !== true &&
-            (yield* compaction.isOverflow({ tokens: lastFinished.tokens, model }))
-          ) {
-            yield* compaction.create({ sessionID, agent: lastUser.agent, model: lastUser.model, auto: true })
-            continue
-          }
-
-          const agent = yield* agents.get(lastUser.agent)
-          if (!agent) {
-            const available = (yield* agents.list()).filter((a) => !a.hidden).map((a) => a.name)
-            const hint = available.length ? ` Available agents: ${available.join(", ")}` : ""
-            const error = new NamedError.Unknown({ message: `Agent not found: "${lastUser.agent}".${hint}` })
-            yield* events.publish(Session.Event.Error, { sessionID, error: error.toObject() })
-            throw error
-          }
-          const maxSteps = agent.steps ?? Infinity
-          const isLastStep = step >= maxSteps
-          msgs = yield* SessionReminders.apply({ messages: msgs, agent, session }).pipe(
-            Effect.provideService(RuntimeFlags.Service, flags),
-            Effect.provideService(FSUtil.Service, fsys),
-            Effect.provideService(Session.Service, sessions),
-          )
-
-          const msg: SessionV1.Assistant = {
-            id: MessageID.ascending(),
-            parentID: lastUser.id,
-            role: "assistant",
-            mode: agent.name,
-            agent: agent.name,
-            variant: lastUser.model.variant,
-            path: { cwd: ctx.directory, root: ctx.worktree },
-            cost: 0,
-            tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
-            modelID: model.id,
-            providerID: model.providerID,
-            time: { created: Date.now() },
-            sessionID,
-          }
-          yield* sessions.updateMessage(msg)
-
-          const finalizeInterruptedAssistant = Effect.gen(function* () {
-            if (msg.time.completed) return
-            msg.error ??= MessageV2.fromError(new DOMException("Aborted", "AbortError"), {
-              providerID: msg.providerID,
-              aborted: true,
-            })
-            msg.time.completed = Date.now()
-            yield* sessions.updateMessage(msg)
+          const output = typeof metadata.output === "string" ? metadata.output : undefined
+          const outputPath = typeof metadata.outputPath === "string" ? metadata.outputPath : undefined
+          const details = [
+            manualRecovery
+              ? "This session was explicitly continued from an uncertain prior execution state. The tool's final outcome is unknown; it may still be running or may have partially or fully executed. Inspect the current state before deciding whether another operation is necessary. Do not blindly repeat potentially non-idempotent actions."
+              : "The tool was interrupted by an unexpected OpenCode shutdown. Its final outcome is unknown. It may have partially or fully executed. Inspect the current state before deciding whether another operation is necessary. Do not blindly repeat potentially non-idempotent actions.",
+            currentPart.state.status === "pending"
+              ? "The provider arguments were incomplete; the preserved raw argument fragment is not executable input."
+              : undefined,
+            output !== undefined
+              ? `Preserved output preview (incomplete and possibly truncated):\n${output}`
+              : undefined,
+            outputPath
+              ? `A partial output file reference was preserved; its contents may be incomplete: ${outputPath}`
+              : undefined,
+          ]
+            .filter((item): item is string => item !== undefined)
+            .join("\n\n")
+          const start =
+            currentPart.state.status === "pending" ? message.info.time.created : currentPart.state.time.start
+          yield* sessions.updatePart({
+            ...currentPart,
+            state: {
+              status: "error",
+              input: currentPart.state.input,
+              error: details,
+              metadata,
+              time: { start, end: Date.now() },
+            },
           })
+          interrupted.push({ callID: currentPart.callID, tool: currentPart.tool, outputLength: output?.length ?? 0 })
+        }
+      }
+      if (interrupted.length > 0)
+        yield* Effect.logWarning("crash recovery reconciled uncertain tool calls", {
+          sessionID,
+          count: interrupted.length,
+          calls: interrupted.slice(0, 20),
+          omitted: Math.max(0, interrupted.length - 20),
+          partialOutputCount: interrupted.filter((item) => item.outputLength > 0).length,
+        })
+    })
 
-          const handle = yield* processor
-            .create({
-              assistantMessage: msg,
-              sessionID,
-              model,
-            })
-            .pipe(Effect.onInterrupt(() => finalizeInterruptedAssistant))
+    const runLoop: (
+      sessionID: SessionID,
+      recovery?: boolean,
+      reconcile?: boolean,
+      manualRecovery?: boolean,
+    ) => Effect.Effect<SessionV1.WithParts> = Effect.fn("SessionPrompt.run")(function* (
+      sessionID: SessionID,
+      recovery = false,
+      reconcile = false,
+      manualRecovery = false,
+    ) {
+      const ctx = yield* InstanceState.context
+      let structured: unknown
+      let step = 0
+      const session = yield* sessions.get(sessionID).pipe(Effect.orDie)
+      if (reconcile) yield* reconcileCrashTools(sessionID, manualRecovery)
 
-          const outcome: "break" | "continue" = yield* Effect.gen(function* () {
-            const lastUserMsg = msgs.findLast((m) => m.info.role === "user")
-            const bypassAgentCheck = lastUserMsg?.parts.some((p) => p.type === "agent") ?? false
-            const promptOps = yield* ops()
+      while (true) {
+        const beforeTurn = yield* runtime.beforeTurn(sessionID)
+        if (!beforeTurn) {
+          yield* Effect.logInfo("restart diagnostic loop stopped at beforeTurn", {
+            sessionID,
+            point: "beforeTurn",
+          })
+          yield* runtime.park(sessionID)
+          break
+        }
+        yield* status.set(sessionID, { type: "busy" })
+        yield* Effect.logInfo("loop", { "session.id": sessionID, step })
 
-            const tools = yield* SessionTools.resolve({
-              agent,
-              session,
-              model,
-              processor: handle,
-              bypassAgentCheck,
-              messages: msgs,
-              promptOps,
-            }).pipe(
-              Effect.provideService(Plugin.Service, plugin),
-              Effect.provideService(Permission.Service, permission),
-              Effect.provideService(ToolRegistry.Service, registry),
-              Effect.provideService(MCP.Service, mcp),
-              Effect.provideService(Truncate.Service, truncate),
-              Effect.provideService(RuntimeFlags.Service, flags),
-            )
+        let msgs = yield* MessageV2.filterCompactedEffect(sessionID).pipe(
+          Effect.provideService(Database.Service, database),
+        )
 
-            if (lastUser.format?.type === "json_schema") {
-              tools["StructuredOutput"] = createStructuredOutputTool({
-                schema: lastUser.format.schema,
-                onSuccess(output) {
-                  structured = output
-                },
-              })
-            }
+        const { user: lastUser, assistant: lastAssistant, finished: lastFinished, tasks } = MessageV2.latest(msgs)
 
-            if (step === 1)
-              yield* summary.summarize({ sessionID, messageID: lastUser.id }).pipe(Effect.ignore, Effect.forkIn(scope))
+        if (!lastUser) throw new Error("No user message found in stream. This should never happen.")
 
-            yield* plugin.trigger("experimental.chat.messages.transform", {}, { messages: msgs })
+        const lastAssistantMsg = msgs.findLast(
+          (msg) => msg.info.role === "assistant" && msg.info.id === lastAssistant?.id,
+        )
+        // Some providers return "stop" even when the assistant message contains
+        // tool calls. Keep the loop running so tool results can be sent back to
+        // the model, but ignore cleanup-marked interrupted orphans.
+        const hasToolCalls =
+          lastAssistantMsg?.parts.some(
+            (part) => part.type === "tool" && !part.metadata?.providerExecuted && !isOrphanedInterruptedTool(part),
+          ) ?? false
+        const interruptedAssistant = recovery && lastAssistant && !lastAssistant.time.completed
 
-            const [skills, env, instructions, mcpInstructions, modelMsgs] = yield* Effect.all([
-              sys.skills(agent),
-              sys.environment(model),
-              instruction.system().pipe(Effect.orDie),
-              sys.mcp(agent, session.permission),
-              MessageV2.toModelMessagesEffect(msgs, model),
-            ])
-            const system = [
-              ...env,
-              ...instructions,
-              ...(mcpInstructions ? [mcpInstructions] : []),
-              ...(skills ? [skills] : []),
-            ]
-            const format = lastUser.format ?? { type: "text" as const }
-            if (format.type === "json_schema") system.push(STRUCTURED_OUTPUT_SYSTEM_PROMPT)
-            const result = yield* handle.process({
-              user: lastUser,
-              agent,
-              permission: session.permission,
-              sessionID,
-              parentSessionID: session.parentID,
-              system,
-              messages: [
-                ...modelMsgs,
-                ...(isLastStep ? [{ role: "assistant" as const, content: MAX_STEPS_PROMPT }] : []),
-              ],
-              tools,
-              model,
-              toolChoice: format.type === "json_schema" ? "required" : undefined,
-            })
-
-            if (structured !== undefined) {
-              handle.message.structured = structured
-              handle.message.finish = handle.message.finish ?? "stop"
-              yield* sessions.updateMessage(handle.message)
-              return "break" as const
-            }
-
-            const finished = handle.message.finish && !["tool-calls", "unknown"].includes(handle.message.finish)
-            if (finished && !handle.message.error) {
-              // Surface any content-filter finish (e.g. Anthropic stop_reason:
-              // refusal) as an error. These turns may have produced no visible
-              // output at all — previously the session went idle silently — or
-              // partial text that was cut off by the provider's filter.
-              if (handle.message.finish === "content-filter") {
-                handle.message.error = new SessionV1.ContentFilterError({
-                  message: "The response was blocked by the provider's content filter",
-                }).toObject()
-                yield* sessions.updateMessage(handle.message)
-                yield* events.publish(Session.Event.Error, { sessionID, error: handle.message.error })
-                return "break" as const
-              }
-              if (format.type === "json_schema") {
-                handle.message.error = new SessionV1.StructuredOutputError({
-                  message: "Model did not produce structured output",
-                  retries: 0,
-                }).toObject()
-                yield* sessions.updateMessage(handle.message)
-                return "break" as const
-              }
-            }
-
-            if (result === "stop") return "break" as const
-            if (result === "compact") {
-              yield* compaction.create({
-                sessionID,
-                agent: lastUser.agent,
-                model: lastUser.model,
-                auto: true,
-                overflow: !handle.message.finish,
-              })
-            }
-            return "continue" as const
-          }).pipe(
-            Effect.ensuring(instruction.clear(handle.message.id)),
-            Effect.onInterrupt(() => finalizeInterruptedAssistant),
+        if (
+          lastAssistant?.finish &&
+          !["tool-calls", "unknown"].includes(lastAssistant.finish) &&
+          !hasToolCalls &&
+          !interruptedAssistant &&
+          lastAssistant.parentID === lastUser.id
+        ) {
+          const orphan = lastAssistantMsg?.parts.find(
+            (part): part is SessionV1.ToolPart => part.type === "tool" && isOrphanedInterruptedTool(part),
           )
-          if (outcome === "break") break
-          const checkpoint = yield* runtime.checkpoint(sessionID)
-          if (!checkpoint) {
-            yield* Effect.logInfo("restart diagnostic loop stopped at checkpoint", {
-              sessionID,
-              point: "checkpoint",
+          if (orphan) {
+            yield* Effect.logWarning("loop exit with orphaned interrupted tool", {
+              "session.id": sessionID,
+              messageID: lastAssistant.id,
+              tool: orphan.tool,
+              callID: orphan.callID,
             })
-            break
           }
+          yield* Effect.logInfo("exiting loop", { "session.id": sessionID })
+          break
+        }
+
+        step++
+        if (step === 1)
+          yield* title({
+            session,
+            modelID: lastUser.model.modelID,
+            providerID: lastUser.model.providerID,
+            history: msgs,
+          }).pipe(Effect.ignore, Effect.forkIn(scope))
+
+        const model = yield* getModel(lastUser.model.providerID, lastUser.model.modelID, sessionID)
+        const task = tasks.pop()
+
+        if (task?.type === "subtask") {
+          yield* handleSubtask({ task, model, lastUser, sessionID, session, msgs })
           continue
         }
 
-        yield* compaction.prune({ sessionID }).pipe(Effect.ignore, Effect.forkIn(scope))
-        return yield* lastAssistant(sessionID)
-      },
-    )
+        if (task?.type === "compaction") {
+          const result = yield* compaction.process({
+            messages: msgs,
+            parentID: lastUser.id,
+            sessionID,
+            auto: task.auto,
+            overflow: task.overflow,
+          })
+          if (result === "stop") break
+          continue
+        }
+
+        if (
+          lastFinished &&
+          lastFinished.summary !== true &&
+          (yield* compaction.isOverflow({ tokens: lastFinished.tokens, model }))
+        ) {
+          yield* compaction.create({ sessionID, agent: lastUser.agent, model: lastUser.model, auto: true })
+          continue
+        }
+
+        const agent = yield* agents.get(lastUser.agent)
+        if (!agent) {
+          const available = (yield* agents.list()).filter((a) => !a.hidden).map((a) => a.name)
+          const hint = available.length ? ` Available agents: ${available.join(", ")}` : ""
+          const error = new NamedError.Unknown({ message: `Agent not found: "${lastUser.agent}".${hint}` })
+          yield* events.publish(Session.Event.Error, { sessionID, error: error.toObject() })
+          throw error
+        }
+        const maxSteps = agent.steps ?? Infinity
+        const isLastStep = step >= maxSteps
+        msgs = yield* SessionReminders.apply({ messages: msgs, agent, session }).pipe(
+          Effect.provideService(RuntimeFlags.Service, flags),
+          Effect.provideService(FSUtil.Service, fsys),
+          Effect.provideService(Session.Service, sessions),
+        )
+
+        const msg: SessionV1.Assistant = {
+          id: MessageID.ascending(),
+          parentID: lastUser.id,
+          role: "assistant",
+          mode: agent.name,
+          agent: agent.name,
+          variant: lastUser.model.variant,
+          path: { cwd: ctx.directory, root: ctx.worktree },
+          cost: 0,
+          tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+          modelID: model.id,
+          providerID: model.providerID,
+          time: { created: Date.now() },
+          sessionID,
+        }
+        yield* sessions.updateMessage(msg)
+
+        const finalizeInterruptedAssistant = Effect.gen(function* () {
+          if (msg.time.completed) return
+          msg.error ??= MessageV2.fromError(new DOMException("Aborted", "AbortError"), {
+            providerID: msg.providerID,
+            aborted: true,
+          })
+          msg.time.completed = Date.now()
+          yield* sessions.updateMessage(msg)
+        })
+
+        const handle = yield* processor
+          .create({
+            assistantMessage: msg,
+            sessionID,
+            model,
+          })
+          .pipe(Effect.onInterrupt(() => finalizeInterruptedAssistant))
+
+        const outcome: "break" | "continue" = yield* Effect.gen(function* () {
+          const lastUserMsg = msgs.findLast((m) => m.info.role === "user")
+          const bypassAgentCheck = lastUserMsg?.parts.some((p) => p.type === "agent") ?? false
+          const promptOps = yield* ops()
+
+          const tools = yield* SessionTools.resolve({
+            agent,
+            session,
+            model,
+            processor: handle,
+            bypassAgentCheck,
+            messages: msgs,
+            promptOps,
+          }).pipe(
+            Effect.provideService(Plugin.Service, plugin),
+            Effect.provideService(Permission.Service, permission),
+            Effect.provideService(ToolRegistry.Service, registry),
+            Effect.provideService(MCP.Service, mcp),
+            Effect.provideService(Truncate.Service, truncate),
+            Effect.provideService(RuntimeFlags.Service, flags),
+          )
+
+          if (lastUser.format?.type === "json_schema") {
+            tools["StructuredOutput"] = createStructuredOutputTool({
+              schema: lastUser.format.schema,
+              onSuccess(output) {
+                structured = output
+              },
+            })
+          }
+
+          if (step === 1)
+            yield* summary.summarize({ sessionID, messageID: lastUser.id }).pipe(Effect.ignore, Effect.forkIn(scope))
+
+          yield* plugin.trigger("experimental.chat.messages.transform", {}, { messages: msgs })
+
+          const [skills, env, instructions, mcpInstructions, modelMsgs] = yield* Effect.all([
+            sys.skills(agent),
+            sys.environment(model),
+            instruction.system().pipe(Effect.orDie),
+            sys.mcp(agent, session.permission),
+            MessageV2.toModelMessagesEffect(msgs, model),
+          ])
+          const system = [
+            ...env,
+            ...instructions,
+            ...(mcpInstructions ? [mcpInstructions] : []),
+            ...(skills ? [skills] : []),
+          ]
+          const format = lastUser.format ?? { type: "text" as const }
+          if (format.type === "json_schema") system.push(STRUCTURED_OUTPUT_SYSTEM_PROMPT)
+          const result = yield* handle.process({
+            user: lastUser,
+            agent,
+            permission: session.permission,
+            sessionID,
+            parentSessionID: session.parentID,
+            system,
+            messages: [
+              ...modelMsgs,
+              ...(isLastStep ? [{ role: "assistant" as const, content: MAX_STEPS_PROMPT }] : []),
+            ],
+            tools,
+            model,
+            toolChoice: format.type === "json_schema" ? "required" : undefined,
+          })
+
+          if (structured !== undefined) {
+            handle.message.structured = structured
+            handle.message.finish = handle.message.finish ?? "stop"
+            yield* sessions.updateMessage(handle.message)
+            return "break" as const
+          }
+
+          const finished = handle.message.finish && !["tool-calls", "unknown"].includes(handle.message.finish)
+          if (finished && !handle.message.error) {
+            // Surface any content-filter finish (e.g. Anthropic stop_reason:
+            // refusal) as an error. These turns may have produced no visible
+            // output at all — previously the session went idle silently — or
+            // partial text that was cut off by the provider's filter.
+            if (handle.message.finish === "content-filter") {
+              handle.message.error = new SessionV1.ContentFilterError({
+                message: "The response was blocked by the provider's content filter",
+              }).toObject()
+              yield* sessions.updateMessage(handle.message)
+              yield* events.publish(Session.Event.Error, { sessionID, error: handle.message.error })
+              return "break" as const
+            }
+            if (format.type === "json_schema") {
+              handle.message.error = new SessionV1.StructuredOutputError({
+                message: "Model did not produce structured output",
+                retries: 0,
+              }).toObject()
+              yield* sessions.updateMessage(handle.message)
+              return "break" as const
+            }
+          }
+
+          if (result === "stop") return "break" as const
+          if (result === "compact") {
+            yield* compaction.create({
+              sessionID,
+              agent: lastUser.agent,
+              model: lastUser.model,
+              auto: true,
+              overflow: !handle.message.finish,
+            })
+          }
+          return "continue" as const
+        }).pipe(
+          Effect.ensuring(instruction.clear(handle.message.id)),
+          Effect.onInterrupt(() => finalizeInterruptedAssistant),
+        )
+        if (outcome === "break") break
+        const checkpoint = yield* runtime.checkpoint(sessionID)
+        if (!checkpoint) {
+          yield* Effect.logInfo("restart diagnostic loop stopped at checkpoint", {
+            sessionID,
+            point: "checkpoint",
+          })
+          break
+        }
+        continue
+      }
+
+      yield* compaction.prune({ sessionID }).pipe(Effect.ignore, Effect.forkIn(scope))
+      return yield* lastAssistant(sessionID)
+    })
 
     const loop: (input: LoopInput) => Effect.Effect<SessionV1.WithParts> = Effect.fn("SessionPrompt.loop")(function* (
       input: LoopInput,
     ) {
-      return yield* state.ensureRunning(input.sessionID, lastAssistant(input.sessionID), runLoop(input.sessionID))
+      return yield* state.ensureRunning(
+        input.sessionID,
+        lastAssistant(input.sessionID),
+        runLoop(input.sessionID, input.recovery, input.reconcile, input.manualRecovery),
+      )
+    })
+
+    const recover = Effect.fn("SessionPrompt.recover")(function* (sessionID: SessionID) {
+      return yield* state.ensureRunning(
+        sessionID,
+        lastAssistant(sessionID),
+        Effect.gen(function* () {
+          yield* reconcileCrashTools(sessionID)
+          yield* runtime.recoveryPrepared(sessionID)
+          return yield* runLoop(sessionID, true)
+        }),
+      )
     })
 
     const shell: (input: ShellInput) => Effect.Effect<SessionV1.WithParts, Session.BusyError> = Effect.fn(
@@ -1525,6 +1668,7 @@ const layer = Layer.effect(
       cancel,
       prompt,
       loop,
+      recover,
       shell,
       command,
       resolvePromptParts,
@@ -1543,6 +1687,7 @@ export const PromptInput = Schema.Struct({
   model: Schema.optional(ModelRef),
   agent: Schema.optional(Schema.String),
   noReply: Schema.optional(Schema.Boolean),
+  idempotent: Schema.optional(Schema.Boolean),
   tools: Schema.optional(Schema.Record(Schema.String, Schema.Boolean)).annotate({
     description:
       "@deprecated tools and permissions have been merged, you can set permissions on the session itself now",
@@ -1563,6 +1708,9 @@ export type PromptInput = Schema.Schema.Type<typeof PromptInput>
 
 export class LoopInput extends Schema.Class<LoopInput>("SessionPrompt.LoopInput")({
   sessionID: SessionID,
+  recovery: Schema.optional(Schema.Boolean),
+  reconcile: Schema.optional(Schema.Boolean),
+  manualRecovery: Schema.optional(Schema.Boolean),
 }) {}
 
 export const ShellInput = Schema.Struct({
