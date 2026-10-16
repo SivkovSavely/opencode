@@ -29,6 +29,7 @@ export const RuntimeExecutionTable = sqliteTable(
     parent_mode: text(),
     parent_notification_state: text(),
     recovery_attempts: integer().notNull().default(0),
+    recovery_preparation_attempts: integer().notNull().default(0),
     time_created: integer().notNull(),
     time_updated: integer().notNull(),
   },

@@ -1788,4 +1788,97 @@ describe("session.message-v2.latest", () => {
     expect(state.tasks).toHaveLength(1)
     expect(state.tasks[0]).toMatchObject({ type: "subtask", prompt: "inspect" })
   })
+
+  test("does not report a settled slash-command subtask as outstanding", () => {
+    const parentID = "msg_subtask_parent"
+    const subtaskID = "prt_subtask"
+    const user: SessionV1.WithParts = {
+      info: userInfo(parentID),
+      parts: [
+        {
+          ...basePart(parentID, subtaskID),
+          type: "subtask",
+          prompt: "run the command",
+          description: "run command",
+          agent: "general",
+          command: "review",
+        },
+      ] as SessionV1.Part[],
+    }
+    const assistantInfoWithToolFinish = assistantInfo("msg_subtask_assistant", parentID)
+    assistantInfoWithToolFinish.finish = "tool-calls"
+    assistantInfoWithToolFinish.time.completed = 2
+    const assistant: SessionV1.WithParts = {
+      info: assistantInfoWithToolFinish,
+      parts: [
+        {
+          ...basePart("msg_subtask_assistant", "task_call"),
+          type: "tool",
+          callID: "call_task",
+          tool: "task",
+          state: {
+            status: "completed",
+            input: {
+              prompt: "run the command",
+              description: "run command",
+              subagent_type: "general",
+              command: "review",
+              subtaskPartID: subtaskID,
+            },
+            output: "result",
+            title: "run command",
+            metadata: {},
+            time: { start: 1, end: 2 },
+          },
+        },
+      ] as SessionV1.Part[],
+    }
+
+    expect(MessageV2.latest([user, assistant]).tasks).toEqual([])
+  })
+
+  test("keeps an unstarted slash-command subtask eligible for execution", () => {
+    const parentID = "msg_subtask_parent"
+    const subtaskID = "prt_subtask"
+    const user: SessionV1.WithParts = {
+      info: userInfo(parentID),
+      parts: [
+        {
+          ...basePart(parentID, subtaskID),
+          type: "subtask",
+          prompt: "run the command",
+          description: "run command",
+          agent: "general",
+          command: "review",
+        },
+      ] as SessionV1.Part[],
+    }
+    const assistantInfoWithToolFinish = assistantInfo("msg_subtask_assistant", parentID)
+    assistantInfoWithToolFinish.finish = "tool-calls"
+    assistantInfoWithToolFinish.time.completed = 2
+    const assistant: SessionV1.WithParts = {
+      info: assistantInfoWithToolFinish,
+      parts: [
+        {
+          ...basePart("msg_subtask_assistant", "task_call"),
+          type: "tool",
+          callID: "call_task",
+          tool: "task",
+          state: {
+            status: "running",
+            input: {
+              prompt: "run the command",
+              description: "run command",
+              subagent_type: "general",
+              command: "review",
+              subtaskPartID: subtaskID,
+            },
+            time: { start: 1 },
+          },
+        },
+      ] as SessionV1.Part[],
+    }
+
+    expect(MessageV2.latest([user, assistant]).tasks).toHaveLength(1)
+  })
 })

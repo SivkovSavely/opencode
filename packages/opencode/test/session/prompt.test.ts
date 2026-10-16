@@ -56,6 +56,7 @@ import { awaitWithTimeout, pollWithTimeout, testEffect } from "../lib/effect"
 import { reply, TestLLMServer } from "../lib/llm-server"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { RuntimeLifecycle } from "@/server/runtime-lifecycle"
+import { ServerRecovery } from "@/server/recovery"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { LocationServiceMap, locationServiceMapLayer } from "@opencode-ai/core/location-services"
@@ -210,20 +211,34 @@ const promptRoot = LayerNode.group([
   RuntimeFlags.node,
 ])
 
-function makePrompt(input?: { mcpInstructions?: MCP.ServerInstructions[]; processor?: "blocking" }) {
+function makePrompt(input?: {
+  mcpInstructions?: MCP.ServerInstructions[]
+  processor?: "blocking"
+  plugin?: Layer.Layer<Plugin.Service>
+}) {
   const replacements = [
     [SessionSummary.node, summary],
     [LSP.node, lsp],
     [MCP.node, makeMcp(input?.mcpInstructions)],
     [RuntimeFlags.node, runtimeFlags],
   ] as const
+  if (input?.plugin) {
+    const withPlugin = [...replacements, [Plugin.node, input.plugin]] as const
+    if (input.processor === "blocking")
+      return LayerNode.compile(promptRoot, [...withPlugin, [SessionProcessor.node, blockingProcessor]])
+    return LayerNode.compile(promptRoot, withPlugin)
+  }
   if (input?.processor === "blocking") {
     return LayerNode.compile(promptRoot, [...replacements, [SessionProcessor.node, blockingProcessor]])
   }
   return LayerNode.compile(promptRoot, replacements)
 }
 
-function makeHttp(input?: { mcpInstructions?: MCP.ServerInstructions[]; processor?: "blocking" }) {
+function makeHttp(input?: {
+  mcpInstructions?: MCP.ServerInstructions[]
+  processor?: "blocking"
+  plugin?: Layer.Layer<Plugin.Service>
+}) {
   const root = LayerNode.group([promptRoot, testLLMServerNode])
   const replacements = [
     [SessionSummary.node, summary],
@@ -231,6 +246,11 @@ function makeHttp(input?: { mcpInstructions?: MCP.ServerInstructions[]; processo
     [MCP.node, makeMcp(input?.mcpInstructions)],
     [RuntimeFlags.node, runtimeFlags],
   ] as const
+  if (input?.plugin) {
+    const withPlugin = [...replacements, [Plugin.node, input.plugin]] as const
+    if (input.processor === "blocking") return LayerNode.compile(root, [...withPlugin, [SessionProcessor.node, blockingProcessor]])
+    return LayerNode.compile(root, withPlugin)
+  }
   if (input?.processor === "blocking") {
     return LayerNode.compile(root, [...replacements, [SessionProcessor.node, blockingProcessor]])
   }
@@ -255,6 +275,22 @@ const withMcpInstructions = testEffect(
     ],
   }),
 )
+const mutatingTaskPlugin = Layer.succeed(
+  Plugin.Service,
+  Plugin.Service.of({
+    trigger: ((name: string, input: { tool?: string }, output: { args: Record<string, string> }) => {
+      if (name === "tool.execute.before" && input.tool === "task") {
+        output.args.prompt = "plugin-mutated prompt"
+        output.args.description = "plugin-mutated description"
+        output.args.subagent_type = "missing-agent"
+      }
+      return Effect.succeed(output)
+    }) as Plugin.Interface["trigger"],
+    list: () => Effect.succeed([]),
+    init: () => Effect.void,
+  }),
+)
+const withMutatingTaskPlugin = testEffect(makeHttp({ plugin: mutatingTaskPlugin }))
 const unix = process.platform !== "win32" ? it.instance : it.instance.skip
 const unixNoLLMServer = process.platform !== "win32" ? noLLMServer.instance : noLLMServer.instance.skip
 
@@ -419,7 +455,7 @@ const seed = Effect.fn("test.seed")(function* (sessionID: SessionID, opts?: { fi
   return { user: msg, assistant }
 })
 
-const addSubtask = (sessionID: SessionID, messageID: MessageID, model = ref) =>
+const addSubtask = (sessionID: SessionID, messageID: MessageID, model = ref, agent = "general") =>
   Effect.gen(function* () {
     const session = yield* Session.Service
     yield* session.updatePart({
@@ -429,7 +465,7 @@ const addSubtask = (sessionID: SessionID, messageID: MessageID, model = ref) =>
       type: "subtask",
       prompt: "look into the cache key path",
       description: "inspect bug",
-      agent: "general",
+      agent,
       model,
     })
   })
@@ -1183,6 +1219,714 @@ it.instance("failed subtask preserves metadata on error tool state", () =>
       providerID: ProviderV2.ID.make("test"),
       modelID: ModelV2.ID.make("missing-model"),
     })
+  }),
+)
+
+it.instance("reuses a recovered slash-command Task result without repeating its child side effect", () =>
+  Effect.gen(function* () {
+    const { dir: directory, llm } = yield* useServerConfig((url) => ({
+      ...providerCfg(url),
+      agent: { general: { mode: "subagent" } },
+      command: {
+        review: {
+          template: "Perform the observable child action",
+          description: "perform child action",
+          agent: "general",
+          subtask: true,
+        },
+      },
+    }))
+    const database = yield* Database.Service
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const scope = yield* Scope.Scope
+    const parent = yield* sessions.create({
+      title: "Interrupted slash command",
+      permission: [{ permission: "*", pattern: "*", action: "allow" }],
+    })
+    const sideEffect = path.join(directory, "task-side-effect")
+    yield* llm.tool("bash", { command: `printf 'once\\n' >> '${sideEffect}'` })
+    yield* llm.text("child completed")
+    yield* llm.text("command summary")
+    yield* prompt.command({ sessionID: parent.id, command: "review", arguments: "" })
+
+    const original = yield* sessions.messages({ sessionID: parent.id })
+    const taskMessage = original.find(
+      (message) =>
+        message.info.role === "assistant" &&
+        message.parts.some((part) => part.type === "tool" && part.tool === "task"),
+    )
+    expect(taskMessage?.info.role).toBe("assistant")
+    if (!taskMessage || taskMessage.info.role !== "assistant") throw new Error("missing slash-command Task message")
+    const taskPart = taskMessage.parts.find(
+      (part): part is SessionV1.ToolPart => part.type === "tool" && part.tool === "task",
+    )
+    expect(taskPart?.state.status).toBe("completed")
+    if (taskPart?.type !== "tool" || taskPart.state.status !== "completed")
+      throw new Error("slash-command Task did not complete")
+    const childID = taskPart.state.metadata?.sessionId
+    expect(typeof childID).toBe("string")
+    if (typeof childID !== "string") throw new Error("missing Task child session linkage")
+    expect(yield* Effect.promise(() => Bun.file(sideEffect).text())).toBe("once\n")
+
+    const child = yield* sessions.get(SessionID.make(childID))
+    expect(child.metadata?.task).toMatchObject({
+      parentSessionId: parent.id,
+      parentMessageID: taskMessage.info.id,
+      parentCallID: taskPart.callID,
+    })
+    yield* sessions.updatePart({
+      ...taskPart,
+      state: {
+        status: "running",
+        input: taskPart.state.input,
+        time: { start: taskPart.state.time.start },
+      },
+    } satisfies SessionV1.ToolPart)
+    yield* sessions.removeMessage({
+      sessionID: parent.id,
+      messageID: MessageID.make(`msg_task_summary_${taskPart.callID}`),
+    })
+
+    delete taskMessage.info.time.completed
+    taskMessage.info.finish = undefined
+    yield* sessions.updateMessage(taskMessage.info)
+    const owner = RuntimeLifecycle.make({ lineage: randomUUID() }, scope, database)
+    yield* owner.admit({ sessionID: parent.id, directory: parent.directory })
+    yield* owner.release(parent.id)
+    yield* database.db.run(sql`
+      UPDATE runtime_execution
+      SET state = ${"active"}, desired_active = 1, owner_start_time = ${"0"}
+      WHERE session_id = ${parent.id}
+    `)
+
+    const row = yield* database.db.get<{ owner_lineage: string }>(sql`
+      SELECT owner_lineage FROM runtime_execution WHERE session_id = ${parent.id}
+    `)
+    if (!row) throw new Error("missing parent runtime execution")
+    const replacement = RuntimeLifecycle.make(
+      { lineage: row.owner_lineage, instance: randomUUID() },
+      scope,
+      database,
+    )
+    yield* replacement.recover((record) => prompt.recover(SessionID.make(record.sessionID)))
+    while (
+      (yield* database.db.get<{ state: string }>(sql`
+        SELECT state FROM runtime_execution WHERE session_id = ${parent.id}
+      `))?.state !== "completed"
+    )
+      yield* Effect.yieldNow
+
+    const recovered = yield* sessions.messages({ sessionID: parent.id })
+    const repairedAssistant = recovered.find((message) => message.info.id === taskMessage.info.id)
+    const repairedTask = repairedAssistant?.parts.find(
+      (part): part is SessionV1.ToolPart => part.type === "tool" && part.callID === taskPart.callID,
+    )
+    expect(repairedAssistant?.info.role).toBe("assistant")
+    if (repairedAssistant?.info.role === "assistant") {
+      expect(repairedAssistant.info.finish).toBe("tool-calls")
+      expect(repairedAssistant.info.time.completed).toBeDefined()
+    }
+    expect(repairedTask?.type).toBe("tool")
+    if (repairedTask?.type !== "tool") throw new Error("recovered slash-command Task was missing")
+    expect(repairedTask.state.status).toBe("completed")
+    if (repairedTask.state.status !== "completed") throw new Error("recovered slash-command Task did not complete")
+    expect(repairedTask.state.metadata?.sessionId).toBe(childID)
+    expect(repairedTask.state.output).toContain("child completed")
+    expect((yield* sessions.children(parent.id)).map((child) => child.id)).toEqual([SessionID.make(childID)])
+    expect(yield* Effect.promise(() => Bun.file(sideEffect).text())).toBe("once\n")
+    expect(yield* llm.calls).toBe(3)
+    expect(
+      recovered.filter(
+        (message) =>
+          message.info.role === "user" && message.info.id === `msg_task_summary_${taskPart.callID}`,
+      ),
+    ).toHaveLength(1)
+  }),
+)
+
+it.instance("foreground recovery settles linked Tasks and leaves cancelled parents untouched", () =>
+  Effect.gen(function* () {
+    const database = yield* Database.Service
+    const sessions = yield* Session.Service
+    const scope = yield* Scope.Scope
+    const parent = yield* sessions.create({ title: "Foreground Task parent" })
+    const child = yield* sessions.create({ title: "Foreground Task child", parentID: parent.id })
+    const parentUser = yield* user(parent.id, "review")
+    const callID = "call_foreground_recovery"
+    const assistant = yield* sessions.updateMessage({
+      id: MessageID.ascending(),
+      role: "assistant",
+      parentID: parentUser.id,
+      sessionID: parent.id,
+      mode: "general",
+      agent: "general",
+      path: { cwd: "/tmp", root: "/tmp" },
+      cost: 0,
+      tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+      modelID: ref.modelID,
+      providerID: ref.providerID,
+      time: { created: Date.now() },
+    })
+    yield* sessions.updatePart({
+      id: PartID.ascending(),
+      messageID: assistant.id,
+      sessionID: parent.id,
+      type: "tool",
+      callID,
+      tool: "task",
+      state: {
+        status: "running",
+        input: { prompt: "review", description: "review", subagent_type: "general", command: "review" },
+        metadata: { sessionId: child.id },
+        time: { start: Date.now() },
+      },
+    })
+    const childUser = yield* user(child.id, "child prompt")
+    const childAssistant = yield* sessions.updateMessage({
+      id: MessageID.ascending(),
+      role: "assistant",
+      parentID: childUser.id,
+      sessionID: child.id,
+      mode: "general",
+      agent: "general",
+      path: { cwd: "/tmp", root: "/tmp" },
+      cost: 0,
+      tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+      modelID: ref.modelID,
+      providerID: ref.providerID,
+      finish: "stop",
+      time: { created: Date.now(), completed: Date.now() },
+    })
+    yield* sessions.updatePart({
+      id: PartID.ascending(),
+      messageID: childAssistant.id,
+      sessionID: child.id,
+      type: "text",
+      text: "child result",
+    })
+    const childResult = (yield* sessions.messages({ sessionID: child.id })).findLast(
+      (message) => message.info.id === childAssistant.id,
+    )
+    if (!childResult) throw new Error("missing completed child result")
+
+    yield* ServerRecovery.settleForeground({
+      database,
+      sessions,
+      record: {
+        sessionID: randomUUID(),
+        parentSessionID: parent.id,
+        parentMessageID: assistant.id,
+        parentCallID: callID,
+      },
+      result: childResult,
+    })
+    const unmatched = yield* sessions.messages({ sessionID: parent.id })
+    const unmatchedAssistant = unmatched.find((message) => message.info.id === assistant.id)
+    const unmatchedTask = unmatchedAssistant?.parts.find(
+      (part): part is SessionV1.ToolPart => part.type === "tool" && part.callID === callID,
+    )
+    expect(unmatchedTask?.type).toBe("tool")
+    if (unmatchedTask?.type !== "tool") throw new Error("missing unmatched Task part")
+    expect(unmatchedTask.state.status).toBe("running")
+    expect(unmatchedAssistant?.info.role).toBe("assistant")
+    if (unmatchedAssistant?.info.role !== "assistant") throw new Error("missing unmatched parent assistant")
+    expect(unmatchedAssistant.info.time.completed).toBeUndefined()
+
+    const lineage = randomUUID()
+    const runtime = RuntimeLifecycle.make({ lineage }, scope, database)
+    const createdAt = Date.now()
+    yield* database.db.run(sql`
+      INSERT INTO runtime_execution
+        (id, session_id, directory, owner_lineage, owner_instance, fence, state, desired_active, time_created, time_updated)
+      VALUES
+        (${parent.id}, ${parent.id}, ${parent.directory}, ${lineage}, ${runtime.identity.instance}, 1,
+         ${"active"}, 1, ${createdAt}, ${createdAt})
+    `)
+    const messagesStarted = yield* Deferred.make<void>()
+    const resumeMessages = yield* Deferred.make<void>()
+    const delayedSessions = {
+      ...sessions,
+      messages: (input: Parameters<typeof sessions.messages>[0]) =>
+        Effect.gen(function* () {
+          yield* Deferred.succeed(messagesStarted, undefined)
+          yield* Deferred.await(resumeMessages)
+          return yield* sessions.messages(input)
+        }),
+    }
+    const settlement = yield* ServerRecovery.settleForeground({
+      database,
+      sessions: delayedSessions,
+      record: {
+        sessionID: child.id,
+        parentSessionID: parent.id,
+        parentMessageID: assistant.id,
+        parentCallID: callID,
+      },
+      result: childResult,
+    }).pipe(Effect.forkChild)
+    yield* Deferred.await(messagesStarted)
+    const cancellation = yield* runtime.cancel(parent.id).pipe(Effect.forkChild)
+    yield* Deferred.succeed(resumeMessages, undefined)
+    yield* Fiber.join(settlement)
+    expect(yield* Fiber.join(cancellation)).toBe(true)
+
+    const recovered = yield* sessions.messages({ sessionID: parent.id })
+    const repairedAssistant = recovered.find((message) => message.info.id === assistant.id)
+    const repairedTask = repairedAssistant?.parts.find(
+      (part): part is SessionV1.ToolPart => part.type === "tool" && part.callID === callID,
+    )
+    expect(repairedAssistant?.info.role).toBe("assistant")
+    if (repairedAssistant?.info.role !== "assistant") throw new Error("missing recovered parent assistant")
+    expect(repairedAssistant.info.finish).toBe("tool-calls")
+    expect(repairedAssistant.info.time.completed).toBeDefined()
+    expect(repairedTask?.type).toBe("tool")
+    if (repairedTask?.type !== "tool") throw new Error("missing recovered Task part")
+    expect(repairedTask.state.status).toBe("completed")
+    if (repairedTask.state.status !== "completed") throw new Error("foreground Task result was not settled")
+    expect(repairedTask.state.output).toContain("child result")
+    expect(recovered.filter((message) => message.info.id === `msg_task_summary_${callID}`)).toHaveLength(1)
+    expect((yield* database.db.get<{ state: string }>(sql`
+      SELECT state FROM runtime_execution WHERE session_id = ${parent.id}
+    `))?.state).toBe("cancelled")
+
+    const cancelledParent = yield* sessions.create({ title: "Cancelled foreground Task parent" })
+    const cancelledChild = yield* sessions.create({ title: "Cancelled foreground Task child", parentID: cancelledParent.id })
+    const cancelledUser = yield* user(cancelledParent.id, "review")
+    const cancelledCallID = "call_cancelled_foreground_recovery"
+    const cancelledAssistant = yield* sessions.updateMessage({
+      id: MessageID.ascending(),
+      role: "assistant",
+      parentID: cancelledUser.id,
+      sessionID: cancelledParent.id,
+      mode: "general",
+      agent: "general",
+      path: { cwd: "/tmp", root: "/tmp" },
+      cost: 0,
+      tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+      modelID: ref.modelID,
+      providerID: ref.providerID,
+      time: { created: Date.now() },
+    })
+    yield* sessions.updatePart({
+      id: PartID.ascending(),
+      messageID: cancelledAssistant.id,
+      sessionID: cancelledParent.id,
+      type: "tool",
+      callID: cancelledCallID,
+      tool: "task",
+      state: {
+        status: "running",
+        input: { prompt: "review", description: "review", subagent_type: "general", command: "review" },
+        metadata: { sessionId: cancelledChild.id },
+        time: { start: Date.now() },
+      },
+    })
+    const now = Date.now()
+    yield* database.db.run(sql`
+      INSERT INTO runtime_execution
+        (id, session_id, directory, owner_lineage, owner_instance, fence, state, desired_active, time_created, time_updated)
+      VALUES
+        (${cancelledParent.id}, ${cancelledParent.id}, ${"/tmp"}, ${randomUUID()}, ${randomUUID()}, 1,
+         ${"cancelled"}, 0, ${now}, ${now})
+    `)
+
+    yield* ServerRecovery.settleForeground({
+      database,
+      sessions,
+      record: {
+        sessionID: cancelledChild.id,
+        parentSessionID: cancelledParent.id,
+        parentMessageID: cancelledAssistant.id,
+        parentCallID: cancelledCallID,
+      },
+      result: childResult,
+    })
+
+    const cancelledTranscript = yield* sessions.messages({ sessionID: cancelledParent.id })
+    const untouchedAssistant = cancelledTranscript.find((message) => message.info.id === cancelledAssistant.id)
+    const untouchedTask = untouchedAssistant?.parts.find(
+      (part): part is SessionV1.ToolPart => part.type === "tool" && part.callID === cancelledCallID,
+    )
+    expect(untouchedAssistant?.info.role).toBe("assistant")
+    if (untouchedAssistant?.info.role !== "assistant") throw new Error("missing cancelled parent assistant")
+    expect(untouchedAssistant.info.time.completed).toBeUndefined()
+    expect(untouchedTask?.type).toBe("tool")
+    if (untouchedTask?.type !== "tool") throw new Error("missing cancelled parent Task part")
+    expect(untouchedTask.state.status).toBe("running")
+    expect(cancelledTranscript.some((message) => message.info.id === `msg_task_summary_${cancelledCallID}`)).toBe(false)
+  }),
+)
+
+it.instance("foreground recovery fails a Task with an incomplete child result", () =>
+  Effect.gen(function* () {
+    const database = yield* Database.Service
+    const sessions = yield* Session.Service
+    const parent = yield* sessions.create({ title: "Incomplete foreground Task parent" })
+    const child = yield* sessions.create({ title: "Incomplete foreground Task child", parentID: parent.id })
+    const parentUser = yield* user(parent.id, "review")
+    const assistant = yield* sessions.updateMessage({
+      id: MessageID.ascending(),
+      role: "assistant",
+      parentID: parentUser.id,
+      sessionID: parent.id,
+      mode: "general",
+      agent: "general",
+      path: { cwd: "/tmp", root: "/tmp" },
+      cost: 0,
+      tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+      modelID: ref.modelID,
+      providerID: ref.providerID,
+      time: { created: Date.now() },
+    })
+    const callID = "call_incomplete_foreground_recovery"
+    yield* sessions.updatePart({
+      id: PartID.ascending(),
+      messageID: assistant.id,
+      sessionID: parent.id,
+      type: "tool",
+      callID,
+      tool: "task",
+      state: {
+        status: "running",
+        input: { prompt: "review", description: "review", subagent_type: "general" },
+        metadata: { sessionId: child.id },
+        time: { start: Date.now() },
+      },
+    })
+    const childUser = yield* user(child.id, "child prompt")
+    const childAssistant = yield* sessions.updateMessage({
+      id: MessageID.ascending(),
+      role: "assistant",
+      parentID: childUser.id,
+      sessionID: child.id,
+      mode: "general",
+      agent: "general",
+      path: { cwd: "/tmp", root: "/tmp" },
+      cost: 0,
+      tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+      modelID: ref.modelID,
+      providerID: ref.providerID,
+      time: { created: Date.now() },
+    })
+    yield* sessions.updatePart({
+      id: PartID.ascending(),
+      messageID: childAssistant.id,
+      sessionID: child.id,
+      type: "text",
+      text: "partial child result",
+    })
+    const childResult = (yield* sessions.messages({ sessionID: child.id })).findLast(
+      (message) => message.info.id === childAssistant.id,
+    )
+    if (!childResult) throw new Error("missing incomplete child result")
+
+    yield* ServerRecovery.settleForeground({
+      database,
+      sessions,
+      record: {
+        sessionID: child.id,
+        parentSessionID: parent.id,
+        parentMessageID: assistant.id,
+        parentCallID: callID,
+      },
+      result: childResult,
+    })
+
+    const recovered = yield* sessions.messages({ sessionID: parent.id })
+    const recoveredAssistant = recovered.find((message) => message.info.id === assistant.id)
+    const recoveredTask = recoveredAssistant?.parts.find(
+      (part): part is SessionV1.ToolPart => part.type === "tool" && part.callID === callID,
+    )
+    expect(recoveredTask?.type).toBe("tool")
+    if (recoveredTask?.type !== "tool") throw new Error("missing failed Task part")
+    expect(recoveredTask.state.status).toBe("error")
+    if (recoveredTask.state.status !== "error") throw new Error("incomplete child result was reported as success")
+    expect(recoveredTask.state.error).toContain("did not produce a completed assistant result")
+    expect(recoveredAssistant?.info.role).toBe("assistant")
+    if (recoveredAssistant?.info.role !== "assistant") throw new Error("missing failed parent assistant")
+    expect(recoveredAssistant.info.finish).toBe("tool-calls")
+    expect(recoveredAssistant.info.time.completed).toBeDefined()
+  }),
+)
+
+it.instance("reuses persisted slash-command Task arguments after recovery", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({
+      title: "Prepared slash-command Task",
+      permission: [{ permission: "*", pattern: "*", action: "allow" }],
+    })
+    yield* llm.text("child completed")
+    yield* llm.text("parent completed")
+    const userMessage = yield* user(chat.id, "run the command")
+    yield* addSubtask(chat.id, userMessage.id)
+    const original = yield* sessions.messages({ sessionID: chat.id })
+    const subtask = original
+      .find((message) => message.info.id === userMessage.id)
+      ?.parts.find((part): part is SessionV1.SubtaskPart => part.type === "subtask")
+    if (!subtask) throw new Error("missing slash-command subtask")
+
+    const assistant = yield* sessions.updateMessage({
+      id: MessageID.ascending(),
+      role: "assistant",
+      parentID: userMessage.id,
+      sessionID: chat.id,
+      mode: "general",
+      agent: "general",
+      path: { cwd: "/tmp", root: "/tmp" },
+      cost: 0,
+      tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+      modelID: ref.modelID,
+      providerID: ref.providerID,
+      time: { created: Date.now() },
+    })
+    yield* sessions.updatePart({
+      id: PartID.ascending(),
+      messageID: assistant.id,
+      sessionID: chat.id,
+      type: "tool",
+      callID: "call_recovered_prepared_task",
+      tool: "task",
+      state: {
+        status: "running",
+        input: {
+          prompt: "persisted effective task prompt",
+          description: "persisted effective description",
+          subagent_type: "general",
+          subtaskPartID: subtask.id,
+          subtaskArgsPrepared: true,
+        },
+        time: { start: Date.now() },
+      },
+    })
+
+    yield* prompt.recover(chat.id)
+
+    const child = (yield* sessions.children(chat.id))[0]
+    expect(child?.title).toContain("persisted effective description")
+    if (!child) throw new Error("recovered Task did not reuse its prepared arguments")
+    const childMessages = yield* sessions.messages({ sessionID: child.id })
+    expect(childMessages.find((message) => message.info.role === "user")?.parts).toContainEqual(
+      expect.objectContaining({ type: "text", text: "persisted effective task prompt" }),
+    )
+  }),
+)
+
+it.instance("foreground recovery reports a completed child with a failed tool as an error", () =>
+  Effect.gen(function* () {
+    const database = yield* Database.Service
+    const sessions = yield* Session.Service
+    const parent = yield* sessions.create({ title: "Failed foreground Task parent" })
+    const child = yield* sessions.create({ title: "Failed foreground Task child", parentID: parent.id })
+    const parentUser = yield* user(parent.id, "review")
+    const assistant = yield* sessions.updateMessage({
+      id: MessageID.ascending(),
+      role: "assistant",
+      parentID: parentUser.id,
+      sessionID: parent.id,
+      mode: "general",
+      agent: "general",
+      path: { cwd: "/tmp", root: "/tmp" },
+      cost: 0,
+      tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+      modelID: ref.modelID,
+      providerID: ref.providerID,
+      time: { created: Date.now() },
+    })
+    const callID = "call_failed_foreground_recovery"
+    yield* sessions.updatePart({
+      id: PartID.ascending(),
+      messageID: assistant.id,
+      sessionID: parent.id,
+      type: "tool",
+      callID,
+      tool: "task",
+      state: {
+        status: "running",
+        input: { prompt: "review", description: "review", subagent_type: "general" },
+        metadata: { sessionId: child.id },
+        time: { start: Date.now() },
+      },
+    })
+    const childUser = yield* user(child.id, "child prompt")
+    const childAssistant = yield* sessions.updateMessage({
+      id: MessageID.ascending(),
+      role: "assistant",
+      parentID: childUser.id,
+      sessionID: child.id,
+      mode: "general",
+      agent: "general",
+      path: { cwd: "/tmp", root: "/tmp" },
+      cost: 0,
+      tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+      modelID: ref.modelID,
+      providerID: ref.providerID,
+      finish: "stop",
+      time: { created: Date.now(), completed: Date.now() },
+    })
+    yield* sessions.updatePart({
+      id: PartID.ascending(),
+      messageID: childAssistant.id,
+      sessionID: child.id,
+      type: "tool",
+      callID: "failed_child_tool",
+      tool: "bash",
+      state: {
+        status: "error",
+        input: { command: "side effect" },
+        error: "child tool failed",
+        time: { start: Date.now(), end: Date.now() },
+      },
+    })
+    const childResult = (yield* sessions.messages({ sessionID: child.id })).findLast(
+      (message) => message.info.id === childAssistant.id,
+    )
+    if (!childResult) throw new Error("missing failed child result")
+
+    yield* ServerRecovery.settleForeground({
+      database,
+      sessions,
+      record: {
+        sessionID: child.id,
+        parentSessionID: parent.id,
+        parentMessageID: assistant.id,
+        parentCallID: callID,
+      },
+      result: childResult,
+    })
+
+    const recovered = yield* sessions.messages({ sessionID: parent.id })
+    const recoveredAssistant = recovered.find((message) => message.info.id === assistant.id)
+    const recoveredTask = recoveredAssistant?.parts.find(
+      (part): part is SessionV1.ToolPart => part.type === "tool" && part.callID === callID,
+    )
+    expect(recoveredTask?.type).toBe("tool")
+    if (recoveredTask?.type !== "tool") throw new Error("missing failed foreground Task")
+    expect(recoveredTask.state.status).toBe("error")
+    if (recoveredTask.state.status !== "error") throw new Error("failed child tool was reported as success")
+    expect(recoveredTask.state.error).toContain("child tool failed")
+    expect(recoveredAssistant?.info.role).toBe("assistant")
+    if (recoveredAssistant?.info.role !== "assistant") throw new Error("missing failed parent assistant")
+    expect(recoveredAssistant.info.time.completed).toBeDefined()
+  }),
+)
+
+it.instance("foreground recovery treats an interrupted child as an error", () =>
+  Effect.gen(function* () {
+    const database = yield* Database.Service
+    const sessions = yield* Session.Service
+    const parent = yield* sessions.create({ title: "Cancelled foreground Task parent" })
+    const child = yield* sessions.create({ title: "Cancelled foreground Task child", parentID: parent.id })
+    const parentUser = yield* user(parent.id, "review")
+    const assistant = yield* sessions.updateMessage({
+      id: MessageID.ascending(),
+      role: "assistant",
+      parentID: parentUser.id,
+      sessionID: parent.id,
+      mode: "general",
+      agent: "general",
+      path: { cwd: "/tmp", root: "/tmp" },
+      cost: 0,
+      tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+      modelID: ref.modelID,
+      providerID: ref.providerID,
+      time: { created: Date.now() },
+    })
+    const callID = "call_cancelled_foreground_recovery"
+    yield* sessions.updatePart({
+      id: PartID.ascending(),
+      messageID: assistant.id,
+      sessionID: parent.id,
+      type: "tool",
+      callID,
+      tool: "task",
+      state: {
+        status: "running",
+        input: { prompt: "review", description: "review", subagent_type: "general" },
+        metadata: { sessionId: child.id },
+        time: { start: Date.now() },
+      },
+    })
+    const childUser = yield* user(child.id, "child prompt")
+    const childAssistant = yield* sessions.updateMessage({
+      id: MessageID.ascending(),
+      role: "assistant",
+      parentID: childUser.id,
+      sessionID: child.id,
+      mode: "general",
+      agent: "general",
+      path: { cwd: "/tmp", root: "/tmp" },
+      cost: 0,
+      tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+      modelID: ref.modelID,
+      providerID: ref.providerID,
+      finish: "stop",
+      error: MessageV2.fromError(new DOMException("Aborted", "AbortError"), {
+        providerID: ref.providerID,
+        aborted: true,
+      }),
+      time: { created: Date.now(), completed: Date.now() },
+    })
+    const childResult = (yield* sessions.messages({ sessionID: child.id })).findLast(
+      (message) => message.info.id === childAssistant.id,
+    )
+    if (!childResult) throw new Error("missing interrupted child result")
+
+    yield* ServerRecovery.settleForeground({
+      database,
+      sessions,
+      record: {
+        sessionID: child.id,
+        parentSessionID: parent.id,
+        parentMessageID: assistant.id,
+        parentCallID: callID,
+      },
+      result: childResult,
+    })
+
+    const recovered = yield* sessions.messages({ sessionID: parent.id })
+    const recoveredAssistant = recovered.find((message) => message.info.id === assistant.id)
+    const recoveredTask = recoveredAssistant?.parts.find(
+      (part): part is SessionV1.ToolPart => part.type === "tool" && part.callID === callID,
+    )
+    expect(recoveredTask?.type).toBe("tool")
+    if (recoveredTask?.type !== "tool") throw new Error("missing cancelled foreground Task")
+    expect(recoveredTask.state.status).toBe("error")
+    if (recoveredTask.state.status !== "error") throw new Error("interrupted child was reported as success")
+    expect(recoveredTask.state.error).toContain("Aborted")
+  }),
+)
+
+withMutatingTaskPlugin.instance("persists plugin-mutated Task arguments and settles an unavailable agent", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({ title: "Unavailable slash-command agent" })
+    yield* llm.text("parent completed")
+    const userMessage = yield* user(chat.id, "run the command")
+    yield* addSubtask(chat.id, userMessage.id)
+
+    yield* prompt.loop({ sessionID: chat.id })
+
+    const messages = yield* sessions.messages({ sessionID: chat.id })
+    const task = messages
+      .flatMap((message) => message.parts)
+      .find((part): part is SessionV1.ToolPart => part.type === "tool" && part.tool === "task")
+    expect(task?.state.status).toBe("error")
+    if (!task || task.type !== "tool" || task.state.status !== "error")
+      throw new Error("unavailable slash-command Task agent did not settle as an error")
+    expect(task.state.error).toContain('Agent not found: "missing-agent"')
+    expect(task.state.input).toMatchObject({
+      prompt: "plugin-mutated prompt",
+      description: "plugin-mutated description",
+      subagent_type: "missing-agent",
+      subtaskArgsPrepared: true,
+    })
+    expect(yield* sessions.children(chat.id)).toHaveLength(0)
   }),
 )
 

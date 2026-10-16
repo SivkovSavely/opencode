@@ -51,7 +51,7 @@ import { EventV2Bridge } from "@/event-v2-bridge"
 import { Database } from "@opencode-ai/core/database/database"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { ProviderV2 } from "@opencode-ai/core/provider"
-import { eq } from "drizzle-orm"
+import { eq, sql } from "drizzle-orm"
 import { SessionTable } from "@opencode-ai/core/session/sql"
 import { SessionReminders } from "./reminders"
 import { SessionTools } from "./tools"
@@ -282,6 +282,117 @@ const layer = Layer.effect(
         .pipe(Effect.catchCause((cause) => Effect.logError("failed to generate title", { error: Cause.squash(cause) })))
     })
 
+    const ensureCommandSummary = Effect.fnUntraced(function* (input: {
+      sessionID: SessionID
+      lastUser: SessionV1.User
+      command?: string
+      callID: string
+    }) {
+      if (!input.command) return
+      const messageID = MessageID.ascending(`msg_task_summary_${input.callID}`)
+      const partID = PartID.ascending(`prt_task_summary_${input.callID}`)
+      const existing = yield* sessions
+        .findMessage(input.sessionID, (message) => message.info.id === messageID)
+        .pipe(Effect.orDie)
+      if (Option.isNone(existing))
+        yield* sessions.updateMessage({
+          id: messageID,
+          sessionID: input.sessionID,
+          role: "user",
+          time: { created: Date.now() },
+          agent: input.lastUser.agent,
+          model: input.lastUser.model,
+        })
+      if (Option.isSome(existing) && existing.value.parts.some((item) => item.id === partID)) return
+      yield* sessions.updatePart({
+        id: partID,
+        messageID,
+        sessionID: input.sessionID,
+        type: "text",
+        text: "Summarize the task tool output above and continue with your task.",
+        synthetic: true,
+      } satisfies SessionV1.TextPart)
+    })
+
+    const finishSubtaskAssistant = Effect.fnUntraced(function* (input: {
+      assistant: SessionV1.Assistant
+      lastUser: SessionV1.User
+      sessionID: SessionID
+      command?: string
+      callID: string
+    }) {
+      yield* ensureCommandSummary(input)
+      if (input.assistant.finish && input.assistant.time.completed) return
+      input.assistant.finish = "tool-calls"
+      input.assistant.time.completed = Date.now()
+      yield* sessions.updateMessage(input.assistant)
+    })
+
+    const reconcileSubtaskCompletions = Effect.fnUntraced(function* (sessionID: SessionID) {
+      const fence = yield* runtime.ownershipFence(sessionID)
+      if (fence === undefined) return
+      yield* database.db.transaction(
+        () =>
+          Effect.gen(function* () {
+            const owner = yield* database.db.get<{
+              owner_lineage: string
+              owner_instance: string
+              fence: number
+              state: string
+              desired_active: number
+            }>(sql`
+              SELECT owner_lineage, owner_instance, fence, state, desired_active
+              FROM runtime_execution WHERE session_id = ${sessionID}
+            `)
+            if (
+              !owner ||
+              owner.owner_lineage !== runtime.identity.lineage ||
+              owner.owner_instance !== runtime.identity.instance ||
+              owner.fence !== fence ||
+              owner.state !== "active" ||
+              owner.desired_active !== 1
+            )
+              return
+            const messages = yield* sessions.messages({ sessionID }).pipe(Effect.orDie)
+            const users = new Map<string, SessionV1.WithParts>(
+              messages.flatMap((message) => (message.info.role === "user" ? [[message.info.id, message] as const] : [])),
+            )
+            for (const message of messages) {
+              if (message.info.role !== "assistant" || !message.info.parentID) continue
+              const parent = users.get(message.info.parentID)
+              if (parent?.info.role !== "user") continue
+              for (const part of message.parts) {
+                if (
+                  part.type !== "tool" ||
+                  part.tool !== "task" ||
+                  !["completed", "error"].includes(part.state.status)
+                )
+                  continue
+                const subtask = parent.parts.find(
+                  (item) =>
+                    item.type === "subtask" &&
+                    (part.state.input.subtaskPartID === item.id ||
+                      (part.state.input.subtaskPartID === undefined &&
+                        part.state.input.prompt === item.prompt &&
+                        part.state.input.description === item.description &&
+                        part.state.input.subagent_type === item.agent &&
+                        part.state.input.command === item.command)),
+                )
+                if (subtask?.type !== "subtask") continue
+                yield* finishSubtaskAssistant({
+                  assistant: message.info,
+                  lastUser: parent.info,
+                  sessionID,
+                  command: subtask.command,
+                  callID: part.callID,
+                })
+              }
+            }
+          }),
+        { behavior: "immediate" },
+      ).pipe(Effect.orDie)
+    })
+
     const handleSubtask = Effect.fn("SessionPrompt.handleSubtask")(function* (input: {
       task: SessionV1.SubtaskPart
       model: Provider.Model
@@ -295,65 +406,216 @@ const layer = Layer.effect(
       const promptOps = yield* ops()
       const { task: taskTool } = yield* registry.named()
       const taskModel = task.model ? yield* getModel(task.model.providerID, task.model.modelID, sessionID) : model
-      const assistantMessage: SessionV1.Assistant = yield* sessions.updateMessage({
-        id: MessageID.ascending(),
-        role: "assistant",
-        parentID: lastUser.id,
-        sessionID,
-        mode: task.agent,
-        agent: task.agent,
-        variant: lastUser.model.variant,
-        path: { cwd: ctx.directory, root: ctx.worktree },
-        cost: 0,
-        tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
-        modelID: taskModel.id,
-        providerID: taskModel.providerID,
-        time: { created: Date.now() },
-      })
-      let part: SessionV1.ToolPart = yield* sessions.updatePart({
-        id: PartID.ascending(),
-        messageID: assistantMessage.id,
-        sessionID: assistantMessage.sessionID,
-        type: "tool",
-        callID: ulid(),
-        tool: TaskTool.id,
-        state: {
-          status: "running",
-          input: {
-            prompt: task.prompt,
-            description: task.description,
-            subagent_type: task.agent,
-            command: task.command,
-          },
-          time: { start: Date.now() },
-        },
-      })
       const taskArgs = {
         prompt: task.prompt,
         description: task.description,
         subagent_type: task.agent,
         command: task.command,
       }
-      yield* plugin.trigger(
-        "tool.execute.before",
-        { tool: TaskTool.id, sessionID, callID: part.id },
-        { args: taskArgs },
+      const isMatchingTask = (part: SessionV1.Part) =>
+        part.type === "tool" &&
+        part.tool === TaskTool.id &&
+        (part.state.input.subtaskPartID === task.id ||
+          (part.state.input.subtaskPartID === undefined &&
+            part.state.input.prompt === task.prompt &&
+            part.state.input.description === task.description &&
+            part.state.input.subagent_type === task.agent &&
+            part.state.input.command === task.command))
+      const previousAssistant = msgs.findLast(
+        (message) =>
+          message.info.role === "assistant" &&
+          message.info.parentID === lastUser.id &&
+          message.parts.some(isMatchingTask),
       )
+      const previousPart = previousAssistant?.parts.find(isMatchingTask)
+      const assistantMessage: SessionV1.Assistant =
+        previousAssistant?.info.role === "assistant"
+          ? previousAssistant.info
+          : yield* sessions.updateMessage({
+              id: MessageID.ascending(),
+              role: "assistant",
+              parentID: lastUser.id,
+              sessionID,
+              mode: task.agent,
+              agent: task.agent,
+              variant: lastUser.model.variant,
+              path: { cwd: ctx.directory, root: ctx.worktree },
+              cost: 0,
+              tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+              modelID: taskModel.id,
+              providerID: taskModel.providerID,
+              time: { created: Date.now() },
+            })
+      let part: SessionV1.ToolPart =
+        previousPart?.type === "tool"
+          ? previousPart
+          : yield* sessions.updatePart({
+              id: PartID.ascending(),
+              messageID: assistantMessage.id,
+              sessionID: assistantMessage.sessionID,
+              type: "tool",
+              callID: ulid(),
+              tool: TaskTool.id,
+              state: {
+                status: "running",
+                input: { ...taskArgs, subtaskPartID: task.id },
+                time: { start: Date.now() },
+              },
+            })
+      const args =
+        part.state.input.subtaskArgsPrepared === true
+          ? {
+              prompt: part.state.input.prompt,
+              description: part.state.input.description,
+              subagent_type: part.state.input.subagent_type,
+              command: part.state.input.command,
+            }
+          : taskArgs
 
-      const taskAgent = yield* agents.get(task.agent)
+      if (part.state.status === "completed" || part.state.status === "error") {
+        yield* finishSubtaskAssistant({
+          assistant: assistantMessage,
+          lastUser,
+          sessionID,
+          command: task.command,
+          callID: part.callID,
+        })
+        return
+      }
+
+      if (part.state.status === "pending") {
+        part = yield* sessions.updatePart({
+          ...part,
+          state: {
+            status: "running",
+            input: { ...taskArgs, subtaskPartID: task.id },
+            time: { start: Date.now() },
+          },
+        } satisfies SessionV1.ToolPart)
+      }
+
+      if (part.state.status === "running" && part.state.metadata && Object.keys(part.state.metadata).length > 0) {
+        part = yield* sessions.updatePart({
+          ...part,
+          state: {
+            status: "error",
+            input: part.state.input,
+            error: "The child Task was interrupted with incomplete recovery linkage; it was not dispatched again.",
+            metadata: part.state.metadata,
+            time: { start: part.state.time.start, end: Date.now() },
+          },
+        } satisfies SessionV1.ToolPart)
+        yield* finishSubtaskAssistant({
+          assistant: assistantMessage,
+          lastUser,
+          sessionID,
+          command: task.command,
+          callID: part.callID,
+        })
+        return
+      }
+
+      const linkedChildren =
+        part.state.status === "running"
+          ? (yield* sessions.children(sessionID)).filter((child) => {
+              const link = child.metadata?.task
+              return (
+                child.parentID === sessionID &&
+                link &&
+                typeof link === "object" &&
+                link.parentSessionId === sessionID &&
+                link.parentMessageID === assistantMessage.id &&
+                link.parentCallID === part.callID
+              )
+            })
+          : []
+      const linkedChild = linkedChildren.length === 1 ? linkedChildren[0] : undefined
+      const linkedMessageID = linkedChild?.metadata?.task?.messageID
+      if (
+        linkedChildren.length > 1 ||
+        (linkedChild &&
+          (typeof linkedMessageID !== "string" ||
+            !linkedMessageID.startsWith("msg") ||
+            part.state.status !== "running" ||
+            part.state.input.subtaskArgsPrepared !== true))
+      ) {
+        part = yield* sessions.updatePart({
+          ...part,
+          state: {
+            status: "error",
+            input: part.state.input,
+            error: "A linked child has incomplete or ambiguous recovery linkage; it was not dispatched again.",
+            metadata:
+              linkedChild ? { sessionId: linkedChild.id } : part.state.status === "running" ? part.state.metadata : undefined,
+            time: { start: part.state.status === "running" ? part.state.time.start : Date.now(), end: Date.now() },
+          },
+        } satisfies SessionV1.ToolPart)
+        yield* finishSubtaskAssistant({
+          assistant: assistantMessage,
+          lastUser,
+          sessionID,
+          command: task.command,
+          callID: part.callID,
+        })
+        return
+      }
+
+      if (part.state.status === "running" && part.state.input.subtaskPartID !== task.id) {
+        part = yield* sessions.updatePart({
+          ...part,
+          state: { ...part.state, input: { ...part.state.input, subtaskPartID: task.id } },
+        } satisfies SessionV1.ToolPart)
+      }
+
+      if (part.state.input.subtaskArgsPrepared !== true) {
+        yield* plugin.trigger(
+          "tool.execute.before",
+          { tool: TaskTool.id, sessionID, callID: part.id },
+          { args },
+        )
+        part = yield* sessions.updatePart({
+          ...part,
+          state: {
+            ...part.state,
+            input: { ...part.state.input, ...args, subtaskPartID: task.id, subtaskArgsPrepared: true },
+          },
+        } satisfies SessionV1.ToolPart)
+      }
+
+      if (part.state.status !== "running") return
+
+      const taskAgent = yield* agents.get(args.subagent_type)
       if (!taskAgent) {
         const available = (yield* agents.list()).filter((a) => !a.hidden).map((a) => a.name)
         const hint = available.length ? ` Available agents: ${available.join(", ")}` : ""
-        const error = new NamedError.Unknown({ message: `Agent not found: "${task.agent}".${hint}` })
+        const message = `Agent not found: "${args.subagent_type}".${hint}`
+        const error = new NamedError.Unknown({ message })
         yield* events.publish(Session.Event.Error, { sessionID, error: error.toObject() })
-        throw error
+        part = yield* sessions.updatePart({
+          ...part,
+          state: {
+            status: "error",
+            input: part.state.input,
+            error: `Tool execution failed: ${message}`,
+            metadata: part.state.metadata,
+            time: { start: part.state.time.start, end: Date.now() },
+          },
+        } satisfies SessionV1.ToolPart)
+        yield* finishSubtaskAssistant({
+          assistant: assistantMessage,
+          lastUser,
+          sessionID,
+          command: task.command,
+          callID: part.callID,
+        })
+        return
       }
 
       let error: Error | undefined
       const taskAbort = new AbortController()
       const result = yield* taskTool
-        .execute(taskArgs, {
-          agent: task.agent,
+        .execute(linkedChild ? { ...args, task_id: linkedChild.id } : args, {
+          agent: args.subagent_type,
           messageID: assistantMessage.id,
           sessionID,
           abort: taskAbort.signal,
@@ -383,18 +645,15 @@ const layer = Layer.effect(
             error = defect instanceof Error ? defect : new Error(String(defect))
             return Effect.logError("subtask execution failed", {
               error,
-              agent: task.agent,
-              description: task.description,
+              agent: args.subagent_type,
+              description: args.description,
             })
           }),
           Effect.onInterrupt(() =>
             Effect.gen(function* () {
               taskAbort.abort()
-              assistantMessage.finish = "tool-calls"
-              assistantMessage.time.completed = Date.now()
-              yield* sessions.updateMessage(assistantMessage)
               if (part.state.status === "running") {
-                yield* sessions.updatePart({
+                part = yield* sessions.updatePart({
                   ...part,
                   state: {
                     status: "error",
@@ -405,6 +664,13 @@ const layer = Layer.effect(
                   },
                 } satisfies SessionV1.ToolPart)
               }
+              yield* finishSubtaskAssistant({
+                assistant: assistantMessage,
+                lastUser,
+                sessionID,
+                command: task.command,
+                callID: part.callID,
+              })
             }),
           ),
         )
@@ -418,16 +684,12 @@ const layer = Layer.effect(
 
       yield* plugin.trigger(
         "tool.execute.after",
-        { tool: TaskTool.id, sessionID, callID: part.id, args: taskArgs },
+        { tool: TaskTool.id, sessionID, callID: part.id, args },
         result,
       )
 
-      assistantMessage.finish = "tool-calls"
-      assistantMessage.time.completed = Date.now()
-      yield* sessions.updateMessage(assistantMessage)
-
       if (result && part.state.status === "running") {
-        yield* sessions.updatePart({
+        part = yield* sessions.updatePart({
           ...part,
           state: {
             status: "completed",
@@ -442,7 +704,7 @@ const layer = Layer.effect(
       }
 
       if (!result) {
-        yield* sessions.updatePart({
+        part = yield* sessions.updatePart({
           ...part,
           state: {
             status: "error",
@@ -457,25 +719,13 @@ const layer = Layer.effect(
         } satisfies SessionV1.ToolPart)
       }
 
-      if (!task.command) return
-
-      const summaryUserMsg: SessionV1.User = {
-        id: MessageID.ascending(),
+      yield* finishSubtaskAssistant({
+        assistant: assistantMessage,
+        lastUser,
         sessionID,
-        role: "user",
-        time: { created: Date.now() },
-        agent: lastUser.agent,
-        model: lastUser.model,
-      }
-      yield* sessions.updateMessage(summaryUserMsg)
-      yield* sessions.updatePart({
-        id: PartID.ascending(),
-        messageID: summaryUserMsg.id,
-        sessionID,
-        type: "text",
-        text: "Summarize the task tool output above and continue with your task.",
-        synthetic: true,
-      } satisfies SessionV1.TextPart)
+        command: task.command,
+        callID: part.callID,
+      })
     })
 
     const shellImpl = Effect.fn("SessionPrompt.shellImpl")(function* (input: ShellInput, ready?: Latch.Latch) {
@@ -1158,6 +1408,9 @@ const layer = Layer.effect(
       manualRecovery = false,
     ) {
       const messages = yield* sessions.messages({ sessionID }).pipe(Effect.orDie)
+      const users = new Map<string, SessionV1.WithParts>(
+        messages.flatMap((message) => (message.info.role === "user" ? [[message.info.id, message] as const] : [])),
+      )
       const interrupted: Array<{ callID: string; tool: string; outputLength: number }> = []
       for (const message of messages) {
         for (const part of message.parts) {
@@ -1169,6 +1422,22 @@ const layer = Layer.effect(
             continue
           const currentPart = stored
           const previousMetadata = currentPart.state.status === "running" ? currentPart.state.metadata : undefined
+          const parent = message.info.role === "assistant" ? users.get(message.info.parentID) : undefined
+          const unstartedSubtask =
+            currentPart.tool === "task" &&
+            currentPart.state.status === "running" &&
+            !previousMetadata &&
+            parent?.parts.some(
+              (item) =>
+                item.type === "subtask" &&
+                (currentPart.state.input.subtaskPartID === item.id ||
+                  (currentPart.state.input.subtaskPartID === undefined &&
+                    currentPart.state.input.prompt === item.prompt &&
+                    currentPart.state.input.description === item.description &&
+                    currentPart.state.input.subagent_type === item.agent &&
+                    currentPart.state.input.command === item.command)),
+            )
+          if (unstartedSubtask) continue
           const metadata: Record<string, unknown> = {
             ...(previousMetadata ?? {}),
             interrupted: true,
@@ -1245,6 +1514,7 @@ const layer = Layer.effect(
           yield* runtime.park(sessionID)
           break
         }
+        if (step === 0) yield* reconcileSubtaskCompletions(sessionID)
         yield* status.set(sessionID, { type: "busy" })
         yield* Effect.logInfo("loop", { "session.id": sessionID, step })
 

@@ -173,12 +173,46 @@ export const TaskTool = Tool.define(
           action: "deny" as const,
         })) ?? []),
       ]
+      const msg = yield* MessageV2.get({ sessionID: ctx.sessionID, messageID: ctx.messageID }).pipe(
+        Effect.provideService(Database.Service, database),
+        Effect.orDie,
+      )
+      if (msg.info.role !== "assistant") return yield* Effect.fail(new Error("Not an assistant message"))
+      const variant = msg.info.variant
+      const model = next.model ?? {
+        modelID: msg.info.modelID,
+        providerID: msg.info.providerID,
+      }
+
+      const previousTask = session?.metadata?.task
+      const reusableMessageID =
+        previousTask &&
+        typeof previousTask === "object" &&
+        previousTask.parentSessionId === ctx.sessionID &&
+        previousTask.parentMessageID === ctx.messageID &&
+        previousTask.parentCallID === ctx.callID &&
+        typeof previousTask.messageID === "string" &&
+        previousTask.messageID.startsWith("msg")
+          ? MessageID.make(previousTask.messageID)
+          : undefined
+      const childMessageID = reusableMessageID ?? MessageID.ascending()
+      const taskLink = {
+        parentSessionId: ctx.sessionID,
+        parentMessageID: ctx.messageID,
+        parentCallID: ctx.callID,
+        messageID: childMessageID,
+        model,
+        inheritVariant: next.model === undefined,
+        variant: next.model ? undefined : variant,
+        ...(runInBackground ? { background: true } : {}),
+      }
       const nextSession =
         session ??
         (yield* sessions.create({
           parentID: ctx.sessionID,
           title: params.description + ` (@${next.name} subagent)`,
           agent: next.name,
+          metadata: { task: taskLink },
           permission: [
             ...childPermission,
             ...childToolDenies.filter(
@@ -190,28 +224,7 @@ export const TaskTool = Tool.define(
             ),
           ],
         }))
-
-      const msg = yield* MessageV2.get({ sessionID: ctx.sessionID, messageID: ctx.messageID }).pipe(
-        Effect.provideService(Database.Service, database),
-        Effect.orDie,
-      )
-      if (msg.info.role !== "assistant") return yield* Effect.fail(new Error("Not an assistant message"))
-      const variant = msg.info.variant
-
-      const model = next.model ?? {
-        modelID: msg.info.modelID,
-        providerID: msg.info.providerID,
-      }
-      const childMessageID = MessageID.ascending()
-      const metadata = {
-        parentSessionId: ctx.sessionID,
-        sessionId: nextSession.id,
-        messageID: childMessageID,
-        model,
-        inheritVariant: next.model === undefined,
-        variant: next.model ? undefined : variant,
-        ...(runInBackground ? { background: true } : {}),
-      }
+      const metadata = { ...taskLink, sessionId: nextSession.id }
 
       const taskDiagnostic = (event: string, fields: Record<string, unknown> = {}) =>
         Effect.logInfo(`restart diagnostic TaskTool ${event}`, {

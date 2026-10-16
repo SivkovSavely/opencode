@@ -589,16 +589,63 @@ export function latest(msgs: WithParts[]) {
   let user: User | undefined
   let assistant: Assistant | undefined
   let finished: Assistant | undefined
+  const users = new Map(msgs.flatMap((msg) => (msg.info.role === "user" ? [[msg.info.id, msg] as const] : [])))
+  const settledSubtaskIDs = new Set<string>()
+  const unstartedSubtaskIDs = new Set<string>()
+  const settledSubtaskCounts = new Map<string, number>()
   for (const msg of msgs) {
     const info = msg.info
     if (info.role === "user" && isAfter(info, user)) user = info
     if (info.role === "assistant" && isAfter(info, assistant)) assistant = info
     if (info.role === "assistant" && info.finish && isAfter(info, finished)) finished = info
+    if (info.role !== "assistant" || !info.parentID) continue
+    const parent = users.get(info.parentID)
+    if (!parent) continue
+    for (const part of msg.parts) {
+      if (
+        part.type !== "tool" ||
+        part.tool !== "task" ||
+        (part.state.status !== "running" && part.state.status !== "completed" && part.state.status !== "error")
+      )
+        continue
+      const subtaskPartID = part.state.input.subtaskPartID
+      if (typeof subtaskPartID === "string") {
+        if (part.state.status === "completed" || part.state.status === "error")
+          settledSubtaskIDs.add(subtaskPartID)
+        else if (!part.state.metadata) unstartedSubtaskIDs.add(subtaskPartID)
+        continue
+      }
+      const subtask = parent.parts.find(
+        (item): item is SubtaskPart =>
+          item.type === "subtask" &&
+          item.prompt === part.state.input.prompt &&
+          item.description === part.state.input.description &&
+          item.agent === part.state.input.subagent_type &&
+          item.command === part.state.input.command,
+      )
+      if (!subtask) continue
+      const key = JSON.stringify([parent.info.id, subtask.prompt, subtask.description, subtask.agent, subtask.command])
+      if (part.state.status === "completed" || part.state.status === "error") {
+        settledSubtaskCounts.set(key, (settledSubtaskCounts.get(key) ?? 0) + 1)
+        continue
+      }
+      if (part.state.status === "running" && !part.state.metadata) unstartedSubtaskIDs.add(subtask.id)
+    }
   }
   const tasks = msgs.flatMap((m) =>
-    finished && !isAfter(m.info, finished)
-      ? []
-      : m.parts.filter((p): p is CompactionPart | SubtaskPart => p.type === "compaction" || p.type === "subtask"),
+    m.parts.filter((p): p is CompactionPart | SubtaskPart => {
+      const afterFinished = !finished || isAfter(m.info, finished)
+      if (p.type === "compaction") return afterFinished
+      if (p.type !== "subtask" || settledSubtaskIDs.has(p.id)) return false
+      if (unstartedSubtaskIDs.has(p.id)) return true
+      const key = JSON.stringify([m.info.id, p.prompt, p.description, p.agent, p.command])
+      const settled = settledSubtaskCounts.get(key) ?? 0
+      if (settled > 0) {
+        settledSubtaskCounts.set(key, settled - 1)
+        return false
+      }
+      return afterFinished
+    }),
   )
   return { user, assistant, finished, tasks }
 }

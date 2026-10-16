@@ -8,6 +8,7 @@ import {
   Deferred,
   Duration,
   Effect,
+  Exit,
   Layer,
   Schema,
   Scope,
@@ -56,6 +57,7 @@ export type ExecutionRecord = {
   parentMode?: "foreground" | "background"
   parentNotificationState?: "pending" | "delivering" | "delivered"
   recoveryAttempts: number
+  recoveryPreparationAttempts: number
 }
 
 export type AdmissionResult = { manualRecovery: boolean }
@@ -83,6 +85,7 @@ export type Interface = {
   readonly progress: (sessionID: string) => Effect.Effect<void>
   readonly release: (sessionID: string) => Effect.Effect<void>
   readonly beforeTurn: (sessionID: string) => Effect.Effect<boolean>
+  readonly ownershipFence: (sessionID: string) => Effect.Effect<number | undefined>
   readonly checkpoint: (sessionID: string) => Effect.Effect<boolean>
   readonly retry: (sessionID: string, retryAt: number) => Effect.Effect<void>
   readonly resumeRetry: (sessionID: string) => Effect.Effect<boolean>
@@ -124,6 +127,7 @@ type Row = {
   parent_call_id: string | null
   parent_mode: "foreground" | "background" | null
   parent_notification_state: "pending" | "delivering" | "delivered" | null
+  recovery_preparation_attempts: number
   owner_host: string | null
   owner_machine_id: string | null
   owner_boot_id: string | null
@@ -209,6 +213,12 @@ type ResumeResult = {
   mode?: LocalExecution["mode"]
   fence?: number
 }
+
+type RecoveryPreparationRetry =
+  | { status: "conflict" }
+  | { status: "parked"; attempts: number; retryAt: number }
+  | { status: "quarantined"; attempts: number }
+  | { status: "retry"; attempts: number; retryAt: number }
 
 export type MakeInput = {
   lineage: string
@@ -312,6 +322,7 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
   const stopped = Deferred.makeUnsafe<{ action: Action }>()
   const recoveryPermits = Semaphore.makeUnsafe(2)
   const notificationClaims = new Set<string>()
+  const recoveryPreparedSessions = new Set<string>()
   const databaseRef: { current?: Database.Interface } = { current: database }
 
   const read = Effect.fnUntraced(function* (sessionID: string) {
@@ -667,6 +678,7 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
             owner_pid = ${owner?.pid ?? null}, owner_start_time = ${owner?.startTime ?? null},
             fence = ${nextFence}, state = ${"active"}, desired_active = 1, retry_at = NULL,
             recovery_attempts = ${takeover && !manualRecovery ? 0 : row.recovery_attempts},
+            recovery_preparation_attempts = ${takeover ? 0 : row.recovery_preparation_attempts},
             parent_session_id = ${parentSessionID},
             parent_message_id = ${parentMessageID},
             parent_call_id = ${parentCallID},
@@ -737,14 +749,27 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
   const recoveryPrepared = Effect.fn("RuntimeLifecycle.recoveryPrepared")(function* (sessionID: string) {
     const current = SynchronizedRef.getUnsafe(ref).active.get(sessionID)
     const row = yield* read(sessionID)
-    yield* settleStartupPending(
-      sessionID,
+    const owned =
       !!current &&
-        row?.state === "active" &&
-        row.owner_lineage === identity.lineage &&
-        row.owner_instance === identity.instance &&
-        row.fence === current.fence,
-    )
+      row?.state === "active" &&
+      row.owner_lineage === identity.lineage &&
+      row.owner_instance === identity.instance &&
+      row.fence === current.fence
+    const database = databaseRef.current ?? (yield* Database.Service)
+    const prepared =
+      !!owned &&
+      !!(yield* database.db.get(sql`
+        UPDATE runtime_execution SET recovery_preparation_attempts = 0, time_updated = ${Date.now()}
+        WHERE session_id = ${sessionID}
+          AND owner_lineage = ${identity.lineage}
+          AND owner_instance = ${identity.instance}
+          AND fence = ${current.fence}
+          AND state = ${"active"}
+          AND desired_active = 1
+        RETURNING session_id
+      `))
+    if (prepared) recoveryPreparedSessions.add(sessionID)
+    yield* settleStartupPending(sessionID, prepared)
   })
 
   const admit = Effect.fn("RuntimeLifecycle.admit")(function* (input: AdmissionInput) {
@@ -981,7 +1006,7 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
     const database = databaseRef.current ?? (yield* Database.Service)
     yield* database.db.get(sql`
       UPDATE runtime_execution
-      SET recovery_attempts = 0, time_updated = ${Date.now()}
+      SET recovery_attempts = 0, recovery_preparation_attempts = 0, time_updated = ${Date.now()}
       WHERE session_id = ${sessionID}
         AND owner_lineage = ${identity.lineage}
         AND owner_instance = ${identity.instance}
@@ -1362,6 +1387,13 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
     return allowed
   })
 
+  const ownershipFence = Effect.fnUntraced(function* (sessionID: string) {
+    const state = SynchronizedRef.getUnsafe(ref)
+    const current = state.active.get(sessionID)
+    if (state.phase !== "running" || current?.mode !== "active") return
+    return current.fence
+  })
+
   const checkpoint = Effect.fn("RuntimeLifecycle.checkpoint")(function* (sessionID: string) {
     if (SynchronizedRef.getUnsafe(ref).phase === "running") {
       yield* Effect.logInfo("restart diagnostic checkpoint reached while running", {
@@ -1547,6 +1579,101 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
     return transitioned
   })
 
+  const retryRecoveryPreparation = Effect.fnUntraced(function* (record: ExecutionRecord) {
+    const attempt = record.recoveryPreparationAttempts + 1
+    const retryAt = (yield* Clock.currentTimeMillis) + Math.min(250 * 2 ** (attempt - 1), 5_000)
+    const transition: RecoveryPreparationRetry = yield* SynchronizedRef.modifyEffect(
+      ref,
+      Effect.fnUntraced(function* (state) {
+        const current = state.active.get(record.sessionID)
+        if (!current || current.fence !== record.fence || current.mode !== "active")
+          return [{ status: "conflict" } as RecoveryPreparationRetry, state] as const
+
+        const quarantine = attempt >= 3
+        const park = state.phase !== "running"
+        const database = databaseRef.current ?? (yield* Database.Service)
+        const updated = decodeRow(
+          yield* database.db.get<Row>(sql`
+            UPDATE runtime_execution
+            SET recovery_preparation_attempts = recovery_preparation_attempts + 1,
+                state = ${quarantine ? "recovery_needed" : park ? "parked" : "retry_wait"},
+                fence = ${quarantine ? record.fence + 1 : record.fence},
+                retry_at = ${quarantine ? null : retryAt},
+                time_updated = ${Date.now()}
+            WHERE session_id = ${record.sessionID}
+              AND owner_lineage = ${identity.lineage}
+              AND owner_instance = ${identity.instance}
+              AND fence = ${record.fence}
+              AND state = ${"active"}
+              AND desired_active = 1
+              AND recovery_preparation_attempts = ${record.recoveryPreparationAttempts}
+            RETURNING *
+          `),
+        )
+        if (!updated) return [{ status: "conflict" } as RecoveryPreparationRetry, state] as const
+
+        const active = new Map(state.active)
+        if (quarantine) {
+          active.delete(record.sessionID)
+          return [
+            { status: "quarantined", attempts: updated.recovery_preparation_attempts } as RecoveryPreparationRetry,
+            { ...state, active },
+          ] as const
+        }
+
+        if (park) {
+          active.delete(record.sessionID)
+          return [
+            { status: "parked", attempts: updated.recovery_preparation_attempts, retryAt } as RecoveryPreparationRetry,
+            { ...state, active },
+          ] as const
+        }
+
+        active.set(record.sessionID, { ...current, mode: "retry_wait", retryAt })
+        return [
+          { status: "retry", attempts: updated.recovery_preparation_attempts, retryAt } as RecoveryPreparationRetry,
+          { ...state, active },
+        ] as const
+      }),
+    )
+    if (transition.status === "quarantined") {
+      yield* Effect.logError("safe recovery preparation failures exhausted automatic recovery budget", {
+        sessionID: record.sessionID,
+        attempts: transition.attempts,
+        fence: record.fence + 1,
+        currentRuntimeInstance: identity.instance,
+      })
+      yield* checkQuiescent()
+      return transition
+    }
+    if (transition.status === "retry") {
+      yield* Effect.logWarning("safe recovery preparation failed; retry scheduled", {
+        sessionID: record.sessionID,
+        attempts: transition.attempts,
+        retryAt: transition.retryAt,
+        currentRuntimeInstance: identity.instance,
+      })
+      return transition
+    }
+    if (transition.status === "parked") {
+      yield* Effect.logInfo("safe recovery preparation retry parked during runtime drain", {
+        sessionID: record.sessionID,
+        attempts: transition.attempts,
+        retryAt: transition.retryAt,
+        currentRuntimeInstance: identity.instance,
+      })
+      yield* checkQuiescent()
+      return transition
+    }
+    yield* Effect.logWarning("safe recovery preparation retry compare-and-set failed", {
+      sessionID: record.sessionID,
+      expectedOwnerInstance: identity.instance,
+      expectedFence: record.fence,
+      expectedRecoveryPreparationAttempts: record.recoveryPreparationAttempts,
+    })
+    return transition
+  })
+
   const recover = Effect.fn("RuntimeLifecycle.recover")(function* (
     run: (record: ExecutionRecord) => Effect.Effect<unknown, unknown>,
   ) {
@@ -1566,7 +1693,7 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
     `)
     const activeOwnedElsewhere = candidates.filter(
       (row) =>
-        (row.state === "active" || row.state === "waiting_child") &&
+        (row.state === "active" || row.state === "waiting_child" || row.state === "retry_wait") &&
         row.owner_lineage === identity.lineage &&
         row.owner_instance !== identity.instance,
     )
@@ -1600,10 +1727,10 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
     const rows = candidates.filter(
       (row) =>
         row.owner_lineage === identity.lineage &&
-        (((row.state === "active" || row.state === "waiting_child") &&
+        (((row.state === "active" || row.state === "waiting_child" || row.state === "retry_wait") &&
           deadOwners.includes(row) &&
           row.recovery_attempts < 3) ||
-          ((row.state === "parked" || row.state === "retry_wait") && row.owner_instance !== identity.instance)),
+          (row.state === "parked" && row.owner_instance !== identity.instance)),
     )
     const eligibleSessionIDs = new Set(rows.map((row) => row.session_id))
     const quarantined = quarantines.filter((result) => result === "quarantined").length
@@ -1747,19 +1874,49 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
           }
         }
         const recoveryRecord = { ...record, state: "active" as const, retryAt: undefined }
+        let preparationAttempts = record.recoveryPreparationAttempts
         yield* Effect.logInfo("restart diagnostic recovery run started", {
           ...recordFields(recoveryRecord),
           recoveryRecord,
         })
-        const work = run(recoveryRecord).pipe(
-          Effect.tap(() =>
-            Effect.logInfo("runtime recovery continuation returned successfully", {
-              ...recordFields(recoveryRecord),
-            }),
-          ),
-          Effect.tap(() => complete(record.sessionID)),
-        )
-        yield* permitHeld ? work : recoveryPermits.withPermit(work)
+        while (true) {
+          recoveryPreparedSessions.delete(record.sessionID)
+          const work = run(recoveryRecord).pipe(
+            Effect.tap(() =>
+              Effect.logInfo("runtime recovery continuation returned successfully", {
+                ...recordFields(recoveryRecord),
+              }),
+            ),
+            Effect.tap(() => complete(record.sessionID)),
+          )
+          const exit = yield* (permitHeld
+            ? Effect.exit(work)
+            : recoveryPermits.withPermit(Effect.exit(work)))
+          if (Exit.isSuccess(exit)) break
+          if (recoveryPreparedSessions.has(record.sessionID) || Cause.hasInterrupts(exit.cause))
+            return yield* Effect.failCause(exit.cause)
+
+          const retry = yield* retryRecoveryPreparation({ ...record, recoveryPreparationAttempts: preparationAttempts })
+          if (retry.status === "quarantined") return false
+          if (retry.status === "conflict") return yield* Effect.failCause(exit.cause)
+          if (retry.status === "parked") return false
+          preparationAttempts = retry.attempts
+
+          const wake = yield* Effect.raceFirst(
+            Effect.sleep(Duration.millis(Math.max(0, retry.retryAt - (yield* Clock.currentTimeMillis)))).pipe(
+              Effect.as("retry_deadline" as const),
+            ),
+            awaitDraining.pipe(Effect.as("runtime_drain" as const)),
+          )
+          yield* Effect.logInfo("runtime recovery preparation retry wait ended", {
+            sessionID: record.sessionID,
+            retryAt: retry.retryAt,
+            wake,
+            lineage: identity.lineage,
+            instance: identity.instance,
+          })
+          if (!(yield* resumeRetry(record.sessionID))) return false
+        }
         if (record.parentMode === "background" && record.parentSessionID)
           yield* scheduleNotification(
             record.parentSessionID,
@@ -1815,6 +1972,7 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
             return false
           }),
         ),
+        Effect.ensuring(Effect.sync(() => recoveryPreparedSessions.delete(record.sessionID))),
       )
     })
 
@@ -1984,6 +2142,7 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
     progress,
     release,
     beforeTurn,
+    ownershipFence,
     checkpoint,
     retry,
     resumeRetry,
@@ -2021,6 +2180,7 @@ export function unavailable(): Interface {
     progress: () => Effect.void,
     release: () => Effect.void,
     beforeTurn: () => Effect.succeed(true),
+    ownershipFence: () => Effect.succeed(undefined),
     checkpoint: () => Effect.succeed(true),
     retry: () => Effect.void,
     resumeRetry: () => Effect.succeed(true),
@@ -2058,6 +2218,7 @@ function rowFields(row: Row) {
     parentMode: row.parent_mode ?? undefined,
     parentNotificationState: row.parent_notification_state ?? undefined,
     recoveryAttempts: row.recovery_attempts,
+    recoveryPreparationAttempts: row.recovery_preparation_attempts,
   }
 }
 
@@ -2076,6 +2237,7 @@ function recordFields(record: ExecutionRecord) {
     parentMode: record.parentMode,
     parentNotificationState: record.parentNotificationState,
     recoveryAttempts: record.recoveryAttempts,
+    recoveryPreparationAttempts: record.recoveryPreparationAttempts,
   }
 }
 
@@ -2094,6 +2256,7 @@ function toExecutionRecord(row: Row): ExecutionRecord {
     parentMode: row.parent_mode ?? undefined,
     parentNotificationState: row.parent_notification_state ?? undefined,
     recoveryAttempts: row.recovery_attempts,
+    recoveryPreparationAttempts: row.recovery_preparation_attempts,
   }
 }
 

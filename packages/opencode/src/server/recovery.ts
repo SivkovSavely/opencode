@@ -1,6 +1,184 @@
 import { SessionV1 } from "@opencode-ai/core/v1/session"
-import { Cause, Effect, Exit } from "effect"
+import { Cause, Effect, Exit, Option } from "effect"
+import type { Database } from "@opencode-ai/core/database/database"
+import type { Session } from "../session/session"
 import { RuntimeLifecycle } from "./runtime-lifecycle"
+
+type ForegroundTaskRecord = {
+  sessionID: string
+  parentSessionID?: string
+  parentMessageID?: string
+  parentCallID?: string
+}
+
+function taskOutcome(sessionID: string, result: SessionV1.WithParts) {
+  const text = result.parts.findLast((part) => part.type === "text")?.text ?? ""
+  const assistant = result.info.role === "assistant" ? result.info : undefined
+  const failed = result.parts.findLast((part) => part.type === "tool" && part.state.status === "error")
+  if (!assistant?.time.completed || !assistant.finish)
+    return {
+      state: "error" as const,
+      text: `Subagent failed (task_id: ${sessionID}): child execution did not produce a completed assistant result`,
+    }
+  if (assistant.error) {
+    const error = assistant.error.data
+    const message = "message" in error && typeof error.message === "string" ? error.message : assistant.error.name
+    return { state: "error" as const, text: `Subagent failed (task_id: ${sessionID}): ${message}` }
+  }
+  if (failed?.type === "tool" && failed.state.status === "error")
+    return { state: "error" as const, text: `Subagent failed (task_id: ${sessionID}): ${failed.state.error}` }
+  return { state: "completed" as const, text }
+}
+
+export const settleForeground = Effect.fn("ServerRecovery.settleForeground")(function* (input: {
+  database: Database.Interface
+  sessions: Session.Interface
+  record: ForegroundTaskRecord
+  result: SessionV1.WithParts
+}) {
+  const { database, sessions, record, result } = input
+  const parentID = record.parentSessionID
+  if (!parentID || !record.parentMessageID || !record.parentCallID) return
+  const { SessionID, MessageID, PartID } = yield* Effect.promise(() => import("../session/schema"))
+  const { sql } = yield* Effect.promise(() => import("drizzle-orm"))
+  const { renderOutput } = yield* Effect.promise(() => import("../tool/task"))
+
+  yield* database.db.transaction(
+    () =>
+      Effect.gen(function* () {
+        const parentExecution = yield* database.db.get<{ state: string }>(sql`
+          SELECT state FROM runtime_execution WHERE session_id = ${parentID}
+        `)
+        if (parentExecution?.state === "cancelled") {
+          yield* Effect.logInfo("foreground Task result not delivered to cancelled parent", {
+            childSessionID: record.sessionID,
+            parentSessionID: record.parentSessionID,
+          })
+          return
+        }
+        const parentSessionID = SessionID.make(parentID)
+        const messages = yield* sessions.messages({ sessionID: parentSessionID }).pipe(Effect.orDie)
+        const message = messages.find((item) => item.info.id === record.parentMessageID)
+        if (!message || message.info.role !== "assistant") {
+          yield* Effect.logWarning("foreground Task recovery could not find the original assistant message", {
+            childSessionID: record.sessionID,
+            parentSessionID: record.parentSessionID,
+            parentMessageID: record.parentMessageID,
+          })
+          return
+        }
+        const part = message.parts.find(
+          (item) => item.type === "tool" && item.tool === "task" && item.callID === record.parentCallID,
+        )
+        if (
+          part?.type !== "tool" ||
+          (part.state.status !== "running" && part.state.status !== "completed" && part.state.status !== "error")
+        ) {
+          yield* Effect.logWarning("foreground Task recovery could not update the original parent call", {
+            childSessionID: record.sessionID,
+            parentSessionID: record.parentSessionID,
+            parentMessageID: record.parentMessageID,
+            parentCallID: record.parentCallID,
+            reason: part?.type === "tool" ? `parent tool is ${part.state.status}` : "parent call is missing",
+          })
+          return
+        }
+        if (part.state.metadata?.sessionId !== record.sessionID) {
+          yield* Effect.logWarning("foreground Task recovery link does not match parent metadata", {
+            childSessionID: record.sessionID,
+            parentSessionID: record.parentSessionID,
+            parentCallID: record.parentCallID,
+          })
+          return
+        }
+        if (part.state.status === "running") {
+          const outcome = taskOutcome(record.sessionID, result)
+          const time = { start: part.state.time.start, end: Date.now() }
+          yield* sessions.updatePart(
+            outcome.state === "completed"
+              ? {
+                  ...part,
+                  state: {
+                    status: "completed",
+                    input: part.state.input,
+                    output: renderOutput({
+                      sessionID: SessionID.make(record.sessionID),
+                      state: "completed",
+                      text: outcome.text,
+                    }),
+                    title: part.state.title ?? "Subagent task",
+                    metadata: part.state.metadata ?? {},
+                    time,
+                  },
+                }
+              : {
+                  ...part,
+                  state: {
+                    status: "error",
+                    input: part.state.input,
+                    error: outcome.text,
+                    metadata: part.state.metadata,
+                    time,
+                  },
+                },
+          )
+        }
+        const command = part.state.input.command
+        if (typeof command === "string" && command.length > 0) {
+          const assistantParentID = message.info.role === "assistant" ? message.info.parentID : undefined
+          const messageID = MessageID.ascending(`msg_task_summary_${record.parentCallID}`)
+          const partID = PartID.ascending(`prt_task_summary_${record.parentCallID}`)
+          const existing = yield* sessions
+            .findMessage(parentSessionID, (item) => item.info.id === messageID)
+            .pipe(Effect.orDie)
+          if (Option.isNone(existing)) {
+            const parent = messages.find(
+              (item) => item.info.role === "user" && item.info.id === assistantParentID,
+            )
+            if (parent?.info.role === "user") {
+              yield* sessions.updateMessage({
+                id: messageID,
+                sessionID: parentSessionID,
+                role: "user",
+                time: { created: Date.now() },
+                agent: parent.info.agent,
+                model: parent.info.model,
+              })
+              yield* sessions.updatePart({
+                id: partID,
+                messageID,
+                sessionID: parentSessionID,
+                type: "text",
+                text: "Summarize the task tool output above and continue with your task.",
+                synthetic: true,
+              } satisfies SessionV1.TextPart)
+            }
+          } else if (!existing.value.parts.some((item) => item.id === partID)) {
+            yield* sessions.updatePart({
+              id: partID,
+              messageID,
+              sessionID: parentSessionID,
+              type: "text",
+              text: "Summarize the task tool output above and continue with your task.",
+              synthetic: true,
+            } satisfies SessionV1.TextPart)
+          }
+        }
+        if (!message.info.finish || !message.info.time.completed) {
+          message.info.finish = "tool-calls"
+          message.info.time.completed = Date.now()
+          yield* sessions.updateMessage(message.info)
+        }
+        yield* Effect.logInfo("foreground Task recovery settled parent call", {
+          childSessionID: record.sessionID,
+          parentSessionID: record.parentSessionID,
+          parentCallID: record.parentCallID,
+          outcome: part.state.status === "running" ? taskOutcome(record.sessionID, result).state : part.state.status,
+        })
+      }),
+    { behavior: "immediate" },
+  )
+})
 
 export const initialize = Effect.fn("ServerRecovery.initialize")(function* () {
   const current = RuntimeLifecycle.current()
@@ -103,7 +281,9 @@ export const initialize = Effect.fn("ServerRecovery.initialize")(function* () {
             }),
           )
           if (result)
-            yield* store.provide({ directory: record.directory }, settleForeground(record, result)).pipe(
+            yield* store
+              .provide({ directory: record.directory }, settleForeground({ database, sessions, record, result }))
+              .pipe(
               Effect.catchCause((cause) => {
                 const error = Cause.squash(cause)
                 return Effect.logWarning("completed foreground Task result could not be persisted", {
@@ -125,7 +305,8 @@ export const initialize = Effect.fn("ServerRecovery.initialize")(function* () {
                 return
               }
               const result = yield* prompt.recover(SessionID.make(record.sessionID))
-              if (record.parentMode === "foreground") yield* settleForeground(record, result)
+              if (record.parentMode === "foreground")
+                yield* settleForeground({ database, sessions, record, result })
             }),
           ),
         )
@@ -247,105 +428,6 @@ export const initialize = Effect.fn("ServerRecovery.initialize")(function* () {
               }
             }
             return count
-          })
-        }
-
-        function taskOutcome(sessionID: string, result: SessionV1.WithParts) {
-          const text = result.parts.findLast((part) => part.type === "text")?.text ?? ""
-          const assistant = result.info.role === "assistant" ? result.info : undefined
-          const failed = result.parts.findLast((part) => part.type === "tool" && part.state.status === "error")
-          if (assistant?.error) {
-            const error = assistant.error.data
-            const message =
-              "message" in error && typeof error.message === "string" ? error.message : assistant.error.name
-            return { state: "error" as const, text: `Subagent failed (task_id: ${sessionID}): ${message}` }
-          }
-          if (failed?.type === "tool" && failed.state.status === "error")
-            return { state: "error" as const, text: `Subagent failed (task_id: ${sessionID}): ${failed.state.error}` }
-          return { state: "completed" as const, text }
-        }
-
-        function settleForeground(
-          record: {
-            sessionID: string
-            parentSessionID?: string
-            parentMessageID?: string
-            parentCallID?: string
-          },
-          result: SessionV1.WithParts,
-        ) {
-          return Effect.gen(function* () {
-            if (!record.parentSessionID || !record.parentMessageID || !record.parentCallID) return
-            const parentExecution = yield* database.db.get<{ state: string }>(sql`
-              SELECT state FROM runtime_execution WHERE session_id = ${record.parentSessionID}
-            `)
-            if (parentExecution?.state === "cancelled") {
-              yield* Effect.logInfo("foreground Task result not delivered to cancelled parent", {
-                childSessionID: record.sessionID,
-                parentSessionID: record.parentSessionID,
-              })
-              return
-            }
-            const parentSessionID = SessionID.make(record.parentSessionID)
-            const messages = yield* sessions.messages({ sessionID: parentSessionID }).pipe(Effect.orDie)
-            const message = messages.find((item) => item.info.id === record.parentMessageID)
-            const part = message?.parts.find(
-              (item) => item.type === "tool" && item.tool === "task" && item.callID === record.parentCallID,
-            )
-            if (part?.type !== "tool" || part.state.status !== "running") {
-              yield* Effect.logWarning("foreground Task recovery could not update the original parent call", {
-                childSessionID: record.sessionID,
-                parentSessionID: record.parentSessionID,
-                parentMessageID: record.parentMessageID,
-                parentCallID: record.parentCallID,
-                reason: part?.type === "tool" ? `parent tool is ${part.state.status}` : "parent call is missing",
-              })
-              return
-            }
-            if (part.state.metadata?.sessionId !== record.sessionID) {
-              yield* Effect.logWarning("foreground Task recovery link does not match parent metadata", {
-                childSessionID: record.sessionID,
-                parentSessionID: record.parentSessionID,
-                parentCallID: record.parentCallID,
-              })
-              return
-            }
-            const outcome = taskOutcome(record.sessionID, result)
-            const time = { start: part.state.time.start, end: Date.now() }
-            yield* sessions.updatePart(
-              outcome.state === "completed"
-                ? {
-                    ...part,
-                    state: {
-                      status: "completed",
-                      input: part.state.input,
-                      output: renderOutput({
-                        sessionID: SessionID.make(record.sessionID),
-                        state: "completed",
-                        text: outcome.text,
-                      }),
-                      title: part.state.title ?? "Subagent task",
-                      metadata: part.state.metadata ?? {},
-                      time,
-                    },
-                  }
-                : {
-                    ...part,
-                    state: {
-                      status: "error",
-                      input: part.state.input,
-                      error: outcome.text,
-                      metadata: part.state.metadata,
-                      time,
-                    },
-                  },
-            )
-            yield* Effect.logInfo("foreground Task recovery settled parent call", {
-              childSessionID: record.sessionID,
-              parentSessionID: record.parentSessionID,
-              parentCallID: record.parentCallID,
-              outcome: outcome.state,
-            })
           })
         }
 

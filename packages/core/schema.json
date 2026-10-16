@@ -1,9 +1,9 @@
 {
   "version": "7",
   "dialect": "sqlite",
-  "id": "3dd5ac0c-7df2-472e-b208-3bcb52f09f92",
+  "id": "a2f5e95d-903d-4cab-80fa-17cad6882c6d",
   "prevIds": [
-    "ef44f982-728a-4be9-9fe0-731fd1912fb9"
+    "3dd5ac0c-7df2-472e-b208-3bcb52f09f92"
   ],
   "ddl": [
     {
@@ -393,6 +393,16 @@
       "default": "0",
       "generated": null,
       "name": "recovery_attempts",
+      "entityType": "columns",
+      "table": "runtime_execution"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "0",
+      "generated": null,
+      "name": "recovery_preparation_attempts",
       "entityType": "columns",
       "table": "runtime_execution"
     },

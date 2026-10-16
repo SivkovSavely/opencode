@@ -46,6 +46,7 @@ export default {
           \`parent_mode\` text,
           \`parent_notification_state\` text,
           \`recovery_attempts\` integer DEFAULT 0 NOT NULL,
+          \`recovery_preparation_attempts\` integer DEFAULT 0 NOT NULL,
           \`time_created\` integer NOT NULL,
           \`time_updated\` integer NOT NULL,
           CONSTRAINT \`fk_runtime_execution_session_id_session_id_fk\` FOREIGN KEY (\`session_id\`) REFERENCES \`session\`(\`id\`) ON DELETE CASCADE

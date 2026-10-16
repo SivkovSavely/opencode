@@ -42,9 +42,10 @@ const executionDetails = (database: Database.Interface, sessionID: string) =>
     recovery_attempts: number
     owner_pid: number | null
     owner_start_time: string | null
+    recovery_preparation_attempts: number
   }>(sql`
     SELECT state, desired_active, owner_lineage, owner_instance, fence, retry_at,
-           recovery_attempts, owner_pid, owner_start_time
+            recovery_attempts, owner_pid, owner_start_time, recovery_preparation_attempts
     FROM runtime_execution
     WHERE session_id = ${sessionID}
   `)
@@ -97,7 +98,11 @@ describe("runtime lifecycle", () => {
       expect(restart.status).toBe(info.restartSupported ? 200 : 400)
       if (info.restartSupported) await listener.lifecycle.awaitStop
     } finally {
-      await listener.stop(true)
+      try {
+        await listener.stop(true)
+      } finally {
+        RuntimeLifecycle.setCurrent(RuntimeLifecycle.unavailable())
+      }
     }
   })
 
@@ -109,7 +114,11 @@ describe("runtime lifecycle", () => {
       await listener.lifecycle.awaitStop
       expect((await response.json()).state).toBe("stopping")
     } finally {
-      await listener.stop(true)
+      try {
+        await listener.stop(true)
+      } finally {
+        RuntimeLifecycle.setCurrent(RuntimeLifecycle.unavailable())
+      }
     }
   })
 
@@ -175,9 +184,11 @@ describe("runtime lifecycle", () => {
       const sessionID = yield* seedSession(database)
       const runtime = RuntimeLifecycle.make({ lineage, instance }, scope, database)
 
+      expect(yield* runtime.ownershipFence(sessionID)).toBeUndefined()
       yield* runtime.admit({ sessionID, directory: "/tmp" })
       expect((yield* runtime.status()).active).toBe(1)
       expect(yield* runtime.beforeTurn(sessionID)).toBe(true)
+      expect(yield* runtime.ownershipFence(sessionID)).toBe(0)
       expect(yield* executionDetails(database, sessionID)).toMatchObject({
         state: "active",
         desired_active: 1,
@@ -188,8 +199,10 @@ describe("runtime lifecycle", () => {
       })
 
       yield* runtime.release(sessionID)
+      expect(yield* runtime.ownershipFence(sessionID)).toBeUndefined()
       yield* runtime.admit({ sessionID, directory: "/tmp" })
       expect((yield* executionDetails(database, sessionID))?.fence).toBe(1)
+      expect(yield* runtime.ownershipFence(sessionID)).toBe(1)
       yield* runtime.release(sessionID)
     }),
   )
@@ -282,6 +295,71 @@ describe("runtime lifecycle", () => {
       yield* Deferred.succeed(allowCompletion, undefined)
       while ((yield* execution(database, sessionID))?.state !== "completed") yield* Effect.yieldNow
       expect((yield* executionDetails(database, sessionID))?.state).toBe("completed")
+    }),
+  )
+
+  it.effect("does not steal a live retry_wait execution from another runtime instance", () =>
+    Effect.gen(function* () {
+      const database = yield* Database.Service
+      const scope = yield* Scope.Scope
+      const lineage = randomUUID()
+      const oldInstance = randomUUID()
+      const sessionID = yield* seedSession(database)
+      const old = RuntimeLifecycle.make({ lineage, instance: oldInstance }, scope, database)
+      const retryAt = (yield* Clock.currentTimeMillis) + 1_000
+      yield* old.admit({ sessionID, directory: "/tmp" })
+      yield* old.retry(sessionID, retryAt)
+
+      const replacement = RuntimeLifecycle.make({ lineage, instance: randomUUID() }, scope, database)
+      const attempts = yield* Ref.make(0)
+      yield* replacement.recover(() => Ref.update(attempts, (value) => value + 1))
+
+      expect(yield* Ref.get(attempts)).toBe(0)
+      expect(yield* executionDetails(database, sessionID)).toMatchObject({
+        state: "retry_wait",
+        owner_instance: oldInstance,
+        fence: 0,
+        retry_at: retryAt,
+        recovery_attempts: 0,
+      })
+
+      yield* TestClock.adjust(1_000)
+      expect(yield* old.resumeRetry(sessionID)).toBe(true)
+      expect(yield* old.beforeTurn(sessionID)).toBe(true)
+      yield* old.release(sessionID)
+      expect((yield* executionDetails(database, sessionID))?.state).toBe("completed")
+    }),
+  )
+
+  it.effect("recovers retry_wait only after its owner is proven dead", () =>
+    Effect.gen(function* () {
+      const database = yield* Database.Service
+      const scope = yield* Scope.Scope
+      const lineage = randomUUID()
+      const sessionID = yield* seedSession(database)
+      const old = RuntimeLifecycle.make({ lineage, instance: randomUUID() }, scope, database)
+      yield* old.admit({ sessionID, directory: "/tmp" })
+      yield* old.retry(sessionID, (yield* Clock.currentTimeMillis) - 1)
+      yield* database.db.run(sql`
+        UPDATE runtime_execution SET owner_start_time = ${"0"} WHERE session_id = ${sessionID}
+      `)
+
+      const replacement = RuntimeLifecycle.make({ lineage, instance: randomUUID() }, scope, database)
+      const started = yield* Deferred.make<void>()
+      yield* replacement.recover(() =>
+        Effect.gen(function* () {
+          yield* replacement.recoveryPrepared(sessionID)
+          yield* Deferred.succeed(started, undefined)
+        }),
+      )
+      yield* Deferred.await(started)
+      while ((yield* execution(database, sessionID))?.state !== "completed") yield* Effect.yieldNow
+      expect(yield* executionDetails(database, sessionID)).toMatchObject({
+        state: "completed",
+        owner_instance: replacement.identity.instance,
+        fence: 1,
+        recovery_attempts: 0,
+      })
     }),
   )
 
@@ -497,8 +575,14 @@ describe("runtime lifecycle", () => {
       const runtime = RuntimeLifecycle.make({ lineage: randomUUID(), instance: randomUUID() }, scope, database)
       yield* runtime.admit({ sessionID, directory: "/tmp" })
       yield* database.db.run(sql`UPDATE runtime_execution SET recovery_attempts = 2 WHERE session_id = ${sessionID}`)
+      yield* database.db.run(
+        sql`UPDATE runtime_execution SET recovery_preparation_attempts = 2 WHERE session_id = ${sessionID}`,
+      )
       yield* runtime.progress(sessionID)
-      expect((yield* executionDetails(database, sessionID))?.recovery_attempts).toBe(0)
+      expect(yield* executionDetails(database, sessionID)).toMatchObject({
+        recovery_attempts: 0,
+        recovery_preparation_attempts: 0,
+      })
     }),
   )
 
@@ -930,6 +1014,7 @@ describe("runtime lifecycle", () => {
       const replacement = RuntimeLifecycle.make({ lineage, instance: randomUUID() }, scope, database)
       yield* replacement.recover(() =>
         Effect.gen(function* () {
+          yield* replacement.recoveryPrepared(sessionID)
           yield* Deferred.succeed(started, undefined)
           return yield* Effect.fail(new Error("recovery failure"))
         }),
@@ -949,6 +1034,168 @@ describe("runtime lifecycle", () => {
         state: "active",
         owner_instance: next.identity.instance,
         fence: 2,
+      })
+    }),
+  )
+
+  it.live("retries a safe recovery preparation failure before succeeding", () =>
+    Effect.gen(function* () {
+      const database = yield* Database.Service
+      const scope = yield* Scope.Scope
+      const lineage = randomUUID()
+      const sessionID = yield* seedSession(database)
+      const old = RuntimeLifecycle.make({ lineage, instance: randomUUID() }, scope, database)
+      yield* old.admit({ sessionID, directory: "/tmp" })
+      yield* database.db.run(sql`
+        UPDATE runtime_execution SET owner_start_time = ${"0"} WHERE session_id = ${sessionID}
+      `)
+
+      const replacement = RuntimeLifecycle.make({ lineage, instance: randomUUID() }, scope, database)
+      const attempts = yield* Ref.make(0)
+      const firstFailed = yield* Deferred.make<void>()
+      const succeeded = yield* Deferred.make<void>()
+      const retryStarted = yield* Clock.currentTimeMillis
+      yield* replacement.recover(() =>
+        Effect.gen(function* () {
+          const count = yield* Ref.updateAndGet(attempts, (value) => value + 1)
+          if (count === 1) {
+            yield* Deferred.succeed(firstFailed, undefined)
+            return yield* Effect.fail(new Error("transient preparation failure"))
+          }
+          yield* replacement.recoveryPrepared(sessionID)
+          yield* Deferred.succeed(succeeded, undefined)
+        }),
+      )
+
+      yield* Deferred.await(firstFailed)
+      while ((yield* execution(database, sessionID))?.state !== "retry_wait") yield* Effect.yieldNow
+      const retry = yield* executionDetails(database, sessionID)
+      expect(retry).toMatchObject({
+        state: "retry_wait",
+        recovery_attempts: 1,
+        recovery_preparation_attempts: 1,
+      })
+      expect(retry?.retry_at).toBeGreaterThanOrEqual(retryStarted + 250)
+      yield* Deferred.await(succeeded)
+      while ((yield* execution(database, sessionID))?.state !== "completed") yield* Effect.yieldNow
+      expect(yield* Ref.get(attempts)).toBe(2)
+      expect(yield* executionDetails(database, sessionID)).toMatchObject({
+        state: "completed",
+        owner_instance: replacement.identity.instance,
+        recovery_attempts: 1,
+        recovery_preparation_attempts: 0,
+      })
+    }),
+  )
+
+  it.live("quarantines safe recovery preparation after its bounded retry budget", () =>
+    Effect.gen(function* () {
+      const database = yield* Database.Service
+      const scope = yield* Scope.Scope
+      const lineage = randomUUID()
+      const sessionID = yield* seedSession(database)
+      const old = RuntimeLifecycle.make({ lineage, instance: randomUUID() }, scope, database)
+      yield* old.admit({ sessionID, directory: "/tmp" })
+      yield* database.db.run(sql`
+        UPDATE runtime_execution SET owner_start_time = ${"0"} WHERE session_id = ${sessionID}
+      `)
+
+      const replacement = RuntimeLifecycle.make({ lineage, instance: randomUUID() }, scope, database)
+      const attempts = yield* Ref.make(0)
+      const firstFailed = yield* Deferred.make<void>()
+      const failedThreeTimes = yield* Deferred.make<void>()
+      yield* replacement.recover(() =>
+        Effect.gen(function* () {
+          const count = yield* Ref.updateAndGet(attempts, (value) => value + 1)
+          if (count === 1) yield* Deferred.succeed(firstFailed, undefined)
+          if (count === 3) yield* Deferred.succeed(failedThreeTimes, undefined)
+          return yield* Effect.fail(new Error("preparation remains unavailable"))
+        }),
+      )
+
+      yield* Deferred.await(firstFailed)
+      while ((yield* executionDetails(database, sessionID))?.recovery_preparation_attempts !== 1)
+        yield* Effect.yieldNow
+      while ((yield* executionDetails(database, sessionID))?.recovery_preparation_attempts !== 2)
+        yield* Effect.yieldNow
+      yield* Deferred.await(failedThreeTimes)
+      while ((yield* execution(database, sessionID))?.state !== "recovery_needed") yield* Effect.yieldNow
+      expect(yield* Ref.get(attempts)).toBe(3)
+      expect(yield* executionDetails(database, sessionID)).toMatchObject({
+        state: "recovery_needed",
+        recovery_attempts: 1,
+        recovery_preparation_attempts: 3,
+        fence: 2,
+      })
+    }),
+  )
+
+  it.live("parks a safe recovery retry when draining starts before the retry transition", () =>
+    Effect.gen(function* () {
+      const database = yield* Database.Service
+      const scope = yield* Scope.Scope
+      const lineage = randomUUID()
+      const sessionID = yield* seedSession(database)
+      const old = RuntimeLifecycle.make({ lineage, instance: randomUUID() }, scope, database)
+      yield* old.admit({ sessionID, directory: "/tmp" })
+      yield* database.db.run(sql`
+        UPDATE runtime_execution SET owner_start_time = ${"0"} WHERE session_id = ${sessionID}
+      `)
+
+      const replacement = RuntimeLifecycle.make({ lineage, instance: randomUUID() }, scope, database)
+      const failed = yield* Deferred.make<void>()
+      yield* replacement.recover(() =>
+        Effect.gen(function* () {
+          yield* replacement.request("shutdown")
+          yield* Deferred.succeed(failed, undefined)
+          return yield* Effect.fail(new Error("transient preparation failure"))
+        }),
+      )
+
+      yield* Deferred.await(failed)
+      yield* replacement.awaitDrain
+      expect((yield* replacement.status()).active).toBe(0)
+      expect(yield* executionDetails(database, sessionID)).toMatchObject({
+        state: "parked",
+        recovery_attempts: 1,
+        recovery_preparation_attempts: 1,
+      })
+      expect((yield* executionDetails(database, sessionID))?.retry_at).not.toBeNull()
+    }),
+  )
+
+  it.effect("does not retry a recovery failure after preparation completes", () =>
+    Effect.gen(function* () {
+      const database = yield* Database.Service
+      const scope = yield* Scope.Scope
+      const lineage = randomUUID()
+      const sessionID = yield* seedSession(database)
+      const old = RuntimeLifecycle.make({ lineage, instance: randomUUID() }, scope, database)
+      yield* old.admit({ sessionID, directory: "/tmp" })
+      yield* database.db.run(sql`
+        UPDATE runtime_execution SET owner_start_time = ${"0"} WHERE session_id = ${sessionID}
+      `)
+
+      const replacement = RuntimeLifecycle.make({ lineage, instance: randomUUID() }, scope, database)
+      const attempts = yield* Ref.make(0)
+      const failed = yield* Deferred.make<void>()
+      yield* replacement.recover(() =>
+        Effect.gen(function* () {
+          yield* Ref.update(attempts, (value) => value + 1)
+          yield* replacement.recoveryPrepared(sessionID)
+          yield* Deferred.succeed(failed, undefined)
+          return yield* Effect.fail(new Error("provider or tool outcome is uncertain"))
+        }),
+      )
+
+      yield* Deferred.await(failed)
+      while ((yield* execution(database, sessionID))?.state !== "recovery_needed") yield* Effect.yieldNow
+      expect(yield* Ref.get(attempts)).toBe(1)
+      expect(yield* executionDetails(database, sessionID)).toMatchObject({
+        state: "recovery_needed",
+        recovery_attempts: 1,
+        recovery_preparation_attempts: 0,
+        fence: 1,
       })
     }),
   )
