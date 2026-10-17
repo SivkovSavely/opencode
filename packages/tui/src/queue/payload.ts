@@ -1,6 +1,15 @@
 import type { QueueCommand } from "@opencode-ai/schema/queue-command"
 import type { SessionQueueV1 } from "@opencode-ai/schema/v1/session-queue"
 
+export function queueSubmissionKey(input: {
+  sessionID?: string
+  payload: SessionQueueV1.Payload
+  front: boolean
+  location?: { directory: string; workspaceID?: string; newCopy: boolean }
+}) {
+  return JSON.stringify(input)
+}
+
 export function queuePayload(
   command: Extract<QueueCommand.Result, { type: "enqueue" }>,
   captured: { agent: string; model: { providerID: string; modelID: string }; variant?: string },

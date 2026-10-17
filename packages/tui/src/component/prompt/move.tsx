@@ -176,8 +176,8 @@ export function usePromptMove(input: { projectID: () => string | undefined; sess
     if (progress()) setProgress("Submitting prompt")
   }
 
-  function finishSubmit() {
-    homeDestination?.clear()
+  function finishSubmit(options?: { preserveDestination: boolean }) {
+    if (!options?.preserveDestination) homeDestination?.clear()
     setProgress(undefined)
     setCreating(false)
   }
@@ -192,6 +192,7 @@ export function usePromptMove(input: { projectID: () => string | undefined; sess
   })
 
   return {
+    destination: () => homeDestination?.destination(),
     creating,
     creatingDots,
     finishSubmit,

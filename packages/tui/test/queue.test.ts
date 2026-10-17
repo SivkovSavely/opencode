@@ -7,11 +7,28 @@ import { SessionV1 } from "@opencode-ai/schema/v1/session"
 import { SessionID } from "@opencode-ai/schema/session-id"
 import { createQueueController, queuePreview, queueRows, type QueueAPI } from "../src/queue/controller"
 import { createQueueDialog } from "../src/queue/dialog"
-import { queuePayload } from "../src/queue/payload"
+import { queuePayload, queueSubmissionKey } from "../src/queue/payload"
 import { expandTrackedPastedText } from "../src/prompt/part"
 
 const sessionID = SessionID.make("ses_queue")
 const captured = { agent: "build", model: { providerID: "provider", modelID: "model" }, variant: "high" }
+
+test("Home queue retries distinguish destination directories, copies and workspaces", () => {
+  const input = {
+    payload: { ...captured, kind: "prompt" as const, parts: [{ type: "text" as const, text: "same input" }] },
+    front: false,
+    location: { directory: "/repo/a", workspaceID: "workspace-a", newCopy: false },
+  }
+  const key = queueSubmissionKey(input)
+  expect(queueSubmissionKey(structuredClone(input))).toBe(key)
+  for (const location of [
+    { ...input.location, directory: "/repo/b" },
+    { ...input.location, workspaceID: "workspace-b" },
+    { ...input.location, newCopy: true },
+  ]) {
+    expect(queueSubmissionKey({ ...input, location })).not.toBe(key)
+  }
+})
 
 function entry(id: string, options: Partial<SessionQueueV1.Entry> = {}): SessionQueueV1.Entry {
   return {

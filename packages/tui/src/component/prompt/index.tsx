@@ -58,7 +58,7 @@ import { usePromptMove } from "./move"
 import { readLocalAttachment } from "./local-attachment"
 import { useLocation } from "../../context/location"
 import { QueueCommand } from "@opencode-ai/schema/queue-command"
-import { queuePayload } from "../../queue/payload"
+import { queuePayload, queueSubmissionKey } from "../../queue/payload"
 import { DialogQueue } from "../dialog-queue"
 import { DialogConfirm } from "../../ui/dialog-confirm"
 
@@ -1115,23 +1115,34 @@ export function Prompt(props: PromptProps) {
             inputText,
           )
         : undefined
+    const selectedWorkspace = workspace.selection()
+    const selectedWorkspaceID = selectedWorkspace?.type === "existing" ? selectedWorkspace.workspaceID : undefined
+    const destination = move.destination()
     const fingerprint = payload
-      ? JSON.stringify([props.sessionID, payload, queued?.type === "enqueue" && queued.front])
+      ? queueSubmissionKey({
+          sessionID: props.sessionID,
+          payload,
+          front: queued?.type === "enqueue" && queued.front,
+          location: props.sessionID
+            ? undefined
+            : {
+                directory: destination?.type === "directory" ? destination.directory : project.instance.directory(),
+                workspaceID: selectedWorkspaceID,
+                newCopy: destination?.type === "new",
+              },
+        })
       : undefined
     if (fingerprint && queueRetry?.fingerprint !== fingerprint) queueRetry = { fingerprint, id: crypto.randomUUID() }
     let sessionID = props.sessionID ?? (fingerprint ? queueRetry?.sessionID : undefined)
     let finishMoveProgress = false
     if (sessionID == null) {
-      const selectedWorkspace = workspace.selection()
-      const workspaceID = selectedWorkspace?.type === "existing" ? selectedWorkspace.workspaceID : undefined
-
       const directory = await move.getDirectory(store.prompt.input)
       if (move.pending() && !directory) return false
       finishMoveProgress = Boolean(move.progress())
 
       const res = await sdk.client.session.create({
         directory,
-        workspace: workspaceID,
+        workspace: selectedWorkspaceID,
         agent: agent.name,
         model: {
           providerID: selectedModel.providerID,
@@ -1141,7 +1152,7 @@ export function Prompt(props: PromptProps) {
       })
 
       if (res.error) {
-        if (finishMoveProgress) move.finishSubmit()
+        if (finishMoveProgress) move.finishSubmit({ preserveDestination: !!payload })
         console.log("Creating a session failed:", res.error)
 
         toast.show({
@@ -1159,7 +1170,7 @@ export function Prompt(props: PromptProps) {
       move.startSubmit()
       const success = await sync.queue.submit(sessionID, { id: queueRetry!.id, payload, front: queued.front })
       if (!success) {
-        if (finishMoveProgress) move.finishSubmit()
+        move.finishSubmit({ preserveDestination: true })
         toast.show({
           title: "Failed to queue input",
           message: sync.queue.data.errors[sessionID] ?? "Queue is busy",
@@ -1255,7 +1266,7 @@ export function Prompt(props: PromptProps) {
         })
       }, 50)
     }
-    if (finishMoveProgress) move.finishSubmit()
+    if (finishMoveProgress || payload) move.finishSubmit()
     return true
   }
 
