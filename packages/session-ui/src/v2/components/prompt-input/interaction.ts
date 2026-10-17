@@ -38,6 +38,9 @@ export type PromptInputV2ViewConfig = {
     stopping: Accessor<boolean>
     working?: Accessor<boolean>
     onSubmit: () => void
+    onQueue?: () => void
+    queueLabel?: Accessor<string>
+    steerLabel?: Accessor<string>
     onStop: () => void
   }
   shell?: {
@@ -186,6 +189,8 @@ export function createPromptInputV2Controller(input: {
   }
 
   const onKeyDown = (event: KeyboardEvent) => {
+    input.view.onKeyDown?.(event)
+    if (event.defaultPrevented) return true
     if (
       state.mode === "normal" &&
       (event.metaKey || event.ctrlKey) &&
@@ -232,7 +237,6 @@ export function createPromptInputV2Controller(input: {
       event.preventDefault()
       return true
     }
-    input.view.onKeyDown?.(event)
     return event.defaultPrevented
   }
 
@@ -329,8 +333,8 @@ export function createPromptInputV2Controller(input: {
     },
     canSubmit() {
       const persisted = draft.state
-      if (persisted.prompt.some((part) => part.type === "image")) return true
-      if (persisted.context.items.some((item) => !!item.comment?.trim())) return true
+      if (persisted.prompt.some((part) => part.type !== "text")) return true
+      if (persisted.context.items.length > 0) return true
       return persisted.prompt.some((part) => "content" in part && !!part.content.trim())
     },
     setEditor(element: HTMLElement) {
@@ -363,6 +367,10 @@ export function createPromptInputV2Controller(input: {
     },
     stop() {
       input.view.submit.onStop()
+    },
+    queue() {
+      input.view.submit.onQueue?.()
+      dispatch({ type: "popover.close" })
     },
     addHistory(prompt: PromptInputV2PersistedState["prompt"], mode: "normal" | "shell") {
       input.history?.add(prompt, mode)

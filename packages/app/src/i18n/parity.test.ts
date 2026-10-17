@@ -66,6 +66,36 @@ const appLocales = [
 ] as const
 const desktopLocales = appLocales
 const appFallbackKeys = new Set([
+  "queue.title",
+  "queue.compact",
+  "queue.menu.empty",
+  "queue.menu.count",
+  "queue.steering",
+  "queue.queued",
+  "queue.empty",
+  "queue.list.one",
+  "queue.list.other",
+  "queue.invalid",
+  "queue.attachmentsUnsupported",
+  "queue.sessionRequired",
+  "queue.pause",
+  "queue.resume",
+  "queue.paused",
+  "queue.running",
+  "queue.blocked",
+  "queue.clear",
+  "queue.clear.confirm",
+  "queue.clear.accept",
+  "queue.up",
+  "queue.down",
+  "queue.toQueue",
+  "queue.toSteer",
+  "queue.claimed",
+  "queue.uncertain",
+  "queue.retry",
+  "queue.migrate.failed",
+  "prompt.action.queue",
+  "prompt.action.steer",
   "session.jumpToMessage.title",
   "session.jumpToMessage.menu",
   "session.jumpToMessage.searchPlaceholder",
@@ -116,7 +146,7 @@ describe("i18n parity", () => {
       const source = await dictionary(domain.source)
       for (const locale of domain.locales) {
         const target = await dictionary(domain.target(locale))
-        // Jump-to-message copy is deliberately served from the shared English base until locale updates land.
+        // Untranslated feature copy is deliberately served from the shared English base.
         const missing = Object.keys(source).filter(
           (key) => !Object.hasOwn(target, key) && !(domain.name === "app" && appFallbackKeys.has(key)),
         )
@@ -124,6 +154,7 @@ describe("i18n parity", () => {
           .filter((key) => !Object.hasOwn(source, key))
           .sort()
         const expected = pluralFamilies(source)
+          .filter((key) => domain.name !== "app" || key !== "queue.list")
           .flatMap((key) => (pluralCategories.get(locale) ?? []).map((category) => `${key}.${category}`))
           .sort()
         expect({ domain: domain.name, locale, missing, extra }).toEqual({
@@ -144,11 +175,15 @@ describe("i18n parity", () => {
         const mismatched = Object.keys(source).filter(
           (key) => Object.hasOwn(target, key) && placeholders(source[key]).join() !== placeholders(target[key]).join(),
         )
-        const pluralMismatched = pluralFamilies(source).flatMap((key) =>
-          (pluralCategories.get(locale) ?? [])
-            .map((category) => `${key}.${category}`)
-            .filter((variant) => placeholders(source[`${key}.other`]).join() !== placeholders(target[variant]).join()),
-        )
+        const pluralMismatched = pluralFamilies(source)
+          .filter((key) => domain.name !== "app" || key !== "queue.list")
+          .flatMap((key) =>
+            (pluralCategories.get(locale) ?? [])
+              .map((category) => `${key}.${category}`)
+              .filter(
+                (variant) => placeholders(source[`${key}.other`]).join() !== placeholders(target[variant]).join(),
+              ),
+          )
         expect({ domain: domain.name, locale, mismatched, pluralMismatched }).toEqual({
           domain: domain.name,
           locale,
@@ -190,7 +225,7 @@ describe("i18n plural parity", () => {
   test("locale-specific categories exist and preserve count placeholders", async () => {
     for (const domain of domains.slice(0, 2)) {
       const source = await dictionary(domain.source)
-      const families = pluralFamilies(source)
+      const families = pluralFamilies(source).filter((key) => domain.name !== "app" || key !== "queue.list")
       for (const locale of domain.locales) {
         const target = await dictionary(domain.target(locale))
         const missing = families.flatMap((key) =>

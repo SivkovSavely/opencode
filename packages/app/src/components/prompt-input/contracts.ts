@@ -7,7 +7,7 @@ export type PromptInputState = ReturnType<typeof usePrompt>
 
 export type PromptInputSubmission = {
   abort: () => Promise<void> | void
-  handleSubmit: (event: Event) => Promise<void> | void
+  handleSubmit: (event: Event, delivery?: "steer" | "queue") => Promise<void> | void
 }
 
 export type PromptInputControls = {
@@ -50,8 +50,7 @@ export interface PromptInputProps {
   onNewSessionWorktreeReset?: () => void
   edit?: { id: string; prompt: Prompt; context: FollowupDraft["context"] }
   onEditLoaded?: () => void
-  shouldQueue?: () => boolean
-  onQueue?: (draft: FollowupDraft) => void
+  onManageQueue?: () => void
   onAbort?: () => void
   onSubmit?: () => void
   onPreparing?: (value: boolean) => void

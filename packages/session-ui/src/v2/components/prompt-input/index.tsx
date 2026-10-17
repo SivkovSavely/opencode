@@ -1,7 +1,6 @@
 import { createEffect, createMemo, For, Show, type Accessor, type JSX } from "solid-js"
 import { FileIcon } from "@opencode-ai/ui/file-icon"
 import { Icon } from "@opencode-ai/ui/icon"
-import { IconButton } from "@opencode-ai/ui/icon-button"
 import { ProviderIcon } from "@opencode-ai/ui/provider-icon"
 import { useI18n } from "@opencode-ai/ui/context/i18n"
 import { ButtonV2 } from "@opencode-ai/ui/v2/button-v2"
@@ -118,7 +117,7 @@ export function PromptInputV2(props: PromptInputV2Props) {
         }}
         onSubmit={(event) => {
           event.preventDefault()
-          if (!props.disabled) props.controller.submit()
+          if (!props.disabled && props.controller.canSubmit()) props.controller.submit()
         }}
         onDragEnter={props.controller.onDragEnter}
         onDragOver={props.controller.onDragOver}
@@ -175,7 +174,7 @@ export function PromptInputV2(props: PromptInputV2Props) {
               if (event.key === "Enter" && !event.isComposing && event.shiftKey === !!props.enterNewline) {
                 event.preventDefault()
                 if (event.repeat) return
-                props.controller.submit()
+                if (!props.disabled && props.controller.canSubmit()) props.controller.submit()
               }
             }}
             onKeyUp={updateCursor}
@@ -258,11 +257,15 @@ export function PromptInputV2(props: PromptInputV2Props) {
           <PromptInputV2SubmitButton
             mode={state.mode}
             stopping={view.submit.stopping()}
+            working={view.submit.working?.()}
             disabled={!props.controller.canSubmit()}
             sendLabel={i18n.t("ui.promptInput.send")}
             stopLabel={i18n.t("ui.promptInput.stop")}
             onSubmit={props.controller.submit}
             onStop={props.controller.stop}
+            onQueue={view.submit.onQueue ? props.controller.queue : undefined}
+            queueLabel={view.submit.queueLabel?.()}
+            steerLabel={view.submit.steerLabel?.()}
           />
         </div>
       </form>
@@ -673,42 +676,56 @@ export function PromptInputV2Popover(props: {
 export function PromptInputV2SubmitButton(props: {
   mode: PromptInputV2Mode
   stopping: boolean
+  working?: boolean
   disabled: boolean
   sendLabel: string
   stopLabel: string
   onSubmit: () => void
   onStop: () => void
+  onQueue?: () => void
+  queueLabel?: string
+  steerLabel?: string
 }) {
+  const label = () =>
+    props.stopping ? props.stopLabel : props.working ? (props.steerLabel ?? props.sendLabel) : props.sendLabel
   return (
-    <TooltipV2
-      placement="top"
-      inactive={!props.stopping && props.disabled}
-      value={props.stopping ? props.stopLabel : props.sendLabel}
-    >
-      <IconButton
-        data-action="prompt-submit"
-        type="button"
-        disabled={!props.stopping && props.disabled}
-        tabIndex={props.mode === "normal" ? undefined : -1}
-        icon={props.stopping ? "stop" : props.mode === "shell" ? "arrow-undo-down" : "arrow-up"}
-        variant="primary"
-        class="size-7 rounded-md p-[6px] text-v2-icon-icon-muted shadow-[var(--v2-elevation-button-contrast)] disabled:opacity-50"
-        style={{
-          "background-image":
-            "linear-gradient(180deg,var(--v2-alpha-light-20) 0%,var(--v2-alpha-light-0) 100%),linear-gradient(90deg,var(--v2-background-bg-contrast) 0%,var(--v2-background-bg-contrast) 100%)",
-        }}
-        aria-label={props.stopping ? props.stopLabel : props.sendLabel}
-        onClick={(event) => {
-          event.preventDefault()
-          event.stopPropagation()
-          if (props.stopping) {
-            props.onStop()
-            return
-          }
-          props.onSubmit()
-        }}
-      />
-    </TooltipV2>
+    <Show when={props.working || props.stopping || !props.disabled}>
+      <div class="flex items-center gap-1">
+        <Show when={props.working && !props.disabled && !props.stopping && props.onQueue}>
+          <ButtonV2 type="button" data-action="prompt-queue" variant="ghost-muted" onClick={props.onQueue}>
+            <Icon name="arrow-up" size="small" />
+            {props.queueLabel}
+          </ButtonV2>
+        </Show>
+        <TooltipV2 placement="top" inactive={!props.stopping && props.disabled} value={label()}>
+          <ButtonV2
+            data-action="prompt-submit"
+            type="button"
+            disabled={!props.stopping && props.disabled}
+            tabIndex={props.mode === "normal" ? undefined : -1}
+            variant="contrast"
+            class="h-7 rounded-md px-2 text-v2-icon-icon-muted shadow-[var(--v2-elevation-button-contrast)] disabled:opacity-50"
+            style={{
+              "background-image":
+                "linear-gradient(180deg,var(--v2-alpha-light-20) 0%,var(--v2-alpha-light-0) 100%),linear-gradient(90deg,var(--v2-background-bg-contrast) 0%,var(--v2-background-bg-contrast) 100%)",
+            }}
+            aria-label={label()}
+            onClick={(event: MouseEvent) => {
+              event.preventDefault()
+              event.stopPropagation()
+              if (props.stopping) {
+                props.onStop()
+                return
+              }
+              props.onSubmit()
+            }}
+          >
+            <Icon name={props.stopping ? "stop" : "arrow-up"} size="small" />
+            {label()}
+          </ButtonV2>
+        </TooltipV2>
+      </div>
+    </Show>
   )
 }
 

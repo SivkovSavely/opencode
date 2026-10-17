@@ -1,4 +1,5 @@
 import { useFilteredList } from "@opencode-ai/ui/hooks"
+import { QueueCommand } from "@opencode-ai/schema/queue-command"
 import { useSpring } from "@opencode-ai/ui/motion-spring"
 import {
   createEffect,
@@ -254,7 +255,6 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
     return paths
   })
   const info = createMemo(() => (props.controls.session.id ? sync().session.get(props.controls.session.id) : undefined))
-  const working = createMemo(() => store.preparing || sync().data.session_working(props.controls.session.id ?? ""))
   const imageAttachments = createMemo(() =>
     prompt.current().filter((part): part is ImageAttachmentPart => part.type === "image"),
   )
@@ -263,6 +263,7 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
     () => prompt.capture(),
     Math.floor(Math.random() * EXAMPLES.length),
   )
+  const working = createMemo(() => store.preparing || sync().data.session_working(props.controls.session.id ?? ""))
   const buttonsSpring = useSpring(() => (store.mode === "normal" ? 1 : 0), { visualDuration: 0.2, bounce: 0 })
   const motion = (value: number) => ({
     opacity: value,
@@ -283,9 +284,19 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
       .current()
       .map((part) => ("content" in part ? part.content : ""))
       .join("")
-    return text.trim().length === 0 && imageAttachments().length === 0 && commentCount() === 0
+    return (
+      text.trim().length === 0 &&
+      !prompt.current().some((part) => part.type !== "text") &&
+      prompt.context.items().length === 0
+    )
   })
   const stopping = createMemo(() => store.preparing || (working() && blank()))
+  const submitLabel = () =>
+    stopping()
+      ? language.t("prompt.action.stop")
+      : working()
+        ? language.t("prompt.action.steer")
+        : language.t("prompt.action.send")
   const tip = () => {
     if (stopping()) {
       return (
@@ -298,7 +309,7 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
 
     return (
       <div class="flex items-center gap-2">
-        <span>{language.t("prompt.action.send")}</span>
+        <span>{submitLabel()}</span>
         <Icon name="enter" size="small" class="text-icon-base" />
       </div>
     )
@@ -1224,8 +1235,7 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
       },
       newSessionWorktree: () => props.newSessionWorktree,
       onNewSessionWorktreeReset: props.onNewSessionWorktreeReset,
-      shouldQueue: props.shouldQueue,
-      onQueue: props.onQueue,
+      onManageQueue: props.onManageQueue,
       onAbort: props.onAbort,
       onSubmit: props.onSubmit,
       onPreparing: (value) => {
@@ -1322,6 +1332,21 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
       return
     }
 
+    if (
+      store.mode === "normal" &&
+      event.key === "Enter" &&
+      QueueCommand.parse(
+        prompt
+          .current()
+          .map((part) => ("content" in part ? part.content : ""))
+          .join(""),
+      )
+    ) {
+      event.preventDefault()
+      if (!event.repeat) void handleSubmit(event)
+      return
+    }
+
     const ctrl = event.ctrlKey && !event.metaKey && !event.altKey && !event.shiftKey
 
     if (store.popover) {
@@ -1384,18 +1409,7 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
     if (event.key === "Enter" && event.shiftKey === settings.general.enterNewline()) {
       event.preventDefault()
       if (event.repeat) return
-      if (
-        working() &&
-        prompt
-          .current()
-          .map((part) => ("content" in part ? part.content : ""))
-          .join("")
-          .trim().length === 0 &&
-        imageAttachments().length === 0 &&
-        commentCount() === 0
-      ) {
-        return
-      }
+      if (working() && blank()) return
       void handleSubmit(event)
     }
   }
@@ -1581,23 +1595,38 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
             />
 
             <div class="flex items-center gap-1 pointer-events-auto">
-              <Tooltip placement="top" inactive={!working() && blank()} value={tip()}>
-                <IconButton
-                  data-action="prompt-submit"
-                  type="submit"
-                  onClick={(event) => {
-                    if (!store.preparing) return
-                    event.preventDefault()
-                    void abort()
-                  }}
-                  disabled={!working() && blank()}
-                  tabIndex={store.mode === "normal" ? undefined : -1}
-                  icon={stopping() ? "stop" : store.mode === "shell" ? "arrow-undo-down" : "arrow-up"}
-                  variant="primary"
-                  class="size-8"
-                  aria-label={stopping() ? language.t("prompt.action.stop") : language.t("prompt.action.send")}
-                />
-              </Tooltip>
+              <Show when={working() && !blank() && !store.preparing}>
+                <Button
+                  data-action="prompt-queue"
+                  type="button"
+                  variant="ghost"
+                  onClick={(event: MouseEvent) => void handleSubmit(event, "queue")}
+                >
+                  <Icon name="arrow-up" size="small" />
+                  {language.t("prompt.action.queue")}
+                </Button>
+              </Show>
+              <Show when={working() || !blank()}>
+                <Tooltip placement="top" value={tip()}>
+                  <Button
+                    data-action="prompt-submit"
+                    type="submit"
+                    onClick={(event: MouseEvent) => {
+                      if (!store.preparing) return
+                      event.preventDefault()
+                      void abort()
+                    }}
+                    disabled={!working() && blank()}
+                    tabIndex={store.mode === "normal" ? undefined : -1}
+                    variant="primary"
+                    class="h-8"
+                    aria-label={submitLabel()}
+                  >
+                    <Icon name={stopping() ? "stop" : "arrow-up"} size="small" />
+                    {submitLabel()}
+                  </Button>
+                </Tooltip>
+              </Show>
             </div>
           </div>
 

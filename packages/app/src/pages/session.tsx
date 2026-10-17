@@ -63,7 +63,10 @@ import { PromptInputV2Composer, usePromptInputV2Controller } from "@/components/
 import { useSettingsCommand } from "@/components/settings-dialog"
 import { setCursorPosition } from "@/components/prompt-input/editor-dom"
 import { promptLength } from "@/components/prompt-input/history"
-import { type FollowupDraft, sendFollowupDraft } from "@/components/prompt-input/submit"
+import { type FollowupDraft } from "@/components/prompt-input/submit"
+import { migrateFollowups } from "@/components/prompt-input/queue-migration"
+import { useSessionQueue } from "@/context/session-queue"
+import { DialogSessionQueue } from "@/components/dialog-session-queue"
 import {
   createPromptInputController,
   createSessionComposerController,
@@ -605,8 +608,9 @@ export default function Page() {
     deferRender: false,
   })
 
-  const [followup, setFollowup] = persisted(
-    Persist.serverWorkspace(serverSDK().scope, sdk().directory, "followup", ["followup.v1"]),
+  const followupSDK = sdk()
+  const [followup, setFollowup, , followupReady] = persisted(
+    Persist.prompt(Persist.serverWorkspace(followupSDK.scope, followupSDK.directory, "followup", ["followup.v1"])),
     createStore<{
       items: Record<string, FollowupItem[] | undefined>
       failed: Record<string, string | undefined>
@@ -1614,16 +1618,18 @@ export default function Page() {
     historyRequests.add(owner.key)
     if (expectedSessionKey) setUi("jumpToMessageHistoryLoading", true)
     const before = timeline.messages().length
-    const loaded = await timeline.history.loadOlder({
-      before: () => owner.run(captureHistoryAnchor),
-      after: (done) => owner.run(() => restoreHistoryAnchor(done)),
-    }).finally(() => {
-      historyRequests.delete(owner.key)
-      if (expectedSessionKey) {
-        if (owner.current() && ui.jumpToMessageOpen) autoScroll.pause()
-        setUi("jumpToMessageHistoryLoading", false)
-      }
-    })
+    const loaded = await timeline.history
+      .loadOlder({
+        before: () => owner.run(captureHistoryAnchor),
+        after: (done) => owner.run(() => restoreHistoryAnchor(done)),
+      })
+      .finally(() => {
+        historyRequests.delete(owner.key)
+        if (expectedSessionKey) {
+          if (owner.current() && ui.jumpToMessageOpen) autoScroll.pause()
+          setUi("jumpToMessageHistoryLoading", false)
+        }
+      })
     if (!loaded || !owner.current()) return false
     if (expectedSessionKey) return true
     if (timeline.messages().length <= before) return true
@@ -1735,102 +1741,68 @@ export default function Page() {
     return followup.edit[id]
   })
 
-  const followupMutation = useMutation(() => ({
-    mutationFn: async (input: { sessionID: string; id: string; manual?: boolean }) => {
-      const owner = sessionOwnership.capture()
-      const item = (followup.items[input.sessionID] ?? []).find((entry) => entry.id === input.id)
-      if (!item) return
-
-      if (input.manual) setFollowup("paused", input.sessionID, undefined)
-      setFollowup("failed", input.sessionID, undefined)
-
-      const ok = await sendFollowupDraft({
-        api: sdk().api.session,
-        sync: sync(),
-        serverSync: serverSync(),
-        draft: item,
-        optimisticBusy: item.sessionDirectory === sdk().directory,
-      }).catch((err) => {
-        setFollowup("failed", input.sessionID, input.id)
-        fail(err)
-        return false
+  const nativeQueue = useSessionQueue(() => params.id)
+  const manageQueue = () => dialog.show(() => <DialogSessionQueue queue={nativeQueue} />)
+  const migration = useMutation(() => ({
+    mutationFn: async (items: FollowupItem[]) => {
+      const source = followupSDK
+      const first = items[0]
+      if (!first) return
+      if (first && (followup.paused[first.sessionID] || followup.failed[first.sessionID])) {
+        const snapshot = (
+          await source.client.session.queueList({ sessionID: first.sessionID, directory: first.sessionDirectory })
+        ).data
+        if (!snapshot) throw new Error(language.t("common.requestFailed"))
+        if (!snapshot.paused)
+          await source.client.session.queueUpdate({
+            sessionID: first.sessionID,
+            directory: first.sessionDirectory,
+            revision: snapshot.revision,
+            mutation: { action: "pause", paused: true },
+          })
+      }
+      return migrateFollowups(items, {
+        // The directory's empty command store may still be hydrating.
+        commands: async () =>
+          (await source.client.command.list({ directory: first.sessionDirectory }, { throwOnError: true })).data.map(
+            (command) => command.name,
+          ),
+        submit: async (draft, submission) =>
+          (
+            await source.client.session.queueSubmit({
+              sessionID: draft.sessionID,
+              directory: draft.sessionDirectory,
+              ...submission,
+            })
+          ).data,
+        acknowledge: (sessionID, id) =>
+          setFollowup("items", sessionID, (entries) => (entries ?? []).filter((entry) => entry.id !== id)),
       })
-      if (!ok) return
-
-      setFollowup("items", input.sessionID, (items) => (items ?? []).filter((entry) => entry.id !== input.id))
-      if (input.manual) owner.run(resumeScroll)
     },
+    onError: (_error, items) =>
+      showToast({
+        title: language.t("queue.migrate.failed"),
+        actions: [
+          {
+            label: language.t("queue.retry"),
+            onClick: () =>
+              migration.mutate(
+                items.filter((item) => followup.items[item.sessionID]?.some((entry) => entry.id === item.id)),
+              ),
+          },
+        ],
+      }),
   }))
-
-  const followupBusy = (sessionID: string) =>
-    followupMutation.isPending && followupMutation.variables?.sessionID === sessionID
-
-  const sendingFollowup = createMemo(() => {
-    const id = params.id
-    if (!id) return
-    if (!followupBusy(id)) return
-    return followupMutation.variables?.id
-  })
-
-  const queueEnabled = createMemo(() => {
-    const id = params.id
-    if (!id) return false
-    return settings.general.followup() === "queue" && busy(id) && !composer.blocked() && !isChildSession()
-  })
-
-  const followupText = (item: FollowupDraft) => {
-    const text = item.prompt
-      .map((part) => {
-        if (part.type === "image") return `[image:${part.filename}]`
-        if (part.type === "file") return `[file:${part.path}]`
-        if (part.type === "agent") return `@${part.name}`
-        return part.content
-      })
-      .join("")
-      .split(/\r?\n/)
-      .map((line) => line.trim())
-      .find((line) => !!line)
-
-    if (text) return text
-    return `[${language.t("common.attachment")}]`
-  }
-
-  const queueFollowup = (draft: FollowupDraft) => {
-    setFollowup("items", draft.sessionID, (items) => [
-      ...(items ?? []),
-      { id: Identifier.ascending("message"), ...draft },
-    ])
-    setFollowup("failed", draft.sessionID, undefined)
-    setFollowup("paused", draft.sessionID, undefined)
-  }
-
-  const followupDock = createMemo(() => queuedFollowups().map((item) => ({ id: item.id, text: followupText(item) })))
-
-  const sendFollowup = (sessionID: string, id: string, opts?: { manual?: boolean }) => {
-    if (sync().session.get(sessionID)?.parentID) return Promise.resolve()
-    const item = (followup.items[sessionID] ?? []).find((entry) => entry.id === id)
-    if (!item) return Promise.resolve()
-    if (followupBusy(sessionID)) return Promise.resolve()
-
-    return followupMutation.mutateAsync({ sessionID, id, manual: opts?.manual })
-  }
-
-  const editFollowup = (id: string) => {
-    const sessionID = params.id
-    if (!sessionID) return
-    if (followupBusy(sessionID)) return
-
-    const item = queuedFollowups().find((entry) => entry.id === id)
-    if (!item) return
-
-    setFollowup("items", sessionID, (items) => (items ?? []).filter((entry) => entry.id !== id))
-    setFollowup("failed", sessionID, (value) => (value === id ? undefined : value))
-    setFollowup("edit", sessionID, {
-      id: item.id,
-      prompt: item.prompt,
-      context: item.context,
-    })
-  }
+  createEffect(
+    on(
+      () => [params.id, followupReady()] as const,
+      ([id, ready]) => {
+        if (!id || !ready) return
+        const items = queuedFollowups().slice()
+        if (items.length) migration.mutate(items)
+      },
+    ),
+  )
 
   const clearFollowupEdit = () => {
     const id = params.id
@@ -1945,22 +1917,6 @@ export default function Page() {
   }
 
   const actions = { revert, openAttachment }
-
-  createEffect(() => {
-    const sessionID = params.id
-    if (!sessionID) return
-
-    const item = queuedFollowups()[0]
-    if (!item) return
-    if (followupBusy(sessionID)) return
-    if (followup.failed[sessionID] === item.id) return
-    if (followup.paused[sessionID]) return
-    if (isChildSession()) return
-    if (composer.blocked()) return
-    if (busy(sessionID)) return
-
-    void sendFollowup(sessionID, item.id)
-  })
 
   createResizeObserver(
     () => promptDock,
@@ -2107,6 +2063,7 @@ export default function Page() {
             <Show when={messagesReady() ? params.id : undefined} keyed>
               {(_id) => (
                 <MessageTimeline
+                  queue={nativeQueue}
                   actions={actions}
                   scroll={ui.scroll}
                   onResumeScroll={resumeScroll}
@@ -2151,12 +2108,7 @@ export default function Page() {
                     }
                     if (jumpToMessageDialogSessionKey !== key) return
                     jumpToMessageDialogSessionKey = undefined
-                    if (
-                      !selected &&
-                      jumpToMessageWasFollowing &&
-                      jumpToMessageHadHistory &&
-                      sessionKey() === key
-                    ) {
+                    if (!selected && jumpToMessageWasFollowing && jumpToMessageHadHistory && sessionKey() === key) {
                       setRestoreJumpToMessageFollow(key)
                     } else {
                       setRestoreJumpToMessageFollow(undefined)
@@ -2207,15 +2159,7 @@ export default function Page() {
               collapsed: () => view().todoCollapsed.get(),
               onToggle: () => view().todoCollapsed.set(!view().todoCollapsed.get()),
             },
-            followup: () =>
-              params.id && !isChildSession()
-                ? {
-                    items: followupDock(),
-                    sending: sendingFollowup(),
-                    onSend: (id) => void sendFollowup(params.id!, id, { manual: true }),
-                    onEdit: editFollowup,
-                  }
-                : undefined,
+            followup: () => undefined,
             revert: () =>
               rolled().length > 0
                 ? {
@@ -2250,13 +2194,7 @@ export default function Page() {
                       }}
                       edit={editingFollowup()}
                       onEditLoaded={clearFollowupEdit}
-                      shouldQueue={queueEnabled}
-                      onQueue={queueFollowup}
-                      onAbort={() => {
-                        const id = params.id
-                        if (!id) return
-                        setFollowup("paused", id, true)
-                      }}
+                      onManageQueue={manageQueue}
                     />
                   }
                 >
@@ -2280,13 +2218,7 @@ export default function Page() {
                         return editingFollowup()
                       },
                       onEditLoaded: clearFollowupEdit,
-                      shouldQueue: queueEnabled,
-                      onQueue: queueFollowup,
-                      onAbort: () => {
-                        const id = params.id
-                        if (!id) return
-                        setFollowup("paused", id, true)
-                      },
+                      onManageQueue: manageQueue,
                     })
                     return <PromptInputV2Composer controller={controller} borderUnderlay />
                   }}

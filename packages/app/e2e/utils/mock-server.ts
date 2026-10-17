@@ -273,6 +273,9 @@ export async function mockOpenCodeServer(page: Page, config: MockServerConfig) {
 
     const todoMatch = path.match(/^\/session\/([^/]+)\/todo$/)
     if (todoMatch) return json(route, config.todos?.(todoMatch[1]!) ?? [])
+    const queueMatch = path.match(/^\/session\/([^/]+)\/queue$/)
+    if (queueMatch && route.request().method() === "GET")
+      return json(route, { sessionID: queueMatch[1], revision: 0, paused: false, blocked: false, items: [] })
     if (/^\/session\/[^/]+\/(children|diff)$/.test(path)) return json(route, [])
 
     const currentMessagesMatch = path.match(/^\/api\/session\/([^/]+)\/message$/)

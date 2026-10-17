@@ -3,7 +3,6 @@ import { useLanguage } from "@/context/language"
 import { useSettings } from "@/context/settings"
 import { SessionPermissionDock } from "@/pages/session/composer/session-permission-dock"
 import { SessionQuestionDock } from "@/pages/session/composer/session-question-dock"
-import { SessionFollowupDock } from "@/pages/session/composer/session-followup-dock"
 import { SessionRevertDock } from "@/pages/session/composer/session-revert-dock"
 import { SessionTodoDock } from "@/pages/session/composer/session-todo-dock"
 import type { SessionComposerRegionController } from "./session-composer-region-controller"
@@ -131,14 +130,6 @@ export function SessionComposerRegion(props: {
                 "margin-top": `${-controller.lift()}px`,
               }}
             >
-              <Show when={controller.followup()?.items.length}>
-                <SessionFollowupDock
-                  items={controller.followup()!.items}
-                  sending={controller.followup()!.sending}
-                  onSend={controller.followup()!.onSend}
-                  onEdit={controller.followup()!.onEdit}
-                />
-              </Show>
               <Show when={!controller.state.blocked()}>{props.promptInput}</Show>
             </div>
           </Show>

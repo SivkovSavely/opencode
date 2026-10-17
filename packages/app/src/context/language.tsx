@@ -35,6 +35,7 @@ type PluralKey =
   | "session.revertDock.summary"
   | "session.jumpToMessage.count"
   | "session.jumpToMessage.loadedCount"
+  | "queue.list"
 type Source = { dict: Record<string, string> }
 
 function cookie(locale: Locale) {

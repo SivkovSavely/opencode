@@ -1,4 +1,5 @@
 import { ImagePreview } from "@opencode-ai/ui/image-preview"
+import { QueueCommand } from "@opencode-ai/schema/queue-command"
 import { useDialog } from "@opencode-ai/ui/context/dialog"
 import { ProviderIcon } from "@opencode-ai/ui/provider-icon"
 import { ButtonV2 } from "@opencode-ai/ui/v2/button-v2"
@@ -91,6 +92,7 @@ export function usePromptInputV2Controller(props: PromptInputV2ControllerProps):
   const dialog = useDialog()
   const command = useCommand()
   const permission = usePermission()
+  const settings = useSettings()
   const language = useLanguage()
   const platform = usePlatform()
   const prompt = props.state ?? usePrompt()
@@ -132,7 +134,11 @@ export function usePromptInputV2Controller(props: PromptInputV2ControllerProps):
       .current()
       .map((part) => ("content" in part ? part.content : ""))
       .join("")
-    return text.trim().length === 0 && attachments().length === 0 && commentCount() === 0
+    return (
+      text.trim().length === 0 &&
+      !prompt.current().some((part) => part.type !== "text") &&
+      prompt.context.items().length === 0
+    )
   })
   const stopping = createMemo(() => submitState.preparing || (working() && blank()))
   const placeholder = createMemo(() =>
@@ -221,8 +227,7 @@ export function usePromptInputV2Controller(props: PromptInputV2ControllerProps):
     },
     newSessionWorktree: () => props.newSessionWorktree,
     onNewSessionWorktreeReset: props.onNewSessionWorktreeReset,
-    shouldQueue: props.shouldQueue,
-    onQueue: props.onQueue,
+    onManageQueue: props.onManageQueue,
     onAbort: props.onAbort,
     onSubmit: props.onSubmit,
     onPreparing: (value) => {
@@ -415,7 +420,31 @@ export function usePromptInputV2Controller(props: PromptInputV2ControllerProps):
         stopping,
         working,
         onSubmit: () => void submission.handleSubmit(new Event("submit")),
+        onQueue: () => void submission.handleSubmit(new Event("submit"), "queue"),
+        queueLabel: () => language.t("prompt.action.queue"),
+        steerLabel: () => language.t("prompt.action.steer"),
         onStop: () => void submission.abort(),
+      },
+      onKeyDown: (event) => {
+        if (
+          mode() !== "normal" ||
+          event.key !== "Enter" ||
+          event.isComposing ||
+          event.shiftKey !== settings.general.enterNewline()
+        )
+          return
+        if (
+          !QueueCommand.parse(
+            prompt
+              .current()
+              .map((part) => ("content" in part ? part.content : ""))
+              .join(""),
+          )
+        )
+          return
+        event.preventDefault()
+        controller.dispatch({ type: "popover.close" })
+        if (!event.repeat) void submission.handleSubmit(event)
       },
     },
   })

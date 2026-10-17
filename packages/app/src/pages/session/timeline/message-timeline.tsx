@@ -79,6 +79,9 @@ import { createTimelineProjection } from "./projection"
 import { MessageComment, SummaryDiff, TimelineRow, TimelineRowMap } from "./rows"
 import { filterVirtualIndexes } from "./virtual-items"
 import { DialogJumpToMessage } from "./dialog-jump-to-message"
+import type { useSessionQueue } from "@/context/session-queue"
+import { DialogSessionQueue } from "@/components/dialog-session-queue"
+import "./queue.css"
 
 const emptyMessages: MessageType[] = []
 const emptyParts: PartType[] = []
@@ -238,6 +241,7 @@ function TimelineDiffView(props: { diff: SummaryDiff }) {
 }
 
 export function MessageTimeline(props: {
+  queue: ReturnType<typeof useSessionQueue>
   actions?: UserActions
   scroll: { overflow: boolean; bottom: boolean; jump: boolean }
   onResumeScroll: () => void
@@ -284,6 +288,10 @@ export function MessageTimeline(props: {
 
   const [listRoot, setListRoot] = createSignal<HTMLDivElement>()
   const sessionID = createMemo(() => params.id)
+  const queue = props.queue
+  const queueLabel = () =>
+    queue.count() ? language.t("queue.menu.count", { count: queue.count() }) : language.t("queue.menu.empty")
+  const manageQueue = () => dialog.show(() => <DialogSessionQueue queue={queue} />)
   const openJumpToMessage = (id: string) => {
     const key = sessionKey()
     let selected = false
@@ -1179,7 +1187,11 @@ export function MessageTimeline(props: {
           <TimelineRowFrame row={userMessageRow}>
             <Show when={message()}>
               {(message) => (
-                <div data-slot="session-turn-message-container" class="w-full px-4 md:px-5">
+                <div
+                  data-slot="session-turn-message-container"
+                  data-pending-steer={queue.pending().has(message().id) || undefined}
+                  class="w-full px-4 md:px-5"
+                >
                   <div data-slot="session-turn-message-content" aria-live="off">
                     <Message
                       message={message()}
@@ -1596,6 +1608,9 @@ export function MessageTimeline(props: {
                                     </DropdownMenu.ItemLabel>
                                   </DropdownMenu.Item>
                                 </Show>
+                                <DropdownMenu.Item onSelect={manageQueue}>
+                                  <DropdownMenu.ItemLabel>{queueLabel()}</DropdownMenu.ItemLabel>
+                                </DropdownMenu.Item>
                                 <DropdownMenu.Item onSelect={() => exportSession(id)}>
                                   <DropdownMenu.ItemLabel>{language.t("common.export")}...</DropdownMenu.ItemLabel>
                                 </DropdownMenu.Item>
@@ -1673,6 +1688,7 @@ export function MessageTimeline(props: {
                                   {language.t("session.share.action.share")}...
                                 </MenuV2.Item>
                               </Show>
+                              <MenuV2.Item onSelect={manageQueue}>{queueLabel()}</MenuV2.Item>
                               <MenuV2.Item onSelect={() => exportSession(id)}>
                                 {language.t("common.export")}...
                               </MenuV2.Item>

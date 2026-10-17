@@ -1,4 +1,5 @@
 import type { ContextItem, Prompt, usePrompt } from "@/context/prompt"
+import { unwrap } from "solid-js/store"
 
 type PromptTarget = ReturnType<ReturnType<typeof usePrompt>["capture"]>
 
@@ -8,11 +9,13 @@ export function createPromptSubmissionState(input: {
   context: (ContextItem & { key: string })[]
 }) {
   const initial = input.target
+  const prompt = structuredClone(unwrap(input.prompt))
+  const context = structuredClone(unwrap(input.context))
   let target = input.target
   let cleared: Prompt | undefined
   const unchanged = () =>
-    JSON.stringify(initial.current()) === JSON.stringify(input.prompt) &&
-    JSON.stringify(initial.context.items()) === JSON.stringify(input.context)
+    JSON.stringify(initial.current()) === JSON.stringify(prompt) &&
+    JSON.stringify(initial.context.items()) === JSON.stringify(context)
   let transferredChanges = false
   let transferredState: string | undefined
 
@@ -25,8 +28,9 @@ export function createPromptSubmissionState(input: {
   }
 
   return {
-    prompt: input.prompt,
-    context: input.context,
+    prompt,
+    context,
+    unchanged,
     target: () => target,
     clear(preserveChanges = false) {
       const currentState = JSON.stringify([initial.current(), initial.context.items()])
@@ -41,7 +45,7 @@ export function createPromptSubmissionState(input: {
       if (next === initial) return
       target = next
       if (unchanged()) {
-        input.context.forEach(next.context.add)
+        context.forEach(next.context.add)
         return
       }
       transferChanges()
@@ -49,7 +53,7 @@ export function createPromptSubmissionState(input: {
     current: (value: PromptTarget) => target === value,
     restore() {
       if (cleared !== undefined && target.current() !== cleared) return
-      return { target, prompt: input.prompt, context: input.context }
+      return { target, prompt, context }
     },
   }
 }

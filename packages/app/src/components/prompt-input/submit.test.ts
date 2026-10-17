@@ -40,6 +40,13 @@ const promotedDrafts: Array<{ draftID: string; server: string; sessionId: string
 const sentPrompts: string[] = []
 const promptInputs: unknown[] = []
 const sentCommands: unknown[] = []
+const queuedInputs: unknown[] = []
+const queueMutations: unknown[] = []
+const queueItems: unknown[] = []
+const statusWrites: unknown[] = []
+let queueGate: Promise<void> | undefined
+let queueError: Error | undefined
+let queueStarted = () => {}
 const interrupted: string[] = []
 const commands: Array<{ name: string }> = []
 let serverSessionSyncs = 0
@@ -55,6 +62,7 @@ let promptGate: Promise<void> | undefined
 let promptError: Error | undefined
 let promptErrorDirectory: string | undefined
 let sessionCreateError: Error | undefined
+let sessionIDOverride: string | undefined
 let worktreeCreateError: Error | undefined
 let worktreeCreateReady: boolean | undefined
 let onPromptStarted: () => void = () => undefined
@@ -147,7 +155,7 @@ const clientFor = (directory: string) => {
           createdSessions.push(location)
           sessionCreateInputs.push(input)
           return {
-            id: `session-${createdSessions.length}`,
+            id: sessionIDOverride ?? `session-${createdSessions.length}`,
             projectID: "project",
             agent: input.agent,
             model: input.model,
@@ -180,6 +188,25 @@ const clientFor = (directory: string) => {
       },
     },
     session: {
+      queueSubmit: async (input: { sessionID: string }) => {
+        queuedInputs.push(input)
+        queueStarted()
+        await queueGate
+        if (queueError) throw queueError
+        return { data: { sessionID: input.sessionID, revision: 1, paused: false, blocked: false, items: [] } }
+      },
+      queueList: async () => ({
+        data: { sessionID: params.id, revision: 2, paused: false, blocked: false, items: queueItems },
+      }),
+      queueUpdate: async (input: unknown) => {
+        queueMutations.push(input)
+        return {
+          data: { sessionID: params.id, revision: 2 + queueMutations.length, paused: true, blocked: false, items: [] },
+        }
+      },
+      queueFlush: async (input: unknown) => {
+        queueMutations.push(input)
+      },
       command: async () => ({ data: undefined }),
       abort: async () => ({ data: undefined }),
     },
@@ -212,7 +239,11 @@ beforeAll(async () => {
       currentPathname = value
     },
     useParams: () => params,
-    useLocation: () => ({ get pathname() { return currentPathname } }),
+    useLocation: () => ({
+      get pathname() {
+        return currentPathname
+      },
+    }),
     useSearchParams: () => [search, () => undefined],
   }))
 
@@ -352,7 +383,9 @@ beforeAll(async () => {
     useServerSync: () => () => ({
       session: {
         remember: () => undefined,
-        set: () => undefined,
+        set: (...args: unknown[]) => {
+          statusWrites.push(args)
+        },
         sync: async () => {
           serverSessionSyncs++
         },
@@ -387,6 +420,7 @@ beforeAll(async () => {
   mock.module("@/context/language", () => ({
     useLanguage: () => ({
       t: (key: string) => key,
+      plural: (key: string, count: number) => `${key}:${count}`,
     }),
   }))
 
@@ -395,6 +429,14 @@ beforeAll(async () => {
 })
 
 beforeEach(() => {
+  queuedInputs.length = 0
+  queueMutations.length = 0
+  queueItems.length = 0
+  statusWrites.length = 0
+  queueGate = undefined
+  queueError = undefined
+  sessionIDOverride = undefined
+  queueStarted = () => {}
   createdClients.length = 0
   createdSessions.length = 0
   sessionCreateCallers.length = 0
@@ -467,7 +509,297 @@ const createSubmit = (options: Partial<Parameters<typeof createPromptSubmit>[0]>
     ...options,
   })
 
+describe("native queue submission", () => {
+  test("captures model and variant before awaiting initial session creation", async () => {
+    selected = "main"
+    variant = "captured"
+    const current = { id: "model", provider: { id: "provider" } }
+    const release = Promise.withResolvers<void>()
+    createSessionGate = release.promise
+    const submit = createSubmit({
+      model: { current: () => current, variant: { current: () => variant } } as unknown as ModelSelection,
+    })
+    const request = submit.handleSubmit(new Event("submit"), "queue")
+    current.id = "edited-model"
+    current.provider.id = "edited-provider"
+    variant = "edited"
+    release.resolve()
+    await request
+    expect(queuedInputs[0]).toMatchObject({
+      payload: { model: { modelID: "model", providerID: "provider" }, variant: "captured" },
+    })
+  })
+  test("awaits admission, guards double submission, and adds no optimistic busy or message", async () => {
+    params.id = "ses_queue"
+    const preparing: boolean[] = []
+    const release = Promise.withResolvers<void>()
+    const started = Promise.withResolvers<void>()
+    queueGate = release.promise
+    queueStarted = () => started.resolve()
+    const submit = createSubmit({ working: () => true, onPreparing: (value) => preparing.push(value) })
+    const request = submit.handleSubmit(new Event("submit"), "queue")
+    await started.promise
+    await submit.handleSubmit(new Event("submit"), "queue")
+    expect(queuedInputs).toHaveLength(1)
+    expect(promptResets).toBe(0)
+    expect(optimistic).toHaveLength(0)
+    expect(preparing).not.toContain(true)
+    expect(statusWrites).toHaveLength(0)
+    release.resolve()
+    await request
+    expect(promptResets).toBe(1)
+    expect(sentPrompts).toHaveLength(0)
+    expect(queuedInputs[0]).toMatchObject({
+      sessionID: "ses_queue",
+      payload: { kind: "prompt", agent: "agent", model: { modelID: "model", providerID: "provider" } },
+    })
+  })
+  test("preserves the composer on queue failure", async () => {
+    params.id = "ses_queue"
+    queueError = new Error("offline")
+    const submit = createSubmit()
+    await submit.handleSubmit(new Event("submit"), "queue")
+    expect(promptResets).toBe(0)
+    expect(promptValue[0]).toMatchObject({ content: "ls" })
+    expect(toasts).toContainEqual(expect.objectContaining({ description: "offline" }))
+    queueError = undefined
+    await submit.handleSubmit(new Event("submit"), "queue")
+    expect(queuedInputs[1]).toEqual(queuedInputs[0])
+  })
+  test("keeps a new-session queue failure on the original draft and reuses its session on retry", async () => {
+    selected = "main"
+    sessionIDOverride = "ses_new_queue"
+    promptValue = [{ type: "text", content: "/queue first draft", start: 0, end: 18 }]
+    queueError = new Error("offline")
+    const submit = createSubmit()
+    await submit.handleSubmit(new Event("submit"))
+    expect(navigated).toHaveLength(0)
+    expect(promptResets).toBe(0)
+    expect(createdSessions).toHaveLength(1)
+    queueError = undefined
+    await submit.handleSubmit(new Event("submit"))
+    expect(createdSessions).toHaveLength(1)
+    expect(navigated).toHaveLength(1)
+    expect(queuedInputs[1]).toEqual(queuedInputs[0])
+    expect(navigated[0]).toEndWith("/session/ses_new_queue")
+    expect(optimistic).toHaveLength(0)
+  })
+  test("preserves edits made while native admission is in flight", async () => {
+    params.id = "ses_queue"
+    const release = Promise.withResolvers<void>()
+    const started = Promise.withResolvers<void>()
+    queueGate = release.promise
+    queueStarted = () => started.resolve()
+    const request = createSubmit().handleSubmit(new Event("submit"), "queue")
+    await started.promise
+    promptValue = [{ type: "text", content: "next draft", start: 0, end: 10 }]
+    release.resolve()
+    await request
+    expect(promptResets).toBe(0)
+    expect(promptValue[0]).toMatchObject({ content: "next draft" })
+  })
+  test("preserves edits during a new-session queue handoff", async () => {
+    selected = "main"
+    sessionIDOverride = "ses_new_queue"
+    promptValue = [{ type: "text", content: "/queue first draft", start: 0, end: 18 }]
+    const release = Promise.withResolvers<void>()
+    const started = Promise.withResolvers<void>()
+    queueGate = release.promise
+    queueStarted = () => started.resolve()
+    const request = createSubmit().handleSubmit(new Event("submit"))
+    await started.promise
+    promptValue = [{ type: "text", content: "next draft", start: 0, end: 10 }]
+    release.resolve()
+    await request
+    expect(sessionPromptValue[0]).toMatchObject({ content: "next draft" })
+    expect(optimistic).toHaveLength(0)
+  })
+  test("captures context immutably and preserves in-place edits during admission", async () => {
+    params.id = "ses_queue"
+    promptContextItems.push({ key: "comment", type: "file", path: "a.ts", comment: "captured comment" })
+    const release = Promise.withResolvers<void>()
+    const started = Promise.withResolvers<void>()
+    queueGate = release.promise
+    queueStarted = () => started.resolve()
+    const request = createSubmit().handleSubmit(new Event("submit"), "queue")
+    await started.promise
+    promptContextItems[0]!.comment = "edited comment"
+    release.resolve()
+    await request
+    expect(promptResets).toBe(0)
+    expect(promptContextItems[0]?.comment).toBe("edited comment")
+    expect(queuedInputs[0]).toMatchObject({
+      payload: {
+        parts: [
+          { type: "text", text: "ls" },
+          { type: "text", text: expect.stringContaining("captured comment") },
+          { type: "file", filename: "a.ts" },
+        ],
+      },
+    })
+  })
+  test("intercepts /queue text before a custom command named queue", async () => {
+    params.id = "ses_queue"
+    commands.push({ name: "queue" })
+    promptValue = [{ type: "text", content: "/queue abc", start: 0, end: 10 }]
+    await createSubmit().handleSubmit(new Event("submit"))
+    expect(queuedInputs[0]).toMatchObject({ payload: { kind: "prompt", parts: [{ type: "text", text: "abc" }] } })
+    expect(sentCommands).toHaveLength(0)
+    expect(sentPrompts).toHaveLength(0)
+  })
+  test.each(["/queue stop", "/queue start", "/queue flush", "/queue clear"])(
+    "%s is a management operation, not a prompt",
+    async (text) => {
+      params.id = "ses_queue"
+      promptValue = [{ type: "text", content: text, start: 0, end: text.length }]
+      const preparing: boolean[] = []
+      await createSubmit({ onPreparing: (value) => preparing.push(value) }).handleSubmit(new Event("submit"))
+      expect(queueMutations).toHaveLength(1)
+      expect(queuedInputs).toHaveLength(0)
+      expect(optimistic).toHaveLength(0)
+      expect(sentPrompts).toHaveLength(0)
+      expect(preparing).not.toContain(true)
+      expect(promptResets).toBe(1)
+    },
+  )
+  test("reserves /queues for management", async () => {
+    params.id = "ses_queue"
+    promptValue = [{ type: "text", content: "/queues", start: 0, end: 7 }]
+    let managed = 0
+    await createSubmit({ onManageQueue: () => managed++ }).handleSubmit(new Event("submit"))
+    expect(managed).toBe(1)
+    expect(queuedInputs).toHaveLength(0)
+    expect(sentPrompts).toHaveLength(0)
+  })
+  test.each(["/queue", "/queue list"])("%s lists pending queued count without submitting", async (text) => {
+    params.id = "ses_queue"
+    queueItems.push(
+      ...["pending", "claimed", "uncertain"].map((state, position) => ({
+        id: state,
+        state,
+        position,
+        sessionID: params.id,
+        delivery: "queue",
+        created: 1,
+        payload: { kind: "compact", agent: "agent", model: { providerID: "provider", modelID: "model" } },
+      })),
+    )
+    promptValue = [{ type: "text", content: text, start: 0, end: text.length }]
+    await createSubmit().handleSubmit(new Event("submit"))
+    expect(toasts).toContainEqual({ title: "queue.title", description: "queue.list:1" })
+    expect(queuedInputs).toHaveLength(0)
+    expect(sentPrompts).toHaveLength(0)
+  })
+  test("indexed clear sends stable IDs with the latest acknowledged CAS revision", async () => {
+    params.id = "ses_queue"
+    queueItems.push(
+      ...["second", "first"].map((id, index) => ({
+        id,
+        position: 1 - index,
+        sessionID: params.id,
+        state: "pending",
+        delivery: "queue",
+        created: 1,
+        payload: { kind: "compact", agent: "agent", model: { providerID: "provider", modelID: "model" } },
+      })),
+    )
+    promptValue = [{ type: "text", content: "/queue clear 2 1", start: 0, end: 16 }]
+    await createSubmit().handleSubmit(new Event("submit"))
+    expect(queueMutations).toEqual([
+      { sessionID: "ses_queue", directory: "/repo/main", revision: 2, mutation: { action: "delete", id: "second" } },
+      { sessionID: "ses_queue", directory: "/repo/main", revision: 3, mutation: { action: "delete", id: "first" } },
+    ])
+  })
+  test("attachment-only queue drafts are admitted instead of stopping the runner", async () => {
+    params.id = "ses_queue"
+    promptValue = [{ type: "file", content: "", path: "a.ts", start: 0, end: 0 }]
+    await createSubmit({ working: () => true }).handleSubmit(new Event("submit"), "queue")
+    expect(queuedInputs[0]).toMatchObject({
+      payload: { kind: "prompt", parts: [{ type: "file", url: "file:///repo/main/a.ts" }] },
+    })
+    expect(interrupted).toHaveLength(0)
+  })
+  test("default Enter steers a busy session instead of queuing", async () => {
+    params.id = "ses_queue"
+    await createSubmit({ working: () => true }).handleSubmit(new Event("submit"))
+    expect(queuedInputs).toHaveLength(0)
+    expect(sentPrompts).toHaveLength(1)
+  })
+  describe.each([false, true])("prompt admission (busy: %s)", (working) => {
+    test("awaits admission before clearing the composer and submitted comments", async () => {
+      params.id = "ses_queue"
+      promptContextItems.push({ key: "comment", type: "file", path: "a.ts", comment: "captured comment" })
+      const release = Promise.withResolvers<void>()
+      const started = Promise.withResolvers<void>()
+      promptGate = release.promise
+      onPromptStarted = () => started.resolve()
+      const submit = createSubmit({ working: () => working })
+      const request = submit.handleSubmit(new Event("submit"))
+      await started.promise
+      await submit.handleSubmit(new Event("submit"))
+      expect(sentPrompts).toHaveLength(1)
+      expect(promptResets).toBe(0)
+      expect(promptContextItems).toHaveLength(1)
+      release.resolve()
+      await request
+      expect(promptResets).toBe(1)
+      expect(promptContextItems).toHaveLength(0)
+      if (working) expect(statusWrites).toHaveLength(0)
+    })
+    test("preserves the captured draft on failure without clearing it", async () => {
+      params.id = "ses_queue"
+      promptError = new Error("offline")
+      await createSubmit({ working: () => working }).handleSubmit(new Event("submit"))
+      expect(promptResets).toBe(0)
+      expect(promptValue[0]).toMatchObject({ content: "ls" })
+      expect(toasts).toContainEqual(expect.objectContaining({ description: "offline" }))
+      if (working) expect(statusWrites).toHaveLength(0)
+    })
+    test.each([false, true])("preserves edits while admission is in flight (failure: %s)", async (fail) => {
+      params.id = "ses_queue"
+      promptContextItems.push({ key: "comment", type: "file", path: "a.ts", comment: "captured comment" })
+      const release = Promise.withResolvers<void>()
+      const started = Promise.withResolvers<void>()
+      promptGate = release.promise
+      promptError = fail ? new Error("offline") : undefined
+      onPromptStarted = () => started.resolve()
+      const request = createSubmit({ working: () => working }).handleSubmit(new Event("submit"))
+      await started.promise
+      promptValue = [{ type: "text", content: "next draft", start: 0, end: 10 }]
+      promptContextItems[0]!.comment = "edited comment"
+      release.resolve()
+      await request
+      expect(promptResets).toBe(0)
+      expect(promptValue[0]).toMatchObject({ content: "next draft" })
+      expect(promptContextItems[0]?.comment).toBe("edited comment")
+      expect(promptInputs[0]).toMatchObject({ text: expect.stringContaining("captured comment") })
+    })
+  })
+})
+
 describe("prompt submit worktree selection", () => {
+  test("waits for initial main-session admission and reuses the session after failure", async () => {
+    selected = "main"
+    const release = Promise.withResolvers<void>()
+    const started = Promise.withResolvers<void>()
+    promptGate = release.promise
+    promptError = new Error("offline")
+    onPromptStarted = () => started.resolve()
+    const submit = createSubmit()
+    const request = submit.handleSubmit(new Event("submit"))
+    await started.promise
+    expect(promptResets).toBe(0)
+    expect(navigated).toHaveLength(0)
+    release.resolve()
+    await request
+    expect(promptResets).toBe(0)
+    expect(navigated).toHaveLength(0)
+    promptError = undefined
+    await submit.handleSubmit(new Event("submit"))
+    expect(createdSessions).toHaveLength(1)
+    expect(promptResets).toBe(1)
+    expect(navigated).toEqual(["//repo/main/session/session-1"])
+  })
   test("waits for backend worktree readiness and submits through the target directory", async () => {
     selected = "create"
     worktreeCreateReady = true
@@ -961,11 +1293,13 @@ describe("prompt submit worktree selection", () => {
     releasePrompt()
     await request
 
-    expect(sessionContextItems).toContainEqual(expect.objectContaining({
-      key: comment.key,
-      comment: "edited while sending",
-      commentID: comment.commentID,
-    }))
+    expect(sessionContextItems).toContainEqual(
+      expect.objectContaining({
+        key: comment.key,
+        comment: "edited while sending",
+        commentID: comment.commentID,
+      }),
+    )
   })
 
   test("does not navigate back if the user changes routes during initial prompt submission", async () => {

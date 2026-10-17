@@ -1,0 +1,5 @@
+[data-pending-steer] [data-slot="user-message-text"],
+[data-pending-steer] [data-slot="user-message-attachment"] {
+  outline: 1px dashed var(--v2-icon-icon-info, var(--border-active));
+  outline-offset: -1px;
+}
