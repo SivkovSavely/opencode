@@ -41,7 +41,6 @@ import { FSUtil } from "@opencode-ai/core/fs-util"
 import { Truncate } from "@/tool/truncate"
 import { Image } from "@/image/image"
 import { decodeDataUrl } from "@/util/data-url"
-import { Process } from "@/util/process"
 import { Cause, Effect, Exit, Latch, Layer, Option, Scope, Context, Schema, Types } from "effect"
 import { InstanceState } from "@/effect/instance-state"
 import { TaskTool, type TaskPromptOps } from "@/tool/task"
@@ -1681,10 +1680,11 @@ const layer = Layer.effect(
           () =>
             Effect.gen(function* () {
               if (!(yield* ownsQueue(sessionID))) return
-              const next = (yield* queue.list(sessionID)).items.find(
-                (entry) => entry.delivery === "queue" && entry.state === "pending",
-              )
-              return yield* queue.claimNext(sessionID, !!next && !!flushing?.has(next.id))
+              if (flushing?.size) {
+                const entry = yield* queue.claimNext(sessionID, true, flushing)
+                if (entry) return entry
+              }
+              return yield* queue.claimNext(sessionID)
             }),
           { behavior: "immediate" },
         )
@@ -1756,7 +1756,9 @@ const layer = Layer.effect(
             return { steer: false, entry }
           }
           flush.delete(sessionID)
-        }),
+        }).pipe(
+          Effect.onExit((exit) => (Exit.isFailure(exit) ? queue.abandon(sessionID).pipe(Effect.orDie) : Effect.void)),
+        ),
       )
       yield* state.startIfIdle(
         sessionID,
@@ -1771,7 +1773,7 @@ const layer = Layer.effect(
             Effect.gen(function* () {
               if (Exit.isSuccess(exit) && flush.get(sessionID)?.size) return
               flush.delete(sessionID)
-              if (Exit.isFailure(exit)) yield* queue.block(sessionID).pipe(Effect.orDie)
+              if (Exit.isFailure(exit)) yield* queue.abandon(sessionID).pipe(Effect.orDie)
             }),
           ),
         ),
@@ -2409,7 +2411,8 @@ const layer = Layer.effect(
               const flush = yield* InstanceState.get(queueState)
               if (Exit.isFailure(exit) || recovery || reconcile || manualRecovery || flush.get(sessionID)?.size === 0)
                 flush.delete(sessionID)
-              if (Exit.isFailure(exit) || recovery || reconcile || manualRecovery)
+              if (Exit.isFailure(exit)) yield* queue.abandon(sessionID).pipe(Effect.orDie)
+              if (Exit.isSuccess(exit) && (recovery || reconcile || manualRecovery))
                 yield* queue.block(sessionID).pipe(Effect.orDie)
             }),
           ),
@@ -2443,7 +2446,21 @@ const layer = Layer.effect(
       "SessionPrompt.shell",
     )(function* (input: ShellInput) {
       const ready = yield* Latch.make()
-      return yield* state.startShell(input.sessionID, lastAssistant(input.sessionID), shellImpl(input, ready), ready)
+      return yield* state.startShell(
+        input.sessionID,
+        lastAssistant(input.sessionID),
+        shellImpl(input, ready).pipe(
+          Effect.onExit((exit) =>
+            Effect.gen(function* () {
+              if (Exit.isSuccess(exit)) return
+              const flush = yield* InstanceState.get(queueState)
+              flush.delete(input.sessionID)
+              yield* queue.block(input.sessionID).pipe(Effect.orDie)
+            }),
+          ),
+        ),
+        ready,
+      )
     })
 
     const command = Effect.fn("SessionPrompt.command")(function* (
@@ -2494,10 +2511,24 @@ const layer = Layer.effect(
       if (shellMatches.length > 0) {
         const cfg = yield* config.get()
         const sh = Shell.preferred(cfg.shell)
-        const results = yield* Effect.promise(() =>
-          Promise.all(
-            shellMatches.map(async ([, cmd]) => (await Process.text([cmd], { shell: sh, nothrow: true })).text),
-          ),
+        const results = yield* Effect.forEach(
+          shellMatches,
+          ([, cmd]) =>
+            Effect.gen(function* () {
+              const handle = yield* spawner.spawn(
+                ChildProcess.make(cmd, {
+                  shell: sh,
+                  extendEnv: true,
+                  stdin: "ignore",
+                  stderr: "ignore",
+                  forceKillAfter: "3 seconds",
+                }),
+              )
+              const output = yield* Stream.mkString(Stream.decodeText(handle.stdout))
+              yield* handle.exitCode
+              return output
+            }).pipe(Effect.scoped, Effect.orDie),
+          { concurrency: "unbounded" },
         )
         let index = 0
         template = template.replace(bashRegex, () => results[index++])

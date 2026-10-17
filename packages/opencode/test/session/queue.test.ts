@@ -15,6 +15,7 @@ import { ProjectTable } from "@opencode-ai/core/project/sql"
 import { InstanceRef } from "@/effect/instance-ref"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { SessionQueue } from "@/session/queue"
+import { RuntimeLifecycle } from "@/server/runtime-lifecycle"
 import { Session } from "@/session/session"
 import { MessageID, PartID, SessionID } from "@/session/schema"
 import { testEffect } from "../lib/effect"
@@ -37,6 +38,7 @@ const payload: SessionQueueV1.Payload = {
   model: { providerID: "test", modelID: "test" },
   parts: [{ type: "text", text: "queued input" }],
 }
+const processIdentity = RuntimeLifecycle.processIdentity()
 
 const setup = Effect.gen(function* () {
   const sessions = yield* Session.Service
@@ -419,6 +421,7 @@ describe("legacy session queue store", () => {
 
   it.instance("service rebuild preserves durable state; old-process claims become uncertain and never replay", () =>
     Effect.gen(function* () {
+      if (!processIdentity) return
       const s = yield* setup
       yield* s.queue.enqueue(s.sessionID, { id: "abandoned", payload })
       yield* s.queue.enqueue(s.sessionID, { id: "remaining", payload })
@@ -429,7 +432,7 @@ describe("legacy session queue store", () => {
       // Model a durable reservation left by a previous process, not a layer reload.
       yield* s.db
         .update(SessionQueueTable)
-        .set({ owner: "previous-process" })
+        .set({ owner: JSON.stringify({ id: "previous-process", process: { ...processIdentity, startTime: "old" } }) })
         .where(eq(SessionQueueTable.id, "abandoned"))
         .run()
       const recovered = yield* rebuilt.list(s.sessionID)
@@ -445,8 +448,71 @@ describe("legacy session queue store", () => {
     }),
   )
 
+  it.instance("queue reads preserve live foreign claims and quarantine them only after verified process exit", () =>
+    Effect.gen(function* () {
+      if (!processIdentity) return
+      const child = yield* Effect.acquireRelease(
+        Effect.sync(() =>
+          Bun.spawn([process.execPath, "-e", "setInterval(() => {}, 1000)"], { stdout: "ignore", stderr: "inherit" }),
+        ),
+        (child) =>
+          Effect.promise(async () => {
+            child.kill()
+            await child.exited
+          }),
+      )
+      const stat = yield* Effect.promise(() => Bun.file(`/proc/${child.pid}/stat`).text())
+      const startTime = stat
+        .slice(stat.lastIndexOf(")") + 1)
+        .trim()
+        .split(/\s+/)[19]
+      if (!startTime) return yield* Effect.die("Missing child process start time")
+      const s = yield* setup
+      yield* s.queue.enqueue(s.sessionID, { id: "foreign-live", payload })
+      yield* s.queue.enqueue(s.sessionID, { id: "remaining", payload })
+      yield* s.queue.claimNext(s.sessionID)
+      yield* s.db
+        .update(SessionQueueTable)
+        .set({
+          owner: JSON.stringify({ id: "other-server", process: { ...processIdentity, pid: child.pid, startTime } }),
+        })
+        .where(eq(SessionQueueTable.id, "foreign-live"))
+        .run()
+      const live = yield* s.queue.list(s.sessionID)
+      expect(live.items[0].state).toBe("claimed")
+      expect(live.blocked).toBe(false)
+      expect(yield* s.queue.list(s.sessionID)).toEqual(live)
+      expect(yield* s.queue.claimNext(s.sessionID, true)).toBeUndefined()
+      yield* s.queue.abandon(s.sessionID)
+      expect((yield* s.queue.get(s.sessionID, "foreign-live")).state).toBe("claimed")
+      child.kill()
+      yield* Effect.promise(() => child.exited)
+      const dead = yield* s.queue.list(s.sessionID)
+      expect(dead.items[0].state).toBe("uncertain")
+      expect(dead.blocked).toBe(true)
+      expect(dead.revision).toBe(live.revision + 2)
+      expect(yield* s.queue.list(s.sessionID)).toEqual(dead)
+      expect((yield* s.queue.claimNext(s.sessionID, true))?.id).toBe("remaining")
+    }),
+  )
+
+  it.instance("unverifiable foreign claims remain reserved without altering queue revisions", () =>
+    Effect.gen(function* () {
+      const s = yield* setup
+      yield* s.queue.enqueue(s.sessionID, { id: "unknown-owner", payload })
+      yield* s.queue.claimNext(s.sessionID)
+      const before = yield* s.queue.list(s.sessionID)
+      for (const owner of [null, "legacy-process-id", JSON.stringify({ id: "unverifiable" })]) {
+        yield* s.db.update(SessionQueueTable).set({ owner }).where(eq(SessionQueueTable.id, "unknown-owner")).run()
+        expect(yield* s.queue.list(s.sessionID)).toEqual(before)
+        expect(yield* s.queue.claimNext(s.sessionID, true)).toBeUndefined()
+      }
+    }),
+  )
+
   it.instance("closing and reopening SQLite preserves pause, block, revisions, tombstones, and abandoned claims", () =>
     Effect.gen(function* () {
+      if (!processIdentity) return
       const s = yield* setup
       const ctx = yield* InstanceRef
       if (!ctx) return yield* Effect.die("Missing test instance")
@@ -472,7 +538,7 @@ describe("legacy session queue store", () => {
         yield* queue.block(s.sessionID)
         yield* db
           .update(SessionQueueTable)
-          .set({ owner: "exited-process" })
+          .set({ owner: JSON.stringify({ id: "exited-process", process: { ...processIdentity, startTime: "old" } }) })
           .where(eq(SessionQueueTable.id, "restart-claim"))
           .run()
         return yield* db

@@ -227,16 +227,17 @@ export type MakeInput = {
   startupRecovery?: boolean
 }
 
-type ProcessIdentity = {
-  host: string
-  machineID: string
-  bootID: string
-  pidNamespace: string
-  pid: number
-  startTime: string
-}
+export const ProcessIdentity = Schema.Struct({
+  host: Schema.String,
+  machineID: Schema.String,
+  bootID: Schema.String,
+  pidNamespace: Schema.String,
+  pid: Schema.Int,
+  startTime: Schema.String,
+})
+export type ProcessIdentity = typeof ProcessIdentity.Type
 
-function processIdentity(): ProcessIdentity | undefined {
+export function processIdentity(): ProcessIdentity | undefined {
   if (process.platform !== "linux") return undefined
   try {
     const stat = readFileSync(`/proc/${process.pid}/stat`, "utf8")
@@ -255,7 +256,13 @@ function processIdentity(): ProcessIdentity | undefined {
   }
 }
 
-function ownerLiveness(row: Row, owner: ProcessIdentity | undefined): "live" | "dead" | "unknown" {
+function ownerLiveness(
+  row: Pick<
+    Row,
+    "owner_host" | "owner_machine_id" | "owner_boot_id" | "owner_pid_namespace" | "owner_pid" | "owner_start_time"
+  >,
+  owner: ProcessIdentity | undefined,
+): "live" | "dead" | "unknown" {
   if (
     !owner ||
     row.owner_host !== owner.host ||
@@ -288,6 +295,20 @@ function ownerLiveness(row: Row, owner: ProcessIdentity | undefined): "live" | "
     }
     return "unknown"
   }
+}
+
+export function processLiveness(identity: ProcessIdentity): "live" | "dead" | "unknown" {
+  return ownerLiveness(
+    {
+      owner_host: identity.host,
+      owner_machine_id: identity.machineID,
+      owner_boot_id: identity.bootID,
+      owner_pid_namespace: identity.pidNamespace,
+      owner_pid: identity.pid,
+      owner_start_time: identity.startTime,
+    },
+    processIdentity(),
+  )
 }
 
 let active: Interface | undefined

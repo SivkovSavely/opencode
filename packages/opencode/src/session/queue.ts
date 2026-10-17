@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto"
 import { and, asc, eq, inArray, isNull, ne, or, sql } from "drizzle-orm"
-import { Context, Effect, Layer, Schema } from "effect"
+import { Context, Effect, Layer, Option, Schema } from "effect"
 import { Database } from "@opencode-ai/core/database/database"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { MessageTable, SessionTable } from "@opencode-ai/core/session/sql"
@@ -9,6 +9,7 @@ import { SessionQueueV1 } from "@opencode-ai/schema/v1/session-queue"
 import { SessionV1 } from "@opencode-ai/schema/v1/session"
 import { InstanceRef, WorkspaceRef } from "@/effect/instance-ref"
 import { EventV2Bridge } from "@/event-v2-bridge"
+import { RuntimeLifecycle } from "@/server/runtime-lifecycle"
 import type { MessageID, SessionID } from "./schema"
 import { SessionQueueMigration } from "./queue-migration"
 
@@ -33,9 +34,14 @@ export interface Interface {
   ) => Result<SessionQueueV1.Entry>
   readonly attachSteer: (sessionID: SessionID, id: string, messageID: MessageID) => Result<SessionQueueV1.Entry>
   readonly claimSteers: (sessionID: SessionID, messageIDs: readonly MessageID[]) => Result<SessionQueueV1.Entry[]>
-  readonly claimNext: (sessionID: SessionID, explicit?: boolean) => Result<SessionQueueV1.Entry | undefined>
+  readonly claimNext: (
+    sessionID: SessionID,
+    explicit?: boolean,
+    ids?: ReadonlySet<string>,
+  ) => Result<SessionQueueV1.Entry | undefined>
   readonly delivered: (sessionID: SessionID, id: string, messageID?: MessageID) => Result<SessionQueueV1.Entry>
   readonly block: (sessionID: SessionID) => Result<SessionQueueV1.Snapshot>
+  readonly abandon: (sessionID: SessionID) => Result<SessionQueueV1.Snapshot>
   readonly unblock: (sessionID: SessionID) => Result<SessionQueueV1.Snapshot>
   readonly get: (sessionID: SessionID, id: string) => Result<SessionQueueV1.Entry>
 }
@@ -44,7 +50,10 @@ export class Service extends Context.Service<Service, Interface>()("@opencode/Se
 
 // A service/layer rebuild is not a process restart. Never automatically retry an
 // entry reserved by another process, even when explicitly bypassing pause/block.
-const owner = randomUUID()
+const ClaimOwner = Schema.fromJsonString(
+  Schema.Struct({ id: Schema.String, process: Schema.optional(RuntimeLifecycle.ProcessIdentity) }),
+)
+const owner = JSON.stringify({ id: randomUUID(), process: RuntimeLifecycle.processIdentity() })
 type Row = typeof SessionQueueTable.$inferSelect
 type State = typeof SessionQueueStateTable.$inferSelect
 
@@ -159,9 +168,9 @@ export const layer = Layer.effect(
                   .onConflictDoNothing()
                   .run()
                   .pipe(Effect.orDie)
-                const recovered = yield* db
-                  .update(SessionQueueTable)
-                  .set({ state: "uncertain" })
+                const foreign = yield* db
+                  .select()
+                  .from(SessionQueueTable)
                   .where(
                     and(
                       eq(SessionQueueTable.session_id, sessionID),
@@ -169,16 +178,35 @@ export const layer = Layer.effect(
                       or(ne(SessionQueueTable.owner, owner), isNull(SessionQueueTable.owner)),
                     ),
                   )
-                  .returning()
                   .all()
                   .pipe(Effect.orDie)
-                if (recovered.length)
+                const recovered = foreign.filter((row) => {
+                  const identity = Schema.decodeUnknownOption(ClaimOwner)(row.owner)
+                  return (
+                    Option.isSome(identity) &&
+                    identity.value.process &&
+                    RuntimeLifecycle.processLiveness(identity.value.process) === "dead"
+                  )
+                })
+                if (recovered.length) {
+                  yield* db
+                    .update(SessionQueueTable)
+                    .set({ state: "uncertain" })
+                    .where(
+                      inArray(
+                        SessionQueueTable.id,
+                        recovered.map((row) => row.id),
+                      ),
+                    )
+                    .run()
+                    .pipe(Effect.orDie)
                   yield* db
                     .update(SessionQueueStateTable)
                     .set({ blocked: true, revision: sql`${SessionQueueStateTable.revision} + 1` })
                     .where(eq(SessionQueueStateTable.session_id, sessionID))
                     .run()
                     .pipe(Effect.orDie)
+                }
                 const state = yield* db
                   .select()
                   .from(SessionQueueStateTable)
@@ -460,13 +488,19 @@ export const layer = Layer.effect(
       )).value
     })
 
-    const claimNext = Effect.fn("SessionQueue.claimNext")(function* (sessionID: SessionID, explicit = false) {
+    const claimNext = Effect.fn("SessionQueue.claimNext")(function* (
+      sessionID: SessionID,
+      explicit = false,
+      ids?: ReadonlySet<string>,
+    ) {
       return (yield* transaction(sessionID, (state) =>
         Effect.gen(function* () {
           const items = yield* rows(sessionID)
           if ((!explicit && (state.paused || state.blocked)) || items.some((row) => row.state === "claimed"))
             return { value: undefined, changed: false }
-          const row = items.find((row) => row.state === "pending" && row.delivery === "queue")
+          const row = items.find(
+            (row) => row.state === "pending" && row.delivery === "queue" && (!ids || ids.has(row.id)),
+          )
           if (!row) return { value: undefined, changed: false }
           yield* db
             .update(SessionQueueTable)
@@ -507,16 +541,31 @@ export const layer = Layer.effect(
       )).value
     })
 
-    const setBlocked = Effect.fnUntraced(function* (sessionID: SessionID, blocked: boolean) {
+    const setBlocked = Effect.fnUntraced(function* (sessionID: SessionID, blocked: boolean, abandon = false) {
       return (yield* transaction(sessionID, (state) =>
         Effect.gen(function* () {
+          const abandoned = abandon
+            ? yield* db
+                .update(SessionQueueTable)
+                .set({ state: "uncertain" })
+                .where(
+                  and(
+                    eq(SessionQueueTable.session_id, sessionID),
+                    eq(SessionQueueTable.state, "claimed"),
+                    eq(SessionQueueTable.owner, owner),
+                  ),
+                )
+                .returning()
+                .all()
+                .pipe(Effect.orDie)
+            : []
           yield* db
             .update(SessionQueueStateTable)
             .set({ blocked })
             .where(eq(SessionQueueStateTable.session_id, sessionID))
             .run()
             .pipe(Effect.orDie)
-          return { value: undefined, changed: state.blocked !== blocked }
+          return { value: undefined, changed: state.blocked !== blocked || abandoned.length > 0 }
         }),
       )).snapshot
     })
@@ -538,6 +587,7 @@ export const layer = Layer.effect(
       delivered,
       get,
       block: (sessionID) => setBlocked(sessionID, true),
+      abandon: (sessionID) => setBlocked(sessionID, true, true),
       unblock: (sessionID) => setBlocked(sessionID, false),
     })
   }),

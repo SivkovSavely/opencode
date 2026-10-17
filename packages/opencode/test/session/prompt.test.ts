@@ -329,6 +329,26 @@ const mutatingTaskPlugin = Layer.succeed(
   }),
 )
 const withMutatingTaskPlugin = testEffect(makeHttp({ plugin: mutatingTaskPlugin }))
+const shellEnvStarted = Deferred.makeUnsafe<void>()
+const shellEnvFailed = Deferred.makeUnsafe<void>()
+const withFailingShellPlugin = testEffect(
+  makeHttp({
+    plugin: Layer.succeed(
+      Plugin.Service,
+      Plugin.Service.of({
+        trigger: (name, _input, output) =>
+          name === "shell.env"
+            ? Deferred.succeed(shellEnvStarted, undefined).pipe(
+                Effect.andThen(Deferred.await(shellEnvFailed)),
+                Effect.andThen(Effect.die("shell environment failed")),
+              )
+            : Effect.succeed(output),
+        list: () => Effect.succeed([]),
+        init: () => Effect.void,
+      }),
+    ),
+  }),
+)
 const withCallbackPlugin = testEffect(
   makeHttp({
     plugin: Layer.effect(
@@ -894,7 +914,7 @@ noLLMServer.instance(
   { config: cfg },
 )
 
-it.instance("native queue idle flush serializes its snapshot without flushing later queued inputs", () =>
+it.instance("native queue idle flush serializes its snapshot past later front insertions", () =>
   Effect.gen(function* () {
     const { llm } = yield* useServerConfig(providerCfg)
     const { prompt, chat } = yield* boot()
@@ -907,13 +927,16 @@ it.instance("native queue idle flush serializes its snapshot without flushing la
     yield* llm.text("second flushed result")
     yield* prompt.queueFlush(chat.id)
     yield* llm.wait(1)
-    yield* prompt.queueSubmit(chat.id, { id: "idle-three", payload: queuedPrompt("later-input") })
+    yield* prompt.queueSubmit(chat.id, { id: "idle-three", front: true, payload: queuedPrompt("later-input") })
     yield* prompt.queueFlush(chat.id)
     yield* Deferred.succeed(release, undefined)
     yield* prompt.loop({ sessionID: chat.id })
     expect(yield* llm.calls).toBe(2)
     expect((yield* queue.get(chat.id, "idle-two")).state).toBe("delivered")
     expect((yield* queue.get(chat.id, "idle-three")).state).toBe("pending")
+    const hits = yield* llm.hits
+    expect(JSON.stringify(hits[1].body)).toContain("idle-two-input")
+    expect(JSON.stringify(hits[1].body)).not.toContain("later-input")
   }),
 )
 
@@ -1018,6 +1041,67 @@ unix("pending command conversions defer interpolation until an irreversible clai
     expect(messages.filter((message) => message.info.id === "msg_queue_roundtrip-command")).toHaveLength(1)
     expect(yield* llm.calls).toBe(2)
   }),
+)
+
+unix("cancelling a queued command terminates its interpolation process before returning", () =>
+  withSh(() =>
+    Effect.gen(function* () {
+      const { directory } = yield* TestInstance
+      const pid = path.join(directory, "interpolation-pid")
+      const gate = path.join(directory, "interpolation-release")
+      const sideEffect = path.join(directory, "interpolation-side-effect")
+      const { llm } = yield* useServerConfig((url) => ({
+        ...providerCfg(url),
+        command: {
+          waiting: {
+            template: `!\`printf '%s' $$ > '${pid}'; while [ ! -f '${gate}' ]; do sleep 0.01; done; touch '${sideEffect}'\``,
+          },
+        },
+      }))
+      const { prompt, chat } = yield* boot()
+      const queue = yield* SessionQueue.Service
+      yield* prompt.queueSubmit(chat.id, {
+        id: "cancel-interpolation",
+        payload: { kind: "command", agent: "build", model: ref, command: "waiting", arguments: "" },
+      })
+      yield* pollWithTimeout(
+        Effect.promise(() => Bun.file(pid).exists()).pipe(Effect.map((exists) => (exists ? true : undefined))),
+        "queued interpolation did not start",
+      )
+      const processID = Number(yield* Effect.promise(() => Bun.file(pid).text()))
+      yield* awaitWithTimeout(prompt.cancel(chat.id), "cancellation did not terminate interpolation")
+      expect(Exit.isFailure(yield* Effect.sync(() => process.kill(processID, 0)).pipe(Effect.exit))).toBe(true)
+      yield* writeText(gate, "release")
+      expect(yield* Effect.promise(() => Bun.file(sideEffect).exists())).toBe(false)
+      expect((yield* queue.list(chat.id)).blocked).toBe(true)
+      expect(yield* llm.calls).toBe(0)
+    }),
+  ),
+)
+
+withFailingShellPlugin.instance(
+  "a failed shell discards queued flush authorization",
+  () =>
+    Effect.gen(function* () {
+      const { prompt, chat } = yield* boot()
+      const queue = yield* SessionQueue.Service
+      const snapshot = yield* queue.list(chat.id)
+      yield* prompt.queueUpdate(chat.id, { revision: snapshot.revision, mutation: { action: "pause", paused: true } })
+      yield* prompt.queueSubmit(chat.id, { id: "before-shell-failure", payload: queuedPrompt("A") })
+      const shell = yield* prompt
+        .shell({ sessionID: chat.id, agent: "build", model: ref, command: "echo shell" })
+        .pipe(Effect.exit, Effect.forkChild)
+      yield* awaitWithTimeout(Deferred.await(shellEnvStarted), "shell did not reach environment hook")
+      yield* prompt.queueFlush(chat.id)
+      yield* Deferred.succeed(shellEnvFailed, undefined)
+      expect(Exit.isFailure(yield* Fiber.join(shell))).toBe(true)
+      yield* prompt.queueSubmit(chat.id, { id: "after-shell-failure", payload: queuedPrompt("B") })
+      const after = yield* queue.list(chat.id)
+      expect(after.paused).toBe(true)
+      expect(after.blocked).toBe(true)
+      expect(after.items.map((entry) => entry.state)).toEqual(["pending", "pending"])
+    }),
+  { config: cfg },
 )
 
 unix("native queue shells persist delivery before executing and do not replay exact submissions", () =>
@@ -1311,7 +1395,7 @@ noLLMServer.instance(
       expect(preserved?.parts.filter((part) => part.type === "text").map((part) => part.text)).toEqual([
         "original collision content",
       ])
-      expect((yield* queue.get(chat.id, "collision")).state).toBe("claimed")
+      expect((yield* queue.get(chat.id, "collision")).state).toBe("uncertain")
     }),
   { config: cfg },
 )
@@ -1405,7 +1489,7 @@ withCallbackPlugin.instance(
     }),
 )
 
-it.instance("native queue retains a failed command claim rather than replaying its template", () =>
+it.instance("native queue retires a failed command claim without replaying it or blocking explicit continuation", () =>
   Effect.gen(function* () {
     const { directory } = yield* TestInstance
     const file = path.join(directory, "command-template-side-effect")
@@ -1423,11 +1507,63 @@ it.instance("native queue retains a failed command claim rather than replaying i
       queue.list(chat.id).pipe(Effect.map((snapshot) => (snapshot.blocked ? true : undefined))),
       "failed command did not block the queue",
     )
-    expect((yield* queue.get(chat.id, "failed-command")).state).toBe("claimed")
+    expect((yield* queue.get(chat.id, "failed-command")).state).toBe("uncertain")
     expect(yield* sessions.messages({ sessionID: chat.id })).toEqual([])
+    yield* prompt.queueSubmit(chat.id, { id: "after-failed-command", payload: queuedPrompt("safe continuation") })
+    yield* llm.text("continued")
     yield* prompt.queueResume(chat.id)
+    yield* pollWithTimeout(
+      queue
+        .get(chat.id, "after-failed-command")
+        .pipe(Effect.map((entry) => (entry.state === "delivered" ? true : undefined))),
+      "failed command claim prevented explicit continuation",
+    )
     expect(yield* Effect.promise(() => Bun.file(file).text())).toBe("once\n")
+    yield* llm.wait(1)
+    const status = yield* SessionStatus.Service
+    yield* pollWithTimeout(
+      status.get(chat.id).pipe(Effect.map((value) => (value.type === "idle" ? true : undefined))),
+      "queue continuation did not finish",
+    )
+    expect(yield* llm.calls).toBe(1)
+    expect((yield* queue.get(chat.id, "failed-command")).state).toBe("uncertain")
+  }),
+)
+
+it.instance("unknown queued commands become uncertain and Start can deliver the remaining backlog", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const { prompt, chat } = yield* boot()
+    const queue = yield* SessionQueue.Service
+    const initial = yield* queue.list(chat.id)
+    yield* prompt.queueUpdate(chat.id, { revision: initial.revision, mutation: { action: "pause", paused: true } })
+    yield* prompt.queueSubmit(chat.id, {
+      id: "unknown-command",
+      payload: { kind: "command", agent: "build", model: ref, command: "missing-command", arguments: "" },
+    })
+    yield* prompt.queueSubmit(chat.id, { id: "remaining-valid", payload: queuedPrompt("continue after failure") })
+    yield* prompt.queueResume(chat.id)
+    yield* pollWithTimeout(
+      queue
+        .get(chat.id, "unknown-command")
+        .pipe(Effect.map((entry) => (entry.state === "uncertain" ? true : undefined))),
+      "failed command reservation remained claimed",
+    )
+    expect((yield* queue.list(chat.id)).blocked).toBe(true)
+    expect((yield* queue.get(chat.id, "remaining-valid")).state).toBe("pending")
     expect(yield* llm.calls).toBe(0)
+    yield* llm.text("continued")
+    const blocked = yield* queue.list(chat.id)
+    yield* prompt.queueUpdate(chat.id, { revision: blocked.revision, mutation: { action: "pause", paused: false } })
+    yield* llm.wait(1)
+    const status = yield* SessionStatus.Service
+    yield* pollWithTimeout(
+      status.get(chat.id).pipe(Effect.map((value) => (value.type === "idle" ? true : undefined))),
+      "remaining queue did not finish",
+    )
+    expect((yield* queue.get(chat.id, "remaining-valid")).state).toBe("delivered")
+    expect((yield* queue.get(chat.id, "unknown-command")).state).toBe("uncertain")
+    expect(yield* llm.calls).toBe(1)
   }),
 )
 
