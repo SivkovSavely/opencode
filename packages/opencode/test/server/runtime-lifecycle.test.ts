@@ -1275,6 +1275,25 @@ describe("runtime lifecycle", () => {
     }),
   )
 
+  it.effect("does not resume a retry after cancellation even when its wake was already accepted", () =>
+    Effect.gen(function* () {
+      const database = yield* Database.Service
+      const scope = yield* Scope.Scope
+      const sessionID = yield* seedSession(database)
+      const runtime = RuntimeLifecycle.make({ lineage: randomUUID(), instance: randomUUID() }, scope, database)
+      const retryAt = (yield* Clock.currentTimeMillis) + 60_000
+      yield* runtime.admit({ sessionID, directory: "/tmp" })
+      yield* runtime.retry(sessionID, retryAt, 1)
+
+      expect(yield* runtime.wakeRetry(sessionID, 1, retryAt)).toBe(true)
+      expect(yield* runtime.cancel(sessionID)).toBe(true)
+      yield* runtime.finishCancel(sessionID)
+      expect(yield* runtime.resumeRetry(sessionID)).toBe(false)
+      expect(yield* runtime.wakeRetry(sessionID, 1, retryAt)).toBe(false)
+      expect(yield* execution(database, sessionID)).toEqual({ state: "cancelled", retry_at: null })
+    }),
+  )
+
   it.effect("drain parks a retry without losing its deadline", () =>
     Effect.gen(function* () {
       const database = yield* Database.Service
@@ -1292,6 +1311,7 @@ describe("runtime lifecycle", () => {
       ).pipe(Effect.forkChild)
       yield* Effect.yieldNow
       yield* runtime.request("shutdown")
+      expect(yield* runtime.wakeRetry(sessionID, 0, retryAt)).toBe(false)
       yield* Fiber.join(timer)
       yield* TestClock.adjust(Duration.millis(20_000))
       expect(yield* Ref.get(attempts)).toBe(0)

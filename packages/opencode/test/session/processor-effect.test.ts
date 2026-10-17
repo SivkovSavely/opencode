@@ -4,9 +4,11 @@ import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { expect } from "bun:test"
 import { tool } from "ai"
-import { Cause, Effect, Exit, Fiber, Layer, Stream } from "effect"
+import { Cause, Deferred, Effect, Exit, Fiber, Layer, Scope, Stream } from "effect"
 import path from "path"
 import z from "zod"
+import { randomUUID } from "node:crypto"
+import { sql } from "drizzle-orm"
 import type { Agent } from "../../src/agent/agent"
 import { Provider } from "@/provider/provider"
 
@@ -26,6 +28,7 @@ import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { LLMEvent } from "@opencode-ai/llm"
+import { RuntimeLifecycle } from "@/server/runtime-lifecycle"
 
 const summary = Layer.succeed(
   SessionSummary.Service,
@@ -185,6 +188,24 @@ const env = LayerNode.compile(
 )
 
 const it = testEffect(env)
+
+const ownedRuntimeEnv = env.pipe(
+  Layer.provideMerge(
+    Layer.effect(
+      RuntimeLifecycle.Service,
+      Effect.gen(function* () {
+        const database = yield* Database.Service
+        const scope = yield* Scope.Scope
+        const previous = RuntimeLifecycle.current() ?? RuntimeLifecycle.unavailable()
+        const runtime = RuntimeLifecycle.make({ lineage: randomUUID() }, scope, database)
+        RuntimeLifecycle.setCurrent(runtime)
+        yield* Effect.addFinalizer(() => Effect.sync(() => RuntimeLifecycle.setCurrent(previous)))
+        return runtime
+      }),
+    ).pipe(Layer.provide(LayerNode.compile(Database.node))),
+  ),
+)
+const itOwnedRuntime = testEffect(ownedRuntimeEnv)
 
 const providerErrorLLM = Layer.succeed(
   LLM.Service,
@@ -757,6 +778,86 @@ it.live("session.processor effect tests publish retry status updates", () =>
         expect(value).toBe("continue")
         expect(yield* llm.calls).toBe(2)
         expect(states).toStrictEqual([1])
+      }),
+    { config: (url) => providerCfg(url) },
+  ),
+)
+
+itOwnedRuntime.live("session.processor resumes the owned execution on manual retry and rejects the old generation", () =>
+  provideTmpdirServer(
+    ({ dir, llm }) =>
+      Effect.gen(function* () {
+        const { processors, session, provider } = yield* boot()
+        const runtime = yield* RuntimeLifecycle.Service
+        const database = yield* Database.Service
+        const events = yield* EventV2Bridge.Service
+        yield* llm.error(429, { type: "error", error: { type: "too_many_requests" } }, { "retry-after-ms": "600000" })
+        yield* llm.error(429, { type: "error", error: { type: "too_many_requests" } }, { "retry-after-ms": "600000" })
+        yield* llm.text("after manual retry")
+
+        const chat = yield* session.create({})
+        const parent = yield* user(chat.id, "manual retry")
+        const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+        const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+        const first = yield* Deferred.make<{ attempt: number; next: number }>()
+        const second = yield* Deferred.make<{ attempt: number; next: number }>()
+        const off = yield* events.listen((evt) => {
+          if (evt.type !== SessionStatus.Event.Status.type) return Effect.void
+          const data = evt.data as typeof SessionStatus.Event.Status.data.Type
+          if (data.sessionID !== chat.id || data.status.type !== "retry") return Effect.void
+          if (data.status.attempt === 1) return Deferred.succeed(first, data.status)
+          if (data.status.attempt === 2) return Deferred.succeed(second, data.status)
+          return Effect.void
+        })
+        yield* runtime.admit({ sessionID: chat.id, directory: dir })
+        const handle = yield* processors.create({ assistantMessage: msg, sessionID: chat.id, model: mdl })
+        const fiber = yield* Effect.forkScoped(
+          handle.process({
+            user: {
+              id: parent.id,
+              sessionID: chat.id,
+              role: "user",
+              time: parent.time,
+              agent: parent.agent,
+              model: { providerID: ref.providerID, modelID: ref.modelID },
+            } satisfies SessionV1.User,
+            sessionID: chat.id,
+            model: mdl,
+            agent: agent(),
+            system: [],
+            messages: [{ role: "user", content: "manual retry" }],
+            tools: {},
+          }),
+        )
+
+        const scheduled = yield* Deferred.await(first)
+        expect(yield* llm.calls).toBe(1)
+        expect(scheduled.next).toBeGreaterThan(Date.now() + 500_000)
+        const waitingExecution = yield* database.db.get<{ id: string; fence: number; state: string; retry_at: number }>(sql`
+          SELECT id, fence, state, retry_at FROM runtime_execution WHERE session_id = ${chat.id}
+        `)
+        expect(waitingExecution).toMatchObject({ state: "retry_wait", retry_at: scheduled.next })
+        expect(scheduled.attempt).toBe(1)
+        expect(yield* runtime.wakeRetry(chat.id, scheduled.attempt, scheduled.next)).toBe(true)
+        expect(yield* runtime.wakeRetry(chat.id, scheduled.attempt, scheduled.next)).toBe(false)
+        yield* llm.wait(2)
+        expect(yield* llm.calls).toBe(2)
+        expect(yield* database.db.get<{ id: string; fence: number; state: string }>(sql`
+          SELECT id, fence, state FROM runtime_execution WHERE session_id = ${chat.id}
+        `)).toMatchObject({ id: waitingExecution?.id, fence: waitingExecution?.fence, state: "active" })
+
+        const next = yield* Deferred.await(second)
+        expect(next.attempt).toBe(2)
+        expect(next.next).toBeGreaterThan(Date.now() + 500_000)
+        expect(yield* runtime.wakeRetry(chat.id, scheduled.attempt, scheduled.next)).toBe(false)
+        expect(yield* runtime.wakeRetry(chat.id, next.attempt, next.next)).toBe(true)
+        yield* llm.wait(3)
+        expect(yield* llm.calls).toBe(3)
+        expect(yield* Fiber.join(fiber)).toBe("continue")
+        const parts = yield* MessageV2.parts(msg.id)
+        expect(parts.some((part) => part.type === "text" && part.text === "after manual retry")).toBe(true)
+        expect(handle.message.error).toBeUndefined()
+        yield* off
       }),
     { config: (url) => providerCfg(url) },
   ),
