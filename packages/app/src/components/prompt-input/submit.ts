@@ -281,6 +281,7 @@ export function createPromptSubmit(input: PromptSubmitInput) {
   const activeSubmissions = new Map<string, ActiveSubmission>()
   const pendingNewSessions = new Map<string, PendingNewSession>()
   const queueRetries = new Map<string, { id: string; signature: string }>()
+  const destinationKey = () => JSON.stringify([location.pathname, search.draftId])
 
   const errorMessage = (err: unknown) => {
     if (err instanceof QueuePayloadError) return language.t(err.key)
@@ -323,7 +324,7 @@ export function createPromptSubmit(input: PromptSubmitInput) {
   }
 
   const abort = async () => {
-    const active = activeSubmissions.get(location.pathname)
+    const active = activeSubmissions.get(destinationKey())
     if (active?.abort) {
       active.abort.abort()
       input.onAbort?.()
@@ -382,19 +383,25 @@ export function createPromptSubmit(input: PromptSubmitInput) {
 
   const handleSubmit = (event: Event, delivery: "steer" | "queue" = "steer") => {
     event.preventDefault()
-    const sourcePath = location.pathname
-    if (submitting.has(sourcePath)) return
-    submitting.add(sourcePath)
+    const draftID = search.draftId
+    const sourceKey = destinationKey()
+    if (submitting.has(sourceKey)) return
+    submitting.add(sourceKey)
     const active: ActiveSubmission = {}
-    activeSubmissions.set(sourcePath, active)
-    return handleSubmitBody(sourcePath, active, delivery).finally(() => {
-      submitting.delete(sourcePath)
-      if (activeSubmissions.get(sourcePath) === active) activeSubmissions.delete(sourcePath)
-      if (location.pathname === sourcePath || !activeSubmissions.has(location.pathname)) input.onPreparing?.(false)
+    activeSubmissions.set(sourceKey, active)
+    return handleSubmitBody(draftID, sourceKey, active, delivery).finally(() => {
+      submitting.delete(sourceKey)
+      if (activeSubmissions.get(sourceKey) === active) activeSubmissions.delete(sourceKey)
+      if (destinationKey() === sourceKey || !activeSubmissions.has(destinationKey())) input.onPreparing?.(false)
     })
   }
 
-  const handleSubmitBody = async (initialPathname: string, active: ActiveSubmission, delivery: "steer" | "queue") => {
+  const handleSubmitBody = async (
+    initialDraftID: string | undefined,
+    initialKey: string,
+    active: ActiveSubmission,
+    delivery: "steer" | "queue",
+  ) => {
     const sourceSDK = sdk()
     const target = prompt.capture()
     const submission = createPromptSubmissionState({
@@ -528,18 +535,18 @@ export function createPromptSubmit(input: PromptSubmitInput) {
     let createdDirectory: string | undefined
     const cleanupCreatedWorktree = async (directory = createdDirectory) => {
       if (!directory) return
-      const prepared = pendingNewSessions.get(initialPathname)
+      const prepared = pendingNewSessions.get(initialKey)
       if (prepared?.directory === directory) {
-        pendingNewSessions.delete(initialPathname)
+        pendingNewSessions.delete(initialKey)
       }
       await removeCreatedWorktree(directory)
     }
-    const prepared = pendingNewSessions.get(initialPathname)
+    const prepared = pendingNewSessions.get(initialKey)
     const reuse =
       isNewSession && prepared?.projectDirectory === projectDirectory && prepared.selection === worktreeSelection
         ? prepared
         : undefined
-    if (!reuse) pendingNewSessions.delete(initialPathname)
+    if (!reuse) pendingNewSessions.delete(initialKey)
 
     let sessionDirectory = reuse?.directory ?? projectDirectory
     let worktreeReady = reuse?.ready === true
@@ -577,7 +584,7 @@ export function createPromptSubmit(input: PromptSubmitInput) {
         sessionDirectory = createdWorktree.directory
         createdDirectory = sessionDirectory
         worktreeReady = createdWorktree.ready === true
-        pendingNewSessions.set(initialPathname, {
+        pendingNewSessions.set(initialKey, {
           projectDirectory,
           selection: worktreeSelection,
           directory: sessionDirectory,
@@ -592,7 +599,7 @@ export function createPromptSubmit(input: PromptSubmitInput) {
             return
           }
           worktreeReady = true
-          pendingNewSessions.set(initialPathname, {
+          pendingNewSessions.set(initialKey, {
             projectDirectory,
             selection: worktreeSelection,
             directory: sessionDirectory,
@@ -642,7 +649,7 @@ export function createPromptSubmit(input: PromptSubmitInput) {
         seed(sessionDirectory, created)
         session = created
         createdNewSession = true
-        pendingNewSessions.set(initialPathname, {
+        pendingNewSessions.set(initialKey, {
           projectDirectory,
           selection: worktreeSelection,
           directory: sessionDirectory,
@@ -654,7 +661,7 @@ export function createPromptSubmit(input: PromptSubmitInput) {
     if (controller?.signal.aborted) {
       if (createdNewSession && session) {
         await sessionApi.remove({ sessionID: session.id, directory: sessionDirectory }).catch(() => {})
-        pendingNewSessions.set(initialPathname, {
+        pendingNewSessions.set(initialKey, {
           projectDirectory,
           selection: worktreeSelection,
           directory: sessionDirectory,
@@ -683,7 +690,7 @@ export function createPromptSubmit(input: PromptSubmitInput) {
       context,
       agent,
       model,
-      variant,
+      variant: forceDefaultVariant ? "default" : variant,
     }
 
     const clearInput = (preserveChanges = false) => {
@@ -695,15 +702,15 @@ export function createPromptSubmit(input: PromptSubmitInput) {
 
     const promoteSession = async () => {
       if (!isNewSession) return
-      if (location.pathname !== initialPathname) {
+      if (destinationKey() !== initialKey) {
         local.session.promote(sessionDirectory, session.id, {
           agent,
           model,
           variant: variant ?? null,
         })
         if (clearInput(true) && enqueue) clearContext(submission.target())
-        if (pendingNewSessions.get(initialPathname)?.session?.id === session.id) {
-          pendingNewSessions.delete(initialPathname)
+        if (pendingNewSessions.get(initialKey)?.session?.id === session.id) {
+          pendingNewSessions.delete(initialKey)
         }
         return
       }
@@ -733,15 +740,15 @@ export function createPromptSubmit(input: PromptSubmitInput) {
           model,
           variant: variant ?? null,
         })
-        if (location.pathname !== initialPathname) return
+        if (destinationKey() !== initialKey) return
         layout.handoff.setTabs(base64Encode(sessionDirectory), session.id)
-        const draftID = search.draftId
-        if (draftID) tabs.promoteDraft(draftID, { server: tabs.draft(draftID).server, sessionId: session.id })
+        if (initialDraftID)
+          tabs.promoteDraft(initialDraftID, { server: tabs.draft(initialDraftID).server, sessionId: session.id })
         else navigate(`/${base64Encode(sessionDirectory)}/session/${session.id}`)
       })
       input.onNewSessionWorktreeReset?.()
-      if (pendingNewSessions.get(initialPathname)?.session?.id === session.id) {
-        pendingNewSessions.delete(initialPathname)
+      if (pendingNewSessions.get(initialKey)?.session?.id === session.id) {
+        pendingNewSessions.delete(initialKey)
       }
     }
 
@@ -753,7 +760,7 @@ export function createPromptSubmit(input: PromptSubmitInput) {
           command: queueCommand?.type === "enqueue" ? queueCommand : undefined,
           custom: text.startsWith("/") && sync().data.command.some((item) => item.name === head?.slice(1)),
         })
-        const key = ScopedKey.from(sourceSDK.scope, sessionDirectory, session.id, initialPathname)
+        const key = ScopedKey.from(sourceSDK.scope, sessionDirectory, session.id, initialKey)
         const front = queueCommand?.type === "enqueue" ? queueCommand.front : undefined
         const signature = JSON.stringify([payload, front])
         const previous = queueRetries.get(key)

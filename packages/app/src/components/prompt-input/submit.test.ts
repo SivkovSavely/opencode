@@ -55,6 +55,7 @@ let params: { id?: string } = {}
 let search: { draftId?: string } = {}
 let selected = "/repo/worktree-a"
 let variant: string | undefined
+let parentID: string | undefined
 let permissionServer = "server-a"
 let createSessionGate: Promise<void> | undefined
 let createWorktreeGate: Promise<void> | undefined
@@ -358,7 +359,7 @@ beforeAll(async () => {
     useSync: () => () => ({
       data: { command: commands },
       session: {
-        get: () => undefined,
+        get: () => (parentID ? { parentID } : undefined),
         optimistic: {
           add: (value: {
             directory?: string
@@ -462,6 +463,7 @@ beforeEach(() => {
   syncedDirectories.length = 0
   selected = "/repo/worktree-a"
   variant = undefined
+  parentID = undefined
   permissionServer = "server-a"
   createSessionGate = undefined
   createWorktreeGate = undefined
@@ -510,6 +512,12 @@ const createSubmit = (options: Partial<Parameters<typeof createPromptSubmit>[0]>
   })
 
 describe("native queue submission", () => {
+  test("preserves an explicit default variant when queueing in a child session", async () => {
+    params.id = "ses_child"
+    parentID = "ses_parent"
+    await createSubmit().handleSubmit(new Event("submit"), "queue")
+    expect(queuedInputs[0]).toMatchObject({ payload: { variant: "default" } })
+  })
   test("captures model and variant before awaiting initial session creation", async () => {
     selected = "main"
     variant = "captured"
@@ -613,6 +621,42 @@ describe("native queue submission", () => {
     await request
     expect(sessionPromptValue[0]).toMatchObject({ content: "next draft" })
     expect(optimistic).toHaveLength(0)
+  })
+  test("does not promote another draft sharing the new-session pathname during queue admission", async () => {
+    selected = "main"
+    currentPathname = "/new-session"
+    search.draftId = "draft-a"
+    const release = Promise.withResolvers<void>()
+    const started = Promise.withResolvers<void>()
+    queueGate = release.promise
+    queueStarted = () => started.resolve()
+    const request = createSubmit().handleSubmit(new Event("submit"), "queue")
+    await started.promise
+    search.draftId = "draft-b"
+    promptValue = [{ type: "text", content: "draft b remains here", start: 0, end: 20 }]
+    release.resolve()
+    await request
+    expect(promotedDrafts).toEqual([])
+    expect(navigated).toEqual([])
+    expect(promptValue[0]).toMatchObject({ content: "draft b remains here" })
+    expect(sessionPromptValue[0]).toMatchObject({ content: "" })
+  })
+  test("does not reuse another draft's prepared session after failed admission", async () => {
+    selected = "main"
+    currentPathname = "/new-session"
+    search.draftId = "draft-a"
+    sessionIDOverride = "session-a"
+    queueError = new Error("offline")
+    const submit = createSubmit()
+    await submit.handleSubmit(new Event("submit"), "queue")
+    search.draftId = "draft-b"
+    sessionIDOverride = "session-b"
+    queueError = undefined
+    await submit.handleSubmit(new Event("submit"), "queue")
+    expect(createdSessions).toHaveLength(2)
+    expect(queuedInputs[0]).toMatchObject({ sessionID: "session-a" })
+    expect(queuedInputs[1]).toMatchObject({ sessionID: "session-b" })
+    expect(promotedDrafts).toEqual([{ draftID: "draft-b", server: "project-server", sessionId: "session-b" }])
   })
   test("captures context immutably and preserves in-place edits during admission", async () => {
     params.id = "ses_queue"
