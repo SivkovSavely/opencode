@@ -32,6 +32,8 @@ import { batch, onMount } from "solid-js"
 import path from "path"
 import { useKV } from "./kv"
 import { usePermission } from "./permission"
+import { createQueueController } from "../queue/controller"
+import { createQueueAPI } from "../queue/api"
 
 const emptyConsoleState: ConsoleState = {
   consoleManagedProviders: [],
@@ -146,6 +148,9 @@ export const {
     const event = useEvent()
     const project = useProject()
     const sdk = useSDK()
+    const queue = createQueueController(
+      createQueueAPI(sdk.client, (sessionID) => store.session.find((session) => session.id === sessionID)),
+    )
 
     const fullSyncedSessions = new Set<string>()
     const syncingSessions = new Map<string, Promise<void>>()
@@ -175,6 +180,12 @@ export const {
 
     event.subscribe((event, { directory, workspace }) => {
       switch (event.type) {
+        case "session.queue.changed":
+          queue.changed(event.properties.sessionID, event.properties.revision)
+          break
+        case "server.connected":
+          queue.reconnect()
+          break
         case "server.instance.disposed":
           void bootstrap()
           break
@@ -557,6 +568,7 @@ export const {
 
     const result = {
       data: store,
+      queue,
       set: setStore,
       get status() {
         return store.status

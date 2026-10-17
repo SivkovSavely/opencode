@@ -336,8 +336,8 @@ export const { use: useEditorContext, provider: EditorContextProvider } = create
       preserveSelectionFromNewSession() {
         preserveSelectionOnReconnect = true
       },
-      markSelectionSent() {
-        if (!store.selection) return
+      markSelectionSent(expectedKey = editorSelectionKey(store.selection)) {
+        if (!store.selection || editorSelectionKey(store.selection) !== expectedKey) return
         setStore("selectionSent", true)
       },
       labelState(): EditorLabelState {

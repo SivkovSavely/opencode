@@ -240,14 +240,6 @@ export function Session() {
   const visible = createMemo(() => !session()?.parentID && permissions().length === 0 && questions().length === 0)
   const disabled = createMemo(() => permissions().length > 0 || questions().length > 0)
 
-  const pending = createMemo(() => {
-    const completed = messages().findLastIndex((message) => message.role === "assistant" && message.time.completed)
-    const pending = messages().findLastIndex(
-      (message, index) => index > completed && message.role === "assistant" && !message.time.completed,
-    )
-    return pending === -1 ? undefined : pending
-  })
-
   const lastAssistant = createMemo(() => {
     return messages().findLast((x) => x.role === "assistant")
   })
@@ -285,6 +277,7 @@ export function Session() {
 
   createEffect(() => {
     const sessionID = route.sessionID
+    void sync.queue.refresh(sessionID).catch(() => {})
     void (async () => {
       const previousWorkspace = untrack(() => project.workspace.current())
       const result = await sdk.client.session.get({ sessionID }, { throwOnError: true })
@@ -1279,7 +1272,7 @@ export function Session() {
                           }}
                           message={message as UserMessage}
                           parts={sync.data.part[message.id] ?? []}
-                          pending={pending()}
+                          steering={sync.queue.steering(route.sessionID, message.id)}
                         />
                       </Match>
                       <Match when={message.role === "assistant"}>
@@ -1366,7 +1359,7 @@ function UserMessage(props: {
   parts: Part[]
   onMouseUp: () => void
   index: number
-  pending?: number
+  steering: boolean
 }) {
   const ctx = use()
   const local = useLocal()
@@ -1384,10 +1377,9 @@ function UserMessage(props: {
   const files = createMemo(() => props.parts.flatMap((x) => (x.type === "file" ? [x] : [])))
   const { theme } = useTheme()
   const [hover, setHover] = createSignal(false)
-  const queued = createMemo(() => props.pending !== undefined && props.index > props.pending)
   const color = createMemo(() => local.agent.color(props.message.agent))
-  const queuedFg = createMemo(() => selectedForeground(theme, color()))
-  const metadataVisible = createMemo(() => queued() || ctx.showTimestamps())
+  const steeringFg = createMemo(() => selectedForeground(theme, color()))
+  const metadataVisible = createMemo(() => props.steering || ctx.showTimestamps())
 
   const compaction = createMemo(() => props.parts.find((x) => x.type === "compaction"))
 
@@ -1435,7 +1427,7 @@ function UserMessage(props: {
               </box>
             </Show>
             <Show
-              when={queued()}
+              when={props.steering}
               fallback={
                 <Show when={ctx.showTimestamps()}>
                   <text fg={theme.textMuted}>
@@ -1447,7 +1439,7 @@ function UserMessage(props: {
               }
             >
               <text fg={theme.textMuted}>
-                <span style={{ bg: color(), fg: queuedFg(), bold: true }}> QUEUED </span>
+                <span style={{ bg: color(), fg: steeringFg(), bold: true }}> STEERING </span>
               </text>
             </Show>
           </box>

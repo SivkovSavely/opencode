@@ -57,6 +57,10 @@ import { usePromptWorkspace } from "./workspace"
 import { usePromptMove } from "./move"
 import { readLocalAttachment } from "./local-attachment"
 import { useLocation } from "../../context/location"
+import { QueueCommand } from "@opencode-ai/schema/queue-command"
+import { queuePayload } from "../../queue/payload"
+import { DialogQueue } from "../dialog-queue"
+import { DialogConfirm } from "../../ui/dialog-confirm"
 
 registerOpencodeSpinner()
 
@@ -335,6 +339,30 @@ export function Prompt(props: PromptProps) {
   const promptCommands = createMemo(() =>
     [
       {
+        title: "Queue information",
+        desc: "Show the queue; /queue <input> submits to the queue",
+        name: "session.queue.list",
+        category: "Session",
+        slashName: "queue",
+        run: () => {
+          if (!props.sessionID) {
+            toast.show({ variant: "info", message: "No session queue yet" })
+            return
+          }
+          dialog.replace(() => <DialogQueue sessionID={props.sessionID!} info />)
+        },
+      },
+      {
+        title: "Manage queue",
+        name: "session.queued_prompts",
+        category: "Session",
+        enabled: Boolean(props.sessionID),
+        slashName: "queues",
+        run: () => {
+          if (props.sessionID) dialog.replace(() => <DialogQueue sessionID={props.sessionID!} />)
+        },
+      },
+      {
         title: "Clear prompt",
         name: "prompt.clear",
         category: "Prompt",
@@ -576,6 +604,7 @@ export function Prompt(props: PromptProps) {
       "session.interrupt",
       "workspace.set",
       "session.move",
+      "session.queued_prompts",
     ]),
   }))
 
@@ -928,6 +957,7 @@ export function Prompt(props: PromptProps) {
   })
 
   let submitting = false
+  let queueRetry: { fingerprint: string; id: string; sessionID?: string } | undefined
   async function submit() {
     // Prevent overlapping invocations (e.g. a double-pressed Enter, or the
     // input's native onSubmit racing another dispatch). Without this guard,
@@ -958,6 +988,74 @@ export function Prompt(props: PromptProps) {
     if (workspace.creating() || move.creating()) return false
     if (auto()?.visible) return false
     if (!store.prompt.input) return false
+    const inputText = expandTrackedPastedText(
+      store.prompt.input,
+      input.extmarks.getAllForTypeId(promptPartTypeId).flatMap((extmark) => {
+        const partIndex = store.extmarkToPartIndex.get(extmark.id)
+        const part = partIndex === undefined ? undefined : store.prompt.parts[partIndex]
+        if (part?.type !== "text") return []
+        return [{ start: extmark.start, end: extmark.end, text: part.text }]
+      }),
+    )
+    const queued =
+      store.mode === "normal"
+        ? QueueCommand.parse(
+            inputText,
+            store.prompt.parts.some((part) => part.type !== "text"),
+          )
+        : undefined
+    if (queued?.type === "error") {
+      toast.show({ variant: "error", message: queued.message })
+      return false
+    }
+    if (queued && queued.type !== "enqueue") {
+      const original = store.prompt.input
+      const sessionID = props.sessionID
+      if (!sessionID) {
+        toast.show({ variant: "info", message: "No session queue yet" })
+        return false
+      }
+      if (queued.type === "manage" || queued.type === "list") {
+        clearPrompt()
+        dialog.replace(() => <DialogQueue sessionID={sessionID} info={queued.type === "list"} />)
+        return false
+      }
+      const snapshot = await sync.queue.refresh(sessionID).catch(() => undefined)
+      if (!snapshot) {
+        toast.show({ variant: "error", message: sync.queue.data.errors[sessionID] ?? "Failed to load queue" })
+        return false
+      }
+      const success =
+        queued.type === "start" || queued.type === "stop"
+          ? await sync.queue.update(sessionID, { action: "pause", paused: queued.type === "stop" })
+          : queued.type === "flush"
+            ? await sync.queue.flush(sessionID)
+            : await (async () => {
+                const pending = sync.queue.pending(sessionID, "queue")
+                const ids = queued.indices.map((index) => pending[index - 1]?.id)
+                if (ids.some((id) => !id)) {
+                  toast.show({ variant: "error", message: "Queue item number is out of range" })
+                  return false
+                }
+                const confirmed = await DialogConfirm.show(
+                  dialog,
+                  "Clear queue",
+                  queued.indices.length
+                    ? `Delete queue items ${queued.indices.join(", ")}?`
+                    : "Clear all pending queued items?",
+                )
+                if (!confirmed) return false
+                if (!ids.length) return sync.queue.update(sessionID, { action: "clear" })
+                for (const id of ids) {
+                  if (!(await sync.queue.update(sessionID, { action: "delete", id: id! }))) return false
+                }
+                return true
+              })()
+      if (success && store.prompt.input === original) clearPrompt()
+      if (!success && sync.queue.data.errors[sessionID])
+        toast.show({ variant: "error", message: sync.queue.data.errors[sessionID]! })
+      return false
+    }
     const agent = local.agent.current()
     if (!agent) return false
     const trimmed = store.prompt.input.trim()
@@ -987,7 +1085,41 @@ export function Prompt(props: PromptProps) {
     }
 
     const variant = local.model.variant.current()
-    let sessionID = props.sessionID
+    const draft = structuredClone(unwrap(store.prompt))
+    const currentMode = store.mode
+    const nonTextParts = draft.parts.filter((part) => part.type !== "text")
+    const editorSelection = editorContext()
+    const selectionKey = editorSelectionKey(editorSelection)
+    const editorParts =
+      editorSelection && editor.labelState() === "pending"
+        ? [
+            {
+              type: "text" as const,
+              text: formatEditorContext(editorSelection),
+              synthetic: true,
+              metadata: {
+                kind: "editor_context",
+                source: editorSelection.source ?? "editor",
+                filePath: editorSelection.filePath,
+                ranges: editorSelection.ranges,
+              },
+            },
+          ]
+        : []
+    const payload =
+      queued?.type === "enqueue"
+        ? queuePayload(
+            queued,
+            { agent: agent.name, model: selectedModel, variant },
+            [...editorParts, ...nonTextParts],
+            inputText,
+          )
+        : undefined
+    const fingerprint = payload
+      ? JSON.stringify([props.sessionID, payload, queued?.type === "enqueue" && queued.front])
+      : undefined
+    if (fingerprint && queueRetry?.fingerprint !== fingerprint) queueRetry = { fingerprint, id: crypto.randomUUID() }
+    let sessionID = props.sessionID ?? (fingerprint ? queueRetry?.sessionID : undefined)
     let finishMoveProgress = false
     if (sessionID == null) {
       const selectedWorkspace = workspace.selection()
@@ -1021,42 +1153,23 @@ export function Prompt(props: PromptProps) {
       }
 
       sessionID = res.data.id
+      if (payload && queueRetry) queueRetry.sessionID = sessionID
     }
-
-    const inputText = expandTrackedPastedText(
-      store.prompt.input,
-      input.extmarks.getAllForTypeId(promptPartTypeId).flatMap((extmark) => {
-        const partIndex = store.extmarkToPartIndex.get(extmark.id)
-        const part = partIndex === undefined ? undefined : store.prompt.parts[partIndex]
-        if (part?.type !== "text") return []
-        return [{ start: extmark.start, end: extmark.end, text: part.text }]
-      }),
-    )
-
-    // Filter out text parts (pasted content) since they're now expanded inline
-    const nonTextParts = store.prompt.parts.filter((part) => part.type !== "text")
-
-    // Capture mode before it gets reset
-    const currentMode = store.mode
-    const editorSelection = editorContext()
-    const editorParts =
-      editorSelection && editor.labelState() === "pending"
-        ? [
-            {
-              type: "text" as const,
-              text: formatEditorContext(editorSelection),
-              synthetic: true,
-              metadata: {
-                kind: "editor_context",
-                source: editorSelection.source ?? "editor",
-                filePath: editorSelection.filePath,
-                ranges: editorSelection.ranges,
-              },
-            },
-          ]
-        : []
-
-    if (store.mode === "shell") {
+    if (payload && queued?.type === "enqueue") {
+      move.startSubmit()
+      const success = await sync.queue.submit(sessionID, { id: queueRetry!.id, payload, front: queued.front })
+      if (!success) {
+        if (finishMoveProgress) move.finishSubmit()
+        toast.show({
+          title: "Failed to queue input",
+          message: sync.queue.data.errors[sessionID] ?? "Queue is busy",
+          variant: "error",
+        })
+        return false
+      }
+      queueRetry = undefined
+      if (editorParts.length && payload.kind === "prompt") editor.markSelectionSent(selectionKey)
+    } else if (store.mode === "shell") {
       move.startSubmit()
       void sdk.client.session.shell({
         sessionID,
@@ -1120,15 +1233,16 @@ export function Prompt(props: PromptProps) {
       if (editorParts.length > 0) editor.markSelectionSent()
     }
     history.append({
-      ...store.prompt,
+      ...draft,
       mode: currentMode,
     })
-    input.extmarks.clear()
-    setStore("prompt", {
-      input: "",
-      parts: [],
-    })
-    setStore("extmarkToPartIndex", new Map())
+    const unchanged = input.plainText === draft.input && JSON.stringify(unwrap(store.prompt)) === JSON.stringify(draft)
+    if (unchanged) {
+      input.clear()
+      input.extmarks.clear()
+      setStore("prompt", { input: "", parts: [] })
+      setStore("extmarkToPartIndex", new Map())
+    }
     props.onSubmit?.()
 
     // temporary hack to make sure the message is sent
@@ -1141,7 +1255,6 @@ export function Prompt(props: PromptProps) {
         })
       }, 50)
     }
-    input.clear()
     if (finishMoveProgress) move.finishSubmit()
     return true
   }
@@ -1654,6 +1767,15 @@ export function Prompt(props: PromptProps) {
           </Switch>
           <Show when={status().type !== "retry"}>
             <box gap={2} flexDirection="row">
+              <Show when={props.sessionID && sync.queue.pending(props.sessionID, "queue").length > 0}>
+                <text
+                  fg={theme.secondary}
+                  onMouseUp={() => dialog.replace(() => <DialogQueue sessionID={props.sessionID!} />)}
+                >
+                  Queue({sync.queue.pending(props.sessionID!, "queue").length})
+                  {sync.queue.data.snapshots[props.sessionID!]?.paused ? " paused" : ""}
+                </text>
+              </Show>
               <Show when={editorContextLabelState() !== "none" ? editorFileLabelDisplay() : undefined}>
                 {(file) => (
                   <text fg={editorContextLabelState() === "pending" ? theme.secondary : theme.textMuted}>{file()}</text>
