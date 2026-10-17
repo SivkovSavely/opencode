@@ -66,7 +66,6 @@ import { useLayout } from "@/context/layout"
 import { useSessionKey } from "@/pages/session/session-layout"
 import { useSessionArchive } from "@/pages/session/session-archive"
 import { useServerSDK } from "@/context/server-sdk"
-import { authTokenFromCredentials } from "@/utils/server"
 import { usePlatform } from "@/context/platform"
 import { useSettings } from "@/context/settings"
 import { legacySessionHref, requireServerKey, sessionHref } from "@/utils/session-route"
@@ -718,25 +717,25 @@ export function MessageTimeline(props: {
   }
 
   const retryNow = async (id: string, retry: { attempt: number; next: number }) => {
+    const client = sdk().client
     try {
-      const server = serverSDK().server.http
-      const url = new URL(`/session/${encodeURIComponent(id)}/retry`, server.url)
-      url.searchParams.set("directory", sdk().directory)
-      const response = await (platform.fetch ?? fetch)(url, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          ...(server.password
-            ? { Authorization: `Basic ${authTokenFromCredentials({ username: server.username, password: server.password })}` }
-            : {}),
-        },
-        body: JSON.stringify(retry),
-      })
-      if (!response.ok) throw new Error(language.t("common.requestFailed"))
-      const result = (await response.json()) as { accepted: boolean }
-      if (!result.accepted) throw new Error(language.t("common.requestFailed"))
+      const result = await client.session.retry({
+        sessionID: id,
+        attempt: retry.attempt,
+        next: retry.next,
+      }, { throwOnError: true })
+      return result.data.accepted === true
     } catch (err) {
-      showToast({ title: language.t("common.requestFailed"), description: errorMessage(err) })
+      const current = sessionStatus()
+      if (
+        sessionID() === id &&
+        current.type === "retry" &&
+        current.attempt === retry.attempt &&
+        current.next === retry.next
+      ) {
+        showToast({ title: language.t("common.requestFailed"), description: errorMessage(err) })
+      }
+      throw err
     }
   }
 
@@ -1277,15 +1276,19 @@ export function MessageTimeline(props: {
       }
       case "Retry": {
         const retryRow = row as Accessor<TimelineRowByTag<"Retry">>
-        const retrySessionID = sessionID()
         return (
           <TimelineRowFrame row={retryRow}>
             <div data-slot="session-turn-message-container" class="w-full px-4 md:px-5">
               <SessionRetry
                 status={sessionStatus()}
                 show={activeMessageID() === retryRow().userMessageID}
-                onRetry={retrySessionID && serverSDK().protocolKind() === "v2"
-                  ? (current) => retryNow(retrySessionID, { attempt: current.attempt, next: current.next })
+                retryKey={sessionID()}
+                onRetry={sessionID()
+                  ? (current) => {
+                      const id = sessionID()
+                      if (!id) return Promise.resolve(false)
+                      return retryNow(id, { attempt: current.attempt, next: current.next })
+                    }
                   : undefined}
               />
             </div>

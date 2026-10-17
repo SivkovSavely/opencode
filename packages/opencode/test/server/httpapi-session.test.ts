@@ -235,6 +235,41 @@ afterEach(async () => {
 })
 
 describe("session HttpApi", () => {
+  it.instance(
+    "decodes manual retry requests and safely rejects non-waiting sessions",
+    () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        const session = yield* createSession({ title: "manual retry contract" })
+        const endpoint = pathFor(SessionPaths.retry, { sessionID: session.id })
+        const headers = { "x-opencode-directory": test.directory, "content-type": "application/json" }
+
+        const response = yield* request(endpoint, {
+          headers,
+          method: "POST",
+          body: JSON.stringify({ attempt: 1, next: Date.now() + 60_000 }),
+        })
+        expect(response.status).toBe(200)
+        expect(yield* responseJson(response)).toEqual({ accepted: false })
+
+        const stale = yield* request(endpoint, {
+          headers,
+          method: "POST",
+          body: JSON.stringify({ attempt: 0, next: Date.now() + 60_000 }),
+        })
+        expect(stale.status).toBe(200)
+        expect(yield* responseJson(stale)).toEqual({ accepted: false })
+
+        const invalid = yield* request(endpoint, {
+          headers,
+          method: "POST",
+          body: JSON.stringify({ attempt: 1 }),
+        })
+        expect(invalid.status).toBe(400)
+      }),
+    { git: true, config: { formatter: false, lsp: false } },
+  )
+
   it.effect("maps busy sessions to public session busy errors", () =>
     Effect.gen(function* () {
       const sessionID = SessionID.descending()

@@ -5,7 +5,12 @@ import { Card } from "@opencode-ai/ui/card"
 import { Tooltip } from "@opencode-ai/ui/tooltip"
 import { Spinner } from "@opencode-ai/ui/spinner"
 
-export function SessionRetry(props: { status: SessionStatus; show?: boolean; onRetry?: (status: Extract<SessionStatus, { type: "retry" }>) => Promise<void> }) {
+export function SessionRetry(props: {
+  status: SessionStatus
+  show?: boolean
+  retryKey?: string
+  onRetry?: (status: Extract<SessionStatus, { type: "retry" }>) => Promise<boolean>
+}) {
   const i18n = useI18n()
   const retry = createMemo(() => {
     if (props.status.type !== "retry") return
@@ -13,6 +18,18 @@ export function SessionRetry(props: { status: SessionStatus; show?: boolean; onR
   })
   const [seconds, setSeconds] = createSignal(0)
   const [pending, setPending] = createSignal(false)
+  const [accepted, setAccepted] = createSignal<string>()
+  const generation = createMemo(() => {
+    const current = retry()
+    if (!current) return
+    return `${props.retryKey ?? ""}:${current.attempt}:${current.next}`
+  })
+  createEffect(
+    on(generation, () => {
+      setAccepted(undefined)
+      setPending(false)
+    }),
+  )
   createEffect(
     on(retry, (current) => {
       if (!current) return
@@ -76,14 +93,17 @@ export function SessionRetry(props: { status: SessionStatus; show?: boolean; onR
                           <button
                             type="button"
                             class="underline disabled:opacity-50"
-                            disabled={pending()}
+                            disabled={pending() || accepted() === generation()}
                             onClick={async () => {
-                              if (pending()) return
+                              const key = generation()
+                              if (!key || pending() || accepted() === key) return
                               setPending(true)
                               try {
-                                await props.onRetry?.(current())
+                                if (await props.onRetry?.(current())) setAccepted(key)
+                              } catch {
+                                // The callback reports transport failures in its owning session context.
                               } finally {
-                                setPending(false)
+                                if (generation() === key) setPending(false)
                               }
                             }}
                           >
