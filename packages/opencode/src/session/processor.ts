@@ -691,19 +691,14 @@ const layer = Layer.effect(
                       messageLength: info.message.length,
                       action: info.action,
                     })
-                    yield* Effect.all(
-                      [
-                        status.set(ctx.sessionID, {
-                          type: "retry",
-                          attempt: info.attempt,
-                          message: info.message,
-                          action: info.action,
-                          next: info.next,
-                        }),
-                        runtime.retry(ctx.sessionID, info.next),
-                      ],
-                      { discard: true },
-                    )
+                    yield* runtime.retry(ctx.sessionID, info.next, info.attempt)
+                    yield* status.set(ctx.sessionID, {
+                      type: "retry",
+                      attempt: info.attempt,
+                      message: info.message,
+                      action: info.action,
+                      next: info.next,
+                    })
                   }),
                 wait: (duration) =>
                   Effect.gen(function* () {
@@ -713,19 +708,25 @@ const layer = Layer.effect(
                       provider: input.model.providerID,
                       waitMs,
                     })
-                    const timerWon = yield* Effect.raceFirst(
-                      Effect.sleep(duration).pipe(Effect.as(true)),
-                      runtime.awaitDraining.pipe(Effect.as(false)),
+                    const scheduled = status.get(ctx.sessionID)
+                    const retryStatus = yield* scheduled
+                    if (retryStatus.type !== "retry") return yield* new RuntimeLifecycle.RuntimeDrainingError({ message: "Retry status was cleared" })
+                    const outcome = yield* Effect.raceFirst(
+                      Effect.sleep(duration).pipe(Effect.as("deadline" as const)),
+                      Effect.raceFirst(
+                        runtime.awaitRetryWake(ctx.sessionID, retryStatus.attempt, retryStatus.next).pipe(Effect.as("manual" as const)),
+                        runtime.awaitDraining.pipe(Effect.as("drain" as const)),
+                      ),
                     )
-                    const resumed = timerWon ? yield* runtime.resumeRetry(ctx.sessionID) : undefined
+                    const resumed = outcome !== "drain" ? yield* runtime.resumeRetry(ctx.sessionID) : undefined
                     yield* Effect.logInfo("restart diagnostic retry wait ended", {
                       sessionID: ctx.sessionID,
                       provider: input.model.providerID,
-                      outcome: timerWon ? "retry_deadline" : "runtime_drain",
+                      outcome: outcome === "deadline" ? "retry_deadline" : outcome === "manual" ? "manual_retry" : "runtime_drain",
                       waitMs,
                       resumeRetry: resumed,
                     })
-                    if (!timerWon || !resumed) {
+                    if (outcome === "drain" || !resumed) {
                       yield* new RuntimeLifecycle.RuntimeDrainingError({ message: "Runtime is draining" })
                     }
                     yield* status.set(ctx.sessionID, { type: "busy" })

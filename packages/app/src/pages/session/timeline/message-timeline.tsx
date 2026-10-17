@@ -66,6 +66,7 @@ import { useLayout } from "@/context/layout"
 import { useSessionKey } from "@/pages/session/session-layout"
 import { useSessionArchive } from "@/pages/session/session-archive"
 import { useServerSDK } from "@/context/server-sdk"
+import { authTokenFromCredentials } from "@/utils/server"
 import { usePlatform } from "@/context/platform"
 import { useSettings } from "@/context/settings"
 import { legacySessionHref, requireServerKey, sessionHref } from "@/utils/session-route"
@@ -716,6 +717,29 @@ export function MessageTimeline(props: {
     return language.t("common.requestFailed")
   }
 
+  const retryNow = async (id: string, retry: { attempt: number; next: number }) => {
+    try {
+      const server = serverSDK().server.http
+      const url = new URL(`/session/${encodeURIComponent(id)}/retry`, server.url)
+      url.searchParams.set("directory", sdk().directory)
+      const response = await (platform.fetch ?? fetch)(url, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          ...(server.password
+            ? { Authorization: `Basic ${authTokenFromCredentials({ username: server.username, password: server.password })}` }
+            : {}),
+        },
+        body: JSON.stringify(retry),
+      })
+      if (!response.ok) throw new Error(language.t("common.requestFailed"))
+      const result = (await response.json()) as { accepted: boolean }
+      if (!result.accepted) throw new Error(language.t("common.requestFailed"))
+    } catch (err) {
+      showToast({ title: language.t("common.requestFailed"), description: errorMessage(err) })
+    }
+  }
+
   const shareMutation = useMutation(() => ({
     mutationFn: (id: string) => serverSDK().client.session.share({ sessionID: id }),
     onError: (err) => {
@@ -1253,10 +1277,17 @@ export function MessageTimeline(props: {
       }
       case "Retry": {
         const retryRow = row as Accessor<TimelineRowByTag<"Retry">>
+        const retrySessionID = sessionID()
         return (
           <TimelineRowFrame row={retryRow}>
             <div data-slot="session-turn-message-container" class="w-full px-4 md:px-5">
-              <SessionRetry status={sessionStatus()} show={activeMessageID() === retryRow().userMessageID} />
+              <SessionRetry
+                status={sessionStatus()}
+                show={activeMessageID() === retryRow().userMessageID}
+                onRetry={retrySessionID && serverSDK().protocolKind() === "v2"
+                  ? (current) => retryNow(retrySessionID, { attempt: current.attempt, next: current.next })
+                  : undefined}
+              />
             </div>
           </TimelineRowFrame>
         )

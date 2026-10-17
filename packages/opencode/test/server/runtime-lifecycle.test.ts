@@ -1254,6 +1254,27 @@ describe("runtime lifecycle", () => {
     }),
   )
 
+  it.effect("accepts one manual wake for the current retry attempt only", () =>
+    Effect.gen(function* () {
+      const database = yield* Database.Service
+      const scope = yield* Scope.Scope
+      const sessionID = yield* seedSession(database)
+      const runtime = RuntimeLifecycle.make({ lineage: randomUUID(), instance: randomUUID() }, scope, database)
+      const retryAt = (yield* Clock.currentTimeMillis) + 60_000
+      yield* runtime.admit({ sessionID, directory: "/tmp" })
+      yield* runtime.retry(sessionID, retryAt, 1)
+
+      const waiting = yield* runtime.awaitRetryWake(sessionID, 1, retryAt).pipe(Effect.forkChild)
+      expect(yield* runtime.wakeRetry(sessionID, 2, retryAt)).toBe(false)
+      expect(yield* runtime.wakeRetry(sessionID, 1, retryAt)).toBe(true)
+      expect(yield* runtime.wakeRetry(sessionID, 1, retryAt)).toBe(false)
+      yield* Fiber.join(waiting)
+      expect(yield* runtime.resumeRetry(sessionID)).toBe(true)
+      expect(yield* runtime.wakeRetry(sessionID, 1, retryAt)).toBe(false)
+      expect(yield* execution(database, sessionID)).toEqual({ state: "active", retry_at: null })
+    }),
+  )
+
   it.effect("drain parks a retry without losing its deadline", () =>
     Effect.gen(function* () {
       const database = yield* Database.Service

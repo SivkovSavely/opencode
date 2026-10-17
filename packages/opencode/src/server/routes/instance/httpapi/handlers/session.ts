@@ -15,6 +15,7 @@ import { SessionQueueV1 } from "@opencode-ai/schema/v1/session-queue"
 import { SessionRevert } from "@/session/revert"
 import { SessionRunState } from "@/session/run-state"
 import { SessionStatus } from "@/session/status"
+import { RuntimeLifecycle } from "@/server/runtime-lifecycle"
 import { SessionSummary } from "@/session/summary"
 import { Todo } from "@/session/todo"
 import { MessageID, PartID, SessionID } from "@/session/schema"
@@ -66,6 +67,7 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
     const agentSvc = yield* Agent.Service
     const permissionSvc = yield* Permission.Service
     const statusSvc = yield* SessionStatus.Service
+    const runtime = yield* RuntimeLifecycle.Service
     const todoSvc = yield* Todo.Service
     const summary = yield* SessionSummary.Service
     const events = yield* EventV2Bridge.Service
@@ -242,6 +244,14 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
     const abort = Effect.fn("SessionHttpApi.abort")(function* (ctx: { params: { sessionID: SessionID } }) {
       yield* promptSvc.cancel(ctx.params.sessionID)
       return true
+    })
+
+    const retry = Effect.fn("SessionHttpApi.retry")(function* (ctx: {
+      params: { sessionID: SessionID }
+      payload: { attempt: number; next: number }
+    }) {
+      yield* requireSession(ctx.params.sessionID)
+      return { accepted: yield* runtime.wakeRetry(ctx.params.sessionID, ctx.payload.attempt, ctx.payload.next) }
     })
 
     const init = Effect.fn("SessionHttpApi.init")(function* (ctx: {
@@ -496,6 +506,7 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       .handle("update", update)
       .handleRaw("fork", forkRaw)
       .handle("abort", abort)
+      .handle("retry", retry)
       .handle("init", init)
       .handle("share", share)
       .handle("unshare", unshare)

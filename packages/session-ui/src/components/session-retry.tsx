@@ -5,13 +5,14 @@ import { Card } from "@opencode-ai/ui/card"
 import { Tooltip } from "@opencode-ai/ui/tooltip"
 import { Spinner } from "@opencode-ai/ui/spinner"
 
-export function SessionRetry(props: { status: SessionStatus; show?: boolean }) {
+export function SessionRetry(props: { status: SessionStatus; show?: boolean; onRetry?: (status: Extract<SessionStatus, { type: "retry" }>) => Promise<void> }) {
   const i18n = useI18n()
   const retry = createMemo(() => {
     if (props.status.type !== "retry") return
     return props.status
   })
   const [seconds, setSeconds] = createSignal(0)
+  const [pending, setPending] = createSignal(false)
   createEffect(
     on(retry, (current) => {
       if (!current) return
@@ -64,7 +65,36 @@ export function SessionRetry(props: { status: SessionStatus; show?: boolean }) {
                   </div>
                 </Tooltip>
               </Show>
-              <Show when={info()}>{(line) => <div data-slot="session-turn-retry-info">{line()}</div>}</Show>
+              <Show when={info()}>
+                {(line) => (
+                  <div data-slot="session-turn-retry-info">
+                    {line()}
+                    <Show when={props.onRetry && retry()}>
+                      {(current) => (
+                        <>
+                          {" - "}
+                          <button
+                            type="button"
+                            class="underline disabled:opacity-50"
+                            disabled={pending()}
+                            onClick={async () => {
+                              if (pending()) return
+                              setPending(true)
+                              try {
+                                await props.onRetry?.(current())
+                              } finally {
+                                setPending(false)
+                              }
+                            }}
+                          >
+                            {i18n.t("ui.sessionTurn.retry.now")}
+                          </button>
+                        </>
+                      )}
+                    </Show>
+                  </div>
+                )}
+              </Show>
             </div>
           </div>
         </Card>

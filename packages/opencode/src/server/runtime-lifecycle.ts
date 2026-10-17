@@ -87,7 +87,9 @@ export type Interface = {
   readonly beforeTurn: (sessionID: string) => Effect.Effect<boolean>
   readonly ownershipFence: (sessionID: string) => Effect.Effect<number | undefined>
   readonly checkpoint: (sessionID: string) => Effect.Effect<boolean>
-  readonly retry: (sessionID: string, retryAt: number) => Effect.Effect<void>
+  readonly retry: (sessionID: string, retryAt: number, attempt?: number) => Effect.Effect<void>
+  readonly wakeRetry: (sessionID: string, attempt: number, retryAt: number) => Effect.Effect<boolean>
+  readonly awaitRetryWake: (sessionID: string, attempt: number, retryAt: number) => Effect.Effect<void>
   readonly resumeRetry: (sessionID: string) => Effect.Effect<boolean>
   readonly park: (sessionID: string) => Effect.Effect<void>
   readonly complete: (sessionID: string) => Effect.Effect<void>
@@ -343,6 +345,7 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
   const stopped = Deferred.makeUnsafe<{ action: Action }>()
   const recoveryPermits = Semaphore.makeUnsafe(2)
   const notificationClaims = new Set<string>()
+  const retryWakes = new Map<string, { attempt: number; retryAt: number; deferred: Deferred.Deferred<void> }>()
   const recoveryPreparedSessions = new Set<string>()
   const databaseRef: { current?: Database.Interface } = { current: database }
 
@@ -855,6 +858,7 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
   })
 
   const cancel = Effect.fn("RuntimeLifecycle.cancel")(function* (sessionID: string) {
+    retryWakes.delete(sessionID)
     const decision = yield* SynchronizedRef.modifyEffect(
       ref,
       Effect.fnUntraced(function* (state) {
@@ -931,6 +935,7 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
         ] as const
       }),
     )
+    for (const id of [sessionID, ...decision.cancelled]) retryWakes.delete(id)
     if (!decision.owner) return false
     yield* Effect.forEach([sessionID, ...decision.cancelled], notifyParentIdle, {
       concurrency: "unbounded",
@@ -1253,6 +1258,7 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
         })
         const active = new Map(state.active)
         active.delete(sessionID)
+        retryWakes.delete(sessionID)
         const result: ReleaseResult = {
           released: true,
           reason: "removed",
@@ -1302,6 +1308,7 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
         })
         const active = new Map(state.active)
         active.delete(sessionID)
+        retryWakes.delete(sessionID)
         return [true, { ...state, active }] as const
       }),
     )
@@ -1338,6 +1345,7 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
         })
         const active = new Map(state.active)
         active.delete(sessionID)
+        retryWakes.delete(sessionID)
         return [current.fence, { ...state, active }] as const
       }),
     )
@@ -1434,7 +1442,8 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
     return false
   })
 
-  const retry = Effect.fn("RuntimeLifecycle.retry")(function* (sessionID: string, retryAt: number) {
+  const retry = Effect.fn("RuntimeLifecycle.retry")(function* (sessionID: string, retryAt: number, attempt = 0) {
+    const deferred = yield* Deferred.make<void>()
     const result = yield* SynchronizedRef.modifyEffect(
       ref,
       Effect.fnUntraced(function* (state) {
@@ -1454,8 +1463,10 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
         const active = new Map(state.active)
         if (state.phase === "running") {
           active.set(sessionID, { ...current, mode: "retry_wait", retryAt })
+          retryWakes.set(sessionID, { attempt, retryAt, deferred })
         } else {
           active.delete(sessionID)
+          retryWakes.delete(sessionID)
         }
         const result: RetryResult = {
           parked: state.phase !== "running",
@@ -1478,6 +1489,27 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
       instance: identity.instance,
     })
     if (result.parked) yield* checkQuiescent()
+  })
+
+  const wakeRetry = Effect.fn("RuntimeLifecycle.wakeRetry")(function* (sessionID: string, attempt: number, retryAt: number) {
+    const state = SynchronizedRef.getUnsafe(ref)
+    const current = state.active.get(sessionID)
+    const wake = retryWakes.get(sessionID)
+    if (
+      state.phase !== "running" ||
+      state.cancelling.has(sessionID) ||
+      current?.mode !== "retry_wait" ||
+      current.retryAt !== retryAt ||
+      wake?.attempt !== attempt ||
+      wake.retryAt !== retryAt
+    ) return false
+    return yield* Deferred.succeed(wake.deferred, undefined)
+  })
+
+  const awaitRetryWake = Effect.fn("RuntimeLifecycle.awaitRetryWake")(function* (sessionID: string, attempt: number, retryAt: number) {
+    const wake = retryWakes.get(sessionID)
+    if (wake?.attempt !== attempt || wake.retryAt !== retryAt) return yield* Effect.never
+    return yield* Deferred.await(wake.deferred)
   })
 
   const resumeRetry = Effect.fn("RuntimeLifecycle.resumeRetry")(function* (sessionID: string) {
@@ -1503,6 +1535,7 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
         })
         const active = new Map(state.active)
         active.set(sessionID, { ...current, mode: "active", retryAt: undefined })
+        retryWakes.delete(sessionID)
         const result: ResumeResult = { resumed: true, phase: state.phase, mode: current.mode, fence: current.fence }
         return [result, { ...state, active }] as const
       }),
@@ -1593,6 +1626,7 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
         })
         const active = new Map(state.active)
         active.delete(sessionID)
+        retryWakes.delete(sessionID)
         return [current.fence, { ...state, active }] as const
       }),
     )
@@ -2166,6 +2200,8 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
     ownershipFence,
     checkpoint,
     retry,
+    wakeRetry,
+    awaitRetryWake,
     resumeRetry,
     park,
     complete,
@@ -2204,6 +2240,8 @@ export function unavailable(): Interface {
     ownershipFence: () => Effect.succeed(undefined),
     checkpoint: () => Effect.succeed(true),
     retry: () => Effect.void,
+    wakeRetry: () => Effect.succeed(false),
+    awaitRetryWake: () => Effect.never,
     resumeRetry: () => Effect.succeed(true),
     park: () => Effect.void,
     complete: () => Effect.void,

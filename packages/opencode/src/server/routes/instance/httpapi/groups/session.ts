@@ -102,6 +102,7 @@ export const SessionPaths = {
   init: `${root}/:sessionID/init`,
   summarize: `${root}/:sessionID/summarize`,
   prompt: `${root}/:sessionID/message`,
+  retry: `${root}/:sessionID/retry`,
   promptAsync: `${root}/:sessionID/prompt_async`,
   queue: `${root}/:sessionID/queue`,
   queueFlush: `${root}/:sessionID/queue/flush`,
@@ -271,6 +272,19 @@ export const SessionApi = HttpApi.make("session")
             identifier: "session.abort",
             summary: "Abort session",
             description: "Abort an active session and stop any ongoing AI processing or command execution.",
+          }),
+        ),
+        HttpApiEndpoint.post("retry", SessionPaths.retry, {
+          params: { sessionID: SessionID },
+          query: WorkspaceRoutingQuery,
+          payload: Schema.Struct({ attempt: Schema.Number, next: Schema.Number }),
+          success: described(Schema.Struct({ accepted: Schema.Boolean }), "Manual retry result"),
+          error: [HttpApiError.BadRequest, ApiNotFoundError],
+        }).annotateMerge(
+          OpenApi.annotations({
+            identifier: "session.retry",
+            summary: "Retry session now",
+            description: "Wake the currently scheduled retry for this session, if its attempt and deadline still match.",
           }),
         ),
         HttpApiEndpoint.post("init", SessionPaths.init, {
