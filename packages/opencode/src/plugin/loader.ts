@@ -11,6 +11,7 @@ import {
 import { ConfigPlugin } from "@/config/plugin"
 import { ConfigPluginV1 } from "@opencode-ai/core/v1/config/plugin"
 import { InstallationVersion } from "@opencode-ai/core/installation/version"
+import { isLegacyQueuePlugin, QUEUE_PLUGIN_CONFLICT } from "./queue-conflict"
 
 export namespace PluginLoader {
   // A normalized plugin declaration derived from config before any filesystem or npm work happens.
@@ -91,6 +92,8 @@ export namespace PluginLoader {
     | { ok: false; stage: "missing"; value: Missing }
     | { ok: false; stage: "install" | "entry" | "compatibility"; error: unknown }
   > {
+    if (isLegacyQueuePlugin(plan.spec))
+      return { ok: false, stage: "compatibility", error: new Error(QUEUE_PLUGIN_CONFLICT) }
     // First make sure the plugin exists locally, installing npm plugins on demand.
     let target = ""
     try {
@@ -107,6 +110,8 @@ export namespace PluginLoader {
     } catch (error) {
       return { ok: false, stage: "entry", error }
     }
+    if (isLegacyQueuePlugin(plan.spec, base.pkg?.json))
+      return { ok: false, stage: "compatibility", error: new Error(QUEUE_PLUGIN_CONFLICT) }
     if (!base.entry)
       return {
         ok: false,
@@ -134,6 +139,7 @@ export namespace PluginLoader {
 
   // Import the resolved module only after all earlier validation has succeeded.
   export async function load(row: Resolved): Promise<{ ok: true; value: Loaded } | { ok: false; error: unknown }> {
+    if (isLegacyQueuePlugin(row.spec, row.pkg?.json)) return { ok: false, error: new Error(QUEUE_PLUGIN_CONFLICT) }
     let mod
     try {
       mod = await import(row.entry)

@@ -51,6 +51,7 @@ export type Event =
   | EventMessagePartDelta
   | EventSessionDiff
   | EventSessionError
+  | EventSessionQueueChanged
   | EventInstallationUpdated
   | EventInstallationUpdateAvailable
   | EventFileEdited
@@ -1224,6 +1225,14 @@ export type GlobalEvent = {
             | ContextOverflowError
             | ContentFilterError
             | ApiError
+        }
+      }
+    | {
+        id: string
+        type: "session.queue.changed"
+        properties: {
+          sessionID: string
+          revision: number
         }
       }
     | {
@@ -2614,6 +2623,23 @@ export type SubtaskPartInput = {
   command?: string
 }
 
+export type SessionNotFoundError = {
+  _tag: "SessionNotFoundError"
+  sessionID: string
+  message: string
+}
+
+export type ForbiddenError = {
+  _tag: "ForbiddenError"
+  message: string
+}
+
+export type ConflictError = {
+  _tag: "ConflictError"
+  message: string
+  resource?: string
+}
+
 export type SessionBusyError = {
   _tag: "SessionBusyError"
   sessionID: string
@@ -2718,22 +2744,10 @@ export type SessionActive = {
   type: "running"
 }
 
-export type SessionNotFoundError = {
-  _tag: "SessionNotFoundError"
-  sessionID: string
-  message: string
-}
-
 export type PromptInput = {
   text: string
   files?: Array<PromptInputFileAttachment>
   agents?: Array<PromptAgentAttachment>
-}
-
-export type ConflictError = {
-  _tag: "ConflictError"
-  message: string
-  resource?: string
 }
 
 export type ServiceUnavailableError = {
@@ -2806,7 +2820,7 @@ export type ProviderNotFoundError = {
   message: string
 }
 
-export type OutputFormat1 =
+export type OutputFormat2 =
   | {
       type: "text"
     }
@@ -2918,6 +2932,7 @@ export type V2Event =
   | MessagePartDelta
   | SessionDiff
   | SessionError
+  | SessionQueueChanged
   | InstallationUpdated
   | InstallationUpdateAvailable
   | FileEdited
@@ -2963,11 +2978,6 @@ export type V2Event =
   | ServerProjectsUpdated
 
 export type V2EventStream = string
-
-export type ForbiddenError = {
-  _tag: "ForbiddenError"
-  message: string
-}
 
 export type ProjectCopyError = {
   name: "ProjectCopyError"
@@ -3873,6 +3883,100 @@ export type PtyTicketConnectToken = {
   ticket: string
   expires_in: number
 }
+
+export type SessionQueueV1Delivery = "queue" | "steer"
+
+export type SessionQueueV1State = "pending" | "claimed" | "delivered" | "deleted" | "uncertain"
+
+export type SessionQueueV1Payload =
+  | {
+      kind: "prompt"
+      agent: string
+      model: {
+        providerID: string
+        modelID: string
+      }
+      variant?: string
+      parts: Array<TextPartInput | FilePartInput | AgentPartInput | SubtaskPartInput>
+      system?: string
+      format?: OutputFormat
+      tools?: {
+        [key: string]: boolean
+      }
+    }
+  | {
+      kind: "command"
+      agent: string
+      model: {
+        providerID: string
+        modelID: string
+      }
+      variant?: string
+      command: string
+      arguments: string
+      parts?: Array<FilePartInput>
+    }
+  | {
+      kind: "shell"
+      agent: string
+      model: {
+        providerID: string
+        modelID: string
+      }
+      variant?: string
+      command: string
+    }
+  | {
+      kind: "compact"
+      agent: string
+      model: {
+        providerID: string
+        modelID: string
+      }
+      variant?: string
+    }
+
+export type SessionQueueV1Entry = {
+  id: string
+  sessionID: string
+  delivery: SessionQueueV1Delivery
+  state: SessionQueueV1State
+  position: number
+  payload: SessionQueueV1Payload
+  messageID?: string
+  created: number
+}
+
+export type SessionQueueV1Snapshot = {
+  sessionID: string
+  revision: number
+  paused: boolean
+  blocked: boolean
+  items: Array<SessionQueueV1Entry>
+}
+
+export type SessionQueueV1Mutation =
+  | {
+      action: "pause"
+      paused: boolean
+    }
+  | {
+      action: "clear"
+    }
+  | {
+      action: "delete"
+      id: string
+    }
+  | {
+      action: "convert"
+      id: string
+      delivery: SessionQueueV1Delivery
+    }
+  | {
+      action: "reorder"
+      delivery: SessionQueueV1Delivery
+      ids: Array<string>
+    }
 
 export type WorkspaceEventConnectionStatus = {
   workspaceID: string
@@ -5385,6 +5489,24 @@ export type SessionError = {
   }
 }
 
+export type SessionQueueChanged = {
+  id: string
+  metadata?: {
+    [key: string]: unknown
+  }
+  type: "session.queue.changed"
+  durable?: {
+    aggregateID: string
+    seq: number
+    version: number
+  }
+  location?: LocationRef
+  data: {
+    sessionID: string
+    revision: number
+  }
+}
+
 export type InstallationUpdated = {
   id: string
   metadata?: {
@@ -6724,6 +6846,15 @@ export type EventSessionError = {
       | ContextOverflowError
       | ContentFilterError
       | ApiError
+  }
+}
+
+export type EventSessionQueueChanged = {
+  id: string
+  type: "session.queue.changed"
+  properties: {
+    sessionID: string
+    revision: number
   }
 }
 
@@ -10023,6 +10154,7 @@ export type SessionPromptData = {
     }
     agent?: string
     noReply?: boolean
+    idempotent?: boolean
     tools?: {
       [key: string]: boolean
     }
@@ -10370,6 +10502,7 @@ export type SessionPromptAsyncData = {
     }
     agent?: string
     noReply?: boolean
+    idempotent?: boolean
     tools?: {
       [key: string]: boolean
     }
@@ -10409,6 +10542,181 @@ export type SessionPromptAsyncResponses = {
 }
 
 export type SessionPromptAsyncResponse = SessionPromptAsyncResponses[keyof SessionPromptAsyncResponses]
+
+export type SessionQueueListData = {
+  body?: never
+  path: {
+    sessionID: string
+  }
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/session/{sessionID}/queue"
+}
+
+export type SessionQueueListErrors = {
+  /**
+   * InvalidRequestError
+   */
+  400: InvalidRequestError
+  /**
+   * ForbiddenError
+   */
+  403: ForbiddenError
+  /**
+   * SessionNotFoundError
+   */
+  404: SessionNotFoundError
+  /**
+   * ConflictError
+   */
+  409: ConflictError
+}
+
+export type SessionQueueListError = SessionQueueListErrors[keyof SessionQueueListErrors]
+
+export type SessionQueueListResponses = {
+  /**
+   * SessionQueueV1.Snapshot
+   */
+  200: SessionQueueV1Snapshot
+}
+
+export type SessionQueueListResponse = SessionQueueListResponses[keyof SessionQueueListResponses]
+
+export type SessionQueueUpdateData = {
+  body?: {
+    revision: number
+    mutation: SessionQueueV1Mutation
+  }
+  path: {
+    sessionID: string
+  }
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/session/{sessionID}/queue"
+}
+
+export type SessionQueueUpdateErrors = {
+  /**
+   * InvalidRequestError
+   */
+  400: InvalidRequestError
+  /**
+   * ForbiddenError
+   */
+  403: ForbiddenError
+  /**
+   * SessionNotFoundError
+   */
+  404: SessionNotFoundError
+  /**
+   * ConflictError
+   */
+  409: ConflictError
+}
+
+export type SessionQueueUpdateError = SessionQueueUpdateErrors[keyof SessionQueueUpdateErrors]
+
+export type SessionQueueUpdateResponses = {
+  /**
+   * SessionQueueV1.Snapshot
+   */
+  200: SessionQueueV1Snapshot
+}
+
+export type SessionQueueUpdateResponse = SessionQueueUpdateResponses[keyof SessionQueueUpdateResponses]
+
+export type SessionQueueSubmitData = {
+  body?: {
+    id: string
+    payload: SessionQueueV1Payload
+    front?: boolean
+  }
+  path: {
+    sessionID: string
+  }
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/session/{sessionID}/queue"
+}
+
+export type SessionQueueSubmitErrors = {
+  /**
+   * InvalidRequestError
+   */
+  400: InvalidRequestError
+  /**
+   * ForbiddenError
+   */
+  403: ForbiddenError
+  /**
+   * SessionNotFoundError
+   */
+  404: SessionNotFoundError
+  /**
+   * ConflictError
+   */
+  409: ConflictError
+}
+
+export type SessionQueueSubmitError = SessionQueueSubmitErrors[keyof SessionQueueSubmitErrors]
+
+export type SessionQueueSubmitResponses = {
+  /**
+   * SessionQueueV1.Snapshot
+   */
+  200: SessionQueueV1Snapshot
+}
+
+export type SessionQueueSubmitResponse = SessionQueueSubmitResponses[keyof SessionQueueSubmitResponses]
+
+export type SessionQueueFlushData = {
+  body?: never
+  path: {
+    sessionID: string
+  }
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/session/{sessionID}/queue/flush"
+}
+
+export type SessionQueueFlushErrors = {
+  /**
+   * InvalidRequestError
+   */
+  400: InvalidRequestError
+  /**
+   * ForbiddenError
+   */
+  403: ForbiddenError
+  /**
+   * SessionNotFoundError
+   */
+  404: SessionNotFoundError
+  /**
+   * ConflictError
+   */
+  409: ConflictError
+}
+
+export type SessionQueueFlushError = SessionQueueFlushErrors[keyof SessionQueueFlushErrors]
+
+export type SessionQueueFlushResponses = {
+  /**
+   * SessionQueueV1.Snapshot
+   */
+  200: SessionQueueV1Snapshot
+}
+
+export type SessionQueueFlushResponse = SessionQueueFlushResponses[keyof SessionQueueFlushResponses]
 
 export type SessionCommandData = {
   body?: {

@@ -1,4 +1,5 @@
 import { PermissionV1 } from "@opencode-ai/core/v1/permission"
+import path from "node:path"
 import { Agent } from "@/agent/agent"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { EventV2Bridge } from "@/event-v2-bridge"
@@ -9,6 +10,8 @@ import { Session } from "@/session/session"
 import { SessionCompaction } from "@/session/compaction"
 import { MessageV2 } from "@/session/message-v2"
 import { SessionPrompt } from "@/session/prompt"
+import { SessionQueue } from "@/session/queue"
+import { SessionQueueV1 } from "@opencode-ai/schema/v1/session-queue"
 import { SessionRevert } from "@/session/revert"
 import { SessionRunState } from "@/session/run-state"
 import { SessionStatus } from "@/session/status"
@@ -36,7 +39,13 @@ import {
   SummarizePayload,
   UpdatePayload,
 } from "../groups/session"
-import { PermissionNotFoundError } from "../errors"
+import {
+  ConflictError,
+  ForbiddenError,
+  InvalidRequestError,
+  PermissionNotFoundError,
+  SessionNotFoundError,
+} from "../errors"
 import * as SessionError from "./session-errors"
 
 const tryParseJson = (text: string) =>
@@ -50,6 +59,7 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
     const session = yield* Session.Service
     const shareSvc = yield* SessionShare.Service
     const promptSvc = yield* SessionPrompt.Service
+    const queueSvc = yield* SessionQueue.Service
     const revertSvc = yield* SessionRevert.Service
     const compactSvc = yield* SessionCompaction.Service
     const runState = yield* SessionRunState.Service
@@ -328,6 +338,68 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       return HttpApiSchema.NoContent.make()
     })
 
+    const queueError = (sessionID: SessionID) => (error: SessionQueue.QueueError) => {
+      if (error.reason === "not_found") return new SessionNotFoundError({ sessionID, message: error.message })
+      if (error.reason === "scope") return new ForbiddenError({ message: error.message })
+      if (error.reason === "invalid") return new InvalidRequestError({ message: error.message })
+      return new ConflictError({ resource: sessionID, message: error.message })
+    }
+
+    const queueScope = Effect.fn("SessionHttpApi.queueScope")(function* (sessionID: SessionID) {
+      const snapshot = yield* queueSvc.list(sessionID).pipe(Effect.mapError(queueError(sessionID)))
+      const current = yield* session.get(sessionID).pipe(Effect.orDie)
+      const request = yield* HttpServerRequest.HttpServerRequest
+      const url = new URL(request.url, "http://localhost")
+      const directory = yield* Effect.try({
+        try: () =>
+          url.searchParams.get("directory") ??
+          (request.headers["x-opencode-directory"]
+            ? decodeURIComponent(request.headers["x-opencode-directory"])
+            : undefined),
+        catch: () => new InvalidRequestError({ message: "Invalid directory encoding" }),
+      })
+      const workspace = url.searchParams.get("workspace") ?? request.headers["x-opencode-workspace"]
+      if (
+        (directory && path.resolve(directory) !== path.resolve(current.directory)) ||
+        (workspace && workspace !== current.workspaceID)
+      )
+        return yield* new ForbiddenError({ message: "Session is outside the requested directory/workspace" })
+      return snapshot
+    })
+
+    const queueList = (ctx: { params: { sessionID: SessionID } }) => queueScope(ctx.params.sessionID)
+
+    const queueSubmit = (ctx: { params: { sessionID: SessionID }; payload: SessionQueueV1.Submit }) =>
+      queueScope(ctx.params.sessionID).pipe(
+        Effect.andThen(() =>
+          promptSvc
+            .queueSubmit(ctx.params.sessionID, ctx.payload)
+            .pipe(Effect.mapError(queueError(ctx.params.sessionID))),
+        ),
+      )
+
+    const queueUpdate = (ctx: { params: { sessionID: SessionID }; payload: SessionQueueV1.Update }) =>
+      queueScope(ctx.params.sessionID).pipe(
+        Effect.andThen(() =>
+          promptSvc
+            .queueUpdate(ctx.params.sessionID, ctx.payload)
+            .pipe(
+              Effect.mapError((error) =>
+                error._tag === "SessionQueueError"
+                  ? queueError(ctx.params.sessionID)(error)
+                  : new InvalidRequestError({ message: error.message }),
+              ),
+            ),
+        ),
+      )
+
+    const queueFlush = (ctx: { params: { sessionID: SessionID } }) =>
+      queueScope(ctx.params.sessionID).pipe(
+        Effect.andThen(() =>
+          promptSvc.queueFlush(ctx.params.sessionID).pipe(Effect.mapError(queueError(ctx.params.sessionID))),
+        ),
+      )
+
     const command = Effect.fn("SessionHttpApi.command")(function* (ctx: {
       params: { sessionID: SessionID }
       payload: typeof CommandPayload.Type
@@ -430,6 +502,10 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       .handle("summarize", summarize)
       .handle("prompt", prompt)
       .handle("promptAsync", promptAsync)
+      .handle("queueList", queueList)
+      .handle("queueSubmit", queueSubmit)
+      .handle("queueUpdate", queueUpdate)
+      .handle("queueFlush", queueFlush)
       .handle("command", command)
       .handle("shell", shell)
       .handle("revert", revert)

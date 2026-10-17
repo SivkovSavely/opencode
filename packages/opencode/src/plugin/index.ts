@@ -202,6 +202,7 @@ const layer = Layer.effect(
                 }
 
                 if (stage === "compatibility") {
+                  bridge.fork(Effect.logWarning(`Plugin ${spec} skipped: ${message}`))
                   publishPluginError(`Plugin ${spec} skipped: ${message}`)
                   return
                 }

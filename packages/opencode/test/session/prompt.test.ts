@@ -38,6 +38,8 @@ import { SessionProcessor } from "../../src/session/processor"
 import { SessionPrompt } from "../../src/session/prompt"
 import { SessionRevert } from "../../src/session/revert"
 import { SessionRunState } from "../../src/session/run-state"
+import { SessionQueue } from "../../src/session/queue"
+import { SessionQueueV1 } from "@opencode-ai/schema/v1/session-queue"
 import { MessageID, PartID, SessionID } from "../../src/session/schema"
 import { SessionStatus } from "../../src/session/status"
 import { SessionV2 } from "@opencode-ai/core/session"
@@ -191,6 +193,7 @@ const promptRoot = LayerNode.group([
   BackgroundJob.node,
   SessionStatus.node,
   SessionRunState.node,
+  SessionQueue.node,
   Database.node,
   EventV2Bridge.node,
   Question.node,
@@ -248,7 +251,8 @@ function makeHttp(input?: {
   ] as const
   if (input?.plugin) {
     const withPlugin = [...replacements, [Plugin.node, input.plugin]] as const
-    if (input.processor === "blocking") return LayerNode.compile(root, [...withPlugin, [SessionProcessor.node, blockingProcessor]])
+    if (input.processor === "blocking")
+      return LayerNode.compile(root, [...withPlugin, [SessionProcessor.node, blockingProcessor]])
     return LayerNode.compile(root, withPlugin)
   }
   if (input?.processor === "blocking") {
@@ -262,6 +266,40 @@ function makeHttpNoLLMServer(input?: { mcpInstructions?: MCP.ServerInstructions[
 }
 
 const it = testEffect(makeHttp())
+const makeOwnedRuntime = (archiveAfterAdmission = false) =>
+  makeHttp().pipe(
+    Layer.provideMerge(
+      Layer.effect(
+        RuntimeLifecycle.Service,
+        Effect.gen(function* () {
+          const database = yield* Database.Service
+          const scope = yield* Scope.Scope
+          const previous = RuntimeLifecycle.current() ?? RuntimeLifecycle.unavailable()
+          const runtime = RuntimeLifecycle.make({ lineage: randomUUID() }, scope, database)
+          const service = archiveAfterAdmission
+            ? {
+                ...runtime,
+                admit: (input: Parameters<RuntimeLifecycle.Interface["admit"]>[0]) =>
+                  runtime
+                    .admit(input)
+                    .pipe(
+                      Effect.tap(() =>
+                        database.db
+                          .run(sql`UPDATE session SET time_archived = ${Date.now()} WHERE id = ${input.sessionID}`)
+                          .pipe(Effect.orDie),
+                      ),
+                    ),
+              }
+            : runtime
+          RuntimeLifecycle.setCurrent(service)
+          yield* Effect.addFinalizer(() => Effect.sync(() => RuntimeLifecycle.setCurrent(previous)))
+          return service
+        }),
+      ).pipe(Layer.provide(LayerNode.compile(Database.node))),
+    ),
+  )
+const ownedRuntime = testEffect(makeOwnedRuntime())
+const archivingRuntime = testEffect(makeOwnedRuntime(true))
 const noLLMServer = testEffect(makeHttpNoLLMServer())
 const raceNoLLMServer = testEffect(makeHttpNoLLMServer({ processor: "blocking" }))
 const withMcpInstructions = testEffect(
@@ -291,6 +329,24 @@ const mutatingTaskPlugin = Layer.succeed(
   }),
 )
 const withMutatingTaskPlugin = testEffect(makeHttp({ plugin: mutatingTaskPlugin }))
+const withCallbackPlugin = testEffect(
+  makeHttp({
+    plugin: Layer.effect(
+      Plugin.Service,
+      Effect.gen(function* () {
+        const database = yield* Database.Service
+        const trigger: Plugin.Interface["trigger"] = (name, _input, output) =>
+          name === "chat.message"
+            ? // Emulate a plugin HTTP callback without inheriting the caller's transaction.
+              Effect.promise(() =>
+                Effect.runPromise(database.db.get(sql`SELECT value FROM queue_callback_probe`)),
+              ).pipe(Effect.as(output))
+            : Effect.succeed(output)
+        return Plugin.Service.of({ trigger, list: () => Effect.succeed([]), init: () => Effect.void })
+      }),
+    ).pipe(Layer.provide(LayerNode.compile(Database.node))),
+  }),
+)
 const unix = process.platform !== "win32" ? it.instance : it.instance.skip
 const unixNoLLMServer = process.platform !== "win32" ? noLLMServer.instance : noLLMServer.instance.skip
 
@@ -481,6 +537,899 @@ const boot = Effect.fn("test.boot")(function* (input?: { title?: string }) {
 })
 
 // Loop semantics
+
+const queuedPrompt = (text: string): SessionQueueV1.Payload => ({
+  kind: "prompt",
+  agent: "build",
+  model: ref,
+  parts: [{ type: "text", text }],
+})
+
+it.instance("native queue waits for success and drains only one input at a time", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const { prompt, sessions, chat } = yield* boot()
+    const queue = yield* SessionQueue.Service
+    const first = yield* Deferred.make<void>()
+    const second = yield* Deferred.make<void>()
+    yield* llm.hold("initial result", deferredAsPromise(first))
+    yield* llm.hold("first queued result", deferredAsPromise(second))
+    yield* llm.text("second queued result")
+    const running = yield* prompt
+      .prompt({ sessionID: chat.id, agent: "build", model: ref, parts: [{ type: "text", text: "initial input" }] })
+      .pipe(Effect.forkChild)
+    yield* llm.wait(1)
+    yield* prompt.queueSubmit(chat.id, { id: "queue-one", payload: queuedPrompt("queued-one") })
+    yield* prompt.queueSubmit(chat.id, { id: "queue-two", payload: queuedPrompt("queued-two") })
+    expect(
+      (yield* sessions.messages({ sessionID: chat.id })).filter((message) => message.info.role === "user"),
+    ).toHaveLength(1)
+    expect((yield* queue.list(chat.id)).items.map((item) => item.state)).toEqual(["pending", "pending"])
+    yield* Deferred.succeed(first, undefined)
+    yield* llm.wait(2)
+    expect((yield* queue.get(chat.id, "queue-one")).state).toBe("delivered")
+    expect((yield* queue.get(chat.id, "queue-one")).messageID).toBe(MessageID.make("msg_queue_queue-one"))
+    expect((yield* queue.get(chat.id, "queue-two")).state).toBe("pending")
+    expect(JSON.stringify((yield* llm.hits)[1].body)).not.toContain("queued-two")
+    yield* Deferred.succeed(second, undefined)
+    yield* Fiber.join(running)
+    expect(yield* llm.calls).toBe(3)
+    expect((yield* queue.list(chat.id)).items).toEqual([])
+  }),
+)
+
+it.instance("native queue idle admission respects pause and front ordering", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const { prompt, chat } = yield* boot()
+    const queue = yield* SessionQueue.Service
+    const paused = yield* queue.list(chat.id)
+    yield* prompt.queueUpdate(chat.id, { revision: paused.revision, mutation: { action: "pause", paused: true } })
+    yield* prompt.queueSubmit(chat.id, { id: "back", payload: queuedPrompt("back-input") })
+    yield* prompt.queueSubmit(chat.id, { id: "front", front: true, payload: queuedPrompt("front-input") })
+    expect(yield* llm.calls).toBe(0)
+    yield* llm.text("front-result")
+    yield* llm.text("back-result")
+    yield* prompt.queueResume(chat.id)
+    yield* llm.wait(2)
+    const hits = yield* llm.hits
+    expect(JSON.stringify(hits[0].body)).toContain("front-input")
+    expect(JSON.stringify(hits[0].body)).not.toContain("back-input")
+    expect(JSON.stringify(hits[1].body)).toContain("back-input")
+    yield* prompt.loop({ sessionID: chat.id })
+    expect((yield* queue.list(chat.id)).items).toEqual([])
+  }),
+)
+
+it.instance("native queue steer reorder changes provider history and the selected parent", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const { prompt, sessions, chat } = yield* boot()
+    const queue = yield* SessionQueue.Service
+    const ready = yield* Deferred.make<void>()
+    yield* llm.hold("initial result", deferredAsPromise(ready))
+    yield* llm.text("steered result")
+    const running = yield* prompt
+      .prompt({ sessionID: chat.id, model: ref, parts: [{ type: "text", text: "initial" }] })
+      .pipe(Effect.forkChild)
+    yield* llm.wait(1)
+    const one = yield* prompt.prompt({
+      sessionID: chat.id,
+      noReply: true,
+      parts: [{ type: "text", text: "steer-one" }],
+    })
+    const two = yield* prompt.prompt({
+      sessionID: chat.id,
+      noReply: true,
+      parts: [{ type: "text", text: "steer-two" }],
+    })
+    const active = (yield* sessions.messages({ sessionID: chat.id })).find(
+      (message) => message.info.role === "assistant",
+    )
+    if (!active) throw new Error("missing active assistant")
+    // A steer can persist after the snapshot but before its assistant is created.
+    yield* sessions.updateMessage({ ...one.info, time: { created: active.info.time.created - 1 } })
+    const pending = yield* queue.list(chat.id)
+    expect(pending.items.map((item) => item.messageID)).toEqual([one.info.id, two.info.id])
+    yield* prompt.queueUpdate(chat.id, {
+      revision: pending.revision,
+      mutation: { action: "reorder", delivery: "steer", ids: [two.info.id, one.info.id] },
+    })
+    yield* Deferred.succeed(ready, undefined)
+    const result = yield* Fiber.join(running)
+    const body = JSON.stringify((yield* llm.hits)[1].body)
+    expect(body.indexOf("initial result")).toBeLessThan(body.indexOf("steer-two"))
+    expect(body.indexOf("steer-two")).toBeLessThan(body.indexOf("steer-one"))
+    expect(result.info.role === "assistant" && result.info.parentID).toBe(one.info.id)
+    yield* prompt.loop({ sessionID: chat.id })
+    expect(yield* llm.calls).toBe(2)
+    const consumed = yield* prompt
+      .queueUpdate(chat.id, {
+        revision: (yield* queue.list(chat.id)).revision,
+        mutation: { action: "convert", id: one.info.id, delivery: "queue" },
+      })
+      .pipe(Effect.exit)
+    expect(Exit.isFailure(consumed)).toBe(true)
+  }),
+)
+
+it.instance("native queue conversion removes the steer bubble before the next boundary", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const { prompt, sessions, chat } = yield* boot()
+    const queue = yield* SessionQueue.Service
+    const ready = yield* Deferred.make<void>()
+    yield* llm.hold("initial result", deferredAsPromise(ready))
+    const running = yield* prompt
+      .prompt({ sessionID: chat.id, model: ref, parts: [{ type: "text", text: "initial" }] })
+      .pipe(Effect.forkChild)
+    yield* llm.wait(1)
+    const steer = yield* prompt.prompt({
+      sessionID: chat.id,
+      noReply: true,
+      parts: [{ type: "text", text: "not-yet" }],
+    })
+    yield* prompt.queueUpdate(chat.id, {
+      revision: (yield* queue.list(chat.id)).revision,
+      mutation: { action: "convert", id: steer.info.id, delivery: "queue" },
+    })
+    expect(
+      (yield* sessions.messages({ sessionID: chat.id })).some((message) => message.info.id === steer.info.id),
+    ).toBe(false)
+    yield* prompt.queueUpdate(chat.id, {
+      revision: (yield* queue.list(chat.id)).revision,
+      mutation: { action: "pause", paused: true },
+    })
+    yield* Deferred.succeed(ready, undefined)
+    yield* Fiber.join(running)
+    expect(yield* llm.calls).toBe(1)
+    expect((yield* queue.get(chat.id, steer.info.id)).state).toBe("pending")
+  }),
+)
+
+it.instance("native queue conversion to steer bypasses queue pause but not the running turn", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const { prompt, sessions, chat } = yield* boot()
+    const queue = yield* SessionQueue.Service
+    const ready = yield* Deferred.make<void>()
+    yield* llm.hold("initial result", deferredAsPromise(ready))
+    yield* llm.text("converted result")
+    const running = yield* prompt
+      .prompt({ sessionID: chat.id, model: ref, parts: [{ type: "text", text: "initial" }] })
+      .pipe(Effect.forkChild)
+    yield* llm.wait(1)
+    yield* prompt.queueSubmit(chat.id, { id: "converted", payload: queuedPrompt("converted-input") })
+    yield* prompt.queueUpdate(chat.id, {
+      revision: (yield* queue.list(chat.id)).revision,
+      mutation: { action: "pause", paused: true },
+    })
+    yield* prompt.queueUpdate(chat.id, {
+      revision: (yield* queue.list(chat.id)).revision,
+      mutation: { action: "convert", id: "converted", delivery: "steer" },
+    })
+    expect(
+      (yield* sessions.messages({ sessionID: chat.id })).some((message) => message.info.id === "msg_queue_converted"),
+    ).toBe(true)
+    expect(yield* llm.calls).toBe(1)
+    yield* Deferred.succeed(ready, undefined)
+    yield* Fiber.join(running)
+    expect(JSON.stringify((yield* llm.hits)[1].body)).toContain("converted-input")
+    expect((yield* queue.get(chat.id, "converted")).state).toBe("delivered")
+  }),
+)
+
+it.instance("native queue wakes retain pending steering when a paused enqueue replaces a shell advisory", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const { prompt, chat } = yield* boot()
+    const queue = yield* SessionQueue.Service
+    const state = yield* SessionRunState.Service
+    const seeded = yield* seed(chat.id, { finish: "stop" })
+    const release = yield* Deferred.make<void>()
+    const ready = yield* Deferred.make<void>()
+    const shell = yield* state
+      .startShell(
+        chat.id,
+        Effect.succeed({ info: seeded.assistant, parts: [] }),
+        Deferred.succeed(ready, undefined).pipe(
+          Effect.andThen(Deferred.await(release)),
+          Effect.as({ info: seeded.assistant, parts: [] }),
+        ),
+      )
+      .pipe(Effect.forkChild)
+    yield* Deferred.await(ready)
+    yield* prompt.queueUpdate(chat.id, { revision: 0, mutation: { action: "pause", paused: true } })
+    yield* prompt.queueSubmit(chat.id, { id: "steering-wake", payload: queuedPrompt("must steer") })
+    yield* prompt.queueUpdate(chat.id, {
+      revision: (yield* queue.list(chat.id)).revision,
+      mutation: { action: "convert", id: "steering-wake", delivery: "steer" },
+    })
+    yield* prompt.queueSubmit(chat.id, { id: "paused-wake", payload: queuedPrompt("must wait") })
+    yield* llm.text("steered after shell")
+    yield* Deferred.succeed(release, undefined)
+    yield* Fiber.join(shell)
+    yield* llm.wait(1)
+    yield* prompt.loop({ sessionID: chat.id })
+    expect(JSON.stringify((yield* llm.hits)[0].body)).toContain("must steer")
+    expect(JSON.stringify((yield* llm.hits)[0].body)).not.toContain("must wait")
+    expect((yield* queue.get(chat.id, "steering-wake")).state).toBe("delivered")
+    expect((yield* queue.get(chat.id, "paused-wake")).state).toBe("pending")
+  }),
+)
+
+it.instance("native queue requeued legacy steers preserve resolved parts without expanding attachments twice", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const { prompt, sessions, chat } = yield* boot()
+    const queue = yield* SessionQueue.Service
+    const original = yield* prompt.prompt({
+      sessionID: chat.id,
+      model: ref,
+      agent: "build",
+      variant: "default",
+      noReply: true,
+      parts: [
+        { type: "file", mime: "text/plain", filename: "inline.txt", url: "data:text/plain;base64,YXR0YWNobWVudA==" },
+      ],
+    })
+    const entry = yield* queue.get(chat.id, original.info.id)
+    expect(entry.payload.agent).toBe("build")
+    expect(entry.payload.model).toEqual(ref)
+    expect(entry.payload.variant).toBe("default")
+    expect(entry.payload.kind === "prompt" && entry.payload.parts.length).toBe(original.parts.length)
+    yield* prompt.queueUpdate(chat.id, {
+      revision: (yield* queue.list(chat.id)).revision,
+      mutation: { action: "convert", id: original.info.id, delivery: "queue" },
+    })
+    yield* llm.text("attachment result")
+    yield* prompt.queueResume(chat.id)
+    yield* llm.wait(1)
+    yield* prompt.loop({ sessionID: chat.id })
+    const replayed = (yield* sessions.messages({ sessionID: chat.id })).find((message) => message.info.role === "user")
+    expect(replayed?.parts.filter((part) => part.type === "text").map((part) => part.text)).toEqual(
+      original.parts.filter((part) => part.type === "text").map((part) => part.text),
+    )
+    expect(replayed?.info.role === "user" && replayed.info.model.variant).toBe("default")
+  }),
+)
+
+it.instance("native queue concurrent flushes coalesce at a successful boundary", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const { prompt, chat } = yield* boot()
+    const queue = yield* SessionQueue.Service
+    const ready = yield* Deferred.make<void>()
+    yield* llm.hold("initial result", deferredAsPromise(ready))
+    yield* llm.text("first flushed result")
+    yield* llm.text("second flushed result")
+    const running = yield* prompt
+      .prompt({ sessionID: chat.id, model: ref, parts: [{ type: "text", text: "initial" }] })
+      .pipe(Effect.forkChild)
+    yield* llm.wait(1)
+    yield* prompt.queueSubmit(chat.id, { id: "flush-one", payload: queuedPrompt("flush-one-input") })
+    yield* prompt.queueSubmit(chat.id, { id: "flush-two", payload: queuedPrompt("flush-two-input") })
+    yield* prompt.queueUpdate(chat.id, {
+      revision: (yield* queue.list(chat.id)).revision,
+      mutation: { action: "pause", paused: true },
+    })
+    yield* Effect.all([prompt.queueFlush(chat.id), prompt.queueFlush(chat.id)], { concurrency: "unbounded" })
+    yield* Deferred.succeed(ready, undefined)
+    yield* Fiber.join(running)
+    expect(yield* llm.calls).toBe(3)
+    expect((yield* queue.get(chat.id, "flush-two")).state).toBe("delivered")
+  }),
+)
+
+it.instance("native queue cancellation blocks pending inputs until explicit resume", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const { prompt, chat } = yield* boot()
+    const queue = yield* SessionQueue.Service
+    yield* llm.hang
+    const running = yield* prompt
+      .prompt({ sessionID: chat.id, model: ref, parts: [{ type: "text", text: "initial" }] })
+      .pipe(Effect.forkChild)
+    yield* llm.wait(1)
+    yield* prompt.queueSubmit(chat.id, { id: "cancel-one", payload: queuedPrompt("cancel-one-input") })
+    yield* prompt.cancel(chat.id)
+    yield* Fiber.join(running)
+    yield* prompt.queueSubmit(chat.id, { id: "cancel-two", payload: queuedPrompt("cancel-two-input") })
+    const blocked = yield* queue.list(chat.id)
+    expect(blocked.blocked).toBe(true)
+    expect(blocked.items.map((item) => item.state)).toEqual(["pending", "pending"])
+    expect(yield* llm.calls).toBe(1)
+    yield* llm.text("resumed-one")
+    yield* llm.text("resumed-two")
+    const resumed = yield* prompt.queueUpdate(chat.id, {
+      revision: blocked.revision,
+      mutation: { action: "pause", paused: false },
+    })
+    expect(resumed.blocked).toBe(false)
+    yield* llm.wait(3)
+    yield* prompt.loop({ sessionID: chat.id })
+    expect((yield* queue.list(chat.id)).items).toEqual([])
+  }),
+)
+
+it.instance("native queue provider errors discard an in-flight explicit flush", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const { prompt, chat } = yield* boot()
+    const queue = yield* SessionQueue.Service
+    const ready = yield* Deferred.make<void>()
+    yield* llm.push(reply().wait(deferredAsPromise(ready)).contentFilter())
+    const running = yield* prompt
+      .prompt({ sessionID: chat.id, model: ref, parts: [{ type: "text", text: "initial" }] })
+      .pipe(Effect.forkChild)
+    yield* llm.wait(1)
+    yield* prompt.queueSubmit(chat.id, { id: "after-error", payload: queuedPrompt("after-error-input") })
+    yield* prompt.queueFlush(chat.id)
+    yield* Deferred.succeed(ready, undefined)
+    yield* Fiber.join(running)
+    const status = yield* SessionStatus.Service
+    yield* pollWithTimeout(
+      status.get(chat.id).pipe(Effect.map((value) => (value.type === "idle" ? true : undefined))),
+      "error completion left queue advisory active",
+    )
+    expect(yield* llm.calls).toBe(1)
+    expect((yield* queue.get(chat.id, "after-error")).state).toBe("pending")
+  }),
+)
+
+noLLMServer.instance(
+  "native queue recovery blocks pending inputs without replaying them",
+  () =>
+    Effect.gen(function* () {
+      const { prompt, sessions, chat } = yield* boot()
+      const queue = yield* SessionQueue.Service
+      const seeded = yield* seed(chat.id, { finish: "stop" })
+      yield* sessions.updateMessage({ ...seeded.assistant, time: { ...seeded.assistant.time, completed: Date.now() } })
+      yield* queue.enqueue(chat.id, { id: "after-recovery", payload: queuedPrompt("after-recovery-input") })
+      yield* prompt.recover(chat.id)
+      const snapshot = yield* queue.list(chat.id)
+      expect(snapshot.blocked).toBe(true)
+      expect(snapshot.items.map((item) => item.state)).toEqual(["pending"])
+    }),
+  { config: cfg },
+)
+
+it.instance("native queue idle flush serializes its snapshot without flushing later queued inputs", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const { prompt, chat } = yield* boot()
+    const queue = yield* SessionQueue.Service
+    yield* prompt.queueUpdate(chat.id, { revision: 0, mutation: { action: "pause", paused: true } })
+    yield* prompt.queueSubmit(chat.id, { id: "idle-one", payload: queuedPrompt("idle-one-input") })
+    yield* prompt.queueSubmit(chat.id, { id: "idle-two", payload: queuedPrompt("idle-two-input") })
+    const release = yield* Deferred.make<void>()
+    yield* llm.hold("idle result", deferredAsPromise(release))
+    yield* llm.text("second flushed result")
+    yield* prompt.queueFlush(chat.id)
+    yield* llm.wait(1)
+    yield* prompt.queueSubmit(chat.id, { id: "idle-three", payload: queuedPrompt("later-input") })
+    yield* prompt.queueFlush(chat.id)
+    yield* Deferred.succeed(release, undefined)
+    yield* prompt.loop({ sessionID: chat.id })
+    expect(yield* llm.calls).toBe(2)
+    expect((yield* queue.get(chat.id, "idle-two")).state).toBe("delivered")
+    expect((yield* queue.get(chat.id, "idle-three")).state).toBe("pending")
+  }),
+)
+
+it.instance("native queue an empty flush does not bypass pause for a later submission", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const { prompt, chat } = yield* boot()
+    yield* prompt.queueUpdate(chat.id, { revision: 0, mutation: { action: "pause", paused: true } })
+    yield* prompt.queueFlush(chat.id)
+    const snapshot = yield* prompt.queueSubmit(chat.id, {
+      id: "after-empty-flush",
+      payload: queuedPrompt("still paused"),
+    })
+    expect(snapshot.items.map((item) => item.state)).toEqual(["pending"])
+    expect(yield* llm.calls).toBe(0)
+  }),
+)
+
+it.instance("native queue explicit flush stops its remaining snapshot after a provider error", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const { prompt, chat } = yield* boot()
+    const queue = yield* SessionQueue.Service
+    yield* prompt.queueUpdate(chat.id, { revision: 0, mutation: { action: "pause", paused: true } })
+    yield* prompt.queueSubmit(chat.id, { id: "flush-error", payload: queuedPrompt("first input") })
+    yield* prompt.queueSubmit(chat.id, { id: "flush-after-error", payload: queuedPrompt("must remain pending") })
+    yield* llm.push(reply().contentFilter())
+    yield* prompt.queueFlush(chat.id)
+    yield* llm.wait(1)
+    const status = yield* SessionStatus.Service
+    yield* pollWithTimeout(
+      status.get(chat.id).pipe(Effect.map((value) => (value.type === "idle" ? true : undefined))),
+      "failed flush did not finish",
+    )
+    expect(yield* llm.calls).toBe(1)
+    expect((yield* queue.get(chat.id, "flush-after-error")).state).toBe("pending")
+    expect((yield* queue.list(chat.id)).blocked).toBe(true)
+  }),
+)
+
+it.instance("native queue commands materialize inside the runner without recursive admission", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig((url) => ({
+      ...providerCfg(url),
+      command: { queued: { template: "queued command $ARGUMENTS" } },
+    }))
+    const { prompt, sessions, chat } = yield* boot()
+    const queue = yield* SessionQueue.Service
+    yield* llm.text("command result")
+    yield* prompt.queueSubmit(chat.id, {
+      id: "command-entry",
+      payload: { kind: "command", agent: "build", model: ref, command: "queued", arguments: "example" },
+    })
+    yield* llm.wait(1)
+    yield* prompt.loop({ sessionID: chat.id })
+    expect(JSON.stringify((yield* llm.hits)[0].body)).toContain("queued command example")
+    const messages = yield* sessions.messages({ sessionID: chat.id })
+    expect(messages.filter((message) => message.info.role === "user").map((message) => message.info.id)).toEqual([
+      MessageID.make("msg_queue_command-entry"),
+    ])
+    expect((yield* queue.get(chat.id, "command-entry")).state).toBe("delivered")
+    expect(yield* llm.calls).toBe(1)
+  }),
+)
+
+unix("pending command conversions defer interpolation until an irreversible claim", () =>
+  Effect.gen(function* () {
+    const { directory } = yield* TestInstance
+    const file = path.join(directory, "converted-command-side-effect")
+    const { llm } = yield* useServerConfig((url) => ({
+      ...providerCfg(url),
+      command: { once: { template: `resolved !\`printf 'once\\n' >> '${file}'; printf command-output\`` } },
+    }))
+    const { prompt, sessions, chat } = yield* boot()
+    const queue = yield* SessionQueue.Service
+    const release = yield* Deferred.make<void>()
+    yield* llm.hold("initial result", deferredAsPromise(release))
+    yield* llm.text("command result")
+    const running = yield* prompt
+      .prompt({ sessionID: chat.id, model: ref, parts: [{ type: "text", text: "initial" }] })
+      .pipe(Effect.forkChild)
+    yield* llm.wait(1)
+    yield* prompt.queueSubmit(chat.id, {
+      id: "roundtrip-command",
+      payload: { kind: "command", agent: "build", model: ref, command: "once", arguments: "" },
+    })
+    for (const delivery of ["steer", "queue", "steer"] as const) {
+      yield* prompt.queueUpdate(chat.id, {
+        revision: (yield* queue.list(chat.id)).revision,
+        mutation: { action: "convert", id: "roundtrip-command", delivery },
+      })
+      expect(yield* Effect.promise(() => Bun.file(file).exists())).toBe(false)
+    }
+    yield* Deferred.succeed(release, undefined)
+    yield* Fiber.join(running)
+    expect(yield* Effect.promise(() => Bun.file(file).text())).toBe("once\n")
+    expect((yield* queue.get(chat.id, "roundtrip-command")).state).toBe("delivered")
+    const body = JSON.stringify((yield* llm.hits)[1].body)
+    expect(body).toContain("resolved command-output")
+    expect(body).not.toContain("/once")
+    const messages = yield* sessions.messages({ sessionID: chat.id })
+    expect(messages.filter((message) => message.info.id === "msg_queue_roundtrip-command")).toHaveLength(1)
+    expect(yield* llm.calls).toBe(2)
+  }),
+)
+
+unix("native queue shells persist delivery before executing and do not replay exact submissions", () =>
+  Effect.gen(function* () {
+    const { dir, llm } = yield* useServerConfig(providerCfg)
+    const { prompt, sessions, chat } = yield* boot()
+    const queue = yield* SessionQueue.Service
+    const file = path.join(dir, "queue-side-effect")
+    const submit = {
+      id: "shell-entry",
+      payload: { kind: "shell" as const, agent: "build", model: ref, command: `printf 'once\\n' >> '${file}'` },
+    }
+    yield* llm.text("shell result")
+    yield* prompt.queueSubmit(chat.id, submit)
+    yield* llm.wait(1)
+    yield* prompt.loop({ sessionID: chat.id })
+    yield* prompt.queueSubmit(chat.id, submit)
+    expect(yield* Effect.promise(() => Bun.file(file).text())).toBe("once\n")
+    expect((yield* queue.get(chat.id, submit.id)).state).toBe("delivered")
+    expect(
+      (yield* sessions.messages({ sessionID: chat.id })).some((message) => message.info.id === "msg_queue_shell-entry"),
+    ).toBe(true)
+    expect(yield* llm.calls).toBe(1)
+  }),
+)
+
+unix("native queue converted shell steers execute only at the runner boundary", () =>
+  Effect.gen(function* () {
+    const { dir, llm } = yield* useServerConfig(providerCfg)
+    const { prompt, sessions, chat } = yield* boot()
+    const queue = yield* SessionQueue.Service
+    const file = path.join(dir, "converted-shell-side-effect")
+    const release = yield* Deferred.make<void>()
+    yield* llm.hold("initial result", deferredAsPromise(release))
+    yield* llm.text("converted shell result")
+    const running = yield* prompt
+      .prompt({ sessionID: chat.id, model: ref, parts: [{ type: "text", text: "initial" }] })
+      .pipe(Effect.forkChild)
+    yield* llm.wait(1)
+    yield* prompt.queueSubmit(chat.id, {
+      id: "converted-shell",
+      payload: { kind: "shell", agent: "build", model: ref, command: `printf 'once\\n' >> '${file}'` },
+    })
+    yield* prompt.queueUpdate(chat.id, {
+      revision: (yield* queue.list(chat.id)).revision,
+      mutation: { action: "convert", id: "converted-shell", delivery: "steer" },
+    })
+    expect(yield* Effect.promise(() => Bun.file(file).exists())).toBe(false)
+    yield* Deferred.succeed(release, undefined)
+    yield* Fiber.join(running)
+    expect(yield* Effect.promise(() => Bun.file(file).text())).toBe("once\n")
+    expect(
+      (yield* sessions.messages({ sessionID: chat.id })).filter((message) => message.info.role === "user"),
+    ).toHaveLength(2)
+    expect((yield* queue.get(chat.id, "converted-shell")).state).toBe("delivered")
+  }),
+)
+
+noLLMServer.instance(
+  "native queue recovery does not start an unconsumed shell steer",
+  () =>
+    Effect.gen(function* () {
+      const { directory } = yield* TestInstance
+      const { prompt, sessions, chat } = yield* boot()
+      const queue = yield* SessionQueue.Service
+      const database = yield* Database.Service
+      const seeded = yield* seed(chat.id, { finish: "stop" })
+      yield* sessions.updateMessage({ ...seeded.assistant, time: { ...seeded.assistant.time, completed: Date.now() } })
+      const file = path.join(directory, "never-started-shell")
+      const snapshot = yield* queue.enqueue(chat.id, {
+        id: "recovered-shell",
+        payload: { kind: "shell", agent: "build", model: ref, command: `touch '${file}'` },
+      })
+      yield* database.db.transaction(
+        () =>
+          Effect.gen(function* () {
+            yield* queue.update(chat.id, {
+              revision: snapshot.revision,
+              mutation: { action: "convert", id: "recovered-shell", delivery: "steer" },
+            })
+            const bubble = yield* user(chat.id, "unconsumed shell")
+            yield* queue.attachSteer(chat.id, "recovered-shell", bubble.id)
+          }),
+        { behavior: "immediate" },
+      )
+      yield* prompt.recover(chat.id)
+      expect(yield* Effect.promise(() => Bun.file(file).exists())).toBe(false)
+      expect((yield* queue.get(chat.id, "recovered-shell")).state).toBe("pending")
+      expect((yield* queue.list(chat.id)).blocked).toBe(true)
+    }),
+  { config: cfg },
+)
+
+noLLMServer.instance(
+  "recovery excludes an unresolved claimed command instead of replaying its template or sending its source",
+  () =>
+    Effect.gen(function* () {
+      const { prompt, sessions, chat } = yield* boot()
+      const queue = yield* SessionQueue.Service
+      const seeded = yield* seed(chat.id, { finish: "stop" })
+      yield* sessions.updateMessage({ ...seeded.assistant, time: { ...seeded.assistant.time, completed: Date.now() } })
+      const snapshot = yield* queue.enqueue(chat.id, {
+        id: "uncertain-command",
+        payload: { kind: "command", agent: "build", model: ref, command: "must-not-resolve", arguments: "" },
+      })
+      yield* queue.update(chat.id, {
+        revision: snapshot.revision,
+        mutation: { action: "convert", id: "uncertain-command", delivery: "steer" },
+      })
+      const bubble = yield* user(chat.id, "/must-not-resolve")
+      yield* queue.attachSteer(chat.id, "uncertain-command", bubble.id)
+      expect((yield* queue.claimSteers(chat.id, [bubble.id]))[0].state).toBe("claimed")
+      yield* prompt.recover(chat.id)
+      expect((yield* queue.get(chat.id, "uncertain-command")).state).toBe("claimed")
+      expect((yield* queue.list(chat.id)).blocked).toBe(true)
+    }),
+  { config: cfg },
+)
+
+it.instance("native queue compaction creates a stable transcript boundary and drains the next input", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const { prompt, sessions, chat } = yield* boot()
+    const queue = yield* SessionQueue.Service
+    const seeded = yield* seed(chat.id, { finish: "stop" })
+    yield* sessions.updateMessage({ ...seeded.assistant, time: { ...seeded.assistant.time, completed: Date.now() } })
+    yield* queue.enqueue(chat.id, { id: "compact-entry", payload: { kind: "compact", agent: "build", model: ref } })
+    yield* queue.enqueue(chat.id, { id: "after-compact", payload: queuedPrompt("after-compact-input") })
+    yield* llm.text("compacted summary")
+    yield* llm.text("after compaction result")
+    yield* prompt.queueResume(chat.id)
+    yield* llm.wait(2)
+    yield* prompt.loop({ sessionID: chat.id })
+    const messages = yield* sessions.messages({ sessionID: chat.id })
+    expect(
+      messages
+        .find((message) => message.info.id === "msg_queue_compact-entry")
+        ?.parts.some((part) => part.type === "compaction"),
+    ).toBe(true)
+    expect((yield* queue.get(chat.id, "compact-entry")).state).toBe("delivered")
+    expect((yield* queue.get(chat.id, "after-compact")).state).toBe("delivered")
+  }),
+)
+
+archivingRuntime.instance("native queue releases admission when a session is archived before its claim", () =>
+  Effect.gen(function* () {
+    const { prompt, chat } = yield* boot()
+    const runtime = yield* RuntimeLifecycle.Service
+    const state = yield* SessionRunState.Service
+    const database = yield* Database.Service
+    yield* prompt.queueSubmit(chat.id, { id: "archive-race", payload: queuedPrompt("not delivered") }).pipe(Effect.exit)
+    expect((yield* runtime.status()).active).toBe(0)
+    yield* state.assertNotBusy(chat.id)
+    expect(
+      yield* database.db.get<{ state: string }>(sql`SELECT state FROM runtime_execution WHERE session_id = ${chat.id}`),
+    ).toMatchObject({ state: "completed" })
+    yield* runtime.request("shutdown")
+    yield* awaitWithTimeout(runtime.awaitDrain, "leaked queue admission prevented graceful drain")
+  }),
+)
+
+ownedRuntime.instance("native queue automatic admission cannot revive a cancelled runtime", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const { prompt, sessions, chat } = yield* boot()
+    const runtime = yield* RuntimeLifecycle.Service
+    const queue = yield* SessionQueue.Service
+    yield* runtime.admit({ sessionID: chat.id, directory: chat.directory })
+    yield* runtime.cancel(chat.id)
+    yield* runtime.finishCancel(chat.id)
+    yield* prompt.queueSubmit(chat.id, { id: "runtime-cancelled", payload: queuedPrompt("runtime-cancelled-input") })
+    expect(yield* sessions.messages({ sessionID: chat.id })).toEqual([])
+    expect((yield* queue.get(chat.id, "runtime-cancelled")).state).toBe("pending")
+    expect((yield* queue.list(chat.id)).blocked).toBe(true)
+    expect(yield* llm.calls).toBe(0)
+    yield* llm.text("explicitly resumed")
+    yield* prompt.queueResume(chat.id)
+    yield* llm.wait(1)
+    yield* prompt.loop({ sessionID: chat.id })
+    expect((yield* queue.get(chat.id, "runtime-cancelled")).state).toBe("delivered")
+  }),
+)
+
+ownedRuntime.instance("native queue admission never performs manual recovery", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const { prompt, chat } = yield* boot()
+    const database = yield* Database.Service
+    const runtime = yield* RuntimeLifecycle.Service
+    const queue = yield* SessionQueue.Service
+    yield* runtime.admit({ sessionID: chat.id, directory: chat.directory })
+    yield* runtime.release(chat.id)
+    yield* database.db.run(sql`UPDATE runtime_execution SET state = 'recovery_needed' WHERE session_id = ${chat.id}`)
+    yield* prompt.queueSubmit(chat.id, { id: "runtime-recovery", payload: queuedPrompt("runtime-recovery-input") })
+    yield* prompt.queueResume(chat.id)
+    expect((yield* queue.get(chat.id, "runtime-recovery")).state).toBe("pending")
+    expect((yield* queue.list(chat.id)).blocked).toBe(true)
+    expect(yield* llm.calls).toBe(0)
+  }),
+)
+
+ownedRuntime.instance("native queue shutdown checkpoints leave queued inputs pending", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const { prompt, chat } = yield* boot()
+    const runtime = yield* RuntimeLifecycle.Service
+    const queue = yield* SessionQueue.Service
+    const release = yield* Deferred.make<void>()
+    yield* llm.hold("last result", deferredAsPromise(release))
+    const running = yield* prompt
+      .prompt({ sessionID: chat.id, model: ref, parts: [{ type: "text", text: "initial" }] })
+      .pipe(Effect.forkChild)
+    yield* llm.wait(1)
+    yield* prompt.queueSubmit(chat.id, { id: "during-shutdown", payload: queuedPrompt("during-shutdown-input") })
+    yield* runtime.request("shutdown")
+    yield* Deferred.succeed(release, undefined)
+    yield* Fiber.join(running)
+    expect((yield* queue.get(chat.id, "during-shutdown")).state).toBe("pending")
+    expect(yield* llm.calls).toBe(1)
+  }),
+)
+
+ownedRuntime.instance("native queue lost ownership cannot claim the next input", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const { prompt, chat } = yield* boot()
+    const database = yield* Database.Service
+    const queue = yield* SessionQueue.Service
+    const release = yield* Deferred.make<void>()
+    yield* llm.hold("last owned result", deferredAsPromise(release))
+    const running = yield* prompt
+      .prompt({ sessionID: chat.id, model: ref, parts: [{ type: "text", text: "initial" }] })
+      .pipe(Effect.exit, Effect.forkChild)
+    yield* llm.wait(1)
+    yield* prompt.queueSubmit(chat.id, { id: "after-fence", payload: queuedPrompt("after-fence-input") })
+    yield* database.db.run(sql`UPDATE runtime_execution SET fence = fence + 1 WHERE session_id = ${chat.id}`)
+    yield* Deferred.succeed(release, undefined)
+    yield* Fiber.join(running)
+    expect((yield* queue.get(chat.id, "after-fence")).state).toBe("pending")
+    expect(yield* llm.calls).toBe(1)
+  }),
+)
+
+noLLMServer.instance(
+  "native queue registration failure rolls back the ordinary prompt bubble",
+  () =>
+    Effect.gen(function* () {
+      const { prompt, sessions, chat } = yield* boot()
+      const queue = yield* SessionQueue.Service
+      const id = MessageID.make("msg_registration-conflict")
+      yield* queue.enqueue(chat.id, { id, payload: queuedPrompt("reserved") })
+      const result = yield* prompt
+        .prompt({
+          sessionID: chat.id,
+          messageID: id,
+          model: ref,
+          noReply: true,
+          parts: [{ type: "text", text: "must roll back" }],
+        })
+        .pipe(Effect.exit)
+      expect(Exit.isFailure(result)).toBe(true)
+      expect(yield* sessions.messages({ sessionID: chat.id })).toEqual([])
+      expect((yield* queue.get(chat.id, id)).delivery).toBe("queue")
+    }),
+  { config: cfg },
+)
+
+noLLMServer.instance(
+  "native queue delivery cannot overwrite a colliding legacy message ID",
+  () =>
+    Effect.gen(function* () {
+      const { prompt, sessions, chat } = yield* boot()
+      const queue = yield* SessionQueue.Service
+      const existing = yield* user(chat.id, "preserve this message")
+      yield* sessions.updateMessage({ ...existing, id: MessageID.make("msg_queue_collision") })
+      yield* sessions.updatePart({
+        id: PartID.ascending(),
+        sessionID: chat.id,
+        messageID: MessageID.make("msg_queue_collision"),
+        type: "text",
+        text: "original collision content",
+      })
+      yield* prompt.queueSubmit(chat.id, { id: "collision", payload: queuedPrompt("must not overwrite") })
+      yield* pollWithTimeout(
+        queue.list(chat.id).pipe(Effect.map((snapshot) => (snapshot.blocked ? true : undefined))),
+        "colliding delivery did not block",
+      )
+      const preserved = (yield* sessions.messages({ sessionID: chat.id })).find(
+        (message) => message.info.id === "msg_queue_collision",
+      )
+      expect(preserved?.parts.filter((part) => part.type === "text").map((part) => part.text)).toEqual([
+        "original collision content",
+      ])
+      expect((yield* queue.get(chat.id, "collision")).state).toBe("claimed")
+    }),
+  { config: cfg },
+)
+
+noLLMServer.instance(
+  "stale queue conversions do not change session agent or model defaults",
+  () =>
+    Effect.gen(function* () {
+      const { prompt, sessions, chat } = yield* boot()
+      const queue = yield* SessionQueue.Service
+      yield* sessions.setAgentModel({
+        sessionID: chat.id,
+        agent: "build",
+        model: { providerID: ref.providerID, id: ref.modelID },
+        time: Date.now(),
+      })
+      const before = yield* sessions.get(chat.id)
+      const snapshot = yield* queue.enqueue(chat.id, {
+        id: "stale-conversion",
+        payload: { ...queuedPrompt("stale"), agent: "plan", variant: "different" },
+      })
+      yield* queue.update(chat.id, { revision: snapshot.revision, mutation: { action: "pause", paused: true } })
+      const result = yield* prompt
+        .queueUpdate(chat.id, {
+          revision: snapshot.revision,
+          mutation: { action: "convert", id: "stale-conversion", delivery: "steer" },
+        })
+        .pipe(Effect.exit)
+      expect(Exit.isFailure(result)).toBe(true)
+      const after = yield* sessions.get(chat.id)
+      expect(after.agent).toBe(before.agent)
+      expect(after.model).toEqual(before.model)
+      expect(yield* sessions.messages({ sessionID: chat.id })).toEqual([])
+    }),
+  { config: cfg },
+)
+
+noLLMServer.instance(
+  "native queue conversion and attachment roll back together when resolution fails",
+  () =>
+    Effect.gen(function* () {
+      const { prompt, sessions, chat } = yield* boot()
+      const queue = yield* SessionQueue.Service
+      const snapshot = yield* queue.enqueue(chat.id, {
+        id: "invalid-conversion",
+        payload: { ...queuedPrompt("invalid"), agent: "missing-agent" },
+      })
+      const result = yield* prompt
+        .queueUpdate(chat.id, {
+          revision: snapshot.revision,
+          mutation: { action: "convert", id: "invalid-conversion", delivery: "steer" },
+        })
+        .pipe(Effect.exit)
+      expect(Exit.isFailure(result)).toBe(true)
+      expect(yield* queue.list(chat.id)).toEqual(snapshot)
+      expect(yield* sessions.messages({ sessionID: chat.id })).toEqual([])
+    }),
+  { config: cfg },
+)
+
+withCallbackPlugin.instance(
+  "queue conversion resolves database-calling message hooks outside its writer transaction",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const { prompt, sessions, chat } = yield* boot()
+      const queue = yield* SessionQueue.Service
+      const database = yield* Database.Service
+      // A temporary table also verifies the callback shares this exact connection.
+      yield* database.db.run(sql`CREATE TEMP TABLE queue_callback_probe (value INTEGER)`)
+      yield* database.db.run(sql`INSERT INTO queue_callback_probe VALUES (1)`)
+      yield* Effect.addFinalizer(() => database.db.run(sql`DROP TABLE queue_callback_probe`).pipe(Effect.orDie))
+      yield* llm.text("converted")
+      const snapshot = yield* queue.enqueue(chat.id, { id: "callback", payload: queuedPrompt("callback prompt") })
+      yield* awaitWithTimeout(
+        prompt.queueUpdate(chat.id, {
+          revision: snapshot.revision,
+          mutation: { action: "convert", id: "callback", delivery: "steer" },
+        }),
+        "conversion deadlocked on its message hook's independent database request",
+      )
+      const status = yield* SessionStatus.Service
+      yield* pollWithTimeout(
+        status.get(chat.id).pipe(Effect.map((value) => (value.type === "idle" ? true : undefined))),
+        "converted prompt did not finish",
+      )
+      expect((yield* queue.get(chat.id, "callback")).state).toBe("delivered")
+      expect(
+        (yield* sessions.messages({ sessionID: chat.id })).filter((message) => message.info.role === "user"),
+      ).toHaveLength(1)
+    }),
+)
+
+it.instance("native queue retains a failed command claim rather than replaying its template", () =>
+  Effect.gen(function* () {
+    const { directory } = yield* TestInstance
+    const file = path.join(directory, "command-template-side-effect")
+    const { llm } = yield* useServerConfig((url) => ({
+      ...providerCfg(url),
+      command: { unsafe: { template: `!\`printf 'once\\n' >> '${file}'\`` } },
+    }))
+    const { prompt, sessions, chat } = yield* boot()
+    const queue = yield* SessionQueue.Service
+    yield* prompt.queueSubmit(chat.id, {
+      id: "failed-command",
+      payload: { kind: "command", agent: "missing-agent", model: ref, command: "unsafe", arguments: "" },
+    })
+    yield* pollWithTimeout(
+      queue.list(chat.id).pipe(Effect.map((snapshot) => (snapshot.blocked ? true : undefined))),
+      "failed command did not block the queue",
+    )
+    expect((yield* queue.get(chat.id, "failed-command")).state).toBe("claimed")
+    expect(yield* sessions.messages({ sessionID: chat.id })).toEqual([])
+    yield* prompt.queueResume(chat.id)
+    expect(yield* Effect.promise(() => Bun.file(file).text())).toBe("once\n")
+    expect(yield* llm.calls).toBe(0)
+  }),
+)
 
 noLLMServer.instance(
   "loop exits immediately when last assistant has stop finish",
@@ -1253,8 +2202,7 @@ it.instance("reuses a recovered slash-command Task result without repeating its 
     const original = yield* sessions.messages({ sessionID: parent.id })
     const taskMessage = original.find(
       (message) =>
-        message.info.role === "assistant" &&
-        message.parts.some((part) => part.type === "tool" && part.tool === "task"),
+        message.info.role === "assistant" && message.parts.some((part) => part.type === "tool" && part.tool === "task"),
     )
     expect(taskMessage?.info.role).toBe("assistant")
     if (!taskMessage || taskMessage.info.role !== "assistant") throw new Error("missing slash-command Task message")
@@ -1304,11 +2252,7 @@ it.instance("reuses a recovered slash-command Task result without repeating its 
       SELECT owner_lineage FROM runtime_execution WHERE session_id = ${parent.id}
     `)
     if (!row) throw new Error("missing parent runtime execution")
-    const replacement = RuntimeLifecycle.make(
-      { lineage: row.owner_lineage, instance: randomUUID() },
-      scope,
-      database,
-    )
+    const replacement = RuntimeLifecycle.make({ lineage: row.owner_lineage, instance: randomUUID() }, scope, database)
     yield* replacement.recover((record) => prompt.recover(SessionID.make(record.sessionID)))
     while (
       (yield* database.db.get<{ state: string }>(sql`
@@ -1338,8 +2282,7 @@ it.instance("reuses a recovered slash-command Task result without repeating its 
     expect(yield* llm.calls).toBe(3)
     expect(
       recovered.filter(
-        (message) =>
-          message.info.role === "user" && message.info.id === `msg_task_summary_${taskPart.callID}`,
+        (message) => message.info.role === "user" && message.info.id === `msg_task_summary_${taskPart.callID}`,
       ),
     ).toHaveLength(1)
   }),
@@ -1486,12 +2429,17 @@ it.instance("foreground recovery settles linked Tasks and leaves cancelled paren
     if (repairedTask.state.status !== "completed") throw new Error("foreground Task result was not settled")
     expect(repairedTask.state.output).toContain("child result")
     expect(recovered.filter((message) => message.info.id === `msg_task_summary_${callID}`)).toHaveLength(1)
-    expect((yield* database.db.get<{ state: string }>(sql`
+    expect(
+      (yield* database.db.get<{ state: string }>(sql`
       SELECT state FROM runtime_execution WHERE session_id = ${parent.id}
-    `))?.state).toBe("cancelled")
+    `))?.state,
+    ).toBe("cancelled")
 
     const cancelledParent = yield* sessions.create({ title: "Cancelled foreground Task parent" })
-    const cancelledChild = yield* sessions.create({ title: "Cancelled foreground Task child", parentID: cancelledParent.id })
+    const cancelledChild = yield* sessions.create({
+      title: "Cancelled foreground Task child",
+      parentID: cancelledParent.id,
+    })
     const cancelledUser = yield* user(cancelledParent.id, "review")
     const cancelledCallID = "call_cancelled_foreground_recovery"
     const cancelledAssistant = yield* sessions.updateMessage({

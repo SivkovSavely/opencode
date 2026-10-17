@@ -35,6 +35,7 @@ import { isMedia } from "@/util/media"
 import type { SystemError } from "bun"
 import type { Provider } from "@/provider/provider"
 import { Effect, Schema } from "effect"
+import { SessionQueueMigration } from "./queue-migration"
 
 /** Error shape thrown by Bun's fetch() when gzip/br decompression fails mid-stream */
 interface FetchDecompressionError extends Error {
@@ -434,6 +435,7 @@ export const page = Effect.fn("MessageV2.page")(function* (input: {
   before?: string
 }) {
   const { db } = yield* Database.Service
+  yield* SessionQueueMigration.ensure(input.sessionID)
   const before = input.before ? cursor.decode(input.before) : undefined
   const where = before
     ? and(eq(MessageTable.session_id, input.sessionID), older(before))
@@ -441,7 +443,7 @@ export const page = Effect.fn("MessageV2.page")(function* (input: {
   const rows = yield* db
     .select()
     .from(MessageTable)
-    .where(where)
+    .where(and(where, SessionQueueMigration.visible))
     .orderBy(desc(MessageTable.time_created), desc(MessageTable.id))
     .limit(input.limit + 1)
     .all()

@@ -9,6 +9,183 @@ const waitForState = <A, E>(runner: Runner.Runner<A, E>, tag: Runner.State<A, E>
   }).pipe(Effect.timeout("1 second"))
 
 describe("Runner", () => {
+  for (const outcome of ["failure", "ineligible", "success", "cancel"] as const) {
+    it.live(
+      `advisory resources are released on ${outcome}`,
+      Effect.gen(function* () {
+        const runner = Runner.make<string>(yield* Scope.Scope)
+        const leases = yield* Ref.make(0)
+        const working = yield* Deferred.make<void>()
+        const prepare = Effect.gen(function* () {
+          yield* Effect.acquireRelease(
+            Ref.update(leases, (count) => count + 1),
+            () => Ref.update(leases, (count) => count - 1),
+          )
+          if (outcome === "failure") return yield* Effect.die("claim failed after admission")
+          return outcome !== "ineligible"
+        })
+        yield* runner.startIfIdle(
+          Deferred.succeed(working, undefined).pipe(
+            Effect.andThen(outcome === "cancel" ? Effect.never : Effect.succeed("done")),
+          ),
+          prepare,
+        )
+        if (outcome === "cancel") {
+          yield* Deferred.await(working)
+          expect(yield* Ref.get(leases)).toBe(1)
+          yield* runner.cancel
+        }
+        yield* waitForState(runner, "Idle")
+        expect(yield* Ref.get(leases)).toBe(0)
+      }),
+    )
+  }
+
+  for (const advisory of [false, true]) {
+    it.live(
+      `cancellation interrupts admission waiting for lifecycle cancellation (${advisory ? "advisory" : "idle"})`,
+      Effect.gen(function* () {
+        const scope = yield* Scope.Scope
+        const runner = Runner.make<string>(scope)
+        const preparing = yield* Deferred.make<void>()
+        const cancelled = yield* Deferred.make<void>()
+        const release = yield* Deferred.make<void>()
+        const active = advisory
+          ? yield* runner.ensureRunning(Deferred.await(release).pipe(Effect.as("first"))).pipe(Effect.forkChild)
+          : undefined
+        if (active) yield* waitForState(runner, "Running")
+        const wake = yield* runner
+          .startIfIdle(
+            Effect.die("cancelled admission must not run"),
+            Deferred.succeed(preparing, undefined).pipe(Effect.andThen(Deferred.await(cancelled)), Effect.as(true)),
+          )
+          .pipe(Effect.forkChild)
+        if (active) yield* Deferred.succeed(release, undefined)
+        yield* Deferred.await(preparing)
+        yield* runner.cancel.pipe(Effect.timeout("1 second"))
+        yield* Deferred.succeed(cancelled, undefined)
+        expect(yield* Fiber.join(wake)).toBe(false)
+        if (active) expect(yield* Fiber.join(active)).toBe("first")
+        expect(runner.busy).toBe(false)
+        expect(yield* runner.ensureRunning(Effect.succeed("after cancellation"))).toBe("after cancellation")
+      }),
+    )
+  }
+
+  it.live(
+    "an ineligible admission does not discard a newer eligible wake",
+    Effect.gen(function* () {
+      const scope = yield* Scope.Scope
+      const runner = Runner.make<string>(scope)
+      const preparing = yield* Deferred.make<void>()
+      const release = yield* Deferred.make<void>()
+      const started = yield* Deferred.make<void>()
+      const first = yield* runner
+        .startIfIdle(
+          Effect.die("ineligible work must not run"),
+          Deferred.succeed(preparing, undefined).pipe(Effect.andThen(Deferred.await(release)), Effect.as(false)),
+        )
+        .pipe(Effect.forkChild)
+      yield* Deferred.await(preparing)
+      yield* runner.startIfIdle(
+        Deferred.succeed(started, undefined).pipe(Effect.andThen(Effect.never)),
+        Effect.succeed(true),
+      )
+      yield* Deferred.succeed(release, undefined)
+      expect(yield* Fiber.join(first)).toBe(false)
+      yield* Deferred.await(started).pipe(Effect.timeout("1 second"))
+      yield* runner.cancel
+    }),
+  )
+
+  it.live(
+    "startIfIdle rechecks an advisory wake before publishing successful completion",
+    Effect.gen(function* () {
+      const scope = yield* Scope.Scope
+      const runner = Runner.make<string>(scope)
+      const ready = yield* Deferred.make<void>()
+      const release = yield* Deferred.make<void>()
+      const queued = yield* Deferred.make<void>()
+      const running = yield* runner
+        .ensureRunning(
+          Deferred.succeed(ready, undefined).pipe(Effect.andThen(Deferred.await(release)), Effect.as("first")),
+        )
+        .pipe(Effect.forkChild)
+      yield* Deferred.await(ready)
+      expect(
+        yield* runner.startIfIdle(
+          Deferred.succeed(queued, undefined).pipe(Effect.andThen(Effect.never)),
+          Effect.succeed(true),
+        ),
+      ).toBe(false)
+      yield* Deferred.succeed(release, undefined)
+      expect(yield* Fiber.join(running)).toBe("first")
+      yield* Deferred.await(queued)
+      expect(runner.busy).toBe(true)
+      yield* runner.cancel
+    }),
+  )
+
+  it.live(
+    "startIfIdle discards advisory work after a failed execution",
+    Effect.gen(function* () {
+      const scope = yield* Scope.Scope
+      const runner = Runner.make<string, string>(scope)
+      const ready = yield* Deferred.make<void>()
+      const release = yield* Deferred.make<void>()
+      const preparations = yield* Ref.make(0)
+      const running = yield* runner
+        .ensureRunning(
+          Deferred.succeed(ready, undefined).pipe(
+            Effect.andThen(Deferred.await(release)),
+            Effect.andThen(Effect.fail("failed")),
+          ),
+        )
+        .pipe(Effect.exit, Effect.forkChild)
+      yield* Deferred.await(ready)
+      yield* runner.startIfIdle(
+        Effect.die("must not run"),
+        Ref.update(preparations, (count) => count + 1).pipe(Effect.as(true)),
+      )
+      yield* Deferred.succeed(release, undefined)
+      expect(Exit.isFailure(yield* Fiber.join(running))).toBe(true)
+      expect(yield* Ref.get(preparations)).toBe(0)
+      expect(runner.busy).toBe(false)
+    }),
+  )
+
+  it.live(
+    "startIfIdle serializes preparation and never admits work while busy",
+    Effect.gen(function* () {
+      const scope = yield* Scope.Scope
+      const runner = Runner.make<string>(scope)
+      const release = yield* Deferred.make<void>()
+      const ready = yield* Deferred.make<void>()
+      const preparations = yield* Ref.make(0)
+      const prepare = Ref.update(preparations, (count) => count + 1).pipe(Effect.as(true))
+      const work = Deferred.succeed(ready, undefined).pipe(Effect.andThen(Deferred.await(release)), Effect.as("done"))
+      const starts = yield* Effect.all([runner.startIfIdle(work, prepare), runner.startIfIdle(work, prepare)], {
+        concurrency: "unbounded",
+      })
+      expect(starts.filter(Boolean)).toHaveLength(1)
+      expect(yield* Ref.get(preparations)).toBe(1)
+      yield* Deferred.await(ready)
+      yield* runner.cancel
+      expect(runner.busy).toBe(false)
+    }),
+  )
+
+  it.live(
+    "startIfIdle leaves the runner idle when preparation finds no eligible work",
+    Effect.gen(function* () {
+      const scope = yield* Scope.Scope
+      const runner = Runner.make<string>(scope)
+      expect(yield* runner.startIfIdle(Effect.die("must not run"), Effect.succeed(false))).toBe(false)
+      expect(runner.busy).toBe(false)
+      expect(yield* runner.ensureRunning(Effect.succeed("normal"))).toBe("normal")
+    }),
+  )
+
   // --- ensureRunning semantics ---
 
   it.live(

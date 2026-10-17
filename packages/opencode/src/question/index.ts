@@ -5,6 +5,7 @@ import { SessionID } from "@/session/schema"
 import { QuestionID } from "./schema"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { QuestionV1 } from "@opencode-ai/schema/question-v1"
+import { SessionQueue } from "@/session/queue"
 
 export const Option = QuestionV1.Option
 export type Option = typeof Option.Type
@@ -65,6 +66,7 @@ const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
     const events = yield* EventV2Bridge.Service
+    const queue = yield* SessionQueue.Service
     const state = yield* InstanceState.make<State>(
       Effect.fn("Question.state")(function* () {
         const state = {
@@ -89,6 +91,31 @@ const layer = Layer.effect(
       questions: ReadonlyArray<Info>
       tool?: Tool
     }) {
+      const switchQuestion = input.questions[0]
+      if (
+        input.questions.length === 1 &&
+        switchQuestion?.header === "Build Agent" &&
+        /^Plan at [\s\S]+ is complete\. Would you like to switch to the build agent and start implementing\?$/.test(
+          switchQuestion.question,
+        ) &&
+        switchQuestion.custom === false &&
+        switchQuestion.options.length === 2 &&
+        switchQuestion.options[0]?.label === "Yes" &&
+        switchQuestion.options[1]?.label === "No"
+      ) {
+        const snapshot = yield* queue.list(input.sessionID).pipe(Effect.option)
+        if (
+          snapshot._tag === "Some" &&
+          !snapshot.value.paused &&
+          !snapshot.value.blocked &&
+          snapshot.value.items.some(
+            (item) => item.delivery === "queue" && (item.state === "pending" || item.state === "claimed"),
+          )
+        ) {
+          yield* Effect.logInfo("Declined Build Agent switch to continue queued work", { sessionID: input.sessionID })
+          return [["No"]]
+        }
+      }
       const pending = (yield* InstanceState.get(state)).pending
       const id = QuestionID.ascending()
       yield* Effect.logInfo("asking", { id, questions: input.questions.length })
@@ -156,6 +183,6 @@ const layer = Layer.effect(
   }),
 )
 
-export const node = LayerNode.make({ service: Service, layer: layer, deps: [EventV2Bridge.node] })
+export const node = LayerNode.make({ service: Service, layer: layer, deps: [EventV2Bridge.node, SessionQueue.node] })
 
 export * as Question from "."

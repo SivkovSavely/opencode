@@ -52,17 +52,23 @@ import { Database } from "@opencode-ai/core/database/database"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { eq, sql } from "drizzle-orm"
-import { SessionTable } from "@opencode-ai/core/session/sql"
+import { MessageTable, SessionTable } from "@opencode-ai/core/session/sql"
 import { SessionReminders } from "./reminders"
 import { SessionTools } from "./tools"
 import { LLMEvent } from "@opencode-ai/llm"
 import { RuntimeLifecycle } from "@/server/runtime-lifecycle"
+import { SessionQueue } from "./queue"
+import { SessionQueueV1 } from "@opencode-ai/schema/v1/session-queue"
+import { SessionQueueTable } from "@opencode-ai/core/session/queue.sql"
 
 // @ts-ignore
 globalThis.AI_SDK_LOG_WARNINGS = false
 
 const decodeMessageInfo = Schema.decodeUnknownExit(SessionV1.Info)
 const decodeMessagePart = Schema.decodeUnknownExit(SessionV1.Part)
+const decodeQueueOrder = Schema.decodeUnknownOption(
+  Schema.Struct({ after: Schema.optional(MessageID), ids: Schema.Array(MessageID) }),
+)
 const MAX_MCP_RESOURCE_BLOB_BYTES = 10 * 1024 * 1024
 const SUPPORTED_MCP_RESOURCE_ATTACHMENT_MIMES = new Set([
   "application/pdf",
@@ -112,6 +118,16 @@ export interface Interface {
   readonly shell: (input: ShellInput) => Effect.Effect<SessionV1.WithParts, Session.BusyError>
   readonly command: (input: CommandInput) => Effect.Effect<SessionV1.WithParts, Image.Error>
   readonly resolvePromptParts: (template: string) => Effect.Effect<PromptInput["parts"]>
+  readonly queueSubmit: (
+    sessionID: SessionID,
+    input: SessionQueueV1.Submit,
+  ) => Effect.Effect<SessionQueueV1.Snapshot, SessionQueue.QueueError>
+  readonly queueUpdate: (
+    sessionID: SessionID,
+    input: SessionQueueV1.Update,
+  ) => Effect.Effect<SessionQueueV1.Snapshot, SessionQueue.QueueError | Image.Error>
+  readonly queueFlush: (sessionID: SessionID) => Effect.Effect<SessionQueueV1.Snapshot, SessionQueue.QueueError>
+  readonly queueResume: (sessionID: SessionID) => Effect.Effect<SessionQueueV1.Snapshot, SessionQueue.QueueError>
 }
 
 type TaskAdmission = {
@@ -153,8 +169,17 @@ const layer = Layer.effect(
     const events = yield* EventV2Bridge.Service
     const flags = yield* RuntimeFlags.Service
     const database = yield* Database.Service
+    const queue = yield* SessionQueue.Service
+    const queueState = yield* InstanceState.make(() => Effect.sync(() => new Map<SessionID, Set<string>>()))
     const runtime = RuntimeLifecycle.current() ?? RuntimeLifecycle.unavailable()
     const { db } = database
+    // Nested store transactions can emit before the enclosing commit. Publish the
+    // authoritative revision again at runtime-owned outer transaction boundaries.
+    const notifyQueue = Effect.fnUntraced(function* (sessionID: SessionID) {
+      const snapshot = yield* queue.list(sessionID)
+      yield* events.publish(SessionQueueV1.Event.Changed, { sessionID, revision: snapshot.revision })
+      return snapshot
+    })
     const ops = Effect.fn("SessionPrompt.ops")(function* () {
       return {
         cancel: (sessionID: SessionID) => cancelTask(sessionID),
@@ -173,12 +198,30 @@ const layer = Layer.effect(
 
     const cancel = Effect.fn("SessionPrompt.cancel")(function* (sessionID: SessionID) {
       yield* Effect.logInfo("cancel", { "session.id": sessionID })
+      yield* queue
+        .block(sessionID)
+        .pipe(
+          Effect.catchTag("SessionQueueError", (error) =>
+            error.reason === "not_found" || error.reason === "archived" ? Effect.void : Effect.die(error),
+          ),
+        )
+      const flush = yield* InstanceState.get(queueState)
+      flush.delete(sessionID)
       const owner = yield* runtime.cancel(sessionID)
       if (!owner) return yield* runtime.waitCancel(sessionID)
       yield* state.cancel(sessionID).pipe(Effect.ensuring(runtime.finishCancel(sessionID)))
     })
 
     const cancelTask = Effect.fn("SessionPrompt.cancelTask")(function* (sessionID: SessionID) {
+      yield* queue
+        .block(sessionID)
+        .pipe(
+          Effect.catchTag("SessionQueueError", (error) =>
+            error.reason === "not_found" || error.reason === "archived" ? Effect.void : Effect.die(error),
+          ),
+        )
+      const flush = yield* InstanceState.get(queueState)
+      flush.delete(sessionID)
       const owner = yield* runtime.cancel(sessionID)
       if (!owner) return yield* state.cancel(sessionID)
       yield* state.cancel(sessionID).pipe(Effect.ensuring(runtime.finishCancel(sessionID)))
@@ -331,66 +374,70 @@ const layer = Layer.effect(
     const reconcileSubtaskCompletions = Effect.fnUntraced(function* (sessionID: SessionID) {
       const fence = yield* runtime.ownershipFence(sessionID)
       if (fence === undefined) return
-      yield* database.db.transaction(
-        () =>
-          Effect.gen(function* () {
-            const owner = yield* database.db.get<{
-              owner_lineage: string
-              owner_instance: string
-              fence: number
-              state: string
-              desired_active: number
-            }>(sql`
+      yield* database.db
+        .transaction(
+          () =>
+            Effect.gen(function* () {
+              const owner = yield* database.db.get<{
+                owner_lineage: string
+                owner_instance: string
+                fence: number
+                state: string
+                desired_active: number
+              }>(sql`
               SELECT owner_lineage, owner_instance, fence, state, desired_active
               FROM runtime_execution WHERE session_id = ${sessionID}
             `)
-            if (
-              !owner ||
-              owner.owner_lineage !== runtime.identity.lineage ||
-              owner.owner_instance !== runtime.identity.instance ||
-              owner.fence !== fence ||
-              owner.state !== "active" ||
-              owner.desired_active !== 1
-            )
-              return
-            const messages = yield* sessions.messages({ sessionID }).pipe(Effect.orDie)
-            const users = new Map<string, SessionV1.WithParts>(
-              messages.flatMap((message) => (message.info.role === "user" ? [[message.info.id, message] as const] : [])),
-            )
-            for (const message of messages) {
-              if (message.info.role !== "assistant" || !message.info.parentID) continue
-              const parent = users.get(message.info.parentID)
-              if (parent?.info.role !== "user") continue
-              for (const part of message.parts) {
-                if (
-                  part.type !== "tool" ||
-                  part.tool !== "task" ||
-                  !["completed", "error"].includes(part.state.status)
-                )
-                  continue
-                const subtask = parent.parts.find(
-                  (item) =>
-                    item.type === "subtask" &&
-                    (part.state.input.subtaskPartID === item.id ||
-                      (part.state.input.subtaskPartID === undefined &&
-                        part.state.input.prompt === item.prompt &&
-                        part.state.input.description === item.description &&
-                        part.state.input.subagent_type === item.agent &&
-                        part.state.input.command === item.command)),
-                )
-                if (subtask?.type !== "subtask") continue
-                yield* finishSubtaskAssistant({
-                  assistant: message.info,
-                  lastUser: parent.info,
-                  sessionID,
-                  command: subtask.command,
-                  callID: part.callID,
-                })
+              if (
+                !owner ||
+                owner.owner_lineage !== runtime.identity.lineage ||
+                owner.owner_instance !== runtime.identity.instance ||
+                owner.fence !== fence ||
+                owner.state !== "active" ||
+                owner.desired_active !== 1
+              )
+                return
+              const messages = yield* sessions.messages({ sessionID }).pipe(Effect.orDie)
+              const users = new Map<string, SessionV1.WithParts>(
+                messages.flatMap((message) =>
+                  message.info.role === "user" ? [[message.info.id, message] as const] : [],
+                ),
+              )
+              for (const message of messages) {
+                if (message.info.role !== "assistant" || !message.info.parentID) continue
+                const parent = users.get(message.info.parentID)
+                if (parent?.info.role !== "user") continue
+                for (const part of message.parts) {
+                  if (
+                    part.type !== "tool" ||
+                    part.tool !== "task" ||
+                    !["completed", "error"].includes(part.state.status)
+                  )
+                    continue
+                  const subtask = parent.parts.find(
+                    (item) =>
+                      item.type === "subtask" &&
+                      (part.state.input.subtaskPartID === item.id ||
+                        (part.state.input.subtaskPartID === undefined &&
+                          part.state.input.prompt === item.prompt &&
+                          part.state.input.description === item.description &&
+                          part.state.input.subagent_type === item.agent &&
+                          part.state.input.command === item.command)),
+                  )
+                  if (subtask?.type !== "subtask") continue
+                  yield* finishSubtaskAssistant({
+                    assistant: message.info,
+                    lastUser: parent.info,
+                    sessionID,
+                    command: subtask.command,
+                    callID: part.callID,
+                  })
+                }
               }
-            }
-          }),
-        { behavior: "immediate" },
-      ).pipe(Effect.orDie)
+            }),
+          { behavior: "immediate" },
+        )
+        .pipe(Effect.orDie)
     })
 
     const handleSubtask = Effect.fn("SessionPrompt.handleSubtask")(function* (input: {
@@ -545,8 +592,11 @@ const layer = Layer.effect(
             status: "error",
             input: part.state.input,
             error: "A linked child has incomplete or ambiguous recovery linkage; it was not dispatched again.",
-            metadata:
-              linkedChild ? { sessionId: linkedChild.id } : part.state.status === "running" ? part.state.metadata : undefined,
+            metadata: linkedChild
+              ? { sessionId: linkedChild.id }
+              : part.state.status === "running"
+                ? part.state.metadata
+                : undefined,
             time: { start: part.state.status === "running" ? part.state.time.start : Date.now(), end: Date.now() },
           },
         } satisfies SessionV1.ToolPart)
@@ -568,11 +618,7 @@ const layer = Layer.effect(
       }
 
       if (part.state.input.subtaskArgsPrepared !== true) {
-        yield* plugin.trigger(
-          "tool.execute.before",
-          { tool: TaskTool.id, sessionID, callID: part.id },
-          { args },
-        )
+        yield* plugin.trigger("tool.execute.before", { tool: TaskTool.id, sessionID, callID: part.id }, { args })
         part = yield* sessions.updatePart({
           ...part,
           state: {
@@ -682,11 +728,7 @@ const layer = Layer.effect(
         messageID: assistantMessage.id,
       }))
 
-      yield* plugin.trigger(
-        "tool.execute.after",
-        { tool: TaskTool.id, sessionID, callID: part.id, args },
-        result,
-      )
+      yield* plugin.trigger("tool.execute.after", { tool: TaskTool.id, sessionID, callID: part.id, args }, result)
 
       if (result && part.state.status === "running") {
         part = yield* sessions.updatePart({
@@ -728,76 +770,98 @@ const layer = Layer.effect(
       })
     })
 
-    const shellImpl = Effect.fn("SessionPrompt.shellImpl")(function* (input: ShellInput, ready?: Latch.Latch) {
+    const shellImpl = Effect.fn("SessionPrompt.shellImpl")(function* (
+      input: ShellInput & { variant?: string },
+      ready?: Latch.Latch,
+      delivery?: SessionQueueV1.Entry,
+    ) {
       return yield* Effect.uninterruptibleMask((restore) =>
         Effect.gen(function* () {
           const markReady = ready ? ready.open.pipe(Effect.asVoid) : Effect.void
-          const { msg, part, cwd } = yield* Effect.gen(function* () {
-            const ctx = yield* InstanceState.context
-            const session = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
-            if (session.revert) {
-              yield* revert.cleanup(session)
-            }
-            const agent = yield* agents.get(input.agent)
-            if (!agent) {
-              const available = (yield* agents.list()).filter((a) => !a.hidden).map((a) => a.name)
-              const hint = available.length ? ` Available agents: ${available.join(", ")}` : ""
-              const error = new NamedError.Unknown({ message: `Agent not found: "${input.agent}".${hint}` })
-              yield* events.publish(Session.Event.Error, { sessionID: input.sessionID, error: error.toObject() })
-              throw error
-            }
-            const model = input.model ?? agent.model ?? (yield* currentModel(input.sessionID))
-            const userMsg: SessionV1.User = {
-              id: input.messageID ?? MessageID.ascending(),
-              sessionID: input.sessionID,
-              time: { created: Date.now() },
-              role: "user",
-              agent: input.agent,
-              model: { providerID: model.providerID, modelID: model.modelID },
-            }
-            yield* sessions.updateMessage(userMsg)
-            const userPart: SessionV1.Part = {
-              type: "text",
-              id: PartID.ascending(),
-              messageID: userMsg.id,
-              sessionID: input.sessionID,
-              text: "The following tool was executed by the user",
-              synthetic: true,
-            }
-            yield* sessions.updatePart(userPart)
+          const { msg, part, cwd } = yield* db
+            .transaction(
+              () =>
+                Effect.gen(function* () {
+                  if (delivery && !(yield* ownsQueue(input.sessionID))) return yield* Effect.interrupt
+                  const ctx = yield* InstanceState.context
+                  const session = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
+                  if (session.revert) {
+                    yield* revert.cleanup(session)
+                  }
+                  const agent = yield* agents.get(input.agent)
+                  if (!agent) {
+                    const available = (yield* agents.list()).filter((a) => !a.hidden).map((a) => a.name)
+                    const hint = available.length ? ` Available agents: ${available.join(", ")}` : ""
+                    const error = new NamedError.Unknown({ message: `Agent not found: "${input.agent}".${hint}` })
+                    yield* events.publish(Session.Event.Error, { sessionID: input.sessionID, error: error.toObject() })
+                    throw error
+                  }
+                  const model = input.model ?? agent.model ?? (yield* currentModel(input.sessionID))
+                  const existing = input.messageID
+                    ? yield* sessions
+                        .findMessage(input.sessionID, (message) => message.info.id === input.messageID)
+                        .pipe(Effect.orDie)
+                    : Option.none<SessionV1.WithParts>()
+                  const userMsg: SessionV1.User = {
+                    id: input.messageID ?? MessageID.ascending(),
+                    sessionID: input.sessionID,
+                    time: Option.isSome(existing) ? existing.value.info.time : { created: Date.now() },
+                    role: "user",
+                    agent: input.agent,
+                    model: { providerID: model.providerID, modelID: model.modelID, variant: input.variant },
+                  }
+                  if (delivery) yield* requireUnusedMessageID(userMsg.id)
+                  const userPart: SessionV1.Part = {
+                    type: "text",
+                    id: PartID.ascending(),
+                    messageID: userMsg.id,
+                    sessionID: input.sessionID,
+                    text: "The following tool was executed by the user",
+                    synthetic: true,
+                  }
+                  if (Option.isNone(existing)) {
+                    yield* sessions.updateMessage(userMsg)
+                    yield* sessions.updatePart(userPart)
+                  }
 
-            const msg: SessionV1.Assistant = {
-              id: MessageID.ascending(),
-              sessionID: input.sessionID,
-              parentID: userMsg.id,
-              mode: input.agent,
-              agent: input.agent,
-              cost: 0,
-              path: { cwd: ctx.directory, root: ctx.worktree },
-              time: { created: Date.now() },
-              role: "assistant",
-              tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
-              modelID: model.modelID,
-              providerID: model.providerID,
-            }
-            yield* sessions.updateMessage(msg)
-            const started = Date.now()
-            const part: SessionV1.ToolPart = {
-              type: "tool",
-              id: PartID.ascending(),
-              messageID: msg.id,
-              sessionID: input.sessionID,
-              tool: ShellID.ToolID,
-              callID: ulid(),
-              state: {
-                status: "running",
-                time: { start: started },
-                input: { command: input.command },
-              },
-            }
-            yield* sessions.updatePart(part)
-            return { msg, part, cwd: ctx.directory }
-          }).pipe(Effect.ensuring(markReady))
+                  const msg: SessionV1.Assistant = {
+                    id: MessageID.ascending(),
+                    sessionID: input.sessionID,
+                    parentID: userMsg.id,
+                    mode: input.agent,
+                    agent: input.agent,
+                    cost: 0,
+                    path: { cwd: ctx.directory, root: ctx.worktree },
+                    time: { created: Date.now() },
+                    role: "assistant",
+                    tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+                    modelID: model.modelID,
+                    providerID: model.providerID,
+                    variant: input.variant,
+                  }
+                  yield* sessions.updateMessage(msg)
+                  const started = Date.now()
+                  const part: SessionV1.ToolPart = {
+                    type: "tool",
+                    id: PartID.ascending(),
+                    messageID: msg.id,
+                    sessionID: input.sessionID,
+                    tool: ShellID.ToolID,
+                    callID: ulid(),
+                    state: {
+                      status: "running",
+                      time: { start: started },
+                      input: { command: input.command },
+                    },
+                  }
+                  yield* sessions.updatePart(part)
+                  if (delivery) yield* queue.delivered(input.sessionID, delivery.id, userMsg.id).pipe(Effect.orDie)
+                  return { msg, part, cwd: ctx.directory }
+                }),
+              { behavior: "immediate" },
+            )
+            .pipe(Effect.orDie, Effect.ensuring(markReady))
+          if (delivery) yield* notifyQueue(input.sessionID).pipe(Effect.orDie)
 
           const cfg = yield* config.get()
           const sh = Shell.preferred(cfg.shell)
@@ -866,7 +930,7 @@ const layer = Layer.effect(
             return yield* Effect.failCause(exit.cause)
           }
 
-          return { info: msg, parts: [part] }
+          return { info: msg, parts: [part], aborted }
         }),
       )
     })
@@ -912,7 +976,11 @@ const layer = Layer.effect(
       return yield* provider.defaultModel().pipe(Effect.orDie)
     })
 
-    const createUserMessage = Effect.fn("SessionPrompt.createUserMessage")(function* (input: PromptInput) {
+    const prepareUserMessage = Effect.fn("SessionPrompt.prepareUserMessage")(function* (
+      input: PromptInput,
+      delivery?: SessionQueueV1.Entry,
+      resolved = false,
+    ) {
       const agentName = input.agent
       const ag = agentName ? yield* agents.get(agentName) : yield* agents.defaultInfo()
       if (!ag) {
@@ -926,12 +994,13 @@ const layer = Layer.effect(
       const model = input.model ?? ag.model ?? (yield* currentModel(input.sessionID))
       const same = ag.model && model.providerID === ag.model.providerID && model.modelID === ag.model.modelID
       const full =
-        !input.variant && ag.variant && same
+        !resolved && !input.variant && ag.variant && same
           ? yield* provider
               .getModel(model.providerID, model.modelID)
               .pipe(Effect.catchIf(Provider.ModelNotFoundError.isInstance, () => Effect.succeed(undefined)))
           : undefined
-      const variant = input.variant ?? (ag.variant && full?.variants?.[ag.variant] ? ag.variant : undefined)
+      const variant =
+        input.variant ?? (!resolved && ag.variant && full?.variants?.[ag.variant] ? ag.variant : undefined)
 
       const info: SessionV1.User = {
         id: input.messageID ?? MessageID.ascending(),
@@ -947,25 +1016,6 @@ const layer = Layer.effect(
         },
         system: input.system,
         format: input.format,
-      }
-
-      const current = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
-      if (
-        current.agent !== info.agent ||
-        current.model?.providerID !== info.model.providerID ||
-        current.model?.id !== info.model.modelID ||
-        (current.model?.variant === "default" ? undefined : current.model?.variant) !== info.model.variant
-      ) {
-        yield* sessions.setAgentModel({
-          sessionID: input.sessionID,
-          agent: info.agent,
-          model: {
-            id: info.model.modelID,
-            providerID: info.model.providerID,
-            variant: info.model.variant ?? "default",
-          },
-          time: info.time.created,
-        })
       }
 
       yield* Effect.addFinalizer(() => instruction.clear(info.id))
@@ -1272,32 +1322,41 @@ const layer = Layer.effect(
         return [{ ...part, messageID: info.id, sessionID: input.sessionID }]
       })
 
-      const resolvedParts = yield* Effect.forEach(input.parts, resolvePart, { concurrency: "unbounded" }).pipe(
-        Effect.map((x) => x.flat().map(assign)),
-      )
+      const resolvedParts = resolved
+        ? input.parts.map((part) => assign({ ...part, messageID: info.id, sessionID: input.sessionID }))
+        : yield* Effect.forEach(input.parts, resolvePart, { concurrency: "unbounded" }).pipe(
+            Effect.map((x) => x.flat().map(assign)),
+          )
 
-      yield* plugin.trigger(
-        "chat.message",
-        {
-          sessionID: input.sessionID,
-          agent: input.agent,
-          model: input.model,
-          messageID: input.messageID,
-          variant: input.variant,
-        },
-        { message: info, parts: resolvedParts },
-      )
+      if (!resolved)
+        yield* plugin.trigger(
+          "chat.message",
+          {
+            sessionID: input.sessionID,
+            agent: input.agent,
+            model: input.model,
+            messageID: input.messageID,
+            variant: input.variant,
+          },
+          { message: info, parts: resolvedParts },
+        )
 
-      const parts = yield* Effect.forEach(resolvedParts, (part) =>
-        part.type === "file" && part.mime.startsWith("image/")
-          ? image.normalize(part).pipe(
-              Effect.catchIf(
-                (error) => error instanceof Image.ResizerUnavailableError,
-                () => Effect.succeed(part),
-              ),
-            )
-          : Effect.succeed(part),
-      )
+      const parts = resolved
+        ? resolvedParts
+        : yield* Effect.forEach(resolvedParts, (part) =>
+            part.type === "file" && part.mime.startsWith("image/")
+              ? image.normalize(part).pipe(
+                  Effect.catchIf(
+                    (error) => error instanceof Image.ResizerUnavailableError,
+                    () => Effect.succeed(part),
+                  ),
+                )
+              : Effect.succeed(part),
+          )
+      for (const part of parts) {
+        if (part.type !== "text" || !part.metadata?.opencode_queue) continue
+        part.metadata = Object.fromEntries(Object.entries(part.metadata).filter(([key]) => key !== "opencode_queue"))
+      }
 
       const parsed = decodeMessageInfo(info, { errors: "all", propertyOrder: "original" })
       if (Exit.isFailure(parsed)) {
@@ -1323,77 +1382,173 @@ const layer = Layer.effect(
         })
       }
 
-      yield* sessions.updateMessage(info)
-      for (const part of parts) yield* sessions.updatePart(part)
+      const save = db
+        .transaction(
+          () =>
+            Effect.gen(function* () {
+              if (delivery && (delivery.delivery === "queue" || delivery.state === "claimed")) {
+                if (!(yield* ownsQueue(input.sessionID))) return yield* Effect.interrupt
+              }
+              if (delivery?.delivery === "steer" && delivery.state === "claimed") {
+                const stored = yield* queue.get(input.sessionID, delivery.id)
+                if (stored.state !== "claimed" || stored.messageID !== info.id) return yield* Effect.interrupt
+                const source = yield* sessions.findMessage(input.sessionID, (message) => message.info.id === info.id)
+                if (Option.isNone(source)) return yield* Effect.interrupt
+                info.time.created = source.value.info.time.created
+                for (const part of source.value.parts) {
+                  yield* sessions.removePart({ sessionID: input.sessionID, messageID: info.id, partID: part.id })
+                  if (part.type === "text" && part.metadata?.opencode_queue)
+                    parts.push({ ...part, text: "", synthetic: true, ignored: true })
+                }
+              } else if (delivery) yield* requireUnusedMessageID(info.id)
+              const current = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
+              if (
+                current.agent !== info.agent ||
+                current.model?.providerID !== info.model.providerID ||
+                current.model?.id !== info.model.modelID ||
+                (current.model?.variant === "default" ? undefined : current.model?.variant) !== info.model.variant
+              ) {
+                yield* sessions.setAgentModel({
+                  sessionID: input.sessionID,
+                  agent: info.agent,
+                  model: {
+                    id: info.model.modelID,
+                    providerID: info.model.providerID,
+                    variant: info.model.variant ?? "default",
+                  },
+                  time: info.time.created,
+                })
+              }
+              yield* sessions.updateMessage(info)
+              for (const part of parts) yield* sessions.updatePart(part)
+              if (delivery && (delivery.delivery === "queue" || delivery.state === "claimed")) {
+                yield* queue.delivered(input.sessionID, delivery.id, info.id)
+                return
+              }
+              if (delivery) {
+                yield* queue.attachSteer(input.sessionID, delivery.id, info.id)
+                return
+              }
+              yield* queue.registerSteer(
+                input.sessionID,
+                info.id,
+                {
+                  kind: "prompt",
+                  agent: info.agent,
+                  model: info.model,
+                  variant: info.model.variant,
+                  parts: parts
+                    .filter(
+                      (part) =>
+                        part.type === "text" ||
+                        part.type === "file" ||
+                        part.type === "agent" ||
+                        part.type === "subtask",
+                    )
+                    .map(({ id, messageID, sessionID, ...part }) => part),
+                  system: info.system,
+                  format: info.format,
+                  tools: info.tools,
+                },
+                info.id,
+              )
+            }),
+          { behavior: "immediate" },
+        )
+        .pipe(Effect.orDie)
 
-      return { info, parts }
+      return { message: { info, parts }, save }
     }, Effect.scoped)
 
-    const prompt: (input: PromptInput, task?: TaskAdmission) => Effect.Effect<SessionV1.WithParts, Image.Error> =
-      Effect.fn("SessionPrompt.prompt")(function* (input: PromptInput, task?: TaskAdmission) {
-        const session = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
-        const work = Effect.gen(function* () {
-          const existing =
-            input.idempotent && input.messageID
-              ? yield* sessions
-                  .findMessage(input.sessionID, (item) => item.info.id === input.messageID)
-                  .pipe(Effect.orDie)
-              : Option.none<SessionV1.WithParts>()
-          const complete =
-            Option.isSome(existing) &&
-            input.parts.every((part) => part.id && existing.value.parts.some((saved) => saved.id === part.id))
-          const message = complete
-            ? existing.value
-            : yield* Effect.gen(function* () {
-                yield* revert.cleanup(session)
-                return yield* createUserMessage(input)
-              })
-          yield* sessions.touch(input.sessionID)
+    const createUserMessage = Effect.fn("SessionPrompt.createUserMessage")(function* (
+      input: PromptInput,
+      delivery?: SessionQueueV1.Entry,
+      resolved = false,
+    ) {
+      const prepared = yield* prepareUserMessage(input, delivery, resolved)
+      yield* prepared.save
+      yield* notifyQueue(input.sessionID).pipe(Effect.orDie)
+      return prepared.message
+    })
 
-          const permissions: PermissionV1.Rule[] = []
-          for (const [t, enabled] of Object.entries(input.tools ?? {})) {
-            permissions.push({ permission: t, action: enabled ? "allow" : "deny", pattern: "*" })
-          }
-          if (permissions.length > 0) {
-            session.permission = permissions
-            yield* sessions.setPermission({ sessionID: session.id, permission: permissions })
-          }
-          return message
-        })
+    const prompt: (
+      input: PromptInput,
+      task?: TaskAdmission,
+      delivery?: SessionQueueV1.Entry,
+      resolved?: boolean,
+    ) => Effect.Effect<SessionV1.WithParts, Image.Error> = Effect.fn("SessionPrompt.prompt")(function* (
+      input: PromptInput,
+      task?: TaskAdmission,
+      delivery?: SessionQueueV1.Entry,
+      resolved = false,
+    ) {
+      const session = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
+      const work = Effect.gen(function* () {
+        const existing =
+          input.idempotent && input.messageID
+            ? yield* sessions
+                .findMessage(input.sessionID, (item) => item.info.id === input.messageID)
+                .pipe(Effect.orDie)
+            : Option.none<SessionV1.WithParts>()
+        const complete =
+          Option.isSome(existing) &&
+          input.parts.every((part) => part.id && existing.value.parts.some((saved) => saved.id === part.id))
+        const message = complete
+          ? existing.value
+          : yield* Effect.gen(function* () {
+              yield* revert.cleanup(session)
+              return yield* createUserMessage(input, delivery, resolved)
+            })
+        yield* sessions.touch(input.sessionID)
 
-        if (input.noReply === true) return yield* work
-        yield* Effect.logInfo("restart diagnostic runtime admission requested", {
-          sessionID: input.sessionID,
-          parentSessionID: session.parentID,
-        })
-        const admission = yield* runtime
-          .admit({
-            sessionID: input.sessionID,
-            directory: session.directory,
-            parentSessionID: session.parentID,
-            parentMessageID: task?.parentMessageID,
-            parentCallID: task?.parentCallID,
-            parentMode: task?.parentMode,
-            rejectCancelled: task?.notification,
-            rejectRecoveryNeeded: task?.notification,
-            manualRecovery: task === undefined,
-          })
-          .pipe(Effect.orDie)
-        yield* Effect.logInfo("restart diagnostic runtime admission accepted", {
-          sessionID: input.sessionID,
-          parentSessionID: session.parentID,
-        })
-        return yield* Effect.acquireUseRelease(
-          work,
-          () =>
-            state.enqueue(
-              input.sessionID,
-              lastAssistant(input.sessionID),
-              runLoop(input.sessionID, admission.manualRecovery, admission.manualRecovery, admission.manualRecovery),
-            ),
-          () => runtime.release(input.sessionID),
-        )
+        const permissions: PermissionV1.Rule[] = []
+        for (const [t, enabled] of Object.entries(input.tools ?? {})) {
+          permissions.push({ permission: t, action: enabled ? "allow" : "deny", pattern: "*" })
+        }
+        if (permissions.length > 0) {
+          session.permission = permissions
+          yield* sessions.setPermission({ sessionID: session.id, permission: permissions })
+        }
+        return message
       })
+
+      if (input.noReply === true) return yield* work
+      yield* Effect.logInfo("restart diagnostic runtime admission requested", {
+        sessionID: input.sessionID,
+        parentSessionID: session.parentID,
+      })
+      const admission = yield* runtime
+        .admit({
+          sessionID: input.sessionID,
+          directory: session.directory,
+          parentSessionID: session.parentID,
+          parentMessageID: task?.parentMessageID,
+          parentCallID: task?.parentCallID,
+          parentMode: task?.parentMode,
+          rejectCancelled: task?.notification,
+          rejectRecoveryNeeded: task?.notification,
+          manualRecovery: task === undefined,
+        })
+        .pipe(Effect.orDie)
+      yield* Effect.logInfo("restart diagnostic runtime admission accepted", {
+        sessionID: input.sessionID,
+        parentSessionID: session.parentID,
+      })
+      return yield* Effect.acquireUseRelease(
+        Effect.void,
+        () =>
+          work.pipe(
+            Effect.andThen(() =>
+              state.enqueue(
+                input.sessionID,
+                lastAssistant(input.sessionID),
+                runLoop(input.sessionID, admission.manualRecovery, admission.manualRecovery, admission.manualRecovery),
+              ),
+            ),
+          ),
+        () => runtime.release(input.sessionID),
+      )
+    })
 
     const lastAssistant = Effect.fnUntraced(function* (sessionID: SessionID) {
       const match = yield* sessions.findMessage(sessionID, (m) => m.info.role !== "user").pipe(Effect.orDie)
@@ -1401,6 +1556,422 @@ const layer = Layer.effect(
       const msgs = yield* sessions.messages({ sessionID, limit: 1 }).pipe(Effect.orDie)
       if (msgs.length > 0) return msgs[0]
       throw new Error("Impossible")
+    })
+
+    const materialize = Effect.fn("SessionPrompt.materializeQueue")(function* (entry: SessionQueueV1.Entry) {
+      const payload = entry.payload
+      const input = {
+        sessionID: entry.sessionID,
+        messageID: MessageID.make(`msg_queue_${entry.id}`),
+        agent: payload.agent,
+        model: {
+          providerID: ProviderV2.ID.make(payload.model.providerID),
+          modelID: ModelV2.ID.make(payload.model.modelID),
+        },
+        variant: payload.variant,
+        noReply: true,
+      }
+      if (payload.kind === "prompt") {
+        // The original admission identity survives conversions. Legacy steers
+        // already contain normalized/plugin-resolved parts and must not expand twice.
+        const original = yield* db
+          .select({ delivery: sql<string>`json_extract(${SessionQueueTable.submission}, '$.delivery')` })
+          .from(SessionQueueTable)
+          .where(eq(SessionQueueTable.id, entry.id))
+          .get()
+          .pipe(Effect.orDie)
+        return yield* prompt({ ...payload, ...input }, undefined, entry, original?.delivery === "steer")
+      }
+      if (payload.kind === "command" && entry.delivery === "steer" && entry.state === "pending")
+        return yield* createUserMessage(
+          {
+            ...input,
+            parts: [
+              { type: "text", text: `/${payload.command} ${payload.arguments}`.trimEnd() },
+              ...(payload.parts ?? []),
+            ],
+          },
+          entry,
+        )
+      if (payload.kind === "command")
+        return yield* command(
+          { ...payload, ...input, model: `${payload.model.providerID}/${payload.model.modelID}` },
+          entry,
+        )
+      if (payload.kind === "shell") {
+        if (entry.delivery === "queue")
+          return yield* shellImpl({ ...input, command: payload.command }, undefined, entry)
+        return yield* createUserMessage(
+          { ...input, parts: [{ type: "text", text: "The following tool was executed by the user", synthetic: true }] },
+          entry,
+        )
+      }
+      return yield* db
+        .transaction(
+          () =>
+            Effect.gen(function* () {
+              if (entry.delivery === "queue" && !(yield* ownsQueue(entry.sessionID))) return yield* Effect.interrupt
+              const info: SessionV1.User = {
+                id: input.messageID,
+                sessionID: input.sessionID,
+                role: "user",
+                agent: input.agent,
+                model: { ...input.model, variant: input.variant },
+                time: { created: Date.now() },
+              }
+              yield* requireUnusedMessageID(info.id)
+              yield* sessions.updateMessage(info)
+              const part = yield* sessions.updatePart({
+                id: PartID.ascending(),
+                sessionID: input.sessionID,
+                messageID: info.id,
+                type: "compaction",
+                auto: false,
+              })
+              if (entry.delivery === "steer") yield* queue.attachSteer(entry.sessionID, entry.id, info.id)
+              if (entry.delivery === "queue") yield* queue.delivered(entry.sessionID, entry.id, info.id)
+              return { info, parts: [part] }
+            }),
+          { behavior: "immediate" },
+        )
+        .pipe(
+          Effect.orDie,
+          Effect.tap(() => notifyQueue(entry.sessionID).pipe(Effect.orDie)),
+        )
+    })
+
+    const requireUnusedMessageID = Effect.fnUntraced(function* (messageID: MessageID) {
+      const existing = yield* db
+        .select({ id: MessageTable.id })
+        .from(MessageTable)
+        .where(eq(MessageTable.id, messageID))
+        .get()
+        .pipe(Effect.orDie)
+      if (existing)
+        return yield* new SessionQueue.QueueError({
+          reason: "conflict",
+          message: `Queue message ID is already in use: ${messageID}`,
+        })
+    })
+
+    const ownsQueue = Effect.fnUntraced(function* (sessionID: SessionID) {
+      if (runtime.identity.instance === "unavailable") return true
+      const fence = yield* runtime.ownershipFence(sessionID)
+      if (fence === undefined) return false
+      const row = yield* db
+        .get<{ owner_lineage: string; owner_instance: string; fence: number; state: string; desired_active: number }>(
+          sql`
+        SELECT owner_lineage, owner_instance, fence, state, desired_active
+        FROM runtime_execution WHERE session_id = ${sessionID}
+      `,
+        )
+        .pipe(Effect.orDie)
+      return (
+        row?.owner_lineage === runtime.identity.lineage &&
+        row.owner_instance === runtime.identity.instance &&
+        row.fence === fence &&
+        row.state === "active" &&
+        row.desired_active === 1
+      )
+    })
+
+    const claimQueue = Effect.fnUntraced(function* (sessionID: SessionID, flushing?: ReadonlySet<string>) {
+      return yield* db
+        .transaction(
+          () =>
+            Effect.gen(function* () {
+              if (!(yield* ownsQueue(sessionID))) return
+              const next = (yield* queue.list(sessionID)).items.find(
+                (entry) => entry.delivery === "queue" && entry.state === "pending",
+              )
+              return yield* queue.claimNext(sessionID, !!next && !!flushing?.has(next.id))
+            }),
+          { behavior: "immediate" },
+        )
+        .pipe(
+          Effect.orDie,
+          Effect.tap(() => notifyQueue(sessionID).pipe(Effect.orDie)),
+        )
+    })
+
+    const advanceQueue = Effect.fnUntraced(function* (sessionID: SessionID) {
+      if (!(yield* runtime.beforeTurn(sessionID))) return false
+      const flush = yield* InstanceState.get(queueState)
+      // Reserve durably before resolving commands, attachments, or executing a shell.
+      const entry = yield* claimQueue(sessionID, flush.get(sessionID))
+      if (!entry) {
+        flush.delete(sessionID)
+        return false
+      }
+      flush.get(sessionID)?.delete(entry.id)
+      yield* materialize(entry).pipe(Effect.orDie)
+      return true
+    })
+
+    const wakeQueue = Effect.fn("SessionPrompt.wakeQueue")(function* (sessionID: SessionID, explicit = false) {
+      const flush = yield* InstanceState.get(queueState)
+      const prepare = yield* Effect.cached(
+        Effect.gen(function* () {
+          const snapshot = yield* queue.list(sessionID).pipe(Effect.orDie)
+          const steer = snapshot.items.some(
+            (item) => item.delivery === "steer" && item.state === "pending" && item.messageID,
+          )
+          if (
+            !steer &&
+            (!snapshot.items.some((item) => item.delivery === "queue" && item.state === "pending") ||
+              (!flush.get(sessionID)?.size && (snapshot.paused || snapshot.blocked)))
+          ) {
+            if (!snapshot.items.some((item) => item.delivery === "queue" && item.state === "pending"))
+              flush.delete(sessionID)
+            return
+          }
+          const session = yield* sessions.get(sessionID).pipe(Effect.orDie)
+          const admission = yield* runtime
+            .admit({
+              sessionID,
+              directory: session.directory,
+              parentSessionID: session.parentID,
+              manualRecovery: false,
+              rejectCancelled: !explicit,
+              rejectRecoveryNeeded: true,
+            })
+            .pipe(
+              Effect.catchTag("RuntimeDrainingError", () =>
+                queue.block(sessionID).pipe(
+                  Effect.orDie,
+                  Effect.tap(() => Effect.sync(() => flush.delete(sessionID))),
+                  Effect.as(undefined),
+                ),
+              ),
+              (acquire) =>
+                Effect.acquireRelease(acquire, (admission) => (admission ? runtime.release(sessionID) : Effect.void), {
+                  interruptible: true,
+                }),
+            )
+          if (!admission) return
+          if (steer) return { steer: true }
+          const entry = yield* claimQueue(sessionID, flush.get(sessionID))
+          if (entry) {
+            flush.get(sessionID)?.delete(entry.id)
+            return { steer: false, entry }
+          }
+          flush.delete(sessionID)
+        }),
+      )
+      yield* state.startIfIdle(
+        sessionID,
+        lastAssistant(sessionID),
+        Effect.gen(function* () {
+          const start = yield* prepare
+          if (!start) return yield* Effect.die("Missing queue admission")
+          if (start.entry) yield* materialize(start.entry).pipe(Effect.orDie)
+          return yield* runLoop(sessionID)
+        }).pipe(
+          Effect.onExit((exit) =>
+            Effect.gen(function* () {
+              if (Exit.isSuccess(exit) && flush.get(sessionID)?.size) return
+              flush.delete(sessionID)
+              if (Exit.isFailure(exit)) yield* queue.block(sessionID).pipe(Effect.orDie)
+            }),
+          ),
+        ),
+        prepare.pipe(Effect.map(Boolean)),
+      )
+    })
+
+    const queueSubmit = Effect.fn("SessionPrompt.queueSubmit")(function* (
+      sessionID: SessionID,
+      input: SessionQueueV1.Submit,
+    ) {
+      yield* queue.enqueue(sessionID, input)
+      yield* wakeQueue(sessionID)
+      return yield* notifyQueue(sessionID)
+    })
+
+    const queueUpdate = Effect.fn("SessionPrompt.queueUpdate")(function* (
+      sessionID: SessionID,
+      input: SessionQueueV1.Update,
+    ) {
+      // Hooks may call back into the server. Resolve outside the writer transaction;
+      // the revision and pending-state checks below still fence the actual conversion.
+      const entry =
+        input.mutation.action === "convert" && input.mutation.delivery === "steer"
+          ? yield* queue.get(sessionID, input.mutation.id)
+          : undefined
+      const original =
+        entry?.payload.kind === "prompt"
+          ? yield* db
+              .select({ delivery: sql<string>`json_extract(${SessionQueueTable.submission}, '$.delivery')` })
+              .from(SessionQueueTable)
+              .where(eq(SessionQueueTable.id, entry.id))
+              .get()
+              .pipe(Effect.orDie)
+          : undefined
+      const prepared =
+        entry && !entry.messageID && entry.payload.kind !== "compact"
+          ? yield* prepareUserMessage(
+              {
+                ...(entry.payload.kind === "prompt" ? entry.payload : {}),
+                sessionID,
+                messageID: MessageID.make(`msg_queue_${entry.id}`),
+                agent: entry.payload.agent,
+                model: {
+                  providerID: ProviderV2.ID.make(entry.payload.model.providerID),
+                  modelID: ModelV2.ID.make(entry.payload.model.modelID),
+                },
+                variant: entry.payload.variant,
+                parts:
+                  entry.payload.kind === "prompt"
+                    ? [...entry.payload.parts]
+                    : entry.payload.kind === "command"
+                      ? [
+                          { type: "text", text: `/${entry.payload.command} ${entry.payload.arguments}`.trimEnd() },
+                          ...(entry.payload.parts ?? []),
+                        ]
+                      : [{ type: "text", text: "The following tool was executed by the user", synthetic: true }],
+              },
+              { ...entry, delivery: "steer" },
+              original?.delivery === "steer",
+            )
+          : undefined
+      yield* db
+        .transaction(
+          () =>
+            Effect.gen(function* () {
+              yield* queue.update(sessionID, input)
+              if (input.mutation.action === "pause" && !input.mutation.paused) yield* queue.unblock(sessionID)
+              if (input.mutation.action !== "convert" || input.mutation.delivery !== "steer") return
+              const entry = yield* queue.get(sessionID, input.mutation.id)
+              if (prepared) yield* prepared.save
+              else if (!entry.messageID) yield* materialize(entry)
+            }),
+          { behavior: "immediate" },
+        )
+        .pipe(Effect.catchTag("SqlError", Effect.die))
+      yield* notifyQueue(sessionID)
+      if (
+        (input.mutation.action === "convert" && input.mutation.delivery === "steer") ||
+        (input.mutation.action === "pause" && !input.mutation.paused)
+      )
+        yield* wakeQueue(sessionID, input.mutation.action === "pause")
+      return yield* queue.list(sessionID)
+    })
+
+    const queueFlush = Effect.fn("SessionPrompt.queueFlush")(function* (sessionID: SessionID) {
+      const snapshot = yield* queue.list(sessionID)
+      const flush = yield* InstanceState.get(queueState)
+      if (!flush.has(sessionID))
+        flush.set(
+          sessionID,
+          new Set(
+            snapshot.items
+              .filter((entry) => entry.delivery === "queue" && entry.state === "pending")
+              .map((entry) => entry.id),
+          ),
+        )
+      yield* wakeQueue(sessionID, true)
+      return yield* queue.list(sessionID)
+    })
+
+    const queueResume = Effect.fn("SessionPrompt.queueResume")(function* (sessionID: SessionID) {
+      yield* db
+        .transaction(
+          () =>
+            Effect.gen(function* () {
+              const snapshot = yield* queue.unblock(sessionID)
+              if (snapshot.paused)
+                yield* queue.update(sessionID, {
+                  revision: snapshot.revision,
+                  mutation: { action: "pause", paused: false },
+                })
+            }),
+          { behavior: "immediate" },
+        )
+        .pipe(Effect.catchTag("SqlError", Effect.die))
+      yield* wakeQueue(sessionID, true)
+      return yield* queue.list(sessionID)
+    })
+
+    const history = Effect.fn("SessionPrompt.queueHistory")(function* (sessionID: SessionID, recovery: boolean) {
+      return yield* db
+        .transaction(
+          () =>
+            Effect.gen(function* () {
+              if (!(yield* ownsQueue(sessionID))) return
+              const entries = yield* queue.list(sessionID)
+              // A restart may continue a provider turn, but must not start a shell that
+              // was only converted to steering before the previous process stopped.
+              const deferred = new Set(
+                entries.items
+                  .filter(
+                    (entry) =>
+                      (recovery && entry.state === "pending" && entry.payload.kind === "shell") ||
+                      (entry.payload.kind === "command" && entry.state !== "pending"),
+                  )
+                  .map((entry) => entry.messageID),
+              )
+              const msgs = (yield* MessageV2.filterCompactedEffect(sessionID).pipe(
+                Effect.provideService(Database.Service, database),
+              )).filter((msg) => !deferred.has(msg.info.id))
+              const claimed = yield* queue.claimSteers(
+                sessionID,
+                msgs.map((msg) => msg.info.id),
+              )
+              const ids = claimed.flatMap((entry) => (entry.messageID ? [entry.messageID] : []))
+              for (const messageID of ids) {
+                const first = msgs.find((msg) => msg.info.id === messageID)
+                if (!first) continue
+                const text = first.parts.find((part) => part.type === "text")
+                // Persist the boundary and batch order without changing bubble timestamps.
+                // Metadata survives runner rebuilds; a hidden marker also covers file-only inputs.
+                const part = yield* sessions.updatePart({
+                  ...(text ?? {
+                    id: PartID.ascending(),
+                    messageID: first.info.id,
+                    sessionID,
+                    type: "text",
+                    text: "",
+                    synthetic: true,
+                    ignored: true,
+                  }),
+                  metadata: {
+                    ...text?.metadata,
+                    opencode_queue: { after: msgs.findLast((msg) => !ids.includes(msg.info.id))?.info.id, ids },
+                  },
+                })
+                first.parts = text
+                  ? first.parts.map((item) => (item.id === part.id ? part : item))
+                  : [...first.parts, part]
+              }
+              const orders = msgs
+                .flatMap((msg) =>
+                  msg.parts.flatMap((part) =>
+                    part.type === "text" ? Option.toArray(decodeQueueOrder(part.metadata?.opencode_queue)) : [],
+                  ),
+                )
+                .filter((order, index, all) => all.findIndex((item) => item.ids[0] === order.ids[0]) === index)
+              const selected = new Map<MessageID, SessionV1.User>()
+              for (const order of orders) {
+                const group = order.ids.flatMap((id) => msgs.filter((msg) => msg.info.id === id))
+                if (!group.length) continue
+                const fallback = msgs.findIndex((msg) => msg.info.id === group[0].info.id)
+                const rest = msgs.filter((msg) => !order.ids.includes(msg.info.id))
+                const anchor = rest.findIndex((msg) => msg.info.id === order.after)
+                rest.splice(anchor < 0 ? Math.min(fallback, rest.length) : anchor + 1, 0, ...group)
+                msgs.splice(0, msgs.length, ...rest)
+                const user = group.at(-1)?.info
+                if (user?.role === "user") for (const id of order.ids) selected.set(id, user)
+              }
+              const latest = MessageV2.latest(msgs)
+              if (latest.user) latest.user = selected.get(latest.user.id) ?? latest.user
+              return { msgs, latest, claimed }
+            }),
+          { behavior: "immediate" },
+        )
+        .pipe(
+          Effect.orDie,
+          Effect.tap(() => notifyQueue(sessionID).pipe(Effect.orDie)),
+        )
     })
 
     const reconcileCrashTools = Effect.fn("SessionPrompt.reconcileCrashTools")(function* (
@@ -1492,291 +2063,358 @@ const layer = Layer.effect(
       recovery?: boolean,
       reconcile?: boolean,
       manualRecovery?: boolean,
-    ) => Effect.Effect<SessionV1.WithParts> = Effect.fn("SessionPrompt.run")(function* (
-      sessionID: SessionID,
-      recovery = false,
-      reconcile = false,
-      manualRecovery = false,
-    ) {
-      const ctx = yield* InstanceState.context
-      let structured: unknown
-      let step = 0
-      const session = yield* sessions.get(sessionID).pipe(Effect.orDie)
-      if (reconcile) yield* reconcileCrashTools(sessionID, manualRecovery)
+    ) => Effect.Effect<SessionV1.WithParts> = Effect.fn("SessionPrompt.run")(
+      function* (sessionID: SessionID, recovery = false, reconcile = false, manualRecovery = false) {
+        const ctx = yield* InstanceState.context
+        let structured: unknown
+        let step = 0
+        const session = yield* sessions.get(sessionID).pipe(Effect.orDie)
+        if (recovery || reconcile || manualRecovery) yield* queue.block(sessionID).pipe(Effect.orDie)
+        if (reconcile) yield* reconcileCrashTools(sessionID, manualRecovery)
+        let userID: MessageID | undefined
 
-      while (true) {
-        const beforeTurn = yield* runtime.beforeTurn(sessionID)
-        if (!beforeTurn) {
-          yield* Effect.logInfo("restart diagnostic loop stopped at beforeTurn", {
-            sessionID,
-            point: "beforeTurn",
-          })
-          yield* runtime.park(sessionID)
-          break
-        }
-        if (step === 0) yield* reconcileSubtaskCompletions(sessionID)
-        yield* status.set(sessionID, { type: "busy" })
-        yield* Effect.logInfo("loop", { "session.id": sessionID, step })
-
-        let msgs = yield* MessageV2.filterCompactedEffect(sessionID).pipe(
-          Effect.provideService(Database.Service, database),
-        )
-
-        const { user: lastUser, assistant: lastAssistant, finished: lastFinished, tasks } = MessageV2.latest(msgs)
-
-        if (!lastUser) throw new Error("No user message found in stream. This should never happen.")
-
-        const lastAssistantMsg = msgs.findLast(
-          (msg) => msg.info.role === "assistant" && msg.info.id === lastAssistant?.id,
-        )
-        // Some providers return "stop" even when the assistant message contains
-        // tool calls. Keep the loop running so tool results can be sent back to
-        // the model, but ignore cleanup-marked interrupted orphans.
-        const hasToolCalls =
-          lastAssistantMsg?.parts.some(
-            (part) => part.type === "tool" && !part.metadata?.providerExecuted && !isOrphanedInterruptedTool(part),
-          ) ?? false
-        const interruptedAssistant = recovery && lastAssistant && !lastAssistant.time.completed
-
-        if (
-          lastAssistant?.finish &&
-          !["tool-calls", "unknown"].includes(lastAssistant.finish) &&
-          !hasToolCalls &&
-          !interruptedAssistant &&
-          lastAssistant.parentID === lastUser.id
-        ) {
-          const orphan = lastAssistantMsg?.parts.find(
-            (part): part is SessionV1.ToolPart => part.type === "tool" && isOrphanedInterruptedTool(part),
-          )
-          if (orphan) {
-            yield* Effect.logWarning("loop exit with orphaned interrupted tool", {
-              "session.id": sessionID,
-              messageID: lastAssistant.id,
-              tool: orphan.tool,
-              callID: orphan.callID,
-            })
-          }
-          yield* Effect.logInfo("exiting loop", { "session.id": sessionID })
-          break
-        }
-
-        step++
-        if (step === 1)
-          yield* title({
-            session,
-            modelID: lastUser.model.modelID,
-            providerID: lastUser.model.providerID,
-            history: msgs,
-          }).pipe(Effect.ignore, Effect.forkIn(scope))
-
-        const model = yield* getModel(lastUser.model.providerID, lastUser.model.modelID, sessionID)
-        const task = tasks.pop()
-
-        if (task?.type === "subtask") {
-          yield* handleSubtask({ task, model, lastUser, sessionID, session, msgs })
-          continue
-        }
-
-        if (task?.type === "compaction") {
-          const result = yield* compaction.process({
-            messages: msgs,
-            parentID: lastUser.id,
-            sessionID,
-            auto: task.auto,
-            overflow: task.overflow,
-          })
-          if (result === "stop") break
-          continue
-        }
-
-        if (
-          lastFinished &&
-          lastFinished.summary !== true &&
-          (yield* compaction.isOverflow({ tokens: lastFinished.tokens, model }))
-        ) {
-          yield* compaction.create({ sessionID, agent: lastUser.agent, model: lastUser.model, auto: true })
-          continue
-        }
-
-        const agent = yield* agents.get(lastUser.agent)
-        if (!agent) {
-          const available = (yield* agents.list()).filter((a) => !a.hidden).map((a) => a.name)
-          const hint = available.length ? ` Available agents: ${available.join(", ")}` : ""
-          const error = new NamedError.Unknown({ message: `Agent not found: "${lastUser.agent}".${hint}` })
-          yield* events.publish(Session.Event.Error, { sessionID, error: error.toObject() })
-          throw error
-        }
-        const maxSteps = agent.steps ?? Infinity
-        const isLastStep = step >= maxSteps
-        msgs = yield* SessionReminders.apply({ messages: msgs, agent, session }).pipe(
-          Effect.provideService(RuntimeFlags.Service, flags),
-          Effect.provideService(FSUtil.Service, fsys),
-          Effect.provideService(Session.Service, sessions),
-        )
-
-        const msg: SessionV1.Assistant = {
-          id: MessageID.ascending(),
-          parentID: lastUser.id,
-          role: "assistant",
-          mode: agent.name,
-          agent: agent.name,
-          variant: lastUser.model.variant,
-          path: { cwd: ctx.directory, root: ctx.worktree },
-          cost: 0,
-          tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
-          modelID: model.id,
-          providerID: model.providerID,
-          time: { created: Date.now() },
-          sessionID,
-        }
-        yield* sessions.updateMessage(msg)
-
-        const finalizeInterruptedAssistant = Effect.gen(function* () {
-          if (msg.time.completed) return
-          msg.error ??= MessageV2.fromError(new DOMException("Aborted", "AbortError"), {
-            providerID: msg.providerID,
-            aborted: true,
-          })
-          msg.time.completed = Date.now()
-          yield* sessions.updateMessage(msg)
-        })
-
-        const handle = yield* processor
-          .create({
-            assistantMessage: msg,
-            sessionID,
-            model,
-          })
-          .pipe(Effect.onInterrupt(() => finalizeInterruptedAssistant))
-
-        const outcome: "break" | "continue" = yield* Effect.gen(function* () {
-          const lastUserMsg = msgs.findLast((m) => m.info.role === "user")
-          const bypassAgentCheck = lastUserMsg?.parts.some((p) => p.type === "agent") ?? false
-          const promptOps = yield* ops()
-
-          const tools = yield* SessionTools.resolve({
-            agent,
-            session,
-            model,
-            processor: handle,
-            bypassAgentCheck,
-            messages: msgs,
-            promptOps,
-          }).pipe(
-            Effect.provideService(Plugin.Service, plugin),
-            Effect.provideService(Permission.Service, permission),
-            Effect.provideService(ToolRegistry.Service, registry),
-            Effect.provideService(MCP.Service, mcp),
-            Effect.provideService(Truncate.Service, truncate),
-            Effect.provideService(RuntimeFlags.Service, flags),
-          )
-
-          if (lastUser.format?.type === "json_schema") {
-            tools["StructuredOutput"] = createStructuredOutputTool({
-              schema: lastUser.format.schema,
-              onSuccess(output) {
-                structured = output
-              },
-            })
-          }
-
-          if (step === 1)
-            yield* summary.summarize({ sessionID, messageID: lastUser.id }).pipe(Effect.ignore, Effect.forkIn(scope))
-
-          yield* plugin.trigger("experimental.chat.messages.transform", {}, { messages: msgs })
-
-          const [skills, env, instructions, mcpInstructions, modelMsgs] = yield* Effect.all([
-            sys.skills(agent),
-            sys.environment(model),
-            instruction.system().pipe(Effect.orDie),
-            sys.mcp(agent, session.permission),
-            MessageV2.toModelMessagesEffect(msgs, model),
-          ])
-          const system = [
-            ...env,
-            ...instructions,
-            ...(mcpInstructions ? [mcpInstructions] : []),
-            ...(skills ? [skills] : []),
-          ]
-          const format = lastUser.format ?? { type: "text" as const }
-          if (format.type === "json_schema") system.push(STRUCTURED_OUTPUT_SYSTEM_PROMPT)
-          const result = yield* handle.process({
-            user: lastUser,
-            agent,
-            permission: session.permission,
-            sessionID,
-            parentSessionID: session.parentID,
-            system,
-            messages: [
-              ...modelMsgs,
-              ...(isLastStep ? [{ role: "assistant" as const, content: MAX_STEPS_PROMPT }] : []),
-            ],
-            tools,
-            model,
-            toolChoice: format.type === "json_schema" ? "required" : undefined,
-          })
-
-          if (structured !== undefined) {
-            handle.message.structured = structured
-            handle.message.finish = handle.message.finish ?? "stop"
-            yield* sessions.updateMessage(handle.message)
-            return "break" as const
-          }
-
-          const finished = handle.message.finish && !["tool-calls", "unknown"].includes(handle.message.finish)
-          if (finished && !handle.message.error) {
-            // Surface any content-filter finish (e.g. Anthropic stop_reason:
-            // refusal) as an error. These turns may have produced no visible
-            // output at all — previously the session went idle silently — or
-            // partial text that was cut off by the provider's filter.
-            if (handle.message.finish === "content-filter") {
-              handle.message.error = new SessionV1.ContentFilterError({
-                message: "The response was blocked by the provider's content filter",
-              }).toObject()
-              yield* sessions.updateMessage(handle.message)
-              yield* events.publish(Session.Event.Error, { sessionID, error: handle.message.error })
-              return "break" as const
-            }
-            if (format.type === "json_schema") {
-              handle.message.error = new SessionV1.StructuredOutputError({
-                message: "Model did not produce structured output",
-                retries: 0,
-              }).toObject()
-              yield* sessions.updateMessage(handle.message)
-              return "break" as const
-            }
-          }
-
-          if (result === "stop") return "break" as const
-          if (result === "compact") {
-            yield* compaction.create({
+        while (true) {
+          const beforeTurn = yield* runtime.beforeTurn(sessionID)
+          if (!beforeTurn) {
+            yield* Effect.logInfo("restart diagnostic loop stopped at beforeTurn", {
               sessionID,
-              agent: lastUser.agent,
-              model: lastUser.model,
-              auto: true,
-              overflow: !handle.message.finish,
+              point: "beforeTurn",
+            })
+            yield* runtime.park(sessionID)
+            break
+          }
+          if (step === 0) yield* reconcileSubtaskCompletions(sessionID)
+          yield* status.set(sessionID, { type: "busy" })
+          yield* Effect.logInfo("loop", { "session.id": sessionID, step })
+
+          const snapshot = yield* history(sessionID, recovery || reconcile || manualRecovery)
+          if (!snapshot) break
+          let msgs = snapshot.msgs
+          const { user: lastUser, assistant: lastAssistant, finished: lastFinished, tasks } = snapshot.latest
+
+          for (const entry of snapshot.claimed) {
+            if (entry.payload.kind === "command") {
+              yield* materialize(entry).pipe(Effect.orDie)
+              continue
+            }
+            if (entry.payload.kind !== "shell") continue
+            yield* shellImpl({
+              sessionID,
+              messageID: entry.messageID,
+              agent: entry.payload.agent,
+              model: {
+                providerID: ProviderV2.ID.make(entry.payload.model.providerID),
+                modelID: ModelV2.ID.make(entry.payload.model.modelID),
+              },
+              command: entry.payload.command,
+              variant: entry.payload.variant,
             })
           }
-          return "continue" as const
-        }).pipe(
-          Effect.ensuring(instruction.clear(handle.message.id)),
-          Effect.onInterrupt(() => finalizeInterruptedAssistant),
-        )
-        if (outcome === "break") break
-        const checkpoint = yield* runtime.checkpoint(sessionID)
-        if (!checkpoint) {
-          yield* Effect.logInfo("restart diagnostic loop stopped at checkpoint", {
-            sessionID,
-            point: "checkpoint",
-          })
-          break
-        }
-        continue
-      }
+          if (snapshot.claimed.some((entry) => entry.payload.kind === "shell" || entry.payload.kind === "command"))
+            continue
 
-      yield* compaction.prune({ sessionID }).pipe(Effect.ignore, Effect.forkIn(scope))
-      return yield* lastAssistant(sessionID)
-    })
+          if (!lastUser) throw new Error("No user message found in stream. This should never happen.")
+          if (userID !== lastUser.id) {
+            step = 0
+            structured = undefined
+            userID = lastUser.id
+          }
+
+          const lastAssistantMsg = msgs.findLast(
+            (msg) => msg.info.role === "assistant" && msg.info.id === lastAssistant?.id,
+          )
+          // Some providers return "stop" even when the assistant message contains
+          // tool calls. Keep the loop running so tool results can be sent back to
+          // the model, but ignore cleanup-marked interrupted orphans.
+          const hasToolCalls =
+            lastAssistantMsg?.parts.some(
+              (part) =>
+                part.type === "tool" &&
+                !part.metadata?.providerExecuted &&
+                !isOrphanedInterruptedTool(part) &&
+                !(part.tool === "StructuredOutput" && lastAssistant?.structured !== undefined),
+            ) ?? false
+          const interruptedAssistant = recovery && lastAssistant && !lastAssistant.time.completed
+
+          if (
+            lastAssistant?.finish &&
+            !["tool-calls", "unknown"].includes(lastAssistant.finish) &&
+            !hasToolCalls &&
+            !interruptedAssistant &&
+            lastAssistant.parentID === lastUser.id
+          ) {
+            const orphan = lastAssistantMsg?.parts.find(
+              (part): part is SessionV1.ToolPart => part.type === "tool" && isOrphanedInterruptedTool(part),
+            )
+            if (orphan) {
+              yield* Effect.logWarning("loop exit with orphaned interrupted tool", {
+                "session.id": sessionID,
+                messageID: lastAssistant.id,
+                tool: orphan.tool,
+                callID: orphan.callID,
+              })
+            }
+            yield* Effect.logInfo("exiting loop", { "session.id": sessionID })
+            if (!recovery && !reconcile && !manualRecovery && !lastAssistant.error && (yield* advanceQueue(sessionID)))
+              continue
+            break
+          }
+
+          step++
+          if (step === 1)
+            yield* title({
+              session,
+              modelID: lastUser.model.modelID,
+              providerID: lastUser.model.providerID,
+              history: msgs,
+            }).pipe(Effect.ignore, Effect.forkIn(scope))
+
+          const model = yield* getModel(lastUser.model.providerID, lastUser.model.modelID, sessionID)
+          const task = tasks.pop()
+
+          if (task?.type === "subtask") {
+            yield* handleSubtask({ task, model, lastUser, sessionID, session, msgs })
+            continue
+          }
+
+          if (task?.type === "compaction") {
+            const result = yield* compaction.process({
+              messages: msgs,
+              parentID: lastUser.id,
+              sessionID,
+              auto: task.auto,
+              overflow: task.overflow,
+            })
+            if (result === "stop") {
+              const completed = yield* sessions
+                .findMessage(sessionID, (message) => message.info.role === "assistant")
+                .pipe(Effect.orDie)
+              if (
+                !recovery &&
+                !reconcile &&
+                !manualRecovery &&
+                Option.isSome(completed) &&
+                completed.value.info.role === "assistant" &&
+                !completed.value.info.error &&
+                (yield* advanceQueue(sessionID))
+              )
+                continue
+              break
+            }
+            continue
+          }
+
+          if (
+            lastFinished &&
+            lastFinished.summary !== true &&
+            (yield* compaction.isOverflow({ tokens: lastFinished.tokens, model }))
+          ) {
+            yield* compaction.create({ sessionID, agent: lastUser.agent, model: lastUser.model, auto: true })
+            continue
+          }
+
+          const agent = yield* agents.get(lastUser.agent)
+          if (!agent) {
+            const available = (yield* agents.list()).filter((a) => !a.hidden).map((a) => a.name)
+            const hint = available.length ? ` Available agents: ${available.join(", ")}` : ""
+            const error = new NamedError.Unknown({ message: `Agent not found: "${lastUser.agent}".${hint}` })
+            yield* events.publish(Session.Event.Error, { sessionID, error: error.toObject() })
+            throw error
+          }
+          const maxSteps = agent.steps ?? Infinity
+          const isLastStep = step >= maxSteps
+          msgs = yield* SessionReminders.apply({ messages: msgs, agent, session }).pipe(
+            Effect.provideService(RuntimeFlags.Service, flags),
+            Effect.provideService(FSUtil.Service, fsys),
+            Effect.provideService(Session.Service, sessions),
+          )
+
+          const msg: SessionV1.Assistant = {
+            id: MessageID.ascending(),
+            parentID: lastUser.id,
+            role: "assistant",
+            mode: agent.name,
+            agent: agent.name,
+            variant: lastUser.model.variant,
+            path: { cwd: ctx.directory, root: ctx.worktree },
+            cost: 0,
+            tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+            modelID: model.id,
+            providerID: model.providerID,
+            time: { created: Date.now() },
+            sessionID,
+          }
+          yield* sessions.updateMessage(msg)
+
+          const finalizeInterruptedAssistant = Effect.gen(function* () {
+            if (msg.time.completed) return
+            msg.error ??= MessageV2.fromError(new DOMException("Aborted", "AbortError"), {
+              providerID: msg.providerID,
+              aborted: true,
+            })
+            msg.time.completed = Date.now()
+            yield* sessions.updateMessage(msg)
+          })
+
+          const handle = yield* processor
+            .create({
+              assistantMessage: msg,
+              sessionID,
+              model,
+            })
+            .pipe(Effect.onInterrupt(() => finalizeInterruptedAssistant))
+
+          const outcome: "break" | "continue" = yield* Effect.gen(function* () {
+            const lastUserMsg = msgs.findLast((m) => m.info.role === "user")
+            const bypassAgentCheck = lastUserMsg?.parts.some((p) => p.type === "agent") ?? false
+            const promptOps = yield* ops()
+
+            const tools = yield* SessionTools.resolve({
+              agent,
+              session,
+              model,
+              processor: handle,
+              bypassAgentCheck,
+              messages: msgs,
+              promptOps,
+            }).pipe(
+              Effect.provideService(Plugin.Service, plugin),
+              Effect.provideService(Permission.Service, permission),
+              Effect.provideService(ToolRegistry.Service, registry),
+              Effect.provideService(MCP.Service, mcp),
+              Effect.provideService(Truncate.Service, truncate),
+              Effect.provideService(RuntimeFlags.Service, flags),
+            )
+
+            if (lastUser.format?.type === "json_schema") {
+              tools["StructuredOutput"] = createStructuredOutputTool({
+                schema: lastUser.format.schema,
+                onSuccess(output) {
+                  structured = output
+                },
+              })
+            }
+
+            if (step === 1)
+              yield* summary.summarize({ sessionID, messageID: lastUser.id }).pipe(Effect.ignore, Effect.forkIn(scope))
+
+            yield* plugin.trigger("experimental.chat.messages.transform", {}, { messages: msgs })
+
+            const [skills, env, instructions, mcpInstructions, modelMsgs] = yield* Effect.all([
+              sys.skills(agent),
+              sys.environment(model),
+              instruction.system().pipe(Effect.orDie),
+              sys.mcp(agent, session.permission),
+              MessageV2.toModelMessagesEffect(msgs, model),
+            ])
+            const system = [
+              ...env,
+              ...instructions,
+              ...(mcpInstructions ? [mcpInstructions] : []),
+              ...(skills ? [skills] : []),
+            ]
+            const format = lastUser.format ?? { type: "text" as const }
+            if (format.type === "json_schema") system.push(STRUCTURED_OUTPUT_SYSTEM_PROMPT)
+            const result = yield* handle.process({
+              user: lastUser,
+              agent,
+              permission: session.permission,
+              sessionID,
+              parentSessionID: session.parentID,
+              system,
+              messages: [
+                ...modelMsgs,
+                ...(isLastStep ? [{ role: "assistant" as const, content: MAX_STEPS_PROMPT }] : []),
+              ],
+              tools,
+              model,
+              toolChoice: format.type === "json_schema" ? "required" : undefined,
+            })
+
+            if (structured !== undefined) {
+              handle.message.structured = structured
+              handle.message.finish = handle.message.finish ?? "stop"
+              yield* sessions.updateMessage(handle.message)
+              return "break" as const
+            }
+
+            const finished = handle.message.finish && !["tool-calls", "unknown"].includes(handle.message.finish)
+            if (finished && !handle.message.error) {
+              // Surface any content-filter finish (e.g. Anthropic stop_reason:
+              // refusal) as an error. These turns may have produced no visible
+              // output at all — previously the session went idle silently — or
+              // partial text that was cut off by the provider's filter.
+              if (handle.message.finish === "content-filter") {
+                handle.message.error = new SessionV1.ContentFilterError({
+                  message: "The response was blocked by the provider's content filter",
+                }).toObject()
+                yield* sessions.updateMessage(handle.message)
+                yield* events.publish(Session.Event.Error, { sessionID, error: handle.message.error })
+                return "break" as const
+              }
+              if (format.type === "json_schema") {
+                handle.message.error = new SessionV1.StructuredOutputError({
+                  message: "Model did not produce structured output",
+                  retries: 0,
+                }).toObject()
+                yield* sessions.updateMessage(handle.message)
+                return "break" as const
+              }
+            }
+
+            if (result === "stop") return "break" as const
+            if (result === "compact") {
+              yield* compaction.create({
+                sessionID,
+                agent: lastUser.agent,
+                model: lastUser.model,
+                auto: true,
+                overflow: !handle.message.finish,
+              })
+            }
+            return "continue" as const
+          }).pipe(
+            Effect.ensuring(instruction.clear(handle.message.id)),
+            Effect.onInterrupt(() => finalizeInterruptedAssistant),
+          )
+          if (
+            outcome === "break" &&
+            (handle.message.error ||
+              !handle.message.finish ||
+              ["tool-calls", "unknown"].includes(handle.message.finish))
+          ) {
+            const flush = yield* InstanceState.get(queueState)
+            flush.delete(sessionID)
+            yield* queue.block(sessionID).pipe(Effect.orDie)
+            break
+          }
+          const checkpoint = yield* runtime.checkpoint(sessionID)
+          if (!checkpoint) {
+            yield* Effect.logInfo("restart diagnostic loop stopped at checkpoint", {
+              sessionID,
+              point: "checkpoint",
+            })
+            break
+          }
+          continue
+        }
+
+        yield* compaction.prune({ sessionID }).pipe(Effect.ignore, Effect.forkIn(scope))
+        return yield* lastAssistant(sessionID)
+      },
+      (effect, sessionID, recovery, reconcile, manualRecovery) =>
+        effect.pipe(
+          Effect.onExit((exit) =>
+            Effect.gen(function* () {
+              const flush = yield* InstanceState.get(queueState)
+              if (Exit.isFailure(exit) || recovery || reconcile || manualRecovery || flush.get(sessionID)?.size === 0)
+                flush.delete(sessionID)
+              if (Exit.isFailure(exit) || recovery || reconcile || manualRecovery)
+                yield* queue.block(sessionID).pipe(Effect.orDie)
+            }),
+          ),
+        ),
+    )
 
     const loop: (input: LoopInput) => Effect.Effect<SessionV1.WithParts> = Effect.fn("SessionPrompt.loop")(function* (
       input: LoopInput,
@@ -1789,6 +2427,7 @@ const layer = Layer.effect(
     })
 
     const recover = Effect.fn("SessionPrompt.recover")(function* (sessionID: SessionID) {
+      yield* queue.block(sessionID).pipe(Effect.orDie)
       return yield* state.ensureRunning(
         sessionID,
         lastAssistant(sessionID),
@@ -1807,7 +2446,10 @@ const layer = Layer.effect(
       return yield* state.startShell(input.sessionID, lastAssistant(input.sessionID), shellImpl(input, ready), ready)
     })
 
-    const command = Effect.fn("SessionPrompt.command")(function* (input: CommandInput) {
+    const command = Effect.fn("SessionPrompt.command")(function* (
+      input: CommandInput,
+      delivery?: SessionQueueV1.Entry,
+    ) {
       yield* Effect.logInfo("command", {
         "session.id": input.sessionID,
         command: input.command,
@@ -1917,14 +2559,19 @@ const layer = Layer.effect(
         { parts },
       )
 
-      const result = yield* prompt({
-        sessionID: input.sessionID,
-        messageID: input.messageID,
-        model: userModel,
-        agent: userAgent,
-        parts,
-        variant: input.variant,
-      })
+      const result = yield* prompt(
+        {
+          sessionID: input.sessionID,
+          messageID: input.messageID,
+          model: userModel,
+          agent: userAgent,
+          parts,
+          variant: input.variant,
+          noReply: delivery ? true : undefined,
+        },
+        undefined,
+        delivery,
+      )
       yield* events.publish(Command.Event.Executed, {
         name: input.command,
         sessionID: input.sessionID,
@@ -1942,6 +2589,10 @@ const layer = Layer.effect(
       shell,
       command,
       resolvePromptParts,
+      queueSubmit,
+      queueUpdate,
+      queueFlush,
+      queueResume,
     })
   }),
 )
@@ -2077,6 +2728,7 @@ export const node = LayerNode.make({
     CrossSpawnSpawner.node,
     Instruction.node,
     SessionRunState.node,
+    SessionQueue.node,
     SessionRevert.node,
     SessionSummary.node,
     SystemPrompt.node,

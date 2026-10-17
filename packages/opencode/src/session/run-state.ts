@@ -22,6 +22,12 @@ export interface Interface {
     onInterrupt: Effect.Effect<SessionV1.WithParts>,
     work: Effect.Effect<SessionV1.WithParts>,
   ) => Effect.Effect<SessionV1.WithParts>
+  readonly startIfIdle: (
+    sessionID: SessionID,
+    onInterrupt: Effect.Effect<SessionV1.WithParts>,
+    work: Effect.Effect<SessionV1.WithParts, never, Scope.Scope>,
+    prepare: Effect.Effect<boolean, never, Scope.Scope>,
+  ) => Effect.Effect<boolean>
   readonly startShell: (
     sessionID: SessionID,
     onInterrupt: Effect.Effect<SessionV1.WithParts>,
@@ -130,7 +136,16 @@ const layer = Layer.effect(
         .pipe(Effect.catchTag("RunnerBusy", () => Effect.fail(busyError(sessionID))))
     })
 
-    return Service.of({ assertNotBusy, cancel, ensureRunning, enqueue, startShell })
+    const startIfIdle = Effect.fn("SessionRunState.startIfIdle")(function* (
+      sessionID: SessionID,
+      onInterrupt: Effect.Effect<SessionV1.WithParts>,
+      work: Effect.Effect<SessionV1.WithParts, never, Scope.Scope>,
+      prepare: Effect.Effect<boolean, never, Scope.Scope>,
+    ) {
+      return yield* (yield* runner(sessionID, onInterrupt)).startIfIdle(work, prepare)
+    })
+
+    return Service.of({ assertNotBusy, cancel, ensureRunning, enqueue, startShell, startIfIdle })
   }),
 )
 

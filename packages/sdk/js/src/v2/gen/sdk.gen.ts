@@ -215,6 +215,16 @@ import type {
   SessionPromptAsyncResponses,
   SessionPromptErrors,
   SessionPromptResponses,
+  SessionQueueFlushErrors,
+  SessionQueueFlushResponses,
+  SessionQueueListErrors,
+  SessionQueueListResponses,
+  SessionQueueSubmitErrors,
+  SessionQueueSubmitResponses,
+  SessionQueueUpdateErrors,
+  SessionQueueUpdateResponses,
+  SessionQueueV1Mutation,
+  SessionQueueV1Payload,
   SessionRevertErrors,
   SessionRevertResponses,
   SessionShareErrors,
@@ -3870,6 +3880,7 @@ export class Session2 extends HeyApiClient {
       }
       agent?: string
       noReply?: boolean
+      idempotent?: boolean
       tools?: {
         [key: string]: boolean
       }
@@ -3892,6 +3903,7 @@ export class Session2 extends HeyApiClient {
             { in: "body", key: "model" },
             { in: "body", key: "agent" },
             { in: "body", key: "noReply" },
+            { in: "body", key: "idempotent" },
             { in: "body", key: "tools" },
             { in: "body", key: "format" },
             { in: "body", key: "system" },
@@ -4223,6 +4235,7 @@ export class Session2 extends HeyApiClient {
       }
       agent?: string
       noReply?: boolean
+      idempotent?: boolean
       tools?: {
         [key: string]: boolean
       }
@@ -4245,6 +4258,7 @@ export class Session2 extends HeyApiClient {
             { in: "body", key: "model" },
             { in: "body", key: "agent" },
             { in: "body", key: "noReply" },
+            { in: "body", key: "idempotent" },
             { in: "body", key: "tools" },
             { in: "body", key: "format" },
             { in: "body", key: "system" },
@@ -4263,6 +4277,146 @@ export class Session2 extends HeyApiClient {
         ...options?.headers,
         ...params.headers,
       },
+    })
+  }
+
+  /**
+   * List pending session inputs
+   */
+  public queueList<ThrowOnError extends boolean = false>(
+    parameters: {
+      sessionID: string
+      directory?: string
+      workspace?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "sessionID" },
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).get<SessionQueueListResponses, SessionQueueListErrors, ThrowOnError>({
+      url: "/session/{sessionID}/queue",
+      ...options,
+      ...params,
+    })
+  }
+
+  /**
+   * Manage pending session inputs
+   */
+  public queueUpdate<ThrowOnError extends boolean = false>(
+    parameters: {
+      sessionID: string
+      directory?: string
+      workspace?: string
+      revision?: number
+      mutation?: SessionQueueV1Mutation
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "sessionID" },
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+            { in: "body", key: "revision" },
+            { in: "body", key: "mutation" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).patch<SessionQueueUpdateResponses, SessionQueueUpdateErrors, ThrowOnError>({
+      url: "/session/{sessionID}/queue",
+      ...options,
+      ...params,
+      headers: {
+        "Content-Type": "application/json",
+        ...options?.headers,
+        ...params.headers,
+      },
+    })
+  }
+
+  /**
+   * Queue a session input
+   */
+  public queueSubmit<ThrowOnError extends boolean = false>(
+    parameters: {
+      sessionID: string
+      directory?: string
+      workspace?: string
+      id?: string
+      payload?: SessionQueueV1Payload
+      front?: boolean
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "sessionID" },
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+            { in: "body", key: "id" },
+            { in: "body", key: "payload" },
+            { in: "body", key: "front" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).post<SessionQueueSubmitResponses, SessionQueueSubmitErrors, ThrowOnError>({
+      url: "/session/{sessionID}/queue",
+      ...options,
+      ...params,
+      headers: {
+        "Content-Type": "application/json",
+        ...options?.headers,
+        ...params.headers,
+      },
+    })
+  }
+
+  /**
+   * Explicitly flush queued session inputs
+   */
+  public queueFlush<ThrowOnError extends boolean = false>(
+    parameters: {
+      sessionID: string
+      directory?: string
+      workspace?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "sessionID" },
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).post<SessionQueueFlushResponses, SessionQueueFlushErrors, ThrowOnError>({
+      url: "/session/{sessionID}/queue/flush",
+      ...options,
+      ...params,
     })
   }
 

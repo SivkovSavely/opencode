@@ -26,6 +26,7 @@ import { SessionEvent } from "./session-event"
 import { SessionStatusEvent } from "./session-status-event"
 import { SessionTodo } from "./session-todo"
 import { SessionV1 } from "./session-v1"
+import { SessionQueueV1 } from "./v1/session-queue"
 import { TuiEvent } from "./tui-event"
 import { VcsEvent } from "./vcs-event"
 import { WorkspaceEvent } from "./workspace-event"
@@ -63,6 +64,7 @@ export const ServerDefinitions = Event.inventory(
 export const Definitions = Event.inventory(
   ...foundationDefinitions,
   ...sessionV1LiveDefinitions,
+  ...SessionQueueV1.Event.Definitions,
   ...InstallationEvent.Definitions,
   ...featureDefinitions,
   ...SessionTodo.Event.Definitions,

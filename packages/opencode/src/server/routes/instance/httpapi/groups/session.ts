@@ -5,6 +5,7 @@ import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { Session } from "@/session/session"
 import { MessageV2 } from "@/session/message-v2"
 import { SessionPrompt } from "@/session/prompt"
+import { SessionQueueV1 } from "@opencode-ai/schema/v1/session-queue"
 import { SessionRevert } from "@/session/revert"
 import { SessionStatus } from "@/session/status"
 import { SessionSummary } from "@/session/summary"
@@ -20,7 +21,15 @@ import {
   WorkspaceRoutingQuery,
   WorkspaceRoutingQueryFields,
 } from "../middleware/workspace-routing"
-import { ApiNotFoundError, PermissionNotFoundError, SessionBusyError } from "../errors"
+import {
+  ApiNotFoundError,
+  ConflictError,
+  ForbiddenError,
+  InvalidRequestError,
+  PermissionNotFoundError,
+  SessionBusyError,
+  SessionNotFoundError,
+} from "../errors"
 import { described } from "./metadata"
 import { QueryBoolean } from "./query"
 import { ProviderV2 } from "@opencode-ai/core/provider"
@@ -94,6 +103,8 @@ export const SessionPaths = {
   summarize: `${root}/:sessionID/summarize`,
   prompt: `${root}/:sessionID/message`,
   promptAsync: `${root}/:sessionID/prompt_async`,
+  queue: `${root}/:sessionID/queue`,
+  queueFlush: `${root}/:sessionID/queue/flush`,
   command: `${root}/:sessionID/command`,
   shell: `${root}/:sessionID/shell`,
   revert: `${root}/:sessionID/revert`,
@@ -339,6 +350,38 @@ export const SessionApi = HttpApi.make("session")
             description:
               "Create and send a new message to a session asynchronously, starting the session if needed and returning immediately.",
           }),
+        ),
+        HttpApiEndpoint.get("queueList", SessionPaths.queue, {
+          params: { sessionID: SessionID },
+          query: WorkspaceRoutingQuery,
+          success: SessionQueueV1.Snapshot,
+          error: [SessionNotFoundError, ForbiddenError, ConflictError, InvalidRequestError],
+        }).annotateMerge(
+          OpenApi.annotations({ identifier: "session.queueList", summary: "List pending session inputs" }),
+        ),
+        HttpApiEndpoint.post("queueSubmit", SessionPaths.queue, {
+          params: { sessionID: SessionID },
+          query: WorkspaceRoutingQuery,
+          payload: Schema.Struct(SessionQueueV1.Submit.fields),
+          success: SessionQueueV1.Snapshot,
+          error: [SessionNotFoundError, ForbiddenError, ConflictError, InvalidRequestError],
+        }).annotateMerge(OpenApi.annotations({ identifier: "session.queueSubmit", summary: "Queue a session input" })),
+        HttpApiEndpoint.patch("queueUpdate", SessionPaths.queue, {
+          params: { sessionID: SessionID },
+          query: WorkspaceRoutingQuery,
+          payload: Schema.Struct(SessionQueueV1.Update.fields),
+          success: SessionQueueV1.Snapshot,
+          error: [SessionNotFoundError, ForbiddenError, ConflictError, InvalidRequestError],
+        }).annotateMerge(
+          OpenApi.annotations({ identifier: "session.queueUpdate", summary: "Manage pending session inputs" }),
+        ),
+        HttpApiEndpoint.post("queueFlush", SessionPaths.queueFlush, {
+          params: { sessionID: SessionID },
+          query: WorkspaceRoutingQuery,
+          success: SessionQueueV1.Snapshot,
+          error: [SessionNotFoundError, ForbiddenError, ConflictError, InvalidRequestError],
+        }).annotateMerge(
+          OpenApi.annotations({ identifier: "session.queueFlush", summary: "Explicitly flush queued session inputs" }),
         ),
         HttpApiEndpoint.post("command", SessionPaths.command, {
           params: { sessionID: SessionID },
