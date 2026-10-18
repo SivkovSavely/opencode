@@ -36,7 +36,7 @@ const entry = (id: string, delivery = "queue", state = "pending", messageID?: st
   ...(messageID ? { messageID } : {}),
 })
 
-async function setup(page: Page, design: boolean, initial = snapshot()) {
+async function setup(page: Page, design: boolean, initial = snapshot(), message = userMessage()) {
   // Exercise both composers even after the product's legacy-interface sunset.
   await page.clock.setFixedTime(new Date("2026-09-01T12:00:00Z"))
   const state = {
@@ -65,7 +65,7 @@ async function setup(page: Page, design: boolean, initial = snapshot()) {
       connected: [model.providerID],
       default: model,
     },
-    pageMessages: () => ({ items: [userMessage(), assistantMessage()] }),
+    pageMessages: () => ({ items: [message, assistantMessage()] }),
     sessionStatus: { [sessionID]: { type: "idle" } },
   })
   await page.route(/\/session\/[^/]+\/queue(?:\/flush)?(?:\?|$)/, async (route) => {
@@ -189,10 +189,13 @@ for (const design of [false, true]) {
     )
     await queue.click()
     await request
+    const confirmation = page.getByText("Queued", { exact: true })
+    await expect(confirmation).toHaveCount(0)
     await expect(fixture.input).toHaveText("Queue this exact draft")
     await expect(submit).toHaveAccessibleName("Steer")
     admission.resolve()
     await expect(fixture.input).toHaveText("")
+    await expect(confirmation).toBeVisible()
     expect(fixture.state.submits).toHaveLength(1)
     expect(fixture.state.submits[0]?.payload).toMatchObject({
       kind: "prompt",
@@ -203,14 +206,17 @@ for (const design of [false, true]) {
       page.locator('[data-component="user-message"]').filter({ hasText: "Queue this exact draft" }),
     ).toHaveCount(0)
     fixture.state.fail = true
+    await page.getByRole("button", { name: "Dismiss", exact: true }).click()
     await fixture.input.fill("Preserve on failure")
     await queue.click()
     await expect(page.getByText("Queue unavailable", { exact: true })).toBeVisible()
     await expect(fixture.input).toHaveText("Preserve on failure")
+    await expect(confirmation).toHaveCount(0)
     fixture.state.fail = false
     await fixture.input.fill("/queue abc")
     await fixture.input.press("Enter")
     await expect(fixture.input).toHaveText("")
+    await expect(confirmation).toBeVisible()
     expect(fixture.state.submits.at(-1)?.payload).toMatchObject({
       kind: "prompt",
       parts: [{ type: "text", text: "abc" }],
@@ -220,9 +226,7 @@ for (const design of [false, true]) {
     await fixture.input.fill("/queue")
     await fixture.input.press("Enter")
     await expect(fixture.input).toHaveText("")
-    await expect(
-      page.getByText("2 queued items. Open Queued from the session menu to manage them.", { exact: true }),
-    ).toBeVisible()
+    await expect(page.getByText(/2 queued items\. Open Queued from the session menu to manage them\./)).toBeVisible()
     await fixture.input.fill("/queues")
     await fixture.input.press("Enter")
     await expect(page.getByRole("dialog")).toBeVisible()
@@ -250,6 +254,104 @@ for (const design of [false, true]) {
     await expect(fixture.input).toHaveText("")
     expect(fixture.state.submits).toHaveLength(3)
   })
+
+  test(`queue list renders bounded numbered previews (${design ? "v2" : "legacy"})`, async ({ page }) => {
+    const fixture = await setup(
+      page,
+      design,
+      snapshot([
+        {
+          ...entry("later"),
+          position: 2,
+          payload: { ...payload, parts: [{ type: "text", text: "Later\nmultiline task" }] },
+        },
+        {
+          ...entry("file"),
+          position: 0,
+          payload: {
+            ...payload,
+            parts: [
+              {
+                type: "file",
+                mime: "application/pdf",
+                filename: "design.pdf",
+                url: "data:application/pdf;base64,PRIVATE",
+              },
+            ],
+          },
+        },
+        {
+          ...entry("command"),
+          position: 1,
+          payload: { kind: "command", agent: "build", model, command: "review", arguments: "changes" },
+        },
+        { ...entry("hidden"), position: 3, payload: { ...payload, parts: [{ type: "text", text: "Fourth task" }] } },
+        entry("steer", "steer"),
+        entry("claimed", "queue", "claimed"),
+        entry("uncertain", "queue", "uncertain"),
+      ]),
+    )
+    await fixture.input.fill("/queue list")
+    await fixture.input.press("Enter")
+    const description = page.getByText(/4 queued items\. Open Queued/)
+    await expect(description).toHaveText(
+      "4 queued items. Open Queued from the session menu to manage them.\n1. design.pdf\n2. /review changes\n3. Later multiline task\nMore queued items are available in Manage queue.",
+      { useInnerText: true },
+    )
+    await expect(description).toHaveCSS("white-space", "pre-line")
+    await expect(description).not.toContainText("PRIVATE")
+    await expect(description).not.toContainText("Fourth task")
+    await page.getByRole("button", { name: "Manage queue", exact: true }).click()
+    await expect(page.getByRole("dialog").locator('[data-queue-id="hidden"]')).toContainText("Fourth task")
+    expect(fixture.state.submits).toHaveLength(0)
+  })
+
+  for (const content of ["file", "image", "mixed"] as const) {
+    test(`pending ${content} steer outlines visible content only (${design ? "v2" : "legacy"})`, async ({ page }) => {
+      const file = {
+        id: "prt_queue_file",
+        type: "file" as const,
+        mime: "application/pdf",
+        filename: "design.pdf",
+        url: "data:application/pdf;base64,JVBERi0=",
+      }
+      const image = {
+        id: "prt_queue_image",
+        type: "file" as const,
+        mime: "image/png",
+        filename: "pixel.png",
+        url: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jvXkAAAAASUVORK5CYII=",
+      }
+      const message = userMessage(
+        content === "file"
+          ? [file]
+          : content === "image"
+            ? [image]
+            : [file, image, { id: "prt_queue_text", type: "text", text: "Mixed steer" }],
+      )
+      const fixture = await setup(page, design, snapshot([entry("steering", "steer", "pending", userID)]), message)
+      const row = page.locator(`[data-message-id="${userID}"][data-timeline-row="UserMessage"]`)
+      const targets = row.locator(
+        '[data-slot="user-message-text"], [data-slot="user-message-attachment"], [data-slot="user-message-attachments"] > [data-component="attachment-card-v2"]',
+      )
+      await expect(targets).toHaveCount(content === "mixed" ? 3 : 1)
+      for (const target of await targets.all()) {
+        await expect(target).toHaveCSS("outline-style", "dashed")
+        await expect(target).toHaveCSS("outline-width", "1px")
+      }
+      await expect(row.locator('[data-slot="user-message-attachments"]')).not.toHaveCSS("outline-style", "dashed")
+      if (design && content !== "image")
+        await expect(row.locator('[data-component="attachment-card-v2"]')).toBeVisible()
+      fixture.state.snapshot = {
+        ...fixture.state.snapshot,
+        revision: 2,
+        items: fixture.state.snapshot.items.map((item) => ({ ...item, state: "claimed" })),
+      }
+      await fixture.change()
+      await expect(row.locator("[data-pending-steer]")).toHaveCount(0)
+      for (const target of await targets.all()) await expect(target).not.toHaveCSS("outline-style", "dashed")
+    })
+  }
 
   test(`native queue management and authoritative pending steers (${design ? "v2" : "legacy"})`, async ({ page }) => {
     const fixture = await setup(

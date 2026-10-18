@@ -5,7 +5,7 @@ import { Button } from "@opencode-ai/ui/button"
 import type { SessionQueueV1 } from "@opencode-ai/schema/v1/session-queue"
 import { useLanguage } from "@/context/language"
 import type { useSessionQueue } from "@/context/session-queue"
-import { queueOrder } from "@/utils/session-queue"
+import { queueOrder, queuePreview } from "@/utils/session-queue"
 
 export function DialogSessionQueue(props: { queue: ReturnType<typeof useSessionQueue> }) {
   const language = useLanguage()
@@ -98,23 +98,7 @@ export function DialogSessionQueue(props: { queue: ReturnType<typeof useSessionQ
                       const pending = () => group(delivery).filter((entry) => entry.state === "pending")
                       const index = () => pending().findIndex((entry) => entry.id === id)
                       const disabled = () => state.pending || item().state !== "pending"
-                      const preview = () => {
-                        const payload = item().payload
-                        if (payload.kind === "compact") return language.t("queue.compact")
-                        if (payload.kind === "shell") return `!${payload.command}`
-                        if (payload.kind === "command") return `/${payload.command} ${payload.arguments}`
-                        return payload.parts
-                          .flatMap((part) =>
-                            part.type === "text"
-                              ? [part.text]
-                              : part.type === "agent"
-                                ? [`@${part.name}`]
-                                : part.type === "subtask"
-                                  ? [part.prompt]
-                                  : [],
-                          )
-                          .join("\n")
-                      }
+                      const preview = () => queuePreview(item().payload, language.t("queue.compact"))
                       const files = () => {
                         const payload = item().payload
                         return payload.kind === "prompt" || payload.kind === "command"

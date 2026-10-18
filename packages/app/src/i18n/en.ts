@@ -10,6 +10,8 @@ export const dict = {
   "queue.empty": "No pending items",
   "queue.list.one": "{{count}} queued item. Open Queued from the session menu to manage it.",
   "queue.list.other": "{{count}} queued items. Open Queued from the session menu to manage them.",
+  "queue.list.more": "More queued items are available in Manage queue.",
+  "queue.manage": "Manage queue",
   "queue.invalid": "Invalid queue command. Use /queue <message>, /queue list, start, stop, flush, or clear [numbers].",
   "queue.attachmentsUnsupported":
     "Queued shell and compact commands do not support attachments. Remove attachments or use a prompt.",

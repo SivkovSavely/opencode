@@ -46,6 +46,7 @@ const queueItems: unknown[] = []
 const statusWrites: unknown[] = []
 let queueGate: Promise<void> | undefined
 let queueError: Error | undefined
+let invalidQueueResponse = false
 let queueStarted = () => {}
 const interrupted: string[] = []
 const commands: Array<{ name: string }> = []
@@ -194,6 +195,7 @@ const clientFor = (directory: string) => {
         queueStarted()
         await queueGate
         if (queueError) throw queueError
+        if (invalidQueueResponse) return { data: {} }
         return { data: { sessionID: input.sessionID, revision: 1, paused: false, blocked: false, items: [] } }
       },
       queueList: async () => ({
@@ -436,6 +438,7 @@ beforeEach(() => {
   statusWrites.length = 0
   queueGate = undefined
   queueError = undefined
+  invalidQueueResponse = false
   sessionIDOverride = undefined
   queueStarted = () => {}
   createdClients.length = 0
@@ -553,10 +556,12 @@ describe("native queue submission", () => {
     expect(optimistic).toHaveLength(0)
     expect(preparing).not.toContain(true)
     expect(statusWrites).toHaveLength(0)
+    expect(toasts).toHaveLength(0)
     release.resolve()
     await request
     expect(promptResets).toBe(1)
     expect(sentPrompts).toHaveLength(0)
+    expect(toasts).toEqual([{ title: "queue.queued", variant: "success", duration: 3000 }])
     expect(queuedInputs[0]).toMatchObject({
       sessionID: "ses_queue",
       payload: { kind: "prompt", agent: "agent", model: { modelID: "model", providerID: "provider" } },
@@ -570,9 +575,24 @@ describe("native queue submission", () => {
     expect(promptResets).toBe(0)
     expect(promptValue[0]).toMatchObject({ content: "ls" })
     expect(toasts).toContainEqual(expect.objectContaining({ description: "offline" }))
+    expect(toasts).not.toContainEqual(expect.objectContaining({ variant: "success" }))
     queueError = undefined
     await submit.handleSubmit(new Event("submit"), "queue")
     expect(queuedInputs[1]).toEqual(queuedInputs[0])
+  })
+  test("rejects an invalid queue response without confirmation or clearing and preserves retry identity", async () => {
+    params.id = "ses_queue"
+    invalidQueueResponse = true
+    const submit = createSubmit()
+    await submit.handleSubmit(new Event("submit"), "queue")
+    expect(promptResets).toBe(0)
+    expect(promptValue[0]).toMatchObject({ content: "ls" })
+    expect(toasts).toContainEqual(expect.objectContaining({ title: "common.requestFailed" }))
+    expect(toasts).not.toContainEqual(expect.objectContaining({ variant: "success" }))
+    invalidQueueResponse = false
+    await submit.handleSubmit(new Event("submit"), "queue")
+    expect(queuedInputs[1]).toEqual(queuedInputs[0])
+    expect(toasts.filter((toast) => (toast as { variant?: string }).variant === "success")).toHaveLength(1)
   })
   test("keeps a new-session queue failure on the original draft and reuses its session on retry", async () => {
     selected = "main"
@@ -584,6 +604,7 @@ describe("native queue submission", () => {
     expect(navigated).toHaveLength(0)
     expect(promptResets).toBe(0)
     expect(createdSessions).toHaveLength(1)
+    expect(toasts).not.toContainEqual(expect.objectContaining({ variant: "success" }))
     queueError = undefined
     await submit.handleSubmit(new Event("submit"))
     expect(createdSessions).toHaveLength(1)
@@ -591,6 +612,9 @@ describe("native queue submission", () => {
     expect(queuedInputs[1]).toEqual(queuedInputs[0])
     expect(navigated[0]).toEndWith("/session/ses_new_queue")
     expect(optimistic).toHaveLength(0)
+    expect(toasts.filter((toast) => (toast as { variant?: string }).variant === "success")).toEqual([
+      { title: "queue.queued", variant: "success", duration: 3000 },
+    ])
   })
   test("preserves edits made while native admission is in flight", async () => {
     params.id = "ses_queue"
@@ -616,11 +640,13 @@ describe("native queue submission", () => {
     queueStarted = () => started.resolve()
     const request = createSubmit().handleSubmit(new Event("submit"))
     await started.promise
+    expect(toasts).toHaveLength(0)
     promptValue = [{ type: "text", content: "next draft", start: 0, end: 10 }]
     release.resolve()
     await request
     expect(sessionPromptValue[0]).toMatchObject({ content: "next draft" })
     expect(optimistic).toHaveLength(0)
+    expect(toasts).toEqual([{ title: "queue.queued", variant: "success", duration: 3000 }])
   })
   test("does not promote another draft sharing the new-session pathname during queue admission", async () => {
     selected = "main"
@@ -690,6 +716,7 @@ describe("native queue submission", () => {
     expect(queuedInputs[0]).toMatchObject({ payload: { kind: "prompt", parts: [{ type: "text", text: "abc" }] } })
     expect(sentCommands).toHaveLength(0)
     expect(sentPrompts).toHaveLength(0)
+    expect(toasts).toEqual([{ title: "queue.queued", variant: "success", duration: 3000 }])
   })
   test.each(["/queue stop", "/queue start", "/queue flush", "/queue clear"])(
     "%s is a management operation, not a prompt",
@@ -715,24 +742,123 @@ describe("native queue submission", () => {
     expect(queuedInputs).toHaveLength(0)
     expect(sentPrompts).toHaveLength(0)
   })
-  test.each(["/queue", "/queue list"])("%s lists pending queued count without submitting", async (text) => {
+  test.each(["/queue", "/queue list"])("%s lists only pending queued items in queue order", async (text) => {
     params.id = "ses_queue"
     queueItems.push(
-      ...["pending", "claimed", "uncertain"].map((state, position) => ({
+      ...["pending", "claimed", "uncertain", "pending"].map((state, position) => ({
         id: state,
         state,
         position,
         sessionID: params.id,
-        delivery: "queue",
+        delivery: position === 3 ? "steer" : "queue",
         created: 1,
         payload: { kind: "compact", agent: "agent", model: { providerID: "provider", modelID: "model" } },
       })),
+      {
+        id: "first",
+        state: "pending",
+        position: -1,
+        sessionID: params.id,
+        delivery: "queue",
+        created: 1,
+        payload: {
+          kind: "prompt",
+          agent: "agent",
+          model: { providerID: "provider", modelID: "model" },
+          parts: [{ type: "text", text: "First line\nsecond line" }],
+        },
+      },
     )
     promptValue = [{ type: "text", content: text, start: 0, end: text.length }]
     await createSubmit().handleSubmit(new Event("submit"))
-    expect(toasts).toContainEqual({ title: "queue.title", description: "queue.list:1" })
+    expect(toasts).toContainEqual({
+      title: "queue.title",
+      description: "queue.list:2\n1. First line second line\n2. queue.compact",
+      multiline: true,
+      duration: 10000,
+      actions: [],
+    })
     expect(queuedInputs).toHaveLength(0)
     expect(sentPrompts).toHaveLength(0)
+    expect(optimistic).toHaveLength(0)
+    expect(statusWrites).toHaveLength(0)
+  })
+  test.each(["/queue", "/queue list"])("%s reports an empty queue", async (text) => {
+    params.id = "ses_queue"
+    promptValue = [{ type: "text", content: text, start: 0, end: text.length }]
+    await createSubmit().handleSubmit(new Event("submit"))
+    expect(toasts).toContainEqual(
+      expect.objectContaining({ description: "queue.list:0\nqueue.empty", multiline: true }),
+    )
+    expect(queuedInputs).toHaveLength(0)
+  })
+  test("list previews attachments and commands without exposing attachment data", async () => {
+    params.id = "ses_queue"
+    const info = { agent: "agent", model: { providerID: "provider", modelID: "model" } }
+    queueItems.push(
+      ...[
+        {
+          kind: "prompt",
+          ...info,
+          parts: [{ type: "file", mime: "image/png", url: "data:image/png;base64,SECRET", filename: "design.png" }],
+        },
+        { kind: "command", ...info, command: "review", arguments: "changed files" },
+        { kind: "shell", ...info, command: "ls -la" },
+      ].map((payload, position) => ({
+        id: `${position}`,
+        position,
+        payload,
+        sessionID: params.id,
+        created: 1,
+        state: "pending",
+        delivery: "queue",
+      })),
+    )
+    promptValue = [{ type: "text", content: "/queue list", start: 0, end: 11 }]
+    await createSubmit().handleSubmit(new Event("submit"))
+    expect(toasts).toContainEqual(
+      expect.objectContaining({ description: "queue.list:3\n1. design.png\n2. /review changed files\n3. !ls -la" }),
+    )
+    expect(JSON.stringify(toasts)).not.toContain("SECRET")
+  })
+  test("bounds list previews and offers the full native queue dialog", async () => {
+    params.id = "ses_queue"
+    queueItems.push(
+      ...Array.from({ length: 4 }, (_, position) => ({
+        id: `${position}`,
+        position,
+        sessionID: params.id,
+        created: 1,
+        state: "pending",
+        delivery: "queue",
+        payload: {
+          kind: "prompt",
+          agent: "agent",
+          model: { providerID: "provider", modelID: "model" },
+          parts: [{ type: "text", text: position === 0 ? "x".repeat(200) : `item-${position}` }],
+        },
+      })),
+    )
+    promptValue = [{ type: "text", content: "/queue list", start: 0, end: 11 }]
+    let managed = 0
+    await createSubmit({ onManageQueue: () => managed++ }).handleSubmit(new Event("submit"))
+    expect(toasts).toContainEqual(
+      expect.objectContaining({
+        description: `queue.list:4\n1. ${"x".repeat(77)}...\n2. item-1\n3. item-2\nqueue.list.more`,
+      }),
+    )
+    const toast = toasts[0] as { actions: { label: string; onClick: () => void }[] }
+    expect(managed).toBe(0)
+    expect(toast.actions[0]?.label).toBe("queue.manage")
+    toast.actions[0]?.onClick()
+    expect(managed).toBe(1)
+    params.id = "ses_other"
+    toast.actions[0]?.onClick()
+    expect(managed).toBe(1)
+    params.id = "ses_queue"
+    currentPathname = "/repo/main/other-session"
+    toast.actions[0]?.onClick()
+    expect(managed).toBe(1)
   })
   test("indexed clear sends stable IDs with the latest acknowledged CAS revision", async () => {
     params.id = "ses_queue"

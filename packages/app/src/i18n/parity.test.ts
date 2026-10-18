@@ -75,6 +75,8 @@ const appFallbackKeys = new Set([
   "queue.empty",
   "queue.list.one",
   "queue.list.other",
+  "queue.list.more",
+  "queue.manage",
   "queue.invalid",
   "queue.attachmentsUnsupported",
   "queue.sessionRequired",

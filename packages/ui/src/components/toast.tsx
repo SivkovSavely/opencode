@@ -108,6 +108,7 @@ export interface ToastAction {
 export interface ToastOptions {
   title?: string
   description?: string
+  multiline?: boolean
   icon?: IconProps["name"]
   variant?: ToastVariant
   duration?: number
@@ -132,7 +133,9 @@ export function showToast(options: ToastOptions | string) {
           <Toast.Title>{opts.title}</Toast.Title>
         </Show>
         <Show when={opts.description}>
-          <Toast.Description>{opts.description}</Toast.Description>
+          <Toast.Description style={{ "white-space": opts.multiline ? "pre-line" : undefined }}>
+            {opts.description}
+          </Toast.Description>
         </Show>
         <Show when={opts.actions?.length}>
           <Toast.Actions>

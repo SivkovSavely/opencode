@@ -170,6 +170,7 @@ export interface ToastV2Action {
 export interface ToastV2Options {
   title?: string
   description?: string
+  multiline?: boolean
   icon?: JSX.Element
   variant?: "default" | "success" | "error" | "loading"
   duration?: number
@@ -192,6 +193,7 @@ export function showToastV2(options: ToastV2Options | string) {
   const key = JSON.stringify({
     title: opts.title,
     description: opts.description,
+    multiline: opts.multiline,
     variant: opts.variant,
     duration: opts.duration,
     persistent: opts.persistent,
@@ -222,7 +224,11 @@ function publishToastV2(entry: ActiveToastV2) {
   const release = () => releaseToastV2(entry)
   toast(entry.options.title ?? "", {
     id: entry.id,
-    description: entry.options.description,
+    description: entry.options.multiline ? (
+      <div style={{ "white-space": "pre-line" }}>{entry.options.description}</div>
+    ) : (
+      entry.options.description
+    ),
     icon: entry.options.icon,
     action: entry.actions,
     closeButton: true,

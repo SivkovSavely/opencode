@@ -26,6 +26,7 @@ import { QueueCommand } from "@opencode-ai/schema/queue-command"
 import { queuePayload, QueuePayloadError } from "./queue-payload"
 import { Schema } from "effect"
 import { SessionQueueV1 } from "@opencode-ai/schema/v1/session-queue"
+import { queuePreview } from "@/utils/session-queue"
 
 type PendingPrompt = {
   abort: AbortController
@@ -440,14 +441,45 @@ export function createPromptSubmit(input: PromptSubmitInput) {
         const snapshot = Schema.decodeUnknownSync(SessionQueueV1.Snapshot)(
           (await client.queueList({ sessionID, directory })).data,
         )
-        if (queueCommand.type === "list")
+        if (queueCommand.type === "list") {
+          const queued = snapshot.items
+            .filter((item) => item.delivery === "queue" && item.state === "pending")
+            .sort((a, b) => a.position - b.position)
+          const previews = queued.slice(0, 3).map((item, index) => {
+            const payload = item.payload
+            const files =
+              payload.kind === "prompt" || payload.kind === "command"
+                ? (payload.parts?.flatMap((part) => (part.type === "file" ? [part.filename ?? part.mime] : [])) ?? [])
+                : []
+            const preview = [queuePreview(payload, language.t("queue.compact")), ...files]
+              .join(" ")
+              .replace(/\s+/g, " ")
+              .trim()
+            return `${index + 1}. ${preview.length > 80 ? `${preview.slice(0, 77)}...` : preview}`
+          })
           showToast({
             title: language.t("queue.title"),
-            description: language.plural(
-              "queue.list",
-              snapshot.items.filter((item) => item.delivery === "queue" && item.state === "pending").length,
-            ),
+            description: [
+              language.plural("queue.list", queued.length),
+              ...(queued.length ? previews : [language.t("queue.empty")]),
+              ...(queued.length > previews.length ? [language.t("queue.list.more")] : []),
+            ].join("\n"),
+            multiline: true,
+            duration: 10000,
+            actions: input.onManageQueue
+              ? [
+                  {
+                    label: language.t("queue.manage"),
+                    onClick: () => {
+                      if (destinationKey() !== initialKey || params.id !== sessionID || sdk().directory !== directory)
+                        return
+                      input.onManageQueue?.()
+                    },
+                  },
+                ]
+              : [],
           })
+        }
         if (queueCommand.type === "flush") await client.queueFlush({ sessionID, directory })
         if (queueCommand.type === "start" || queueCommand.type === "stop")
           await client.queueUpdate({
@@ -775,6 +807,7 @@ export function createPromptSubmit(input: PromptSubmitInput) {
           front,
         })
         Schema.decodeUnknownSync(SessionQueueV1.Snapshot)(result.data)
+        showToast({ title: language.t("queue.queued"), variant: "success", duration: 3000 })
         if (isNewSession) {
           await promoteSession()
           queueRetries.delete(key)
