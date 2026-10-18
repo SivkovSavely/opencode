@@ -18,7 +18,7 @@ export function createQueueDialog(queue: QueueController, sessionID: string) {
   }
 
   function confirmClear() {
-    if (!busy() && queue.pending(sessionID).length) setConfirmation({ action: "clear" })
+    if (!busy() && queue.pending(sessionID, "queue").length) setConfirmation({ action: "clear" })
   }
 
   return {

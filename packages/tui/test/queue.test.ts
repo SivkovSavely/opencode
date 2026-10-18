@@ -295,6 +295,44 @@ describe("queue synchronization", () => {
 })
 
 describe("queue dialog controller", () => {
+  test.each([
+    ["steering-only", [entry("steer", { delivery: "steer" })], false],
+    [
+      "claimed/uncertain-only",
+      [entry("claimed", { state: "claimed" }), entry("uncertain", { state: "uncertain" })],
+      false,
+    ],
+    ["empty", [], false],
+    [
+      "mixed pending",
+      [
+        entry("steer", { delivery: "steer" }),
+        entry("claimed", { state: "claimed" }),
+        entry("uncertain", { state: "uncertain" }),
+        entry("queued"),
+      ],
+      true,
+    ],
+  ] as const)("clear confirmation requires pending queued entries: %s", async (_name, items, confirmable) => {
+    const h = harness(snapshot([...items]))
+    await h.queue.refresh(sessionID)
+    const ui = createRoot(() => createQueueDialog(h.queue, sessionID))
+    ui.key({ name: "c" })
+    expect(ui.confirmation()).toEqual(confirmable ? { action: "clear" } : undefined)
+    if (!confirmable) {
+      expect(ui.key({ name: "y" })).toBe(false)
+      expect(h.mutations).toHaveLength(0)
+      return
+    }
+    expect(ui.key({ name: "escape" })).toBe(true)
+    expect(ui.confirmation()).toBeUndefined()
+    expect(h.mutations).toHaveLength(0)
+    ui.key({ name: "c" })
+    expect(ui.confirmation()).toEqual({ action: "clear" })
+    expect(ui.key({ name: "y" })).toBe(true)
+    expect(h.mutations[0].mutation).toEqual({ action: "clear" })
+  })
+
   test("groups steering first, preserves selected ID, and reorders only the selected delivery", async () => {
     const h = harness(
       snapshot([entry("q1", { position: 1 }), entry("s1", { delivery: "steer" }), entry("q2", { position: 2 })]),
