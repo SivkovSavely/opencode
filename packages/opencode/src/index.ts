@@ -29,8 +29,18 @@ import { DbCommand } from "./cli/cmd/db"
 import { errorMessage } from "./util/error"
 import { PluginCommand } from "./cli/cmd/plug"
 import { Heap } from "./cli/heap"
+import { ApiCommand } from "./cli/cmd/api"
+import { apiCompletion, waitForApiCompletion } from "./cli/cmd/api/completion"
+import { normalizeApiArgs } from "./cli/cmd/api/args"
 
-const args = hideBin(process.argv)
+const normalizedArgs = normalizeApiArgs(hideBin(process.argv))
+const args = normalizedArgs.args
+const apiInvocation = normalizedArgs.api
+const apiIndex = apiInvocation ? args.indexOf("api") : -1
+const completionIndex = args.indexOf("--get-yargs-completions")
+const completionArgs = completionIndex < 0 ? [] : args.slice(completionIndex + 1)
+const completionRootArgs = completionArgs[0]?.split(/[\\/]/).at(-1) === "opencode" ? completionArgs.slice(1) : completionArgs
+const runMessageNamedApi = completionIndex >= 0 && !apiInvocation && completionRootArgs[0] === "run" && completionRootArgs[1] === "api"
 
 function show(out: string) {
   const text = out.trimStart()
@@ -70,6 +80,12 @@ const cli = yargs(args)
       process.env.OPENCODE_PURE = "1"
     }
 
+    const offlineApiInvocation =
+      args[0] === "completion" ||
+      args.includes("--get-yargs-completions") ||
+      (apiIndex >= 0 && args.slice(apiIndex).some((arg) => arg === "-h" || arg === "--help"))
+    if (offlineApiInvocation) return
+
     Heap.start()
 
     process.env.AGENT = "1"
@@ -77,7 +93,7 @@ const cli = yargs(args)
     process.env.OPENCODE_PID = String(process.pid)
   })
   .usage("")
-  .completion("completion", "generate shell completion script")
+  .completion("completion", "generate shell completion script", apiCompletion)
   .command(AcpCommand)
   .command(McpCommand)
   .command(TuiThreadCommand)
@@ -101,7 +117,14 @@ const cli = yargs(args)
   .command(SessionCommand)
   .command(PluginCommand)
   .command(DbCommand)
+  .command(runMessageNamedApi ? [] : [ApiCommand])
   .fail((msg, err) => {
+    if (args.includes("--get-yargs-completions")) return
+    if (apiInvocation && (msg?.startsWith("Unknown argument") || msg?.startsWith("Invalid values:"))) {
+      if (err) throw err
+      process.stderr.write(msg + EOL)
+      process.exit(1)
+    }
     if (
       msg?.startsWith("Unknown argument") ||
       msg?.startsWith("Not enough non-option arguments") ||
@@ -122,6 +145,57 @@ try {
       if (!out) return
       show(out)
     })
+  } else if (args[0] === "completion" && (process.env.SHELL?.includes("zsh") || process.env.ZSH_NAME?.includes("zsh"))) {
+    const chunks: string[] = []
+    const originalWrite = process.stdout.write
+    const originalLog = console.log
+    const originalExit = process.exit
+    const completionExit = Symbol("completion exit")
+    process.stdout.write = ((chunk: string | Uint8Array, encoding?: BufferEncoding | ((error?: Error | null) => void), callback?: (error?: Error | null) => void) => {
+      chunks.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString(typeof encoding === "string" ? encoding : "utf8"))
+      if (typeof encoding === "function") encoding()
+      callback?.()
+      return true
+    }) as typeof process.stdout.write
+    console.log = (...values: Parameters<typeof console.log>) => chunks.push(values.map(String).join(" ") + EOL)
+    process.exit = ((code?: number) => {
+      process.exitCode = code ?? 0
+      throw completionExit
+    }) as typeof process.exit
+    try {
+      await cli.parse()
+    } catch (error) {
+      if (error !== completionExit) throw error
+    } finally {
+      process.stdout.write = originalWrite
+      console.log = originalLog
+      process.exit = originalExit
+    }
+    const script = chunks.join("").replace(
+      "  else\n    _default\n  fi",
+      `  else
+    if [[ " \${words[*]} " != *" api "* ]]; then
+      _default
+      return
+    fi
+    case \${words[CURRENT]} in
+      --directory=*) IPREFIX=\${words[CURRENT]%%=*}=; PREFIX=\${words[CURRENT]#*=}; _files -/; return 0 ;;
+      --body-file=*) IPREFIX=\${words[CURRENT]%%=*}=; PREFIX=\${words[CURRENT]#*=}; compadd -- -; _files; return 0 ;;
+      --output=*) IPREFIX=\${words[CURRENT]%%=*}=; PREFIX=\${words[CURRENT]#*=}; _files; return 0 ;;
+      --path=*) IPREFIX=\${words[CURRENT]%%=*}=; PREFIX=\${words[CURRENT]#*=}; _files; return 0 ;;
+    esac
+    case \${words[CURRENT-1]} in
+      --directory|--directory=*) _files -/ ;;
+      --body-file|--body-file=*) compadd -- -; _files ;;
+      --output|--output=*|--path|--path=*) _files ;;
+      *)
+        if [[ " \${words[*]} " == *" api v2 fs read "* ]]; then _files; return 0; fi
+        return 0
+        ;;
+    esac
+  fi`,
+    )
+    process.stdout.write(script)
   } else {
     await cli.parse()
   }
@@ -134,6 +208,13 @@ try {
   }
   process.exitCode = 1
 } finally {
+  if (args.includes("--get-yargs-completions")) await waitForApiCompletion()
+  if ((apiInvocation || args.includes("--get-yargs-completions")) && process.exitCode !== 130 && process.exitCode !== 124) {
+    await Promise.all([
+      new Promise<void>((resolve) => process.stdout.write("", () => resolve())),
+      new Promise<void>((resolve) => process.stderr.write("", () => resolve())),
+    ])
+  }
   // Some subprocesses don't react properly to SIGTERM and similar signals.
   // Most notably, some docker-container-based MCP servers don't handle such signals unless
   // run using `docker run --init`.
