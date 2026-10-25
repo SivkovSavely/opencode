@@ -531,6 +531,7 @@ describe("runtime lifecycle", () => {
 
       expect(yield* runtime.admit({ sessionID, directory: "/tmp", manualRecovery: true })).toEqual({
         manualRecovery: true,
+        fence: 1,
       })
       expect(yield* executionDetails(database, sessionID)).toMatchObject({
         state: "active",
@@ -1318,6 +1319,123 @@ describe("runtime lifecycle", () => {
       expect(yield* runtime.awaitDrain).toBeUndefined()
       expect(yield* runtime.isParked(sessionID)).toBe(true)
       expect(yield* execution(database, sessionID)).toEqual({ state: "parked", retry_at: retryAt })
+    }),
+  )
+
+  it.effect("parks an interrupted retry-wait execution without losing its deadline", () =>
+    Effect.gen(function* () {
+      const database = yield* Database.Service
+      const scope = yield* Scope.Scope
+      const sessionID = yield* seedSession(database)
+      const runtime = RuntimeLifecycle.make({ lineage: randomUUID(), instance: randomUUID() }, scope, database)
+      const retryAt = (yield* Clock.currentTimeMillis) + 10_000
+      const admission = yield* runtime.admit({ sessionID, directory: "/tmp" })
+      yield* runtime.retry(sessionID, retryAt)
+
+      expect(yield* runtime.ownershipFence(sessionID)).toBe(0)
+      expect(yield* runtime.releaseInterrupted(sessionID, admission.fence)).toBe("parked")
+
+      expect(yield* runtime.isParked(sessionID)).toBe(true)
+      expect(yield* execution(database, sessionID)).toEqual({ state: "parked", retry_at: retryAt })
+    }),
+  )
+
+  it.effect("releases interrupted admission leases before parking the final owner", () =>
+    Effect.gen(function* () {
+      const database = yield* Database.Service
+      const scope = yield* Scope.Scope
+      const sessionID = yield* seedSession(database)
+      const runtime = RuntimeLifecycle.make({ lineage: randomUUID(), instance: randomUUID() }, scope, database)
+      const first = yield* runtime.admit({ sessionID, directory: "/tmp" })
+      const second = yield* runtime.admit({ sessionID, directory: "/tmp" })
+
+      expect(second.fence).toBe(first.fence)
+      expect(yield* runtime.releaseInterrupted(sessionID, first.fence + 1)).toBe("absent")
+      yield* runtime.release(sessionID, first.fence + 1)
+      expect(yield* runtime.status()).toMatchObject({ active: 1, parked: 0 })
+      expect(yield* runtime.releaseInterrupted(sessionID, first.fence)).toBe("active")
+      expect(yield* runtime.status()).toMatchObject({ active: 1, parked: 0 })
+      expect(yield* runtime.releaseInterrupted(sessionID, second.fence)).toBe("parked")
+      expect(yield* execution(database, sessionID)).toMatchObject({ state: "parked" })
+    }),
+  )
+
+  it.effect("retires interrupted local ownership after a durable takeover", () =>
+    Effect.gen(function* () {
+      const database = yield* Database.Service
+      const scope = yield* Scope.Scope
+      const lineage = randomUUID()
+      const sessionID = yield* seedSession(database)
+      const previousInstance = randomUUID()
+      const replacementInstance = randomUUID()
+      const previous = RuntimeLifecycle.make({ lineage, instance: previousInstance }, scope, database)
+      const admission = yield* previous.admit({ sessionID, directory: "/tmp" })
+      yield* replaceOwner(database, sessionID, replacementInstance, admission.fence + 1)
+
+      expect(yield* previous.releaseInterrupted(sessionID, admission.fence)).toBe("absent")
+      expect(yield* previous.status()).toMatchObject({ active: 0 })
+      expect(yield* executionDetails(database, sessionID)).toMatchObject({
+        state: "active",
+        owner_lineage: lineage,
+        owner_instance: replacementInstance,
+        fence: admission.fence + 1,
+      })
+    }),
+  )
+
+  it.effect("completes drain after interrupted stale ownership is retired", () =>
+    Effect.gen(function* () {
+      const database = yield* Database.Service
+      const scope = yield* Scope.Scope
+      const lineage = randomUUID()
+      const sessionID = yield* seedSession(database)
+      const runtime = RuntimeLifecycle.make({ lineage, instance: randomUUID() }, scope, database)
+      const admission = yield* runtime.admit({ sessionID, directory: "/tmp" })
+      yield* runtime.request("shutdown")
+      yield* replaceOwner(database, sessionID, randomUUID(), admission.fence + 1)
+
+      expect(yield* runtime.releaseInterrupted(sessionID, admission.fence)).toBe("absent")
+      expect(yield* runtime.awaitDrain).toBeUndefined()
+      expect((yield* runtime.status()).state).toBe("stopping")
+    }),
+  )
+
+  it.effect("serializes cancellation after the parked status update", () =>
+    Effect.gen(function* () {
+      const database = yield* Database.Service
+      const scope = yield* Scope.Scope
+      const sessionID = yield* seedSession(database)
+      const runtime = RuntimeLifecycle.make({ lineage: randomUUID(), instance: randomUUID() }, scope, database)
+      const admission = yield* runtime.admit({ sessionID, directory: "/tmp" })
+      const statusStarted = yield* Deferred.make<void>()
+      const finishStatus = yield* Deferred.make<void>()
+      const cancelStarted = yield* Deferred.make<void>()
+      const cancelFinished = yield* Deferred.make<void>()
+
+      const release = yield* runtime
+        .releaseInterrupted(
+          sessionID,
+          admission.fence,
+          Effect.gen(function* () {
+            yield* Deferred.succeed(statusStarted, undefined)
+            yield* Deferred.await(finishStatus)
+          }),
+        )
+        .pipe(Effect.forkChild)
+      yield* Deferred.await(statusStarted)
+      const cancel = yield* Effect.gen(function* () {
+        yield* Deferred.succeed(cancelStarted, undefined)
+        yield* runtime.cancel(sessionID)
+        yield* Deferred.succeed(cancelFinished, undefined)
+      }).pipe(Effect.forkChild)
+      yield* Deferred.await(cancelStarted)
+      yield* Effect.yieldNow
+      expect(yield* Deferred.isDone(cancelFinished)).toBe(false)
+
+      yield* Deferred.succeed(finishStatus, undefined)
+      expect(yield* Fiber.join(release)).toBe("parked")
+      yield* Fiber.join(cancel)
+      expect(yield* execution(database, sessionID)).toMatchObject({ state: "cancelled" })
     }),
   )
 

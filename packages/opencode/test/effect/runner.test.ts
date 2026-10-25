@@ -9,6 +9,86 @@ const waitForState = <A, E>(runner: Runner.Runner<A, E>, tag: Runner.State<A, E>
   }).pipe(Effect.timeout("1 second"))
 
 describe("Runner", () => {
+  it.live(
+    "does not turn an unrequested interruption into successful cancellation",
+    Effect.gen(function* () {
+      const scope = yield* Scope.Scope
+      let interrupted = false
+      const runner = Runner.make<string>(scope, {
+        onInterrupt: Effect.sync(() => {
+          interrupted = true
+          return "cancelled"
+        }),
+      })
+
+      const exit = yield* runner.ensureRunning(Effect.interrupt).pipe(Effect.exit)
+
+      expect(Exit.isFailure(exit)).toBe(true)
+      if (Exit.isFailure(exit)) {
+        expect(Cause.hasDies(exit.cause)).toBe(true)
+        expect(Cause.squash(exit.cause)).toBeInstanceOf(Runner.Interrupted)
+      }
+      expect(interrupted).toBe(false)
+      expect(runner.busy).toBe(false)
+    }),
+  )
+
+  it.live(
+    "does not route scope interruption through user cancellation handling",
+    Effect.gen(function* () {
+      const scope = yield* Scope.Scope
+      let interrupted = false
+      const runner = Runner.make<string>(scope, {
+        onInterrupt: Effect.sync(() => {
+          interrupted = true
+          return "cancelled"
+        }),
+      })
+      const fiber = yield* runner.ensureRunning(Effect.never.pipe(Effect.as("never"))).pipe(Effect.forkChild)
+      yield* waitForState(runner, "Running")
+
+      yield* runner.cancelWithReason("scope")
+      const exit = yield* Fiber.await(fiber)
+
+      expect(Exit.isFailure(exit)).toBe(true)
+      if (Exit.isFailure(exit)) {
+        expect(Cause.hasDies(exit.cause)).toBe(true)
+        const error = Cause.squash(exit.cause)
+        expect(error).toBeInstanceOf(Runner.Interrupted)
+        if (error instanceof Runner.Interrupted) expect(error.reason).toBe("scope")
+      }
+      expect(interrupted).toBe(false)
+    }),
+  )
+
+  it.live(
+    "classifies scope closure before instance cleanup runs",
+    Effect.gen(function* () {
+      const scope = yield* Scope.make()
+      let interrupted = false
+      const runner = Runner.make<string>(scope, {
+        onInterrupt: Effect.sync(() => {
+          interrupted = true
+          return "cancelled"
+        }),
+      })
+      const fiber = yield* runner.ensureRunning(Effect.never.pipe(Effect.as("never"))).pipe(Effect.forkChild)
+      yield* waitForState(runner, "Running")
+
+      yield* Scope.close(scope, Exit.void)
+      const exit = yield* Fiber.await(fiber)
+
+      expect(Exit.isFailure(exit)).toBe(true)
+      if (Exit.isFailure(exit)) {
+        expect(Cause.hasDies(exit.cause)).toBe(true)
+        const error = Cause.squash(exit.cause)
+        expect(error).toBeInstanceOf(Runner.Interrupted)
+        if (error instanceof Runner.Interrupted) expect(error.reason).toBe("scope")
+      }
+      expect(interrupted).toBe(false)
+    }),
+  )
+
   for (const outcome of ["failure", "ineligible", "success", "cancel"] as const) {
     it.live(
       `advisory resources are released on ${outcome}`,

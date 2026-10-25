@@ -45,6 +45,7 @@ import { Cause, Effect, Exit, Latch, Layer, Option, Scope, Context, Schema, Type
 import { InstanceState } from "@/effect/instance-state"
 import { TaskTool, type TaskPromptOps } from "@/tool/task"
 import { SessionRunState } from "./run-state"
+import { Runner } from "@/effect/runner"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { Database } from "@opencode-ai/core/database/database"
@@ -172,6 +173,20 @@ const layer = Layer.effect(
     const queueState = yield* InstanceState.make(() => Effect.sync(() => new Map<SessionID, Set<string>>()))
     const runtime = RuntimeLifecycle.current() ?? RuntimeLifecycle.unavailable()
     const { db } = database
+    const releaseInterrupted = Effect.fnUntraced(function* (sessionID: SessionID, fence: number) {
+      const result = yield* runtime
+        .releaseInterrupted(sessionID, fence, status.set(sessionID, { type: "busy" }))
+        .pipe(
+          Effect.catchCause(() =>
+            Effect.logWarning("retrying failed interrupted session release", { sessionID }).pipe(
+              Effect.andThen(
+                runtime.releaseInterrupted(sessionID, fence, status.set(sessionID, { type: "busy" })),
+              ),
+            ),
+          ),
+        )
+      return result
+    })
     // Nested store transactions can emit before the enclosing commit. Publish the
     // authoritative revision again at runtime-owned outer transaction boundaries.
     const notifyQueue = Effect.fnUntraced(function* (sessionID: SessionID) {
@@ -1533,19 +1548,35 @@ const layer = Layer.effect(
         sessionID: input.sessionID,
         parentSessionID: session.parentID,
       })
+      let interrupted = false
+      const loop = runLoop(
+        input.sessionID,
+        admission.manualRecovery,
+        admission.manualRecovery,
+        admission.manualRecovery,
+        true,
+      ).pipe(
+        Effect.onExit((exit) =>
+          Effect.sync(() => (interrupted = Exit.isFailure(exit) && Cause.hasInterrupts(exit.cause))),
+        ),
+      )
       return yield* Effect.acquireUseRelease(
         Effect.void,
         () =>
           work.pipe(
-            Effect.andThen(() =>
-              state.enqueue(
-                input.sessionID,
-                lastAssistant(input.sessionID),
-                runLoop(input.sessionID, admission.manualRecovery, admission.manualRecovery, admission.manualRecovery),
-              ),
+            Effect.andThen(() => state.enqueue(input.sessionID, lastAssistant(input.sessionID), loop)),
+            Effect.onExit((exit) =>
+              Effect.sync(() => {
+                if (Exit.isFailure(exit) && Cause.squash(exit.cause) instanceof Runner.Interrupted) interrupted = true
+              }),
             ),
           ),
-        () => runtime.release(input.sessionID),
+        () =>
+          interrupted
+            ? Effect.gen(function* () {
+                yield* releaseInterrupted(input.sessionID, admission.fence)
+              })
+            : runtime.release(input.sessionID, admission.fence),
       )
     })
 
@@ -1710,6 +1741,7 @@ const layer = Layer.effect(
 
     const wakeQueue = Effect.fn("SessionPrompt.wakeQueue")(function* (sessionID: SessionID, explicit = false) {
       const flush = yield* InstanceState.get(queueState)
+      let interrupted = false
       const prepare = yield* Effect.cached(
         Effect.gen(function* () {
           const snapshot = yield* queue.list(sessionID).pipe(Effect.orDie)
@@ -1744,9 +1776,16 @@ const layer = Layer.effect(
                 ),
               ),
               (acquire) =>
-                Effect.acquireRelease(acquire, (admission) => (admission ? runtime.release(sessionID) : Effect.void), {
-                  interruptible: true,
-                }),
+                Effect.acquireRelease(
+                  acquire,
+                  (admission) => {
+                    if (!admission) return Effect.void
+                    return interrupted
+                      ? releaseInterrupted(sessionID, admission.fence).pipe(Effect.asVoid)
+                      : runtime.release(sessionID, admission.fence)
+                  },
+                  { interruptible: true },
+                ),
             )
           if (!admission) return
           if (steer) return { steer: true }
@@ -1757,7 +1796,12 @@ const layer = Layer.effect(
           }
           flush.delete(sessionID)
         }).pipe(
-          Effect.onExit((exit) => (Exit.isFailure(exit) ? queue.abandon(sessionID).pipe(Effect.orDie) : Effect.void)),
+          Effect.onExit((exit) =>
+            Effect.gen(function* () {
+              if (Exit.isFailure(exit) && Cause.hasInterrupts(exit.cause)) interrupted = true
+              if (Exit.isFailure(exit)) yield* queue.abandon(sessionID).pipe(Effect.orDie)
+            }),
+          ),
         ),
       )
       yield* state.startIfIdle(
@@ -1767,8 +1811,13 @@ const layer = Layer.effect(
           const start = yield* prepare
           if (!start) return yield* Effect.die("Missing queue admission")
           if (start.entry) yield* materialize(start.entry).pipe(Effect.orDie)
-          return yield* runLoop(sessionID)
+          return yield* runLoop(sessionID, false, false, false, true)
         }).pipe(
+          Effect.onExit((exit) =>
+            Effect.sync(() => {
+              if (Exit.isFailure(exit) && Cause.hasInterrupts(exit.cause)) interrupted = true
+            }),
+          ),
           Effect.onExit((exit) =>
             Effect.gen(function* () {
               if (Exit.isSuccess(exit) && flush.get(sessionID)?.size) return
@@ -2065,8 +2114,15 @@ const layer = Layer.effect(
       recovery?: boolean,
       reconcile?: boolean,
       manualRecovery?: boolean,
+      deferInterruptedPark?: boolean,
     ) => Effect.Effect<SessionV1.WithParts> = Effect.fn("SessionPrompt.run")(
-      function* (sessionID: SessionID, recovery = false, reconcile = false, manualRecovery = false) {
+      function* (
+        sessionID: SessionID,
+        recovery = false,
+        reconcile = false,
+        manualRecovery = false,
+        deferInterruptedPark = false,
+      ) {
         const ctx = yield* InstanceState.context
         let structured: unknown
         let step = 0
@@ -2404,11 +2460,25 @@ const layer = Layer.effect(
         yield* compaction.prune({ sessionID }).pipe(Effect.ignore, Effect.forkIn(scope))
         return yield* lastAssistant(sessionID)
       },
-      (effect, sessionID, recovery, reconcile, manualRecovery) =>
+      (effect, sessionID, recovery, reconcile, manualRecovery, deferInterruptedPark) =>
         effect.pipe(
           Effect.onExit((exit) =>
             Effect.gen(function* () {
               const flush = yield* InstanceState.get(queueState)
+              if (Exit.isFailure(exit) && Cause.hasInterrupts(exit.cause)) {
+                yield* Effect.logWarning("session run interrupted", {
+                  sessionID,
+                  interruptOnly: Cause.hasInterruptsOnly(exit.cause),
+                  hasDefects: Cause.hasDies(exit.cause),
+                  interruptors: Array.from(Cause.interruptors(exit.cause)),
+                })
+                if (!deferInterruptedPark && (yield* runtime.ownershipFence(sessionID)) !== undefined)
+                  yield* runtime
+                    .park(sessionID)
+                    .pipe(
+                      Effect.catchCause(() => Effect.logWarning("failed to park interrupted session", { sessionID })),
+                    )
+              }
               if (Exit.isFailure(exit) || recovery || reconcile || manualRecovery || flush.get(sessionID)?.size === 0)
                 flush.delete(sessionID)
               if (Exit.isFailure(exit)) yield* queue.abandon(sessionID).pipe(Effect.orDie)
@@ -2437,7 +2507,7 @@ const layer = Layer.effect(
         Effect.gen(function* () {
           yield* reconcileCrashTools(sessionID)
           yield* runtime.recoveryPrepared(sessionID)
-          return yield* runLoop(sessionID, true)
+          return yield* runLoop(sessionID, true, false, false, true)
         }),
       )
     })

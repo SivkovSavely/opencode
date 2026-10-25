@@ -60,7 +60,7 @@ export type ExecutionRecord = {
   recoveryPreparationAttempts: number
 }
 
-export type AdmissionResult = { manualRecovery: boolean }
+export type AdmissionResult = { manualRecovery: boolean; fence: number }
 
 export type Interface = {
   readonly identity: {
@@ -83,7 +83,12 @@ export type Interface = {
   readonly acknowledgeParentNotification: (sessionID: string, parentCallID?: string) => Effect.Effect<void>
   readonly scheduleNotification: (parentSessionID: string, effect: Effect.Effect<void>) => Effect.Effect<void>
   readonly progress: (sessionID: string) => Effect.Effect<void>
-  readonly release: (sessionID: string) => Effect.Effect<void>
+  readonly release: (sessionID: string, fence?: number) => Effect.Effect<void>
+  readonly releaseInterrupted: (
+    sessionID: string,
+    fence: number,
+    onPark?: Effect.Effect<void>,
+  ) => Effect.Effect<"absent" | "active" | "parked">
   readonly beforeTurn: (sessionID: string) => Effect.Effect<boolean>
   readonly ownershipFence: (sessionID: string) => Effect.Effect<number | undefined>
   readonly checkpoint: (sessionID: string) => Effect.Effect<boolean>
@@ -832,7 +837,10 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
             const parentModeOverrides = new Map(state.parentModeOverrides)
             parentModeOverrides.delete(input.sessionID)
             return [
-              { _tag: "admitted" as const, result: { manualRecovery: claimed.manualRecovery } } as AdmissionDecision,
+              {
+                _tag: "admitted" as const,
+                result: { manualRecovery: claimed.manualRecovery, fence: claimed.row.fence },
+              } as AdmissionDecision,
               { ...state, active, parentModeOverrides },
             ] as const
           }
@@ -843,7 +851,10 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
           const parentModeOverrides = new Map(state.parentModeOverrides)
           parentModeOverrides.delete(input.sessionID)
           return [
-            { _tag: "admitted" as const, result: { manualRecovery: claimed.manualRecovery } } as AdmissionDecision,
+            {
+              _tag: "admitted" as const,
+              result: { manualRecovery: claimed.manualRecovery, fence: claimed.row.fence },
+            } as AdmissionDecision,
             { ...state, active, parentModeOverrides },
           ] as const
         }),
@@ -1225,12 +1236,12 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
     }).pipe(Effect.forkIn(scope, { startImmediately: true }), Effect.asVoid)
   })
 
-  const release = Effect.fn("RuntimeLifecycle.release")(function* (sessionID: string) {
+  const release = Effect.fn("RuntimeLifecycle.release")(function* (sessionID: string, fence?: number) {
     const result = yield* SynchronizedRef.modifyEffect(
       ref,
       Effect.fnUntraced(function* (state) {
         const current = state.active.get(sessionID)
-        if (!current) {
+        if (!current || (fence !== undefined && current.fence !== fence)) {
           const result: ReleaseResult = { released: false, reason: "absent", phase: state.phase }
           return [result, state] as const
         }
@@ -1290,6 +1301,56 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
       instance: identity.instance,
     })
     yield* checkQuiescent()
+  })
+
+  const releaseInterrupted = Effect.fn("RuntimeLifecycle.releaseInterrupted")(function* (
+    sessionID: string,
+    fence: number,
+    onPark?: Effect.Effect<void>,
+  ) {
+    const result = yield* SynchronizedRef.modifyEffect(
+      ref,
+      Effect.fnUntraced(function* (state) {
+        const current = state.active.get(sessionID)
+        if (!current || current.fence !== fence) return ["absent" as const, state] as const
+        if (current.leases > 1) {
+          const active = new Map(state.active)
+          active.set(sessionID, { ...current, leases: current.leases - 1 })
+          return ["active" as const, { ...state, active }] as const
+        }
+        const expectedState = current.mode === "retry_wait" ? "retry_wait" : "active"
+        const transition = yield* Effect.exit(update({
+          sessionID,
+          operation: "park",
+          fence: current.fence,
+          expectedState,
+          nextState: "parked",
+          retryAt: current.mode === "retry_wait" ? current.retryAt : undefined,
+        }))
+        if (Exit.isFailure(transition)) {
+          const row = yield* read(sessionID)
+          if (
+            row?.owner_lineage === identity.lineage &&
+            row.owner_instance === identity.instance &&
+            row.fence === current.fence &&
+            row.state === expectedState
+          )
+            return yield* Effect.failCause(transition.cause)
+          const active = new Map(state.active)
+          active.delete(sessionID)
+          retryWakes.delete(sessionID)
+          return ["absent" as const, { ...state, active }] as const
+        }
+        if (onPark) yield* onPark.pipe(Effect.catchCause(() => Effect.void))
+        const active = new Map(state.active)
+        active.delete(sessionID)
+        retryWakes.delete(sessionID)
+        return ["parked" as const, { ...state, active }] as const
+      }),
+    )
+    if (result !== "active") yield* checkQuiescent()
+    if (result !== "parked") return result
+    return result
   })
 
   const park = Effect.fn("RuntimeLifecycle.park")(function* (sessionID: string) {
@@ -1419,7 +1480,7 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
   const ownershipFence = Effect.fnUntraced(function* (sessionID: string) {
     const state = SynchronizedRef.getUnsafe(ref)
     const current = state.active.get(sessionID)
-    if (state.phase !== "running" || current?.mode !== "active") return
+    if (state.phase !== "running" || (current?.mode !== "active" && current?.mode !== "retry_wait")) return
     return current.fence
   })
 
@@ -2196,6 +2257,7 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
     scheduleNotification,
     progress,
     release,
+    releaseInterrupted,
     beforeTurn,
     ownershipFence,
     checkpoint,
@@ -2223,7 +2285,7 @@ export function unavailable(): Interface {
     bindDatabase() {},
     finishStartupRecovery: () => Effect.void,
     recoveryPrepared: () => Effect.void,
-    admit: () => Effect.succeed({ manualRecovery: false }),
+    admit: () => Effect.succeed({ manualRecovery: false, fence: 0 }),
     cancel: () => Effect.succeed(true),
     waitCancel: () => Effect.void,
     finishCancel: () => Effect.void,
@@ -2236,6 +2298,7 @@ export function unavailable(): Interface {
     scheduleNotification: () => Effect.void,
     progress: () => Effect.void,
     release: () => Effect.void,
+    releaseInterrupted: () => Effect.succeed("absent"),
     beforeTurn: () => Effect.succeed(true),
     ownershipFence: () => Effect.succeed(undefined),
     checkpoint: () => Effect.succeed(true),

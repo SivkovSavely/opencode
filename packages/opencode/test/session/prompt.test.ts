@@ -38,6 +38,7 @@ import { SessionProcessor } from "../../src/session/processor"
 import { SessionPrompt } from "../../src/session/prompt"
 import { SessionRevert } from "../../src/session/revert"
 import { SessionRunState } from "../../src/session/run-state"
+import { Runner } from "@/effect/runner"
 import { SessionQueue } from "../../src/session/queue"
 import { SessionQueueV1 } from "@opencode-ai/schema/v1/session-queue"
 import { MessageID, PartID, SessionID } from "../../src/session/schema"
@@ -168,6 +169,11 @@ const blockingProcessor = Layer.succeed(
     create: () => Effect.sync(() => processorCreateStarted.shift()?.()).pipe(Effect.andThen(Effect.never)),
   }),
 )
+const interruptedSnapshot = Layer.mock(Snapshot.Service)({
+  init: () => Effect.void,
+  cleanup: () => Effect.void,
+  track: () => Effect.interrupt,
+})
 
 const runtimeFlags = RuntimeFlags.layer({ experimentalEventSystem: true })
 
@@ -217,13 +223,16 @@ const promptRoot = LayerNode.group([
 function makePrompt(input?: {
   mcpInstructions?: MCP.ServerInstructions[]
   processor?: "blocking"
+  snapshot?: Layer.Layer<Snapshot.Service>
   plugin?: Layer.Layer<Plugin.Service>
 }) {
+  const snapshotReplacement = input?.snapshot ? [[Snapshot.node, input.snapshot] as const] : []
   const replacements = [
     [SessionSummary.node, summary],
     [LSP.node, lsp],
     [MCP.node, makeMcp(input?.mcpInstructions)],
     [RuntimeFlags.node, runtimeFlags],
+    ...snapshotReplacement,
   ] as const
   if (input?.plugin) {
     const withPlugin = [...replacements, [Plugin.node, input.plugin]] as const
@@ -240,14 +249,17 @@ function makePrompt(input?: {
 function makeHttp(input?: {
   mcpInstructions?: MCP.ServerInstructions[]
   processor?: "blocking"
+  snapshot?: Layer.Layer<Snapshot.Service>
   plugin?: Layer.Layer<Plugin.Service>
 }) {
   const root = LayerNode.group([promptRoot, testLLMServerNode])
+  const snapshotReplacement = input?.snapshot ? [[Snapshot.node, input.snapshot] as const] : []
   const replacements = [
     [SessionSummary.node, summary],
     [LSP.node, lsp],
     [MCP.node, makeMcp(input?.mcpInstructions)],
     [RuntimeFlags.node, runtimeFlags],
+    ...snapshotReplacement,
   ] as const
   if (input?.plugin) {
     const withPlugin = [...replacements, [Plugin.node, input.plugin]] as const
@@ -266,8 +278,13 @@ function makeHttpNoLLMServer(input?: { mcpInstructions?: MCP.ServerInstructions[
 }
 
 const it = testEffect(makeHttp())
-const makeOwnedRuntime = (archiveAfterAdmission = false) =>
-  makeHttp().pipe(
+const makeOwnedRuntime = (
+  archiveAfterAdmission = false,
+  processor?: "blocking",
+  snapshot?: Layer.Layer<Snapshot.Service>,
+  failInterruptedReleaseOnce = false,
+) =>
+  makeHttp({ processor, snapshot }).pipe(
     Layer.provideMerge(
       Layer.effect(
         RuntimeLifecycle.Service,
@@ -276,6 +293,7 @@ const makeOwnedRuntime = (archiveAfterAdmission = false) =>
           const scope = yield* Scope.Scope
           const previous = RuntimeLifecycle.current() ?? RuntimeLifecycle.unavailable()
           const runtime = RuntimeLifecycle.make({ lineage: randomUUID() }, scope, database)
+          let shouldFailInterruptedRelease = failInterruptedReleaseOnce
           const service = archiveAfterAdmission
             ? {
                 ...runtime,
@@ -291,15 +309,29 @@ const makeOwnedRuntime = (archiveAfterAdmission = false) =>
                     ),
               }
             : runtime
-          RuntimeLifecycle.setCurrent(service)
+          const decorated = failInterruptedReleaseOnce
+            ? {
+                ...service,
+                releaseInterrupted: (sessionID: string, fence: number, onPark?: Effect.Effect<void>) => {
+                  if (shouldFailInterruptedRelease) {
+                    shouldFailInterruptedRelease = false
+                    return Effect.die(new Error("simulated interrupted release failure"))
+                  }
+                  return runtime.releaseInterrupted(sessionID, fence, onPark)
+                },
+              }
+            : service
+          RuntimeLifecycle.setCurrent(decorated)
           yield* Effect.addFinalizer(() => Effect.sync(() => RuntimeLifecycle.setCurrent(previous)))
-          return service
+          return decorated
         }),
       ).pipe(Layer.provide(LayerNode.compile(Database.node))),
     ),
   )
 const ownedRuntime = testEffect(makeOwnedRuntime())
+const ownedBlockingRuntime = testEffect(makeOwnedRuntime(false, "blocking"))
 const archivingRuntime = testEffect(makeOwnedRuntime(true))
+const interruptedReleaseRetryRuntime = testEffect(makeOwnedRuntime(false, undefined, interruptedSnapshot, true))
 const noLLMServer = testEffect(makeHttpNoLLMServer())
 const raceNoLLMServer = testEffect(makeHttpNoLLMServer({ processor: "blocking" }))
 const withMcpInstructions = testEffect(
@@ -3307,6 +3339,127 @@ raceNoLLMServer.instance(
       }
     }),
   { config: cfg },
+  3_000,
+)
+
+ownedBlockingRuntime.instance(
+  "does not park shared execution when a queued prompt waiter is interrupted",
+  () =>
+    Effect.gen(function* () {
+      processorCreateStarted.length = 0
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          processorCreateStarted.length = 0
+        }),
+      )
+
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const runtime = yield* RuntimeLifecycle.Service
+      const chat = yield* sessions.create({ title: "Interrupted queued prompt" })
+      const firstCreate = defer<void>()
+      processorCreateStarted.push(firstCreate.resolve)
+      const first = yield* prompt
+        .prompt({ sessionID: chat.id, agent: "build", parts: [{ type: "text", text: "first" }] })
+        .pipe(Effect.forkChild)
+      yield* Effect.promise(() => firstCreate.promise)
+
+      const second = yield* prompt
+        .prompt({ sessionID: chat.id, agent: "build", parts: [{ type: "text", text: "second" }] })
+        .pipe(Effect.forkChild)
+      yield* pollWithTimeout(
+        Effect.gen(function* () {
+          const messages = yield* sessions.messages({ sessionID: chat.id })
+          return messages.some(
+            (message) =>
+              message.info.role === "user" &&
+              message.parts.some((part) => part.type === "text" && part.text === "second"),
+          )
+            ? true
+            : undefined
+        }),
+        "second prompt was not admitted",
+      )
+      yield* Effect.yieldNow
+
+      yield* Fiber.interrupt(second)
+      const status = yield* runtime.status()
+      expect(status.active).toBe(1)
+      expect(status.parked).toBe(0)
+
+      yield* prompt.cancel(chat.id)
+      expect(Exit.isSuccess(yield* Fiber.await(first))).toBe(true)
+    }),
+  3_000,
+)
+
+interruptedReleaseRetryRuntime.instance(
+  "retries failed interrupted release instead of completing durable execution",
+  () =>
+    Effect.gen(function* () {
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const runtime = yield* RuntimeLifecycle.Service
+      const sessionStatus = yield* SessionStatus.Service
+      const chat = yield* sessions.create({ title: "Snapshot interruption" })
+
+      const result = yield* prompt
+        .prompt({ sessionID: chat.id, agent: "build", parts: [{ type: "text", text: "diagnostic" }] })
+        .pipe(Effect.exit)
+
+      expect(Exit.isFailure(result)).toBe(true)
+      if (Exit.isFailure(result)) {
+        expect(Cause.hasDies(result.cause)).toBe(true)
+        expect(Cause.squash(result.cause)).toBeInstanceOf(Runner.Interrupted)
+      }
+
+      const messages = yield* sessions.messages({ sessionID: chat.id })
+      const assistant = messages.at(-1)
+      expect(assistant?.info.role).toBe("assistant")
+      expect(assistant?.parts).toHaveLength(0)
+      const runtimeStatus = yield* runtime.status()
+      expect(runtimeStatus.active).toBe(0)
+      expect(runtimeStatus.parked).toBe(1)
+      expect((yield* sessionStatus.get(chat.id)).type).toBe("busy")
+      if (assistant?.info.role === "assistant") {
+        expect(assistant.info.time.completed).toBeNumber()
+        expect(assistant.info.error?.name).toBe("MessageAbortedError")
+      }
+    }),
+  3_000,
+)
+
+interruptedReleaseRetryRuntime.instance(
+  "keeps interrupted recovery quarantined for runtime recovery policy",
+  () =>
+    Effect.gen(function* () {
+      const database = yield* Database.Service
+      const prompt = yield* SessionPrompt.Service
+      const runtime = yield* RuntimeLifecycle.Service
+      const sessions = yield* Session.Service
+      const scope = yield* Scope.Scope
+      const chat = yield* sessions.create({ title: "Interrupted recovery" })
+      yield* seed(chat.id, { finish: "stop" })
+
+      const abandoned = RuntimeLifecycle.make(
+        { lineage: runtime.identity.lineage, instance: randomUUID() },
+        scope,
+        database,
+      )
+      yield* abandoned.admit({ sessionID: chat.id, directory: chat.directory })
+      yield* database.db.run(sql`
+        UPDATE runtime_execution SET owner_start_time = ${"0"} WHERE session_id = ${chat.id}
+      `)
+
+      yield* runtime.recover((record) => prompt.recover(SessionID.make(record.sessionID)))
+      yield* pollWithTimeout(
+        database.db
+          .get<{ state: string }>(sql`SELECT state FROM runtime_execution WHERE session_id = ${chat.id}`)
+          .pipe(Effect.map((row) => (row?.state === "recovery_needed" ? (true as const) : undefined))),
+        "interrupted recovery was not quarantined",
+      )
+      expect(yield* runtime.isParked(chat.id)).toBe(false)
+    }),
   3_000,
 )
 
