@@ -45,6 +45,7 @@ import { MessageID, PartID, SessionID } from "../../src/session/schema"
 import { SessionStatus } from "../../src/session/status"
 import { SessionV2 } from "@opencode-ai/core/session"
 import { SessionExecution } from "@opencode-ai/core/session/execution"
+import { InstanceStore } from "@/project/instance-store"
 import { Skill } from "../../src/skill"
 import { SystemPrompt } from "../../src/session/system"
 import { Shell } from "@opencode-ai/core/shell"
@@ -3391,6 +3392,69 @@ ownedBlockingRuntime.instance(
       expect(Exit.isSuccess(yield* Fiber.await(first))).toBe(true)
     }),
   3_000,
+)
+
+ownedBlockingRuntime.instance(
+  "parks and recovers an admitted prompt after its instance is disposed",
+  () =>
+    Effect.gen(function* () {
+      processorCreateStarted.length = 0
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          processorCreateStarted.length = 0
+        }),
+      )
+
+      const database = yield* Database.Service
+      const prompt = yield* SessionPrompt.Service
+      const runtime = yield* RuntimeLifecycle.Service
+      const sessions = yield* Session.Service
+      const store = yield* InstanceStore.Service
+      const scope = yield* Scope.Scope
+      const chat = yield* sessions.create({ title: "Disposed prompt instance" })
+      const processorStarted = defer<void>()
+      processorCreateStarted.push(processorStarted.resolve)
+      const result = yield* prompt
+        .prompt({ sessionID: chat.id, agent: "build", parts: [{ type: "text", text: "diagnostic" }] })
+        .pipe(Effect.exit, Effect.forkChild)
+      yield* Effect.promise(() => processorStarted.promise)
+
+      const instance = yield* store.load({ directory: chat.directory })
+      yield* store.dispose(instance)
+
+      const exit = yield* Fiber.join(result)
+      expect(Exit.isFailure(exit)).toBe(true)
+      if (Exit.isFailure(exit)) {
+        expect(Cause.hasDies(exit.cause)).toBe(true)
+        expect(Cause.squash(exit.cause)).toBeInstanceOf(Runner.Interrupted)
+        const error = Cause.squash(exit.cause)
+        if (error instanceof Runner.Interrupted) expect(error.reason).toBe("scope")
+      }
+      expect(yield* runtime.status()).toMatchObject({ active: 0, parked: 1 })
+      expect(
+        yield* database.db.get<{ state: string }>(sql`SELECT state FROM runtime_execution WHERE session_id = ${chat.id}`),
+      ).toEqual({ state: "parked" })
+
+      const replacement = RuntimeLifecycle.make(
+        { lineage: runtime.identity.lineage, instance: randomUUID() },
+        scope,
+        database,
+      )
+      let recovered = 0
+      yield* replacement.recover((record) =>
+        Effect.sync(() => {
+          if (record.sessionID === chat.id) recovered++
+        }),
+      )
+      yield* pollWithTimeout(
+        database.db
+          .get<{ state: string }>(sql`SELECT state FROM runtime_execution WHERE session_id = ${chat.id}`)
+          .pipe(Effect.map((row) => (row?.state === "completed" ? (true as const) : undefined))),
+        "disposed prompt was not recovered",
+      )
+      expect(recovered).toBe(1)
+    }),
+  5_000,
 )
 
 interruptedReleaseRetryRuntime.instance(
