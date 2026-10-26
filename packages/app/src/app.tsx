@@ -259,7 +259,7 @@ function LayoutCompatibility(props: ParentProps) {
     if (protocol !== "v2") return
     const next = global.servers.list().find((s) => {
       if (ServerConnection.key(s) === ServerConnection.key(current)) return false
-      return global.ensureServerCtx(s).sdk.protocolKind() !== "v2"
+      return global.ensureServerCtx(s).sdk.protocolKind() === "v1"
     })
     if (!next) return
     navigate("/")

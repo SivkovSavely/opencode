@@ -26,7 +26,7 @@ export function createChildStoreManager(input: {
   persist: typeof persisted
   isBooting: (directory: string) => boolean
   isLoadingSessions: (directory: string) => boolean
-  onBootstrap: (directory: string) => void
+  onBootstrap: (directory: string, priority?: boolean) => void
   onMcp: (directory: string, setStore: SetStoreFunction<State>) => void
   onDispose: (directory: string) => void
   translate: (key: string, vars?: Record<string, string | number>) => string
@@ -305,7 +305,7 @@ export function createChildStoreManager(input: {
     const shouldBootstrap = options.bootstrap ?? true
     if (shouldBootstrap) activate(key)
     if (shouldBootstrap && childStore[0].status === "loading") {
-      input.onBootstrap(directory)
+      input.onBootstrap(directory, options.priority)
     }
     return childStore
   }
@@ -317,7 +317,7 @@ export function createChildStoreManager(input: {
     const shouldBootstrap = options.bootstrap ?? true
     if (shouldBootstrap) activate(key)
     if (shouldBootstrap && childStore[0].status === "loading") {
-      input.onBootstrap(directory)
+      input.onBootstrap(directory, options.priority)
     }
     return childStore
   }
@@ -336,6 +336,10 @@ export function createChildStoreManager(input: {
   function activate(key: DirectoryKey) {
     if (activeDirectories.has(key)) return
     activeDirectories.add(key)
+  }
+
+  function activateQueries(directory: string) {
+    const key = directoryKey(directory)
     activationToggles.get(key)?.(true)
   }
 
@@ -378,6 +382,7 @@ export function createChildStoreManager(input: {
     ensureChild,
     child,
     peek,
+    activateQueries,
     projectMeta,
     projectIcon,
     mark,

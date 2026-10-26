@@ -8,7 +8,7 @@ import type {
 } from "@opencode-ai/sdk/v2/client"
 import { showToast } from "@/utils/toast"
 import { getFilename } from "@opencode-ai/core/util/path"
-import { type Accessor, batch, createMemo, getOwner, onCleanup, onMount, untrack } from "solid-js"
+import { type Accessor, batch, createEffect, createMemo, getOwner, onCleanup, onMount, untrack } from "solid-js"
 import { createStore, produce, reconcile } from "solid-js/store"
 import { useLanguage } from "@/context/language"
 import type { InitError } from "../pages/error"
@@ -59,6 +59,7 @@ import type {
 } from "@opencode-ai/client/promise"
 import { toggleMcp } from "./global-sync/mcp"
 import { createServerSession, type ServerSession } from "./server-session"
+import { resolveServerProtocol, type ServerProtocolSource } from "@/utils/server-protocol"
 
 type GlobalStore = {
   ready: boolean
@@ -90,12 +91,28 @@ type SessionActiveApi = {
   readonly active: () => Promise<SessionActiveOutput>
 }
 
+const protocolDependentQueries = new Set([
+  "config",
+  "providers",
+  "path",
+  "agents",
+  "references",
+  "mcp",
+  "mcpResources",
+  "activeSessions",
+])
+
+export const isProtocolDependentQuery = (scope: ServerScope, queryKey: readonly unknown[]) => {
+  const name = queryKey[2] ?? queryKey[1]
+  return queryKey[0] === scope && typeof name === "string" && protocolDependentQueries.has(name)
+}
+
 export const loadMcpQuery = (
   scope: ServerScope,
   directory: string,
   api: McpListApi,
   legacy?: OpencodeClient,
-  protocol?: Promise<"v1" | "v2">,
+  protocol?: ServerProtocolSource,
 ): ApiQueryOptions<Record<string, McpServer["status"]>, readonly [ServerScope, string, "mcp"]> =>
   queryOptions<
     Record<string, McpServer["status"]>,
@@ -105,7 +122,7 @@ export const loadMcpQuery = (
   >({
     queryKey: [scope, directory, "mcp"] as const,
     queryFn: async () => {
-      if ((await protocol) === "v1" && legacy) return (await legacy.mcp.status()).data ?? {}
+      if ((await resolveServerProtocol(protocol)) === "v1" && legacy) return (await legacy.mcp.status()).data ?? {}
       return api
         .list({ location: { directory } })
         .then((result) => Object.fromEntries(result.data.map((server) => [server.name, server.status])))
@@ -117,7 +134,7 @@ export const loadMcpResourcesQuery = (
   directory: string,
   api: McpResourceApi,
   legacy?: OpencodeClient,
-  protocol?: Promise<"v1" | "v2">,
+  protocol?: ServerProtocolSource,
 ): ApiQueryOptions<Record<string, McpResource>, readonly [ServerScope, string, "mcpResources"]> =>
   queryOptions<
     Record<string, McpResource>,
@@ -127,7 +144,7 @@ export const loadMcpResourcesQuery = (
   >({
     queryKey: [scope, directory, "mcpResources"] as const,
     queryFn: async () => {
-      if ((await protocol) === "v1" && legacy) {
+      if ((await resolveServerProtocol(protocol)) === "v1" && legacy) {
         return Object.fromEntries(
           Object.entries((await legacy.experimental.resource.list()).data ?? {}).map(([key, resource]) => [
             key,
@@ -181,7 +198,7 @@ function makeQueryOptionsApi(
   serverSDK: () => OpencodeClient,
   serverAPI: ServerApi,
   sdkFor: (dir: PathKey) => OpencodeClient,
-  protocol: Promise<"v1" | "v2">,
+  protocol: ServerProtocolSource,
 ) {
   return {
     globalConfig: () => loadGlobalConfigQuery(scope, serverSDK(), protocol),
@@ -225,14 +242,14 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
   }
 
   const session = createServerSession(serverSDK.client, serverSDK.api.session, serverSDK.api.message, {
-    protocol: serverSDK.protocol,
+    protocol: serverSDK.getProtocol,
   })
   const queryOptionsApi = makeQueryOptionsApi(
     serverSDK.scope,
     () => serverSDK.client,
     serverSDK.api,
     sdkFor,
-    serverSDK.protocol,
+    serverSDK.getProtocol,
   )
 
   const [configQuery, providerQuery, pathQuery] = useQueries(() => ({
@@ -290,6 +307,8 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
 
   const queryClient = useQueryClient()
   const homeSessions = createHomeSessionIndexCache(queryClient, ServerConnection.key(serverSDK.server))
+  const protocolDependentQuery = (query: { queryKey: readonly unknown[] }) =>
+    isProtocolDependentQuery(serverSDK.scope, query.queryKey)
   const refreshProviders = () =>
     queryClient.refetchQueries({
       predicate: (query) => query.queryKey[0] === serverSDK.scope && query.queryKey[2] === "providers",
@@ -323,7 +342,7 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
       await bootstrapGlobal({
         serverSDK: serverSDK.client,
         serverAPI: serverSDK.api,
-        protocol: serverSDK.protocol,
+        protocol: serverSDK.getProtocol,
         scope: serverSDK.scope,
         requestFailedTitle: language.t("common.requestFailed"),
         translate: language.t,
@@ -352,6 +371,9 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
     bootstrap: () => queryClient.fetchQuery({ queryKey: [serverSDK.scope, "bootstrap"] }),
     bootstrapInstance,
   })
+  createEffect(() => {
+    if (globalStore.reload === undefined) queue.resume()
+  })
 
   const children = createChildStoreManager({
     owner,
@@ -359,11 +381,11 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
     persist: persisted,
     isBooting: (directory) => booting.has(directory),
     isLoadingSessions: (directory) => sessionLoads.has(directory),
-    onBootstrap: (directory) => {
-      void bootstrapInstance(directory)
+    onBootstrap: (directory, priority) => {
+      queue.push(directory, { priority })
     },
     onMcp: (directory, setStore) => {
-      void loadCommands(directory, serverSDK.api.command, sdkFor(directory), serverSDK.protocol)
+      void loadCommands(directory, serverSDK.api.command, sdkFor(directory), serverSDK.getProtocol)
         .then((commands) => setStore("command", commands))
         .catch((err) => {
           showToast({
@@ -385,6 +407,30 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
     global: {
       provider: globalStore.provider,
     },
+  })
+
+  let disposed = false
+  let currentProtocol = serverSDK.protocolKind()
+  createEffect(() => {
+    const next = serverSDK.protocolKind()
+    if (next === undefined || currentProtocol === undefined) {
+      currentProtocol = next
+      return
+    }
+    if (next === currentProtocol) return
+    currentProtocol = next
+    void (async () => {
+      await queryClient.cancelQueries({ predicate: protocolDependentQuery })
+      if (disposed) return
+      await queryClient.invalidateQueries({ predicate: protocolDependentQuery, refetchType: "none" })
+      if (disposed) return
+      void bootstrap.refetch()
+      void activeSessionsQuery.refetch()
+      for (const directory of Object.keys(children.children)) {
+        if (!children.active(directory)) continue
+        queue.push(directory)
+      }
+    })()
   })
 
   async function loadSessions(directory: string, options?: { limit?: number }) {
@@ -416,7 +462,8 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
       .fetchQuery({
         ...queryOptionsApi.sessions(key),
         queryFn: () =>
-          serverSDK.protocol
+          serverSDK
+            .getProtocol()
             .then((protocol) =>
               protocol === "v1"
                 ? loadRootSessionsV1({ client: sdkFor(directory), directory, limit })
@@ -479,6 +526,7 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
       const child = children.ensureChild(directory)
       const cache = children.vcsCache.get(key)
       if (!cache) return
+      children.activateQueries(directory)
       const sdk = sdkFor(directory)
       await bootstrapDirectory({
         directory,
@@ -499,7 +547,7 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
         translate: language.t,
         queryClient,
         session,
-        protocol: serverSDK.protocol,
+        protocol: serverSDK.getProtocol,
       })
     })
 
@@ -622,6 +670,7 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
 
   onCleanup(unsub)
   onCleanup(() => {
+    disposed = true
     queue.dispose()
   })
   onCleanup(() => {

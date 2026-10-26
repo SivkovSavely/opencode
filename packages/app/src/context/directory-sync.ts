@@ -27,7 +27,7 @@ export const createDirSyncContext = (
   serverSDK: ReturnType<typeof createServerSdkContext>,
 ) => {
   const client = serverSDK.createClient({ directory, throwOnError: true })
-  const current = createMemo(() => serverSync.child(directory, { mcp: true }))
+  const current = createMemo(() => serverSync.child(directory, { mcp: true, priority: true }))
   const absolute = (path: string) => (current()[0].path.directory + "/" + path).replace("//", "/")
   const data = new Proxy({} as State, {
     get(_, property: keyof State) {

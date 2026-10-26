@@ -1,5 +1,5 @@
 import type { ServerApi } from "./server"
-import type { ServerProtocol } from "./server-protocol"
+import { resolveServerProtocol, type ServerProtocolSource } from "./server-protocol"
 import type { AgentPartInput, FilePartInput, OpencodeClient, Session, TextPartInput } from "@opencode-ai/sdk/v2/client"
 import type {
   Project,
@@ -47,7 +47,7 @@ type LegacyPrompt = {
 }
 type LegacyLocation = { directory?: string }
 type CompatibleInput = {
-  protocol: Promise<ServerProtocol>
+  protocol: ServerProtocolSource
   current: ServerApi
   legacy: LegacyFor
   directory?: string
@@ -85,20 +85,24 @@ function sessionInfo(session: Session): SessionInfo {
 
 export function createCompatibleApi(input: CompatibleInput): CompatibleApi {
   const v1 = createV1Api(input)
-  return lazyApi(
-    input.protocol.then((protocol) => (protocol === "v1" ? v1 : input.current)),
-    input.current,
-  )
+  const fixed =
+    typeof input.protocol === "function"
+      ? undefined
+      : input.protocol.then((protocol) => (protocol === "v1" ? v1 : input.current))
+  const implementation = () =>
+    fixed ??
+    Promise.resolve(resolveServerProtocol(input.protocol)).then((protocol) => (protocol === "v1" ? v1 : input.current))
+  return lazyApi(implementation, input.current)
 }
 
-function lazyApi<T extends object>(implementation: Promise<T>, shape: T): T {
+function lazyApi<T extends object>(implementation: () => Promise<T>, shape: T): T {
   const cache = new Map<PropertyKey, unknown>()
   return new Proxy(shape, {
     get(target, property, receiver) {
       const sample = Reflect.get(target, property, receiver)
       if (typeof sample === "function") {
         return (...args: unknown[]) =>
-          implementation.then((value) => {
+          implementation().then((value) => {
             const method = Reflect.get(value, property)
             if (typeof method !== "function") throw new Error(`API method unavailable: ${String(property)}`)
             return Reflect.apply(method, value, args)
@@ -107,13 +111,14 @@ function lazyApi<T extends object>(implementation: Promise<T>, shape: T): T {
       if (sample === null || typeof sample !== "object") return sample
       if (cache.has(property)) return cache.get(property)
       const nested = lazyApi(
-        implementation.then((value) => {
-          const result = Reflect.get(value, property)
-          if (result === null || typeof result !== "object") {
-            throw new Error(`API namespace unavailable: ${String(property)}`)
-          }
-          return result
-        }),
+        () =>
+          implementation().then((value) => {
+            const result = Reflect.get(value, property)
+            if (result === null || typeof result !== "object") {
+              throw new Error(`API namespace unavailable: ${String(property)}`)
+            }
+            return result
+          }),
         sample,
       )
       cache.set(property, nested)

@@ -3,7 +3,7 @@ import type { Event } from "@opencode-ai/sdk/v2/client"
 import { createSimpleContext } from "@opencode-ai/ui/context"
 import { createGlobalEmitter } from "@solid-primitives/event-bus"
 import { makeEventListener } from "@solid-primitives/event-listener"
-import { type Accessor, batch, createMemo, createResource, onCleanup, onMount } from "solid-js"
+import { type Accessor, batch, createMemo, createSignal, onCleanup, onMount } from "solid-js"
 import { createApiForServer, createSdkForServer, type ServerApi } from "@/utils/server"
 import { useLanguage } from "./language"
 import { usePlatform } from "./platform"
@@ -11,7 +11,7 @@ import { ServerConnection, useServer } from "./server"
 import { createRefCountMap } from "@/utils/refcount"
 import { useGlobal } from "./global"
 import { ServerScope } from "@/utils/server-scope"
-import { detectServerProtocol, type ServerProtocol } from "@/utils/server-protocol"
+import { createServerProtocol, type ServerProtocol } from "@/utils/server-protocol"
 import { createCompatibleApi, type CompatibleApi } from "@/utils/server-compat"
 
 const isAbortError = (error: unknown) =>
@@ -169,6 +169,7 @@ type ServerSDKBase = {
   server: ServerConnection.Any
   scope: ServerScope
   protocol: Promise<ServerProtocol>
+  getProtocol: () => Promise<ServerProtocol>
   protocolKind: Accessor<ServerProtocol | undefined>
   url: string
   client: ReturnType<typeof createSdkForServer>
@@ -206,14 +207,21 @@ function createServerSdkContextBase(server: ServerConnection.Any, scope: ServerS
     fetch: eventFetch,
     server: server.http,
   })
-  const protocol = detectServerProtocol(server.http, platform.fetch ?? globalThis.fetch)
-  const [protocolKind] = createResource(
-    () => protocol,
-    (value) => value,
-  )
   const emitter = createGlobalEmitter<{
     [key: string]: ServerEvent
   }>()
+  const [protocolKind, setProtocolKind] = createSignal<ServerProtocol>()
+  const protocolState = createServerProtocol(server.http, platform.fetch ?? globalThis.fetch, {
+    onChange(protocol, previous) {
+      setProtocolKind(protocol)
+      if (previous && previous !== protocol)
+        emitter.emit("global", {
+          id: "server-protocol-changed",
+          type: "server.connected",
+          properties: {},
+        } as ServerEvent)
+    },
+  })
 
   type Queued = QueuedServerEvent
   const FLUSH_FRAME_MS = 16
@@ -273,7 +281,7 @@ function createServerSdkContextBase(server: ServerConnection.Any, scope: ServerS
         }
         abort.signal.addEventListener("abort", onAbort)
         try {
-          const kind = await protocol
+          const kind = await protocolState.get()
           const events =
             kind === "v1"
               ? (await eventSdk.global.event({ signal: attempt.signal })).stream
@@ -307,6 +315,10 @@ function createServerSdkContextBase(server: ServerConnection.Any, scope: ServerS
 
         if (abort.signal.aborted || !started || generation !== active) return
         await wait(RECONNECT_DELAY_MS)
+        if (abort.signal.aborted || !started || generation !== active) return
+        await protocolState.refresh().catch((error) => {
+          if (!abort.signal.aborted) throw error
+        })
       }
     })().finally(() => {
       if (run !== current) return
@@ -331,6 +343,7 @@ function createServerSdkContextBase(server: ServerConnection.Any, scope: ServerS
   onCleanup(() => {
     stop()
     abort.abort()
+    protocolState.dispose()
     flush()
   })
 
@@ -347,14 +360,17 @@ function createServerSdkContextBase(server: ServerConnection.Any, scope: ServerS
       throwOnError: true,
       directory,
     })
-  const api = createCompatibleApi({ protocol, current: currentApi, legacy })
+  const api = createCompatibleApi({ protocol: protocolState.get, current: currentApi, legacy })
   const apiForDirectory = (directory: string) =>
-    createCompatibleApi({ protocol, current: currentApi, legacy, directory })
+    createCompatibleApi({ protocol: protocolState.get, current: currentApi, legacy, directory })
 
   return {
     server,
     scope,
-    protocol,
+    get protocol() {
+      return protocolState.get()
+    },
+    getProtocol: protocolState.get,
     protocolKind,
     url: server.http.url,
     client: sdk,
@@ -428,7 +444,9 @@ function createDirSdkContext(directory: string, serverSDK: ServerSDKBase) {
 
   return {
     scope: serverSDK.scope,
-    protocol: serverSDK.protocol,
+    get protocol() {
+      return serverSDK.protocol
+    },
     directory,
     client,
     api: serverSDK.apiForDirectory(directory),

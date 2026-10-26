@@ -10,8 +10,15 @@ import type {
 import { QueryClient } from "@tanstack/solid-query"
 import { canDisposeDirectory, pickDirectoriesToEvict } from "./global-sync/eviction"
 import { estimateRootSessionTotal, loadRootSessions } from "./global-sync/session-load"
-import { loadActiveSessionsQuery, loadMcpQuery, loadMcpResourcesQuery, seedActiveSessionStatuses } from "./server-sync"
+import {
+  isProtocolDependentQuery,
+  loadActiveSessionsQuery,
+  loadMcpQuery,
+  loadMcpResourcesQuery,
+  seedActiveSessionStatuses,
+} from "./server-sync"
 import { ServerScope } from "@/utils/server-scope"
+import { ServerConnection } from "./server"
 import { createServerSession } from "./server-session"
 import type { ServerApi } from "@/utils/server"
 
@@ -81,6 +88,12 @@ describe("active session query", () => {
     expect(calls).toBe(1)
     expect(options.enabled).toBe(true)
     expect([...options.queryKey]).toEqual([ServerScope.local, "activeSessions"])
+  })
+
+  test("cancels in-flight active session queries when protocol changes", () => {
+    const otherScope = ServerScope.fromServerKey(ServerConnection.Key.make("server"))
+    expect(isProtocolDependentQuery(ServerScope.local, [ServerScope.local, "activeSessions"])).toBe(true)
+    expect(isProtocolDependentQuery(ServerScope.local, [otherScope, "activeSessions"])).toBe(false)
   })
 
   test("does not overwrite statuses already written by events", () => {

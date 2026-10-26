@@ -43,7 +43,7 @@ import { loadMcpQuery, loadMcpResourcesQuery } from "../server-sync"
 import { NormalizedProviderListResponse } from "@opencode-ai/session-ui/context"
 import { ScopedKey, type ServerScope } from "@/utils/server-scope"
 import { normalizeSessionInfo } from "@/utils/session"
-import type { ServerProtocol } from "@/utils/server-protocol"
+import { resolveServerProtocol, type ServerProtocolSource } from "@/utils/server-protocol"
 import type { ServerApi } from "@/utils/server"
 
 type GlobalStore = {
@@ -105,11 +105,11 @@ function showErrors(input: {
   })
 }
 
-export const loadGlobalConfigQuery = (scope: ServerScope, sdk: OpencodeClient, protocol?: Promise<ServerProtocol>) =>
+export const loadGlobalConfigQuery = (scope: ServerScope, sdk: OpencodeClient, protocol?: ServerProtocolSource) =>
   queryOptions({
     queryKey: [scope, "config"],
     queryFn: async () => {
-      if ((await protocol) !== "v1") return {}
+      if ((await resolveServerProtocol(protocol)) !== "v1") return {}
       return retry(() => sdk.global.config.get().then((x) => x.data!))
     },
   })
@@ -143,7 +143,7 @@ export const loadProjectsQuery = (scope: ServerScope, api: ProjectApi) =>
 export async function bootstrapGlobal(input: {
   serverSDK: OpencodeClient
   serverAPI: CatalogApi & { readonly project: ProjectApi }
-  protocol?: Promise<ServerProtocol>
+  protocol?: ServerProtocolSource
   scope: ServerScope
   requestFailedTitle: string
   translate: (key: string, vars?: Record<string, string | number>) => string
@@ -223,13 +223,13 @@ export const loadProvidersQuery = (
   directory: string | null,
   sdk: CatalogApi,
   legacy?: OpencodeClient,
-  protocol?: Promise<ServerProtocol>,
+  protocol?: ServerProtocolSource,
 ) =>
   queryOptions({
     queryKey: [scope, directory, "providers"],
     queryFn: () =>
       retry(async () => {
-        if ((await protocol) === "v1" && legacy) {
+        if ((await resolveServerProtocol(protocol)) === "v1" && legacy) {
           const result = await legacy.provider.list()
           return normalizeProviderList(result.data!)
         }
@@ -260,13 +260,14 @@ export const loadAgentsQuery = (
   directory: string,
   sdk: AgentListApi,
   legacy?: OpencodeClient,
-  protocol?: Promise<ServerProtocol>,
+  protocol?: ServerProtocolSource,
 ) =>
   queryOptions({
     queryKey: [scope, directory, "agents"],
     queryFn: () =>
       retry(async () => {
-        if ((await protocol) === "v1" && legacy) return normalizeAgentList((await legacy.app.agents()).data ?? [])
+        if ((await resolveServerProtocol(protocol)) === "v1" && legacy)
+          return normalizeAgentList((await legacy.app.agents()).data ?? [])
         return sdk.list({ location: { directory } }).then((result) => normalizeAgentList(result.data))
       }),
   })
@@ -275,10 +276,10 @@ export const loadCommands = (
   directory: string,
   api: CommandListApi,
   legacy?: OpencodeClient,
-  protocol?: Promise<ServerProtocol>,
+  protocol?: ServerProtocolSource,
 ): Promise<CommandInfo[]> =>
   retry(async () => {
-    if ((await protocol) === "v1" && legacy) {
+    if ((await resolveServerProtocol(protocol)) === "v1" && legacy) {
       return ((await legacy.command.list()).data ?? []).map((command) => {
         const [providerID, id] = command.model?.split("/") ?? []
         return {
@@ -299,12 +300,12 @@ export const loadPathQuery = (
   scope: ServerScope,
   directory: string | null,
   sdk: OpencodeClient,
-  protocol?: Promise<ServerProtocol>,
+  protocol?: ServerProtocolSource,
 ) =>
   queryOptions<Path>({
     queryKey: [scope, directory, "path"],
     queryFn: async () => {
-      if ((await protocol) !== "v1")
+      if ((await resolveServerProtocol(protocol)) !== "v1")
         return { state: "", config: "", worktree: "", directory: directory ?? "", home: "" }
       return retry(() => sdk.path.get({ directory: directory ?? undefined }).then((result) => result.data!))
     },
@@ -315,13 +316,14 @@ export const loadReferencesQuery = (
   directory: string,
   api: ReferenceListApi,
   legacy?: OpencodeClient,
-  protocol?: Promise<ServerProtocol>,
+  protocol?: ServerProtocolSource,
 ) =>
   queryOptions<ReferenceInfo[]>({
     queryKey: [scope, directory, "references"] as const,
     queryFn: () =>
       retry(async () => {
-        if ((await protocol) === "v1" && legacy) return (await legacy.v2.reference.list()).data?.data ?? []
+        if ((await resolveServerProtocol(protocol)) === "v1" && legacy)
+          return (await legacy.v2.reference.list()).data?.data ?? []
         return api.list({ location: { directory } }).then((result) => result.data)
       }).catch(() => []),
     placeholderData: [],
@@ -356,7 +358,7 @@ export async function bootstrapDirectory(input: {
   }
   queryClient: QueryClient
   session?: ServerSession
-  protocol?: Promise<ServerProtocol>
+  protocol?: ServerProtocolSource
 }) {
   const loading = input.store.status !== "complete"
   const seededProject = projectID(input.directory, input.global.project)
@@ -371,22 +373,22 @@ export async function bootstrapDirectory(input: {
   const revKey = ScopedKey.from(input.scope, input.directory)
   const rev = (providerRev.get(revKey) ?? 0) + 1
   providerRev.set(revKey, rev)
-  ;(async () => {
+  return (async () => {
     const slow = [
       () => Promise.resolve(input.loadSessions(input.directory)),
       () =>
         input.queryClient
-          .ensureQueryData(loadAgentsQuery(input.scope, input.directory, input.api.agent, input.sdk, input.protocol))
+          .fetchQuery(loadAgentsQuery(input.scope, input.directory, input.api.agent, input.sdk, input.protocol))
           .then((data) => input.setStore("agent", data)),
       () =>
         retry(async () => {
-          if ((await input.protocol) !== "v1") return
+          if ((await resolveServerProtocol(input.protocol)) !== "v1") return
           return input.sdk.config.get().then((x) => input.setStore("config", reconcile(x.data!, { merge: false })))
         }),
       () =>
         retry(() =>
           (async () => {
-            if ((await input.protocol) !== "v1") return
+            if ((await resolveServerProtocol(input.protocol)) !== "v1") return
             const x = await input.sdk.session.status()
             if (!input.session) {
               input.setStore("session_status", x.data!)
@@ -418,14 +420,14 @@ export async function bootstrapDirectory(input: {
       !seededPath &&
         (() =>
           input.queryClient
-            .ensureQueryData(loadPathQuery(input.scope, input.directory, input.sdk, input.protocol))
+            .fetchQuery(loadPathQuery(input.scope, input.directory, input.sdk, input.protocol))
             .then((data) => {
               const next = projectID(data.directory ?? input.directory, input.global.project)
               if (next) input.setStore("project", next)
             })),
       () =>
         retry(async () => {
-          if ((await input.protocol) !== "v1") return
+          if ((await resolveServerProtocol(input.protocol)) !== "v1") return
           return input.sdk.vcs.get().then((result) => {
             const next = { branch: result.data?.branch, default_branch: result.data?.default_branch }
             input.setStore("vcs", next)
@@ -444,7 +446,8 @@ export async function bootstrapDirectory(input: {
       () =>
         retry(() =>
           (async () => {
-            if ((await input.protocol) === "v1") return (await input.sdk.permission.list()).data ?? []
+            if ((await resolveServerProtocol(input.protocol)) === "v1")
+              return (await input.sdk.permission.list()).data ?? []
             return input.api.permission.request
               .list({ location: { directory: input.directory } })
               .then((result) => result.data.map(normalizePermissionRequest))
@@ -480,7 +483,8 @@ export async function bootstrapDirectory(input: {
       () =>
         retry(() =>
           (async () => {
-            if ((await input.protocol) === "v1") return (await input.sdk.question.list()).data ?? []
+            if ((await resolveServerProtocol(input.protocol)) === "v1")
+              return (await input.sdk.question.list()).data ?? []
             return input.api.question.request
               .list({ location: { directory: input.directory } })
               .then((result) => result.data)

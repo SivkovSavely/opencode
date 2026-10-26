@@ -3,7 +3,7 @@ import { createApiForServer, createSdkForServer } from "./server"
 import { createCompatibleApi } from "./server-compat"
 
 function setup(
-  protocol: "v1" | "v2" | Promise<"v1" | "v2">,
+  protocol: "v1" | "v2" | Promise<"v1" | "v2"> | (() => Promise<"v1" | "v2">),
   responses?: { vcs?: { branch: string; default_branch: string } },
 ) {
   const requests: Request[] = []
@@ -170,6 +170,33 @@ describe("createCompatibleApi", () => {
     await api.session.list()
 
     expect(detections).toBe(1)
+  })
+
+  test("uses the current protocol after a server restart changes API generations", async () => {
+    let protocol: "v1" | "v2" = "v1"
+    const { api, requests } = setup(() => Promise.resolve(protocol))
+
+    await api.session.list()
+    protocol = "v2"
+    await api.session.prompt({ sessionID: "ses_1", text: "hello" })
+
+    expect(new URL(requests[0]!.url).pathname).toBe("/session")
+    expect(new URL(requests[1]!.url).pathname).toBe("/api/session/ses_1/prompt")
+  })
+
+  test("waits for protocol detection before issuing API requests", async () => {
+    let resolve!: (protocol: "v1" | "v2") => void
+    const protocol = new Promise<"v1" | "v2">((done) => (resolve = done))
+    const { api, requests } = setup(protocol)
+
+    const pending = api.session.list()
+    await Promise.resolve()
+    expect(requests).toEqual([])
+
+    resolve("v2")
+    await pending
+
+    expect(new URL(requests[0]!.url).pathname).toBe("/api/session")
   })
 
   /*

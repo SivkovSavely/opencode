@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test"
 import { createStore } from "solid-js/store"
 import { QueryClient } from "@tanstack/solid-query"
-import type { Config, OpencodeClient, Project } from "@opencode-ai/sdk/v2/client"
+import type { Config, OpencodeClient, Path, Project } from "@opencode-ai/sdk/v2/client"
 import type { AgentApi, CatalogApi, CommandApi, ReferenceApi } from "@opencode-ai/client/promise"
 import type { NormalizedProviderListResponse } from "@opencode-ai/session-ui/context"
 import {
@@ -81,7 +81,7 @@ describe("bootstrapDirectory", () => {
     const mcpReads: string[] = []
     const [store, setStore] = directoryState()
 
-    await bootstrapDirectory({
+    const completion = bootstrapDirectory({
       directory: "/project",
       scope: ServerScope.local,
       mcp: true,
@@ -138,7 +138,7 @@ describe("bootstrapDirectory", () => {
 
     expect(store.status).toBe("partial")
 
-    await new Promise((resolve) => setTimeout(resolve, 80))
+    await completion
 
     expect(store.status).toBe("complete")
     expect(legacyConfigReads).toEqual(["directory"])
@@ -148,7 +148,7 @@ describe("bootstrapDirectory", () => {
   test("skips legacy config while refreshing a v2 directory", async () => {
     const [store, setStore] = directoryState()
 
-    await bootstrapDirectory({
+    const completion = bootstrapDirectory({
       directory: "/project",
       scope: ServerScope.local,
       mcp: false,
@@ -177,9 +177,68 @@ describe("bootstrapDirectory", () => {
 
     expect(store.status).toBe("partial")
 
-    await new Promise((resolve) => setTimeout(resolve, 80))
+    await completion
 
     expect(store.status).toBe("complete")
+  })
+
+  test("refreshes cached V1 directory queries after a protocol change", async () => {
+    const [store, setStore] = directoryState()
+    const queryClient = new QueryClient()
+    const legacy = {
+      app: { agents: async () => ({ data: [{ name: "legacy", mode: "primary" }] }) },
+      path: {
+        get: async () => ({
+          data: { state: "legacy", config: "", worktree: "/project", directory: "/project", home: "/home" },
+        }),
+      },
+    } as unknown as OpencodeClient
+    const agentApi = {
+      list: async () => ({ location: {}, data: [{ name: "current", mode: "primary" }] }),
+    } as unknown as AgentApi
+    const directoryApi = { ...api, agent: agentApi } as ServerApi
+
+    await queryClient.fetchQuery(
+      loadAgentsQuery(ServerScope.local, "/project", api.agent, legacy, Promise.resolve("v1")),
+    )
+    await queryClient.fetchQuery(loadPathQuery(ServerScope.local, "/project", legacy, Promise.resolve("v1")))
+    await queryClient.invalidateQueries({
+      predicate: (query) =>
+        query.queryKey[0] === ServerScope.local && ["agents", "path"].includes(query.queryKey[2] as string),
+      refetchType: "none",
+    })
+
+    const completion = bootstrapDirectory({
+      directory: "/project",
+      scope: ServerScope.local,
+      mcp: false,
+      global: {
+        config: {} satisfies Config,
+        path: { state: "", config: "", worktree: "/other", directory: "/other", home: "/home" },
+        project: [],
+        provider,
+      },
+      sdk: legacy,
+      api: directoryApi,
+      store,
+      setStore,
+      vcsCache: { setStore() {} } as unknown as VcsCache,
+      loadSessions() {},
+      translate: (key) => key,
+      queryClient,
+      protocol: Promise.resolve("v2"),
+    })
+
+    await completion
+
+    expect(store.agent.map((agent) => agent.name)).toEqual(["current"])
+    expect(queryClient.getQueryData<Path>(loadPathQuery(ServerScope.local, "/project", legacy).queryKey)).toEqual({
+      state: "",
+      config: "",
+      worktree: "",
+      directory: "/project",
+      home: "",
+    })
   })
 })
 

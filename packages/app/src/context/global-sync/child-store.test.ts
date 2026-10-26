@@ -261,11 +261,17 @@ describe("createChildStoreManager", () => {
       expect(bootstraps).toEqual([])
 
       manager.child("/project")
+      expect(queries[0]?.().enabled).toBe(false)
+      expect(queries[3]?.().enabled).toBe(false)
+      expect(queries[4]?.().enabled).toBe(false)
+      expect(queries[5]?.().enabled).toBe(false)
+      expect(bootstraps).toEqual(["/project"])
+
+      manager.activateQueries("/project")
       expect(queries[0]?.().enabled).toBe(true)
       expect(queries[3]?.().enabled).toBe(true)
       expect(queries[4]?.().enabled).toBe(true)
       expect(queries[5]?.().enabled).toBe(true)
-      expect(bootstraps).toEqual(["/project"])
 
       manager.child("/project", { bootstrap: false })
       expect(queries[0]?.().enabled).toBe(true)
