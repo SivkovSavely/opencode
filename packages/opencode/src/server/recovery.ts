@@ -1,5 +1,5 @@
 import { SessionV1 } from "@opencode-ai/core/v1/session"
-import { Cause, Effect, Exit, Option } from "effect"
+import { Cause, Effect, Exit } from "effect"
 import type { Database } from "@opencode-ai/core/database/database"
 import type { Session } from "../session/session"
 import { RuntimeLifecycle } from "./runtime-lifecycle"
@@ -30,6 +30,39 @@ function taskOutcome(sessionID: string, result: SessionV1.WithParts) {
   return { state: "completed" as const, text }
 }
 
+export const foregroundSettlementComplete = Effect.fn("ServerRecovery.foregroundSettlementComplete")(function* (input: {
+  database: Database.Interface
+  record: ForegroundTaskRecord
+}) {
+  const { database, record } = input
+  if (!record.parentSessionID || !record.parentMessageID || !record.parentCallID) return false
+  const { SessionID, MessageID, PartID } = yield* Effect.promise(() => import("../session/schema"))
+  const { MessageV2 } = yield* Effect.promise(() => import("../session/message-v2"))
+  const databaseService = yield* Effect.promise(() => import("@opencode-ai/core/database/database"))
+  const parentSessionID = SessionID.make(record.parentSessionID)
+  const getMessage = (messageID: ReturnType<typeof MessageID.make>) =>
+    MessageV2.get({ sessionID: parentSessionID, messageID }).pipe(
+      Effect.provideService(databaseService.Database.Service, database),
+      Effect.catchTag("NotFoundError", () => Effect.succeed(undefined)),
+    )
+  const message = yield* getMessage(MessageID.make(record.parentMessageID))
+  if (!message || message.info.role !== "assistant" || !message.info.finish || !message.info.time.completed)
+    return false
+  const part = message.parts.find(
+    (item) => item.type === "tool" && item.tool === "task" && item.callID === record.parentCallID,
+  )
+  if (
+    part?.type !== "tool" ||
+    (part.state.status !== "completed" && part.state.status !== "error") ||
+    part.state.metadata?.sessionId !== record.sessionID
+  )
+    return false
+  const command = part.state.input.command
+  if (typeof command !== "string" || command.length === 0) return true
+  const summary = yield* getMessage(MessageID.ascending(`msg_task_summary_${record.parentCallID}`))
+  return summary?.parts.some((item) => item.id === PartID.ascending(`prt_task_summary_${record.parentCallID}`)) ?? false
+})
+
 export const settleForeground = Effect.fn("ServerRecovery.settleForeground")(function* (input: {
   database: Database.Interface
   sessions: Session.Interface
@@ -38,10 +71,19 @@ export const settleForeground = Effect.fn("ServerRecovery.settleForeground")(fun
 }) {
   const { database, sessions, record, result } = input
   const parentID = record.parentSessionID
-  if (!parentID || !record.parentMessageID || !record.parentCallID) return
+  const parentMessageID = record.parentMessageID
+  const parentCallID = record.parentCallID
+  if (!parentID || !parentMessageID || !parentCallID) return
   const { SessionID, MessageID, PartID } = yield* Effect.promise(() => import("../session/schema"))
+  const { MessageV2 } = yield* Effect.promise(() => import("../session/message-v2"))
+  const databaseService = yield* Effect.promise(() => import("@opencode-ai/core/database/database"))
   const { sql } = yield* Effect.promise(() => import("drizzle-orm"))
   const { renderOutput } = yield* Effect.promise(() => import("../tool/task"))
+  const getMessage = (sessionID: ReturnType<typeof SessionID.make>, messageID: ReturnType<typeof MessageID.make>) =>
+    MessageV2.get({ sessionID, messageID }).pipe(
+      Effect.provideService(databaseService.Database.Service, database),
+      Effect.catchTag("NotFoundError", () => Effect.succeed(undefined)),
+    )
 
   yield* database.db.transaction(
     () =>
@@ -57,8 +99,7 @@ export const settleForeground = Effect.fn("ServerRecovery.settleForeground")(fun
           return
         }
         const parentSessionID = SessionID.make(parentID)
-        const messages = yield* sessions.messages({ sessionID: parentSessionID }).pipe(Effect.orDie)
-        const message = messages.find((item) => item.info.id === record.parentMessageID)
+        const message = yield* getMessage(parentSessionID, MessageID.make(parentMessageID))
         if (!message || message.info.role !== "assistant") {
           yield* Effect.logWarning("foreground Task recovery could not find the original assistant message", {
             childSessionID: record.sessionID,
@@ -68,7 +109,7 @@ export const settleForeground = Effect.fn("ServerRecovery.settleForeground")(fun
           return
         }
         const part = message.parts.find(
-          (item) => item.type === "tool" && item.tool === "task" && item.callID === record.parentCallID,
+          (item) => item.type === "tool" && item.tool === "task" && item.callID === parentCallID,
         )
         if (
           part?.type !== "tool" ||
@@ -91,6 +132,18 @@ export const settleForeground = Effect.fn("ServerRecovery.settleForeground")(fun
           })
           return
         }
+        const command = part.state.input.command
+        const messageID = MessageID.ascending(`msg_task_summary_${parentCallID}`)
+        const partID = PartID.ascending(`prt_task_summary_${parentCallID}`)
+        const existing =
+          typeof command === "string" && command.length > 0 ? yield* getMessage(parentSessionID, messageID) : undefined
+        if (
+          part.state.status !== "running" &&
+          message.info.finish &&
+          message.info.time.completed &&
+          (typeof command !== "string" || command.length === 0 || existing?.parts.some((item) => item.id === partID))
+        )
+          return
         if (part.state.status === "running") {
           const outcome = taskOutcome(record.sessionID, result)
           const time = { start: part.state.time.start, end: Date.now() }
@@ -123,18 +176,10 @@ export const settleForeground = Effect.fn("ServerRecovery.settleForeground")(fun
                 },
           )
         }
-        const command = part.state.input.command
         if (typeof command === "string" && command.length > 0) {
           const assistantParentID = message.info.role === "assistant" ? message.info.parentID : undefined
-          const messageID = MessageID.ascending(`msg_task_summary_${record.parentCallID}`)
-          const partID = PartID.ascending(`prt_task_summary_${record.parentCallID}`)
-          const existing = yield* sessions
-            .findMessage(parentSessionID, (item) => item.info.id === messageID)
-            .pipe(Effect.orDie)
-          if (Option.isNone(existing)) {
-            const parent = messages.find(
-              (item) => item.info.role === "user" && item.info.id === assistantParentID,
-            )
+          if (!existing) {
+            const parent = assistantParentID ? yield* getMessage(parentSessionID, assistantParentID) : undefined
             if (parent?.info.role === "user") {
               yield* sessions.updateMessage({
                 id: messageID,
@@ -153,7 +198,7 @@ export const settleForeground = Effect.fn("ServerRecovery.settleForeground")(fun
                 synthetic: true,
               } satisfies SessionV1.TextPart)
             }
-          } else if (!existing.value.parts.some((item) => item.id === partID)) {
+          } else if (!existing.parts.some((item) => item.id === partID)) {
             yield* sessions.updatePart({
               id: partID,
               messageID,
@@ -270,6 +315,10 @@ export const initialize = Effect.fn("ServerRecovery.initialize")(function* () {
             parentNotificationState: child.parent_notification_state ?? undefined,
             recoveryAttempts: child.recovery_attempts,
           }
+          const settled = yield* foregroundSettlementComplete({ database, record }).pipe(
+            Effect.catchCause(() => Effect.succeed(false)),
+          )
+          if (settled) continue
           const result = yield* store.provide({ directory: record.directory }, childResult(record)).pipe(
             Effect.catchCause((cause) => {
               const error = Cause.squash(cause)
@@ -284,15 +333,15 @@ export const initialize = Effect.fn("ServerRecovery.initialize")(function* () {
             yield* store
               .provide({ directory: record.directory }, settleForeground({ database, sessions, record, result }))
               .pipe(
-              Effect.catchCause((cause) => {
-                const error = Cause.squash(cause)
-                return Effect.logWarning("completed foreground Task result could not be persisted", {
-                  childSessionID: record.sessionID,
-                  parentSessionID: record.parentSessionID,
-                  errorType: error instanceof Error ? error.name : typeof error,
-                })
-              }),
-            )
+                Effect.catchCause((cause) => {
+                  const error = Cause.squash(cause)
+                  return Effect.logWarning("completed foreground Task result could not be persisted", {
+                    childSessionID: record.sessionID,
+                    parentSessionID: record.parentSessionID,
+                    errorType: error instanceof Error ? error.name : typeof error,
+                  })
+                }),
+              )
         }
 
         yield* runtime.recover((record) =>
@@ -305,8 +354,7 @@ export const initialize = Effect.fn("ServerRecovery.initialize")(function* () {
                 return
               }
               const result = yield* prompt.recover(SessionID.make(record.sessionID))
-              if (record.parentMode === "foreground")
-                yield* settleForeground({ database, sessions, record, result })
+              if (record.parentMode === "foreground") yield* settleForeground({ database, sessions, record, result })
             }),
           ),
         )

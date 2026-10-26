@@ -2467,6 +2467,7 @@ it.instance("foreground recovery settles linked Tasks and leaves cancelled paren
     const scope = yield* Scope.Scope
     const parent = yield* sessions.create({ title: "Foreground Task parent" })
     const child = yield* sessions.create({ title: "Foreground Task child", parentID: parent.id })
+    for (let index = 0; index < 100; index++) yield* user(parent.id, `history ${index}`)
     const parentUser = yield* user(parent.id, "review")
     const callID = "call_foreground_recovery"
     const assistant = yield* sessions.updateMessage({
@@ -2558,16 +2559,24 @@ it.instance("foreground recovery settles linked Tasks and leaves cancelled paren
         (${parent.id}, ${parent.id}, ${parent.directory}, ${lineage}, ${runtime.identity.instance}, 1,
          ${"active"}, 1, ${createdAt}, ${createdAt})
     `)
-    const messagesStarted = yield* Deferred.make<void>()
-    const resumeMessages = yield* Deferred.make<void>()
+    const partStarted = yield* Deferred.make<void>()
+    const resumePart = yield* Deferred.make<void>()
+    let historyReads = 0
     const delayedSessions = {
       ...sessions,
       messages: (input: Parameters<typeof sessions.messages>[0]) =>
         Effect.gen(function* () {
-          yield* Deferred.succeed(messagesStarted, undefined)
-          yield* Deferred.await(resumeMessages)
+          historyReads++
           return yield* sessions.messages(input)
         }),
+      updatePart: <T extends SessionV1.Part>(input: T) =>
+        input.messageID === assistant.id
+          ? Effect.gen(function* () {
+              yield* Deferred.succeed(partStarted, undefined)
+              yield* Deferred.await(resumePart)
+              return yield* sessions.updatePart(input)
+            })
+          : sessions.updatePart(input),
     }
     const settlement = yield* ServerRecovery.settleForeground({
       database,
@@ -2580,11 +2589,12 @@ it.instance("foreground recovery settles linked Tasks and leaves cancelled paren
       },
       result: childResult,
     }).pipe(Effect.forkChild)
-    yield* Deferred.await(messagesStarted)
+    yield* Deferred.await(partStarted)
     const cancellation = yield* runtime.cancel(parent.id).pipe(Effect.forkChild)
-    yield* Deferred.succeed(resumeMessages, undefined)
+    yield* Deferred.succeed(resumePart, undefined)
     yield* Fiber.join(settlement)
     expect(yield* Fiber.join(cancellation)).toBe(true)
+    expect(historyReads).toBe(0)
 
     const recovered = yield* sessions.messages({ sessionID: parent.id })
     const repairedAssistant = recovered.find((message) => message.info.id === assistant.id)
@@ -2606,6 +2616,41 @@ it.instance("foreground recovery settles linked Tasks and leaves cancelled paren
       SELECT state FROM runtime_execution WHERE session_id = ${parent.id}
     `))?.state,
     ).toBe("cancelled")
+    yield* database.db.run(sql`
+      UPDATE runtime_execution SET state = ${"completed"} WHERE session_id = ${parent.id}
+    `)
+    expect(
+      yield* ServerRecovery.foregroundSettlementComplete({
+        database,
+        record: {
+          sessionID: child.id,
+          parentSessionID: parent.id,
+          parentMessageID: assistant.id,
+          parentCallID: callID,
+        },
+      }),
+    ).toBe(true)
+    const settledSessions = {
+      ...sessions,
+      messages: () => Effect.die(new Error("settled foreground recovery must not load full history")),
+      updatePart: <T extends SessionV1.Part>() =>
+        Effect.die(new Error("settled foreground recovery must not write parts")),
+      updateMessage: <T extends SessionV1.Info>() =>
+        Effect.die(new Error("settled foreground recovery must not write messages")),
+    }
+    for (let attempt = 0; attempt < 2; attempt++)
+      yield* ServerRecovery.settleForeground({
+        database,
+        sessions: settledSessions,
+        record: {
+          sessionID: child.id,
+          parentSessionID: parent.id,
+          parentMessageID: assistant.id,
+          parentCallID: callID,
+        },
+        result: childResult,
+      })
+    expect(historyReads).toBe(0)
 
     const cancelledParent = yield* sessions.create({ title: "Cancelled foreground Task parent" })
     const cancelledChild = yield* sessions.create({
