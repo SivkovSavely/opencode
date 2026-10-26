@@ -667,10 +667,10 @@ it.instance("remote timeout aborts both real HTTP transport attempts", () =>
 
 it.live("McpOAuthCallback.cancelPending rejects the pending callback", () =>
   Effect.acquireUseRelease(
-    Effect.sync(() => McpOAuthCallback.waitForCallback("abc123hexstate", "my-mcp-server")),
+    Effect.sync(() => McpOAuthCallback.waitForCallback("abc123hexstate")),
     (callback) =>
       Effect.gen(function* () {
-        McpOAuthCallback.cancelPending("my-mcp-server")
+        McpOAuthCallback.cancelPending("abc123hexstate")
         const exit = yield* Effect.tryPromise({
           try: () => callback,
           catch: (error) => (error instanceof Error ? error : new Error(String(error))),

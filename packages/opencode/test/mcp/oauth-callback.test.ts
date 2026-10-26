@@ -66,6 +66,16 @@ describe("McpOAuthCallback.ensureRunning", () => {
     expect(McpOAuthCallback.isRunning()).toBe(true)
   })
 
+  test("shares concurrent callback server startup", async () => {
+    const port = await getFreeLoopbackPort()
+    const redirectUri = `http://127.0.0.1:${port}/custom/callback`
+
+    await Promise.all([McpOAuthCallback.ensureRunning(redirectUri), McpOAuthCallback.ensureRunning(redirectUri)])
+
+    expect(McpOAuthCallback.isRunning()).toBe(true)
+    expect(await canConnect("127.0.0.1", port)).toBe(true)
+  })
+
   test("stops after the callback completes", async () => {
     const redirectUri = "http://127.0.0.1:18003/custom/callback"
     await McpOAuthCallback.ensureRunning(redirectUri)

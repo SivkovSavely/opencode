@@ -30,6 +30,7 @@ export class McpOAuthProvider implements OAuthClientProvider {
     protected config: McpOAuthConfig,
     private callbacks: McpOAuthCallbacks,
     protected auth: McpAuth.Interface,
+    protected authKey = mcpName,
   ) {}
 
   get redirectUrl(): string {
@@ -129,11 +130,11 @@ export class McpOAuthProvider implements OAuthClientProvider {
   }
 
   async saveCodeVerifier(codeVerifier: string): Promise<void> {
-    await Effect.runPromise(this.auth.updateCodeVerifier(this.mcpName, codeVerifier))
+    await Effect.runPromise(this.auth.updateCodeVerifier(this.authKey, codeVerifier))
   }
 
   async codeVerifier(): Promise<string> {
-    const entry = await Effect.runPromise(this.auth.get(this.mcpName))
+    const entry = await Effect.runPromise(this.auth.get(this.authKey))
     if (!entry?.codeVerifier) {
       throw new Error(`No code verifier saved for MCP server: ${this.mcpName}`)
     }
@@ -141,11 +142,11 @@ export class McpOAuthProvider implements OAuthClientProvider {
   }
 
   async saveState(state: string): Promise<void> {
-    await Effect.runPromise(this.auth.updateOAuthState(this.mcpName, state))
+    await Effect.runPromise(this.auth.updateOAuthState(this.authKey, state))
   }
 
   async state(): Promise<string> {
-    const entry = await Effect.runPromise(this.auth.get(this.mcpName))
+    const entry = await Effect.runPromise(this.auth.get(this.authKey))
     if (entry?.oauthState) {
       return entry.oauthState
     }
@@ -157,7 +158,7 @@ export class McpOAuthProvider implements OAuthClientProvider {
     const newState = Array.from(crypto.getRandomValues(new Uint8Array(32)))
       .map((b) => b.toString(16).padStart(2, "0"))
       .join("")
-    await Effect.runPromise(this.auth.updateOAuthState(this.mcpName, newState))
+    await Effect.runPromise(this.auth.updateOAuthState(this.authKey, newState))
     return newState
   }
 

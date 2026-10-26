@@ -5,13 +5,14 @@ import { ListResourcesRequestSchema, ListToolsRequestSchema } from "@modelcontex
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { FSUtil } from "@opencode-ai/core/fs-util"
-import { Effect } from "effect"
+import { Effect, Exit, Fiber } from "effect"
 import { Config } from "../../src/config/config"
 import { EventV2Bridge } from "../../src/event-v2-bridge"
 import { McpAuth } from "../../src/mcp/auth"
 import { MCP } from "../../src/mcp/index"
 import { McpOAuthCallback } from "../../src/mcp/oauth-callback"
-import { McpOAuthPendingProvider, McpOAuthProvider } from "../../src/mcp/oauth-provider"
+import { McpOAuthPendingProvider, McpOAuthProvider, OAUTH_CALLBACK_PORT } from "../../src/mcp/oauth-provider"
+import { provideInstance, tmpdirScoped } from "../fixture/fixture"
 import { testEffect } from "../lib/effect"
 
 const mcpTest = testEffect(
@@ -37,7 +38,14 @@ function serveOAuthMcp(options: OAuthMcpOptions = {}) {
         enableJsonResponse: true,
       })
       let listToolsCalls = 0
+      let mcpRequests = 0
       let requiresAuth = true
+      let nextDiscovery:
+        | {
+            reached: () => void
+            wait: Promise<void>
+          }
+        | undefined
 
       if (capabilities === "tools") {
         protocol.setRequestHandler(ListToolsRequestSchema, () => {
@@ -60,6 +68,10 @@ function serveOAuthMcp(options: OAuthMcpOptions = {}) {
           const mcpUrl = `${origin}/mcp`
 
           if (url.pathname === "/.well-known/oauth-protected-resource/mcp") {
+            const pause = nextDiscovery
+            nextDiscovery = undefined
+            pause?.reached()
+            if (pause) await pause.wait
             return Response.json({
               resource: mcpUrl,
               authorization_servers: [origin],
@@ -67,6 +79,10 @@ function serveOAuthMcp(options: OAuthMcpOptions = {}) {
             })
           }
           if (url.pathname === "/.well-known/oauth-protected-resource") {
+            const pause = nextDiscovery
+            nextDiscovery = undefined
+            pause?.reached()
+            if (pause) await pause.wait
             return Response.json({
               resource: mcpUrl,
               authorization_servers: [origin],
@@ -101,6 +117,7 @@ function serveOAuthMcp(options: OAuthMcpOptions = {}) {
             return Response.json({ access_token: "replacement-token", token_type: "Bearer" })
           }
           if (url.pathname !== "/mcp") return new Response("Not found", { status: 404 })
+          mcpRequests++
 
           if (request.method === "GET") return new Response(null, { status: 405 })
           if (requiresAuth && request.headers.get("authorization") !== "Bearer replacement-token") {
@@ -120,7 +137,19 @@ function serveOAuthMcp(options: OAuthMcpOptions = {}) {
         allowAnonymous: () => {
           requiresAuth = false
         },
+        requireAuth: () => {
+          requiresAuth = true
+        },
         listToolsCalls: () => listToolsCalls,
+        mcpRequests: () => mcpRequests,
+        pauseNextDiscovery: () => {
+          let reached!: () => void
+          let release!: () => void
+          const started = new Promise<void>((resolve) => (reached = resolve))
+          const wait = new Promise<void>((resolve) => (release = resolve))
+          nextDiscovery = { reached, wait }
+          return { started, release }
+        },
         close: async () => {
           await http.stop(true)
           await protocol.close()
@@ -212,9 +241,10 @@ mcpTest.instance("failed reauthentication preserves existing credentials", () =>
     yield* auth.updateClientInfo(name, { clientId: "dynamic-client", clientSecret: "dynamic-secret" }, server.url)
     yield* auth.updateTokens(name, { accessToken: "working-token" }, server.url)
     yield* mcp.add(name, remote(server.url))
-    expect((yield* mcp.startAuth(name)).authorizationUrl).toContain("/authorize")
+    const started = yield* mcp.startAuth(name)
+    expect(started.authorizationUrl).toContain("/authorize")
 
-    expect(yield* mcp.finishAuth(name, "invalid-code")).toEqual({
+    expect(yield* mcp.finishAuth(name, "invalid-code", started.oauthState)).toEqual({
       status: "failed",
       error: "OAuth completion failed: Token exchange failed",
     })
@@ -223,6 +253,10 @@ mcpTest.instance("failed reauthentication preserves existing credentials", () =>
       clientId: "dynamic-client",
       clientSecret: "dynamic-secret",
     })
+
+    const requests = server.mcpRequests()
+    expect(yield* mcp.ensureConnected(name)).toEqual({ status: "needs_auth" })
+    expect(server.mcpRequests()).toBeGreaterThan(requests)
   }),
 )
 
@@ -237,14 +271,161 @@ mcpTest.instance("successful reauthentication commits replacement credentials", 
     yield* auth.updateClientInfo(name, { clientId: "old-client" }, server.url)
     yield* auth.updateTokens(name, { accessToken: "old-token" }, server.url)
     yield* mcp.add(name, remote(server.url))
-    expect((yield* mcp.startAuth(name)).authorizationUrl).toContain("/authorize")
+    const started = yield* mcp.startAuth(name)
+    expect(started.authorizationUrl).toContain("/authorize")
     expect((yield* auth.get(name))?.tokens?.accessToken).toBe("old-token")
 
-    expect((yield* mcp.finishAuth(name, "valid-code")).status).toBe("connected")
+    expect((yield* mcp.finishAuth(name, "valid-code", started.oauthState)).status).toBe("connected")
     const entry = yield* auth.get(name)
     expect(entry?.tokens?.accessToken).toBe("replacement-token")
     expect(entry?.clientInfo?.clientId).toBe("replacement-client")
     expect(entry?.serverUrl).toBe(server.url)
+  }),
+)
+
+mcpTest.instance("lazy activation during explicit OAuth reuses the pending authentication flow", () =>
+  Effect.gen(function* () {
+    yield* stopOAuthCallback
+    const server = yield* serveOAuthMcp()
+    const mcp = yield* MCP.Service
+    const name = "test-oauth-lazy-activation"
+
+    expect((yield* mcp.add(name, remote(server.url))).status).toMatchObject({ [name]: { status: "needs_auth" } })
+    const started = yield* mcp.startAuth(name)
+    expect(started.authorizationUrl).toContain("/authorize")
+
+    const requests = server.mcpRequests()
+    expect(yield* mcp.ensureConnected(name)).toEqual({ status: "needs_auth" })
+    expect(server.mcpRequests()).toBe(requests)
+    expect((yield* mcp.finishAuth(name, "valid-code", started.oauthState)).status).toBe("connected")
+
+    const connectedRequests = server.mcpRequests()
+    expect(yield* mcp.ensureConnected(name)).toEqual({ status: "connected" })
+    expect(server.mcpRequests()).toBe(connectedRequests)
+  }),
+)
+
+mcpTest.instance("lazy activation reuses a healthy client during explicit reauthentication", () =>
+  Effect.gen(function* () {
+    yield* stopOAuthCallback
+    const server = yield* serveOAuthMcp()
+    server.allowAnonymous()
+    const mcp = yield* MCP.Service
+    const name = "test-oauth-healthy-reauth"
+
+    expect((yield* mcp.add(name, remote(server.url))).status).toMatchObject({
+      [name]: { status: "connected" },
+    })
+    server.requireAuth()
+    const started = yield* mcp.startAuth(name)
+    expect(started.authorizationUrl).toContain("/authorize")
+
+    const requests = server.mcpRequests()
+    expect(yield* mcp.ensureConnected(name)).toEqual({ status: "connected" })
+    expect(server.mcpRequests()).toBe(requests)
+  }),
+)
+
+mcpTest.instance("OAuth cleanup stays scoped to the owning directory", () =>
+  Effect.gen(function* () {
+    yield* stopOAuthCallback
+    const server = yield* serveOAuthMcp()
+    const name = "test-oauth-instance-cleanup"
+    const first = yield* MCP.Service
+    yield* first.add(name, remote(server.url))
+    const firstStarted = yield* first.startAuth(name)
+
+    const secondDirectory = yield* tmpdirScoped()
+    const secondStarted = yield* provideInstance(secondDirectory)(
+      Effect.gen(function* () {
+        const second = yield* MCP.Service
+        yield* second.add(name, remote(server.url))
+        return yield* second.startAuth(name)
+      }),
+    )
+    const callback = McpOAuthCallback.waitForCallback(secondStarted.oauthState)
+
+    yield* first.disconnect(name)
+    const auth = yield* McpAuth.Service
+    expect((yield* auth.get(`${name}:${firstStarted.oauthState}`))?.oauthState).toBeUndefined()
+    expect((yield* auth.get(`${name}:${secondStarted.oauthState}`))?.oauthState).toBe(secondStarted.oauthState)
+
+    const callbackUrl = new URL(`http://127.0.0.1:${OAUTH_CALLBACK_PORT}/mcp/oauth/callback`)
+    callbackUrl.searchParams.set("code", "valid-code")
+    callbackUrl.searchParams.set("state", secondStarted.oauthState)
+    expect((yield* Effect.promise(() => fetch(callbackUrl))).ok).toBe(true)
+    expect(yield* Effect.promise(() => callback)).toBe("valid-code")
+
+    expect(
+      yield* provideInstance(secondDirectory)(
+        Effect.gen(function* () {
+          const second = yield* MCP.Service
+          return yield* second.finishAuth(name, "valid-code", secondStarted.oauthState)
+        }),
+      ),
+    ).toMatchObject({ status: "connected" })
+  }),
+)
+
+mcpTest.instance("lazy activation cannot race explicit OAuth flow registration", () =>
+  Effect.gen(function* () {
+    yield* stopOAuthCallback
+    const server = yield* serveOAuthMcp()
+    const mcp = yield* MCP.Service
+    const name = "test-oauth-registration-race"
+
+    yield* mcp.add(name, remote(server.url))
+    const barrier = server.pauseNextDiscovery()
+    const start = yield* Effect.forkScoped(mcp.startAuth(name), { startImmediately: true })
+    yield* Effect.promise(() => barrier.started)
+
+    const requests = server.mcpRequests()
+    expect(yield* mcp.ensureConnected(name)).toEqual({ status: "needs_auth" })
+    expect(server.mcpRequests()).toBe(requests)
+
+    barrier.release()
+    const started = yield* Fiber.join(start)
+    expect(started.authorizationUrl).toContain("/authorize")
+    expect((yield* mcp.finishAuth(name, "valid-code", started.oauthState)).status).toBe("connected")
+  }),
+)
+
+mcpTest.instance("disconnect prevents a starting OAuth flow from registering its transport", () =>
+  Effect.gen(function* () {
+    yield* stopOAuthCallback
+    const server = yield* serveOAuthMcp()
+    const mcp = yield* MCP.Service
+    const name = "test-oauth-start-disconnect"
+
+    yield* mcp.add(name, remote(server.url))
+    const barrier = server.pauseNextDiscovery()
+    const start = yield* Effect.forkScoped(mcp.startAuth(name), { startImmediately: true })
+    yield* Effect.promise(() => barrier.started)
+    yield* mcp.disconnect(name)
+    barrier.release()
+
+    expect(Exit.isFailure(yield* Fiber.await(start))).toBe(true)
+    expect(yield* mcp.finishAuth(name, "valid-code", "stale-state")).toEqual({ status: "disabled" })
+    expect((yield* mcp.status())[name]?.status).toBe("disabled")
+  }),
+)
+
+mcpTest.instance("interrupting a starting OAuth flow releases its connection guard", () =>
+  Effect.gen(function* () {
+    yield* stopOAuthCallback
+    const server = yield* serveOAuthMcp()
+    const mcp = yield* MCP.Service
+    const name = "test-oauth-start-cancelled"
+
+    yield* mcp.add(name, remote(server.url))
+    const barrier = server.pauseNextDiscovery()
+    const start = yield* Effect.forkScoped(mcp.startAuth(name), { startImmediately: true })
+    yield* Effect.promise(() => barrier.started)
+    yield* Fiber.interrupt(start)
+
+    const requests = server.mcpRequests()
+    expect(yield* mcp.ensureConnected(name)).toEqual({ status: "needs_auth" })
+    expect(server.mcpRequests()).toBeGreaterThan(requests)
   }),
 )
 
@@ -256,11 +437,34 @@ mcpTest.instance("disconnect prevents pending OAuth completion from reconnecting
     const name = "test-oauth-disconnect-race"
 
     yield* mcp.add(name, remote(server.url))
-    expect((yield* mcp.startAuth(name)).authorizationUrl).toContain("/authorize")
+    const started = yield* mcp.startAuth(name)
+    expect(started.authorizationUrl).toContain("/authorize")
     yield* mcp.disconnect(name)
 
-    expect(yield* mcp.finishAuth(name, "valid-code")).toEqual({ status: "disabled" })
+    expect(yield* mcp.finishAuth(name, "valid-code", started.oauthState)).toEqual({ status: "disabled" })
     expect((yield* mcp.status())[name]?.status).toBe("disabled")
+  }),
+)
+
+mcpTest.instance("a stale OAuth callback cannot consume a replacement attempt", () =>
+  Effect.gen(function* () {
+    yield* stopOAuthCallback
+    const server = yield* serveOAuthMcp()
+    const mcp = yield* MCP.Service
+    const name = "test-oauth-stale-callback"
+
+    yield* mcp.add(name, remote(server.url))
+    const first = yield* mcp.startAuth(name)
+    yield* mcp.disconnect(name)
+    expect(yield* mcp.ensureConnected(name)).toEqual({ status: "needs_auth" })
+    const second = yield* mcp.startAuth(name)
+
+    expect(second.oauthState).not.toBe(first.oauthState)
+    expect(yield* mcp.finishAuth(name, "valid-code", first.oauthState)).toEqual({
+      status: "failed",
+      error: "OAuth state mismatch",
+    })
+    expect((yield* mcp.finishAuth(name, "valid-code", second.oauthState)).status).toBe("connected")
   }),
 )
 

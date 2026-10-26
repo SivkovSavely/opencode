@@ -1856,6 +1856,7 @@ export type McpLocalConfig = {
     [key: string]: string
   }
   enabled?: boolean
+  description?: string
   timeout?: number
 }
 
@@ -1877,6 +1878,7 @@ export type McpRemoteConfig = {
    */
   url: string
   enabled?: boolean
+  description?: string
   headers?: {
     [key: string]: string
   }
@@ -8921,6 +8923,7 @@ export type McpAuthStartResponse = McpAuthStartResponses[keyof McpAuthStartRespo
 export type McpAuthCallbackData = {
   body?: {
     code: string
+    oauthState: string
   }
   path: {
     name: string

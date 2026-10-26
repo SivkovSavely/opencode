@@ -29,6 +29,7 @@ import { TuiEvent } from "@/server/tui-event"
 import { Cause, Effect, Exit, Layer, Context, Schema, Stream, Semaphore } from "effect"
 import { EffectBridge } from "@/effect/bridge"
 import { InstanceState } from "@/effect/instance-state"
+import { InstanceRef } from "@/effect/instance-ref"
 import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { McpCatalog } from "./catalog"
@@ -36,6 +37,7 @@ import { McpEvent } from "@opencode-ai/schema/mcp-event"
 import { McpBrowser } from "./browser"
 
 const DEFAULT_TIMEOUT = 30_000
+const OAUTH_ATTEMPT_TIMEOUT = 5 * 60 * 1000
 const CLIENT_OPTIONS = {
   capabilities: {
     // https://github.com/anomalyco/opencode/issues/11948
@@ -108,10 +110,20 @@ export type Status = Schema.Schema.Type<typeof Status>
 
 // Store transports for OAuth servers to allow finishing auth
 type TransportWithAuth = StreamableHTTPClientTransport | SSEClientTransport
-const pendingOAuthTransports = new Map<
-  string,
-  { transport: TransportWithAuth; provider?: McpOAuthPendingProvider; revision: number }
->()
+interface OAuthAttempt {
+  revision: number
+  authKey?: string
+  oauthState?: string
+  timeout?: ReturnType<typeof setTimeout>
+}
+
+interface PendingOAuthTransport {
+  transport: TransportWithAuth
+  provider?: McpOAuthPendingProvider
+  revision: number
+  attempt?: OAuthAttempt
+  oauthState?: string
+}
 
 // Prompt cache types
 type PromptInfo = Awaited<ReturnType<MCPClient["listPrompts"]>>["prompts"][number]
@@ -137,8 +149,10 @@ interface CreateResult {
 interface AuthResult {
   authorizationUrl: string
   oauthState: string
+  authKey: string
   revision: number
   client?: MCPClient
+  attempt: OAuthAttempt
 }
 
 // --- Effect Service ---
@@ -151,6 +165,8 @@ interface State {
   instructions: Record<string, string>
   connectLocks: Map<string, Semaphore.Semaphore>
   connectRevisions: Record<string, number>
+  activeOAuth: Map<string, OAuthAttempt>
+  pendingOAuthTransports: Map<string, PendingOAuthTransport>
 }
 
 export interface ServerInstructions {
@@ -207,7 +223,11 @@ export interface Interface {
     mcpName: string,
     onAuthorization?: (authorizationUrl: string) => void,
   ) => Effect.Effect<Status, NotFoundError>
-  readonly finishAuth: (mcpName: string, authorizationCode: string) => Effect.Effect<Status, NotFoundError>
+  readonly finishAuth: (
+    mcpName: string,
+    authorizationCode: string,
+    oauthState: string,
+  ) => Effect.Effect<Status, NotFoundError>
   readonly removeAuth: (mcpName: string) => Effect.Effect<void>
   readonly supportsOAuth: (mcpName: string) => Effect.Effect<boolean, NotFoundError>
   readonly hasStoredTokens: (mcpName: string) => Effect.Effect<boolean>
@@ -251,6 +271,7 @@ const layer = Layer.effect(
     const DISABLED_RESULT: CreateResult = { status: { status: "disabled" } }
 
     const connectRemote = Effect.fn("MCP.connectRemote")(function* (
+      s: State,
       key: string,
       mcp: ConfigMCPV1.Info & { type: "remote" },
       revision: number,
@@ -327,7 +348,7 @@ const layer = Layer.effect(
                   })
                   .pipe(Effect.ignore, Effect.as(undefined))
               } else {
-                pendingOAuthTransports.set(key, { transport, revision })
+                s.pendingOAuthTransports.set(key, { transport, revision })
                 lastStatus = { status: "needs_auth" as const }
                 return events
                   .publish(TuiEvent.ToastShow, {
@@ -388,14 +409,14 @@ const layer = Layer.effect(
     })
 
     const create = Effect.fn("MCP.create")(
-      function* (key: string, mcp: ConfigMCPV1.Info, revision = 0) {
+      function* (s: State, key: string, mcp: ConfigMCPV1.Info, revision = 0) {
         if (mcp.enabled === false) {
           return DISABLED_RESULT
         }
 
         const { client: mcpClient, status } =
           mcp.type === "remote"
-            ? yield* connectRemote(key, mcp as ConfigMCPV1.Info & { type: "remote" }, revision)
+            ? yield* connectRemote(s, key, mcp as ConfigMCPV1.Info & { type: "remote" }, revision)
             : yield* connectLocal(key, mcp as ConfigMCPV1.Info & { type: "local" })
 
         if (!mcpClient) {
@@ -520,6 +541,8 @@ const layer = Layer.effect(
           instructions: {},
           connectLocks: new Map(),
           connectRevisions: {},
+          activeOAuth: new Map(),
+          pendingOAuthTransports: new Map(),
         }
 
         yield* Effect.forEach(
@@ -536,7 +559,7 @@ const layer = Layer.effect(
                 return
               }
 
-              const result = yield* create(key, mcp)
+              const result = yield* create(s, key, mcp)
               s.status[key] = result.status
               if (result.mcpClient) {
                 s.clients[key] = result.mcpClient
@@ -550,6 +573,15 @@ const layer = Layer.effect(
 
         yield* Effect.addFinalizer(() =>
           Effect.gen(function* () {
+            for (const attempt of s.activeOAuth.values()) {
+              if (attempt.timeout) clearTimeout(attempt.timeout)
+              if (attempt.oauthState) McpOAuthCallback.cancelPending(attempt.oauthState)
+              if (attempt.authKey) {
+                yield* auth.clearOAuthState(attempt.authKey).pipe(Effect.ignore)
+                yield* auth.clearCodeVerifier(attempt.authKey).pipe(Effect.ignore)
+              }
+            }
+            s.activeOAuth.clear()
             const clients = Object.values(s.clients)
             s.clients = {}
             s.defs = {}
@@ -571,7 +603,10 @@ const layer = Layer.effect(
                 }),
               { concurrency: "unbounded" },
             )
-            pendingOAuthTransports.clear()
+            for (const [name, pending] of s.pendingOAuthTransports) {
+              s.pendingOAuthTransports.delete(name)
+              yield* Effect.tryPromise(() => pending.transport.close()).pipe(Effect.ignore)
+            }
           }),
         )
 
@@ -595,6 +630,35 @@ const layer = Layer.effect(
     function bumpConnectRevision(s: State, name: string) {
       s.connectRevisions[name] = connectRevision(s, name) + 1
     }
+
+    function releaseOAuth(s: State, name: string, attempt?: OAuthAttempt) {
+      if (attempt && s.activeOAuth.get(name) !== attempt) return Effect.void
+      const active = s.activeOAuth.get(name)
+      s.activeOAuth.delete(name)
+      if (active?.timeout) clearTimeout(active.timeout)
+      if (active?.oauthState) McpOAuthCallback.cancelPending(active.oauthState)
+      const pending = s.pendingOAuthTransports.get(name)
+      const close = pending && active && pending.attempt === active ? pending : undefined
+      if (close) s.pendingOAuthTransports.delete(name)
+      return Effect.gen(function* () {
+        if (active?.authKey) {
+          yield* auth.clearOAuthState(active.authKey).pipe(Effect.ignore)
+          yield* auth.clearCodeVerifier(active.authKey).pipe(Effect.ignore)
+        }
+        if (close) yield* Effect.tryPromise(() => close.transport.close()).pipe(Effect.ignore)
+      })
+    }
+
+    function closePendingOAuth(s: State, name: string, pending: PendingOAuthTransport) {
+      if (s.pendingOAuthTransports.get(name) !== pending) return Effect.void
+      s.pendingOAuthTransports.delete(name)
+      return Effect.tryPromise(() => pending.transport.close()).pipe(Effect.ignore)
+    }
+
+    const clearOAuth = Effect.fnUntraced(function* (name: string, attempt: OAuthAttempt) {
+      const s = yield* InstanceState.get(state)
+      yield* connectLock(s, name).withPermits(1)(releaseOAuth(s, name, attempt))
+    })
 
     function configured(s: State, cfg: ConfigV1.Info) {
       return { ...cfg.mcp, ...s.config } as Record<string, McpEntry>
@@ -690,7 +754,7 @@ const layer = Layer.effect(
 
     const createAndStore = Effect.fn("MCP.createAndStore")(function* (name: string, mcp: ConfigMCPV1.Info) {
       const s = yield* InstanceState.get(state)
-      const result = yield* create(name, mcp, connectRevision(s, name))
+      const result = yield* create(s, name, mcp, connectRevision(s, name))
 
       s.status[name] = result.status
       if (!result.mcpClient) {
@@ -706,6 +770,7 @@ const layer = Layer.effect(
       const s = yield* InstanceState.get(state)
       return yield* connectLock(s, name).withPermits(1)(
         Effect.gen(function* () {
+          yield* releaseOAuth(s, name)
           s.config[name] = mcp
           bumpConnectRevision(s, name)
           yield* createAndStore(name, mcp)
@@ -718,6 +783,7 @@ const layer = Layer.effect(
       const s = yield* InstanceState.get(state)
       yield* connectLock(s, name).withPermits(1)(
         Effect.gen(function* () {
+          yield* releaseOAuth(s, name)
           bumpConnectRevision(s, name)
           const mcp = yield* requireMcpConfig(name)
           yield* createAndStore(name, { ...mcp, enabled: true })
@@ -730,6 +796,7 @@ const layer = Layer.effect(
       return yield* connectLock(s, name).withPermits(1)(
         Effect.gen(function* () {
           if (s.status[name]?.status === "connected" && s.clients[name] && s.defs[name]) return s.status[name]
+          if (s.activeOAuth.has(name)) return { status: "needs_auth" as const }
           bumpConnectRevision(s, name)
           const mcp = yield* requireMcpConfig(name)
           yield* createAndStore(name, { ...mcp, enabled: true })
@@ -747,6 +814,7 @@ const layer = Layer.effect(
       yield* connectLock(s, name).withPermits(1)(
         Effect.gen(function* () {
           yield* requireMcpConfig(name)
+          yield* releaseOAuth(s, name)
           bumpConnectRevision(s, name)
           yield* closeClient(s, name)
           delete s.clients[name]
@@ -925,14 +993,34 @@ const layer = Layer.effect(
       return mcpConfig
     })
 
-    const startAuth = Effect.fn("MCP.startAuth")(function* (mcpName: string) {
-      const mcpConfig = yield* requireMcpConfig(mcpName)
-      if (mcpConfig.type !== "remote") throw new Error(`MCP server ${mcpName} is not a remote server`)
-      if (mcpConfig.oauth === false) throw new Error(`MCP server ${mcpName} has OAuth explicitly disabled`)
+    const startAuth = Effect.fn("MCP.startAuth")(function* (mcpName: string, retainConnectedAttempt = false) {
       const s = yield* InstanceState.get(state)
-      const revision = connectRevision(s, mcpName)
-      const url = remoteURL(mcpConfig.url)
-      if (!url) throw new Error(`Invalid MCP URL for "${mcpName}"`)
+      const instance = yield* InstanceState.context
+      const registration = yield* connectLock(s, mcpName).withPermits(1)(
+        Effect.gen(function* () {
+          const mcpConfig = yield* requireMcpConfig(mcpName)
+          if (mcpConfig.type !== "remote") throw new Error(`MCP server ${mcpName} is not a remote server`)
+          if (mcpConfig.oauth === false) throw new Error(`MCP server ${mcpName} has OAuth explicitly disabled`)
+          if (s.activeOAuth.has(mcpName)) throw new Error(`OAuth authentication is already in progress for ${mcpName}`)
+          const url = remoteURL(mcpConfig.url)
+          if (!url) throw new Error(`Invalid MCP URL for "${mcpName}"`)
+          const attempt: OAuthAttempt = { revision: connectRevision(s, mcpName) }
+          s.activeOAuth.set(mcpName, attempt)
+          return { mcpConfig, url, attempt }
+        }),
+      )
+      const mcpConfig = registration.mcpConfig
+      const attempt = registration.attempt
+      const revision = attempt.revision
+      const url = registration.url
+      attempt.timeout = setTimeout(() => {
+        void Effect.runPromise(
+          connectLock(s, mcpName)
+            .withPermits(1)(releaseOAuth(s, mcpName, attempt))
+            .pipe(Effect.provideService(InstanceRef, instance)),
+        ).catch(() => {})
+      }, OAUTH_ATTEMPT_TIMEOUT)
+      attempt.timeout.unref?.()
 
       // OAuth config is optional - if not provided, we'll use auto-discovery
       const oauthConfig = typeof mcpConfig.oauth === "object" ? mcpConfig.oauth : undefined
@@ -943,153 +1031,268 @@ const layer = Layer.effect(
         (oauthConfig?.callbackPort ? `http://127.0.0.1:${oauthConfig.callbackPort}${OAUTH_CALLBACK_PATH}` : undefined)
 
       // Start the callback server with custom redirectUri if configured
-      yield* Effect.promise(() => McpOAuthCallback.ensureRunning(effectiveRedirectUri))
+      const result = yield* Effect.gen(function* () {
+        yield* Effect.promise(() => McpOAuthCallback.ensureRunning(effectiveRedirectUri))
 
-      const oauthState = Array.from(crypto.getRandomValues(new Uint8Array(32)))
-        .map((b) => b.toString(16).padStart(2, "0"))
-        .join("")
-      yield* auth.updateOAuthState(mcpName, oauthState)
-      let capturedUrl: URL | undefined
-      const authProvider = new McpOAuthPendingProvider(
-        mcpName,
-        mcpConfig.url,
-        {
-          clientId: oauthConfig?.clientId,
-          clientSecret: oauthConfig?.clientSecret,
-          scope: oauthConfig?.scope,
-          redirectUri: effectiveRedirectUri,
-        },
-        {
-          onRedirect: async (url) => {
-            capturedUrl = url
+        const oauthState = Array.from(crypto.getRandomValues(new Uint8Array(32)))
+          .map((b) => b.toString(16).padStart(2, "0"))
+          .join("")
+        const authKey = `${mcpName}:${oauthState}`
+        const current = yield* connectLock(s, mcpName).withPermits(1)(
+          Effect.gen(function* () {
+            if (connectRevision(s, mcpName) !== revision || s.activeOAuth.get(mcpName) !== attempt) return false
+            attempt.authKey = authKey
+            attempt.oauthState = oauthState
+            yield* auth.updateOAuthState(authKey, oauthState)
+            return true
+          }),
+        )
+        if (!current) return yield* Effect.die(new Error(`OAuth authentication for ${mcpName} was invalidated`))
+        let capturedUrl: URL | undefined
+        const authProvider = new McpOAuthPendingProvider(
+          mcpName,
+          mcpConfig.url,
+          {
+            clientId: oauthConfig?.clientId,
+            clientSecret: oauthConfig?.clientSecret,
+            scope: oauthConfig?.scope,
+            redirectUri: effectiveRedirectUri,
           },
-        },
-        auth,
-      )
+          {
+            onRedirect: async (url) => {
+              capturedUrl = url
+            },
+          },
+          auth,
+          authKey,
+        )
 
-      const transport = new StreamableHTTPClientTransport(url, {
-        authProvider,
-        requestInit: mcpConfig.headers ? { headers: mcpConfig.headers } : undefined,
-      })
-      const directory = yield* InstanceState.directory
+        const transport = new StreamableHTTPClientTransport(url, {
+          authProvider,
+          requestInit: mcpConfig.headers ? { headers: mcpConfig.headers } : undefined,
+        })
+        const pending = { transport, provider: authProvider, revision, attempt, oauthState }
+        const registered = yield* connectLock(s, mcpName).withPermits(1)(
+          Effect.gen(function* () {
+            if (connectRevision(s, mcpName) !== revision || s.activeOAuth.get(mcpName) !== attempt) return false
+            const previous = s.pendingOAuthTransports.get(mcpName)
+            if (previous) {
+              s.pendingOAuthTransports.delete(mcpName)
+              yield* Effect.tryPromise(() => previous.transport.close()).pipe(Effect.ignore)
+            }
+            s.pendingOAuthTransports.set(mcpName, pending)
+            return true
+          }),
+        )
+        if (!registered) {
+          yield* Effect.tryPromise(() => transport.close()).pipe(Effect.ignore)
+          return yield* Effect.die(new Error(`OAuth authentication for ${mcpName} was invalidated`))
+        }
+        const directory = yield* InstanceState.directory
 
-      return yield* Effect.tryPromise({
-        try: () => {
-          const client = createClient(directory)
-          return client.connect(transport).then(async () => {
-            await authProvider.commit()
-            return { authorizationUrl: "", oauthState, revision, client } satisfies AuthResult
-          })
-        },
-        catch: (error) => error,
-      }).pipe(
-        Effect.catch((error) => {
-          if (error instanceof UnauthorizedError && capturedUrl) {
-            pendingOAuthTransports.set(mcpName, { transport, provider: authProvider, revision })
-            return Effect.succeed({
-              authorizationUrl: capturedUrl.toString(),
-              oauthState,
-              revision,
-            } satisfies AuthResult)
+        const result: AuthResult = yield* Effect.tryPromise({
+          try: () => {
+            const client = createClient(directory)
+            return client.connect(transport).then(async () => {
+              await authProvider.commit()
+              return { authorizationUrl: "", oauthState, authKey, revision, client, attempt } satisfies AuthResult
+            })
+          },
+          catch: (error) => error,
+        }).pipe(
+          Effect.catch((error): Effect.Effect<AuthResult> => {
+            if (!(error instanceof UnauthorizedError) || !capturedUrl) {
+              return Effect.tryPromise(() => transport.close()).pipe(Effect.ignore, Effect.andThen(Effect.die(error)))
+            }
+            const authorizationUrl = capturedUrl.toString()
+            return Effect.gen(function* () {
+              const current = yield* connectLock(s, mcpName).withPermits(1)(
+                Effect.sync(
+                  () =>
+                    connectRevision(s, mcpName) === revision &&
+                    s.activeOAuth.get(mcpName) === attempt &&
+                    s.pendingOAuthTransports.get(mcpName) === pending,
+                ),
+              )
+              if (!current) {
+                yield* Effect.tryPromise(() => transport.close()).pipe(Effect.ignore)
+                return yield* Effect.die(new Error(`OAuth authentication for ${mcpName} was invalidated`))
+              }
+              return {
+                authorizationUrl,
+                oauthState,
+                authKey,
+                revision,
+                attempt,
+              } satisfies AuthResult
+            })
+          }),
+          Effect.onExit((exit) =>
+            Exit.isFailure(exit) ? Effect.tryPromise(() => transport.close()).pipe(Effect.ignore) : Effect.void,
+          ),
+        )
+        if (!result.authorizationUrl) {
+          const current = yield* connectLock(s, mcpName).withPermits(1)(
+            Effect.sync(
+              () =>
+                connectRevision(s, mcpName) === revision &&
+                s.activeOAuth.get(mcpName) === attempt &&
+                s.pendingOAuthTransports.get(mcpName) === pending,
+            ),
+          )
+          if (!current) {
+            yield* Effect.tryPromise(() => result.client?.close() ?? Promise.resolve()).pipe(Effect.ignore)
+            return yield* Effect.die(new Error(`OAuth authentication for ${mcpName} was invalidated`))
           }
-          return Effect.die(error)
-        }),
-      )
+        }
+        return result
+      }).pipe(Effect.onExit((exit) => (Exit.isFailure(exit) ? clearOAuth(mcpName, attempt) : Effect.void)))
+      if (!result.authorizationUrl && !retainConnectedAttempt) yield* clearOAuth(mcpName, attempt)
+      return result
     })
 
     const authenticate = Effect.fn("MCP.authenticate")(function* (
       mcpName: string,
       onAuthorization?: (authorizationUrl: string) => void,
     ) {
-      const result = yield* startAuth(mcpName)
-      if (!result.authorizationUrl) {
-        const client = "client" in result ? result.client : undefined
-        const mcpConfig = yield* requireMcpConfig(mcpName).pipe(
-          Effect.tapError(() => Effect.tryPromise(() => client?.close() ?? Promise.resolve()).pipe(Effect.ignore)),
-        )
+      const result = yield* startAuth(mcpName, true)
+      return yield* Effect.gen(function* () {
+        if (!result.authorizationUrl) {
+          const client = "client" in result ? result.client : undefined
+          const mcpConfig = yield* requireMcpConfig(mcpName).pipe(
+            Effect.tapError(() => Effect.tryPromise(() => client?.close() ?? Promise.resolve()).pipe(Effect.ignore)),
+          )
 
-        const listed = client
-          ? client.getServerCapabilities()?.tools
-            ? yield* McpCatalog.defs(client, mcpConfig.timeout)
-            : []
-          : undefined
-        if (!client || !listed) {
-          yield* Effect.tryPromise(() => client?.close() ?? Promise.resolve()).pipe(Effect.ignore)
-          return { status: "failed", error: "Failed to get tools" } satisfies Status
+          const listed = client
+            ? client.getServerCapabilities()?.tools
+              ? yield* McpCatalog.defs(client, mcpConfig.timeout)
+              : []
+            : undefined
+          if (!client || !listed) {
+            yield* Effect.tryPromise(() => client?.close() ?? Promise.resolve()).pipe(Effect.ignore)
+            return { status: "failed", error: "Failed to get tools" } satisfies Status
+          }
+
+          const s = yield* InstanceState.get(state)
+          yield* auth.clearOAuthState(result.authKey)
+          return yield* connectLock(s, mcpName).withPermits(1)(
+            Effect.gen(function* () {
+              if (connectRevision(s, mcpName) !== result.revision || s.activeOAuth.get(mcpName) !== result.attempt) {
+                yield* Effect.tryPromise(() => client.close()).pipe(Effect.ignore)
+                return s.status[mcpName] ?? { status: "disabled" as const }
+              }
+              const status = yield* storeClient(
+                s,
+                mcpName,
+                client,
+                listed,
+                client.getInstructions()?.trim(),
+                mcpConfig.timeout,
+              )
+              if (s.pendingOAuthTransports.get(mcpName)?.attempt === result.attempt)
+                s.pendingOAuthTransports.delete(mcpName)
+              return status
+            }),
+          )
         }
 
         const s = yield* InstanceState.get(state)
-        yield* auth.clearOAuthState(mcpName)
-        return yield* connectLock(s, mcpName).withPermits(1)(
-          Effect.gen(function* () {
-            if (connectRevision(s, mcpName) !== result.revision) {
-              yield* Effect.tryPromise(() => client.close()).pipe(Effect.ignore)
-              return s.status[mcpName] ?? { status: "disabled" as const }
-            }
-            return yield* storeClient(s, mcpName, client, listed, client.getInstructions()?.trim(), mcpConfig.timeout)
+        const callbackPromise = yield* connectLock(s, mcpName).withPermits(1)(
+          Effect.sync(() =>
+            connectRevision(s, mcpName) === result.revision && s.activeOAuth.get(mcpName) === result.attempt
+              ? McpOAuthCallback.waitForCallback(result.oauthState)
+              : undefined,
+          ),
+        )
+        if (!callbackPromise) return s.status[mcpName] ?? { status: "disabled" as const }
+        void callbackPromise.catch(() => {})
+        onAuthorization?.(result.authorizationUrl)
+
+        yield* browser.open(result.authorizationUrl).pipe(
+          Effect.catch(() => {
+            return events.publish(BrowserOpenFailed, { mcpName, url: result.authorizationUrl }).pipe(Effect.ignore)
           }),
         )
-      }
 
-      const callbackPromise = McpOAuthCallback.waitForCallback(result.oauthState, mcpName)
-      onAuthorization?.(result.authorizationUrl)
+        const code = yield* Effect.promise(() => callbackPromise)
 
-      yield* browser.open(result.authorizationUrl).pipe(
-        Effect.catch(() => {
-          return events.publish(BrowserOpenFailed, { mcpName, url: result.authorizationUrl }).pipe(Effect.ignore)
-        }),
-      )
-
-      const code = yield* Effect.promise(() => callbackPromise)
-
-      const storedState = yield* auth.getOAuthState(mcpName)
-      if (storedState !== result.oauthState) {
-        yield* auth.clearOAuthState(mcpName)
-        throw new Error("OAuth state mismatch - potential CSRF attack")
-      }
-      yield* auth.clearOAuthState(mcpName)
-      return yield* finishAuth(mcpName, code)
+        const storedState = yield* auth.getOAuthState(result.authKey)
+        if (storedState !== result.oauthState) {
+          yield* auth.clearOAuthState(result.authKey)
+          throw new Error("OAuth state mismatch - potential CSRF attack")
+        }
+        yield* auth.clearOAuthState(result.authKey)
+        return yield* finishAuth(mcpName, code, result.oauthState)
+      }).pipe(Effect.onExit(() => clearOAuth(mcpName, result.attempt)))
     })
 
-    const finishAuth = Effect.fn("MCP.finishAuth")(function* (mcpName: string, authorizationCode: string) {
+    const finishAuth = Effect.fn("MCP.finishAuth")(function* (
+      mcpName: string,
+      authorizationCode: string,
+      oauthState: string,
+    ) {
       const s = yield* InstanceState.get(state)
       return yield* connectLock(s, mcpName).withPermits(1)(
         Effect.gen(function* () {
           yield* requireMcpConfig(mcpName)
-          const pending = pendingOAuthTransports.get(mcpName)
-          if (!pending) throw new Error(`No pending OAuth flow for MCP server: ${mcpName}`)
-          if (connectRevision(s, mcpName) !== pending.revision) {
-            pendingOAuthTransports.delete(mcpName)
-            yield* Effect.tryPromise(() => pending.transport.close()).pipe(Effect.ignore)
-            return s.status[mcpName] ?? { status: "disabled" as const }
+          const pending = s.pendingOAuthTransports.get(mcpName)
+          if (!pending) {
+            if (s.status[mcpName]?.status === "disabled") return s.status[mcpName]
+            throw new Error(`No pending OAuth flow for MCP server: ${mcpName}`)
           }
+          if (pending.oauthState !== oauthState)
+            return { status: "failed", error: "OAuth state mismatch" } satisfies Status
+          return yield* Effect.gen(function* () {
+            if (connectRevision(s, mcpName) !== pending.revision) {
+              if (pending.attempt) yield* releaseOAuth(s, mcpName, pending.attempt)
+               else yield* closePendingOAuth(s, mcpName, pending)
+              return s.status[mcpName] ?? { status: "disabled" as const }
+            }
 
-          const error = yield* Effect.tryPromise({
-            try: () => pending.transport.finishAuth(authorizationCode),
-            catch: (error) => error,
+            const error = yield* Effect.tryPromise({
+              try: () => pending.transport.finishAuth(authorizationCode),
+              catch: (error) => error,
+            }).pipe(
+              Effect.match({
+                onFailure: (error) => (error instanceof Error ? error.message : String(error)),
+                onSuccess: () => undefined,
+              }),
+            )
+
+            if (error) {
+              if (pending.attempt) yield* releaseOAuth(s, mcpName, pending.attempt)
+               else yield* closePendingOAuth(s, mcpName, pending)
+              return { status: "failed", error: `OAuth completion failed: ${error}` } satisfies Status
+            }
+
+            yield* Effect.promise(() => pending.provider?.commit() ?? Promise.resolve())
+            yield* auth.clearCodeVerifier(pending.attempt?.authKey ?? mcpName)
+
+            const mcpConfig = yield* requireMcpConfig(mcpName)
+            const status = yield* createAndStore(mcpName, { ...mcpConfig, enabled: true })
+            if (pending.attempt) yield* releaseOAuth(s, mcpName, pending.attempt)
+               else yield* closePendingOAuth(s, mcpName, pending)
+            return status
           }).pipe(
-            Effect.match({
-              onFailure: (error) => (error instanceof Error ? error.message : String(error)),
-              onSuccess: () => undefined,
+            Effect.onExit((exit) => {
+              if (Exit.isSuccess(exit)) return Effect.void
+              if (pending.attempt) return releaseOAuth(s, mcpName, pending.attempt)
+              return closePendingOAuth(s, mcpName, pending)
             }),
           )
-
-          if (error) return { status: "failed", error: `OAuth completion failed: ${error}` } satisfies Status
-
-          yield* Effect.promise(() => pending.provider?.commit() ?? Promise.resolve())
-          yield* auth.clearCodeVerifier(mcpName)
-          pendingOAuthTransports.delete(mcpName)
-
-          const mcpConfig = yield* requireMcpConfig(mcpName)
-          return yield* createAndStore(mcpName, { ...mcpConfig, enabled: true })
         }),
       )
     })
 
     const removeAuth = Effect.fn("MCP.removeAuth")(function* (mcpName: string) {
-      yield* auth.remove(mcpName)
-      McpOAuthCallback.cancelPending(mcpName)
-      pendingOAuthTransports.delete(mcpName)
+      const s = yield* InstanceState.get(state)
+      yield* connectLock(s, mcpName).withPermits(1)(
+        Effect.gen(function* () {
+          bumpConnectRevision(s, mcpName)
+          yield* releaseOAuth(s, mcpName)
+          yield* auth.remove(mcpName)
+        }),
+      )
     })
 
     const supportsOAuth = Effect.fn("MCP.supportsOAuth")(function* (mcpName: string) {

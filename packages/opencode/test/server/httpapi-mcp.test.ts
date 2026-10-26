@@ -199,7 +199,11 @@ describe("mcp HttpApi", () => {
         for (const input of [
           { method: "POST", route: "/mcp/missing/auth" },
           { method: "POST", route: "/mcp/missing/auth/authenticate" },
-          { method: "POST", route: "/mcp/missing/auth/callback", body: JSON.stringify({ code: "code" }) },
+          {
+            method: "POST",
+            route: "/mcp/missing/auth/callback",
+            body: JSON.stringify({ code: "code", oauthState: "state" }),
+          },
           { method: "DELETE", route: "/mcp/missing/auth" },
           { method: "POST", route: "/mcp/missing/connect" },
           { method: "POST", route: "/mcp/missing/disconnect" },
