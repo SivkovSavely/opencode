@@ -242,12 +242,15 @@ mcpTest.instance("failed reauthentication preserves existing credentials", () =>
     yield* auth.updateTokens(name, { accessToken: "working-token" }, server.url)
     yield* mcp.add(name, remote(server.url))
     const started = yield* mcp.startAuth(name)
+    const temporaryKey = `${name}:${started.oauthState}`
     expect(started.authorizationUrl).toContain("/authorize")
+    expect(yield* auth.get(temporaryKey)).toMatchObject({ oauthState: started.oauthState })
 
     expect(yield* mcp.finishAuth(name, "invalid-code", started.oauthState)).toEqual({
       status: "failed",
       error: "OAuth completion failed: Token exchange failed",
     })
+    expect(yield* auth.get(temporaryKey)).toBeUndefined()
     expect((yield* auth.get(name))?.tokens?.accessToken).toBe("working-token")
     expect((yield* auth.get(name))?.clientInfo).toMatchObject({
       clientId: "dynamic-client",
@@ -272,10 +275,13 @@ mcpTest.instance("successful reauthentication commits replacement credentials", 
     yield* auth.updateTokens(name, { accessToken: "old-token" }, server.url)
     yield* mcp.add(name, remote(server.url))
     const started = yield* mcp.startAuth(name)
+    const temporaryKey = `${name}:${started.oauthState}`
     expect(started.authorizationUrl).toContain("/authorize")
+    expect(yield* auth.get(temporaryKey)).toMatchObject({ oauthState: started.oauthState })
     expect((yield* auth.get(name))?.tokens?.accessToken).toBe("old-token")
 
     expect((yield* mcp.finishAuth(name, "valid-code", started.oauthState)).status).toBe("connected")
+    expect(yield* auth.get(temporaryKey)).toBeUndefined()
     const entry = yield* auth.get(name)
     expect(entry?.tokens?.accessToken).toBe("replacement-token")
     expect(entry?.clientInfo?.clientId).toBe("replacement-client")
@@ -395,6 +401,7 @@ mcpTest.instance("disconnect prevents a starting OAuth flow from registering its
     yield* stopOAuthCallback
     const server = yield* serveOAuthMcp()
     const mcp = yield* MCP.Service
+    const auth = yield* McpAuth.Service
     const name = "test-oauth-start-disconnect"
 
     yield* mcp.add(name, remote(server.url))
@@ -402,11 +409,15 @@ mcpTest.instance("disconnect prevents a starting OAuth flow from registering its
     const start = yield* Effect.forkScoped(mcp.startAuth(name), { startImmediately: true })
     yield* Effect.promise(() => barrier.started)
     yield* mcp.disconnect(name)
+    const replacement = yield* mcp.startAuth(name)
+    const temporaryKey = `${name}:${replacement.oauthState}`
+    expect(yield* auth.get(temporaryKey)).toMatchObject({ oauthState: replacement.oauthState })
     barrier.release()
 
     expect(Exit.isFailure(yield* Fiber.await(start))).toBe(true)
-    expect(yield* mcp.finishAuth(name, "valid-code", "stale-state")).toEqual({ status: "disabled" })
-    expect((yield* mcp.status())[name]?.status).toBe("disabled")
+    expect(yield* auth.get(temporaryKey)).toMatchObject({ oauthState: replacement.oauthState })
+    expect((yield* mcp.finishAuth(name, "valid-code", replacement.oauthState)).status).toBe("connected")
+    expect(yield* auth.get(temporaryKey)).toBeUndefined()
   }),
 )
 
@@ -415,13 +426,17 @@ mcpTest.instance("interrupting a starting OAuth flow releases its connection gua
     yield* stopOAuthCallback
     const server = yield* serveOAuthMcp()
     const mcp = yield* MCP.Service
+    const auth = yield* McpAuth.Service
     const name = "test-oauth-start-cancelled"
 
     yield* mcp.add(name, remote(server.url))
     const barrier = server.pauseNextDiscovery()
     const start = yield* Effect.forkScoped(mcp.startAuth(name), { startImmediately: true })
     yield* Effect.promise(() => barrier.started)
+    const temporaryKey = Object.keys(yield* auth.all()).find((key) => key.startsWith(`${name}:`))
+    if (!temporaryKey) throw new Error("OAuth attempt did not create a temporary credential record")
     yield* Fiber.interrupt(start)
+    expect(yield* auth.get(temporaryKey)).toBeUndefined()
 
     const requests = server.mcpRequests()
     expect(yield* mcp.ensureConnected(name)).toEqual({ status: "needs_auth" })
@@ -434,12 +449,16 @@ mcpTest.instance("disconnect prevents pending OAuth completion from reconnecting
     yield* stopOAuthCallback
     const server = yield* serveOAuthMcp()
     const mcp = yield* MCP.Service
+    const auth = yield* McpAuth.Service
     const name = "test-oauth-disconnect-race"
 
     yield* mcp.add(name, remote(server.url))
     const started = yield* mcp.startAuth(name)
+    const temporaryKey = `${name}:${started.oauthState}`
     expect(started.authorizationUrl).toContain("/authorize")
+    expect(yield* auth.get(temporaryKey)).toMatchObject({ oauthState: started.oauthState })
     yield* mcp.disconnect(name)
+    expect(yield* auth.get(temporaryKey)).toBeUndefined()
 
     expect(yield* mcp.finishAuth(name, "valid-code", started.oauthState)).toEqual({ status: "disabled" })
     expect((yield* mcp.status())[name]?.status).toBe("disabled")
@@ -451,6 +470,7 @@ mcpTest.instance("a stale OAuth callback cannot consume a replacement attempt", 
     yield* stopOAuthCallback
     const server = yield* serveOAuthMcp()
     const mcp = yield* MCP.Service
+    const auth = yield* McpAuth.Service
     const name = "test-oauth-stale-callback"
 
     yield* mcp.add(name, remote(server.url))
@@ -458,13 +478,17 @@ mcpTest.instance("a stale OAuth callback cannot consume a replacement attempt", 
     yield* mcp.disconnect(name)
     expect(yield* mcp.ensureConnected(name)).toEqual({ status: "needs_auth" })
     const second = yield* mcp.startAuth(name)
+    const temporaryKey = `${name}:${second.oauthState}`
 
     expect(second.oauthState).not.toBe(first.oauthState)
+    expect(yield* auth.get(temporaryKey)).toMatchObject({ oauthState: second.oauthState })
     expect(yield* mcp.finishAuth(name, "valid-code", first.oauthState)).toEqual({
       status: "failed",
       error: "OAuth state mismatch",
     })
+    expect(yield* auth.get(temporaryKey)).toMatchObject({ oauthState: second.oauthState })
     expect((yield* mcp.finishAuth(name, "valid-code", second.oauthState)).status).toBe("connected")
+    expect(yield* auth.get(temporaryKey)).toBeUndefined()
   }),
 )
 

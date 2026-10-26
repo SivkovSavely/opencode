@@ -576,10 +576,7 @@ const layer = Layer.effect(
             for (const attempt of s.activeOAuth.values()) {
               if (attempt.timeout) clearTimeout(attempt.timeout)
               if (attempt.oauthState) McpOAuthCallback.cancelPending(attempt.oauthState)
-              if (attempt.authKey) {
-                yield* auth.clearOAuthState(attempt.authKey).pipe(Effect.ignore)
-                yield* auth.clearCodeVerifier(attempt.authKey).pipe(Effect.ignore)
-              }
+              if (attempt.authKey) yield* auth.remove(attempt.authKey).pipe(Effect.ignore)
             }
             s.activeOAuth.clear()
             const clients = Object.values(s.clients)
@@ -642,8 +639,7 @@ const layer = Layer.effect(
       if (close) s.pendingOAuthTransports.delete(name)
       return Effect.gen(function* () {
         if (active?.authKey) {
-          yield* auth.clearOAuthState(active.authKey).pipe(Effect.ignore)
-          yield* auth.clearCodeVerifier(active.authKey).pipe(Effect.ignore)
+          yield* auth.remove(active.authKey).pipe(Effect.ignore)
         }
         if (close) yield* Effect.tryPromise(() => close.transport.close()).pipe(Effect.ignore)
       })
@@ -1266,7 +1262,8 @@ const layer = Layer.effect(
             }
 
             yield* Effect.promise(() => pending.provider?.commit() ?? Promise.resolve())
-            yield* auth.clearCodeVerifier(pending.attempt?.authKey ?? mcpName)
+            if (pending.attempt?.authKey) yield* auth.remove(pending.attempt.authKey)
+            else yield* auth.clearCodeVerifier(mcpName)
 
             const mcpConfig = yield* requireMcpConfig(mcpName)
             const status = yield* createAndStore(mcpName, { ...mcpConfig, enabled: true })
