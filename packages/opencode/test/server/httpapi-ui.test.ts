@@ -138,6 +138,7 @@ function routeOrderingApp() {
         yield* router.add("GET", "/session/:sessionID", () =>
           Effect.succeed(HttpServerResponse.jsonUnsafe({ error: "Not Found" }, { status: 404 })),
         )
+        yield* router.add("GET", "/api/health", () => Effect.succeed(HttpServerResponse.jsonUnsafe({ healthy: true })))
         yield* router.add("*", "/*", (request) =>
           serveUIEffect(request, { fs, client, disableEmbeddedWebUi: flags.disableEmbeddedWebUi }),
         )
@@ -363,6 +364,42 @@ describe("HttpApi UI fallback", () => {
 
       expect(response.status).toBe(404)
       expect(server.proxiedUrl()).toBeUndefined()
+    }),
+  )
+
+  it.live("returns JSON 404 for unmatched reserved API paths", () =>
+    Effect.gen(function* () {
+      const server = routeOrderingApp()
+      for (const [path, method] of [
+        ["/api", "GET"],
+        ["/api/unknown?directory=%2Fproject", "GET"],
+        ["/api/unknown", "POST"],
+      ]) {
+        const response = yield* server.request(path, { method })
+
+        expect(response.status).toBe(404)
+        expect(response.headers.get("content-type")).toContain("application/json")
+        expect(yield* responseText(response)).toBe(JSON.stringify({ error: "Not Found" }))
+      }
+      expect(server.proxiedUrl()).toBeUndefined()
+    }),
+  )
+
+  it.live("keeps valid API endpoints ahead of the reserved API fallback", () =>
+    Effect.gen(function* () {
+      const response = yield* routeOrderingApp().request("/api/health")
+
+      expect(response.status).toBe(200)
+      expect(yield* responseText(response)).toBe(JSON.stringify({ healthy: true }))
+    }),
+  )
+
+  it.live("keeps unmatched API paths behind the existing password authentication", () =>
+    Effect.gen(function* () {
+      const response = yield* uiApp({ password: "secret", username: "opencode" }).request("/api/unknown")
+
+      expect(response.status).toBe(401)
+      expect(response.headers.get("www-authenticate")).toBe('Basic realm="Secure Area"')
     }),
   )
 
