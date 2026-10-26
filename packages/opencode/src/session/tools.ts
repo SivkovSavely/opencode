@@ -23,6 +23,7 @@ import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { isRecord } from "@/util/record"
 import { RuntimeFlags } from "@/effect/runtime-flags"
+import { McpActivation } from "./mcp-activation"
 
 const MCP_RESOURCE_TOOLS = {
   list: "list_mcp_resources",
@@ -53,6 +54,9 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
   const permission = yield* Permission.Service
   const registry = yield* ToolRegistry.Service
   const mcp = yield* MCP.Service
+  const sessions = yield* Session.Service
+  const current = yield* sessions.get(input.session.id).pipe(Effect.orDie)
+  const activated = McpActivation.names(current.metadata)
   const truncate = yield* Truncate.Service
   const flags = yield* RuntimeFlags.Service
 
@@ -61,7 +65,12 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
     abort: options.abortSignal!,
     messageID: input.processor.message.id,
     callID: options.toolCallId,
-    extra: { model: input.model, bypassAgentCheck: input.bypassAgentCheck, promptOps: input.promptOps },
+    extra: {
+      model: input.model,
+      bypassAgentCheck: input.bypassAgentCheck,
+      promptOps: input.promptOps,
+      mcpActivated: activated,
+    },
     agent: input.agent.name,
     messages: input.messages,
     metadata: (val) =>
@@ -94,6 +103,8 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
     providerID: input.model.providerID,
     agent: input.agent,
     permission: input.session.permission,
+    sessionID: input.session.id,
+    mcpActivated: activated,
   })) {
     const schema = ProviderTransform.schema(input.model, ToolJsonSchema.fromTool(item))
     tools[item.id] = tool({
@@ -133,7 +144,7 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
     })
   }
 
-  const hasMcpResourceServer = Object.values(yield* mcp.clients()).some(
+  const hasMcpResourceServer = Object.values(yield* mcp.clients(activated)).some(
     (client) => !!client.getServerCapabilities()?.resources,
   )
   if (hasMcpResourceServer) {
@@ -157,7 +168,7 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
           Effect.gen(function* () {
             const parsed = parseListMcpResourcesArgs(args)
             const ctx = context(toRecord(args), opts)
-            const clients = yield* mcp.clients()
+            const clients = yield* mcp.clients(activated)
             const resourceServers = Object.entries(clients)
               .filter((entry) => !!entry[1].getServerCapabilities()?.resources)
               .map((entry) => entry[0])
@@ -184,7 +195,7 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
               always: permissionPatterns,
             })
 
-            const resources = Object.values(yield* mcp.resources(parsed.server))
+            const resources = Object.values(yield* mcp.resources(parsed.server, activated))
             const filtered = resources
               .filter((resource) => !parsed.server || resource.client === parsed.server)
               .toSorted((a, b) =>
@@ -240,7 +251,7 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
           Effect.gen(function* () {
             const parsed = parseListMcpResourcesArgs(args)
             const ctx = context(toRecord(args), opts)
-            const clients = yield* mcp.clients()
+            const clients = yield* mcp.clients(activated)
             const resourceServers = Object.entries(clients)
               .filter((entry) => !!entry[1].getServerCapabilities()?.resources)
               .map((entry) => entry[0])
@@ -267,7 +278,7 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
               always: permissionPatterns,
             })
 
-            const templates = Object.values(yield* mcp.resourceTemplates(parsed.server))
+            const templates = Object.values(yield* mcp.resourceTemplates(parsed.server, activated))
             const filtered = templates
               .filter((template) => !parsed.server || template.client === parsed.server)
               .toSorted((a, b) =>
@@ -327,10 +338,10 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
           Effect.gen(function* () {
             const parsed = parseReadMcpResourceArgs(args)
             const ctx = context(toRecord(args), opts)
-            const clients = yield* mcp.clients()
+            const clients = yield* mcp.clients(activated)
             const client = clients[parsed.server]
             if (!client) {
-              throw new Error(`MCP server "${parsed.server}" is not connected`)
+              throw new Error(`MCP server "${parsed.server}" is not visible to this session`)
             }
             if (!client.getServerCapabilities()?.resources) {
               throw new Error(`MCP server "${parsed.server}" does not support resources`)
@@ -347,7 +358,7 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
               always: [`mcp:${parsed.server}:*`],
             })
 
-            const content = yield* mcp.readResource(parsed.server, parsed.uri)
+            const content = yield* mcp.readResource(parsed.server, parsed.uri, activated)
             if (!content) throw new Error(`Failed to read MCP resource: ${parsed.server}/${parsed.uri}`)
 
             const formatted = formatMcpResourceContent(parsed.server, parsed.uri, content)
@@ -387,7 +398,7 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
 
   if (flags.experimentalCodeMode) return tools
 
-  for (const [key, entry] of Object.entries(yield* mcp.tools())) {
+  for (const [key, entry] of Object.entries(yield* mcp.tools(activated))) {
     const item = McpCatalog.convertTool(entry.def, entry.client, entry.timeout)
     const execute = item.execute
     if (!execute) continue

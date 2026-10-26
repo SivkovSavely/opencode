@@ -135,7 +135,7 @@ async function buildTool() {
   const listed = (await client.listTools()).tools as MCPToolDef[]
   const mcpTools: Record<string, MCP.McpTool> = {}
   for (const def of listed) {
-    mcpTools[McpCatalog.toolName(SERVER, def.name)] = { def, client: client as unknown as Client }
+    mcpTools[McpCatalog.toolName(SERVER, def.name)] = { server: SERVER, def, client: client as unknown as Client }
   }
 
   const layer = Layer.mergeAll(
@@ -155,7 +155,7 @@ async function buildTool() {
   )
   return {
     tool: await Effect.runPromise(CodeModeTool.pipe(Effect.flatMap(Tool.init), Effect.provide(layer))),
-    description: describeCatalog(mcpTools, [SERVER]),
+    description: describeCatalog(mcpTools),
   }
 }
 

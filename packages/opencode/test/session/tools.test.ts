@@ -15,6 +15,7 @@ import { ToolRegistry } from "@/tool/registry"
 import { Truncate } from "@/tool/truncate"
 import { Plugin } from "@/plugin"
 import { RuntimeFlags } from "@/effect/runtime-flags"
+import { McpActivation } from "@/session/mcp-activation"
 import { Effect, Layer, Schema } from "effect"
 import { testEffect } from "../lib/effect"
 
@@ -37,7 +38,18 @@ const model = {
 
 function fakeMcp() {
   return MCP.Service.of({
-    tools: () => Effect.succeed({}),
+    tools: (activated = []) =>
+      Effect.succeed(
+        activated.includes("lazy")
+          ? {
+              lazy_lookup: {
+                server: "lazy",
+                def: { name: "lookup", inputSchema: { type: "object", properties: {} } },
+                client: {} as MCP.McpTool["client"],
+              },
+            }
+          : {},
+      ),
     clients: () => Effect.succeed({}),
   } as Partial<MCP.Interface> as MCP.Interface)
 }
@@ -62,6 +74,12 @@ const fakeTruncate = Truncate.Service.of({
 } satisfies Truncate.Interface)
 
 const layer = Layer.mergeAll(
+  Layer.succeed(
+    Session.Service,
+    Session.Service.of({
+      get: () => Effect.succeed({ id: sessionID, metadata: {} } as unknown as Session.Info),
+    } as Partial<Session.Interface> as Session.Interface),
+  ),
   Layer.succeed(Plugin.Service, fakePlugin),
   Layer.succeed(Permission.Service, fakePermission),
   Layer.succeed(MCP.Service, fakeMcp()),
@@ -93,6 +111,15 @@ const layer = Layer.mergeAll(
 )
 
 const it = testEffect(layer)
+
+const sessionWithActivation = (activated: string[]) =>
+  Session.Service.of({
+    get: () =>
+      Effect.succeed({
+        id: sessionID,
+        metadata: { [McpActivation.METADATA_KEY]: activated },
+      } as unknown as Session.Info),
+  } as Partial<Session.Interface> as Session.Interface)
 
 it.effect("preserves running tool start time across metadata updates", () =>
   Effect.gen(function* () {
@@ -163,5 +190,32 @@ it.effect("preserves running tool start time across metadata updates", () =>
     if (state.state.status === "running") {
       expect(state.state.time.start).toBe(100)
     }
+  }),
+)
+
+it.effect("refreshes MCP tools from current session metadata without leaking them to another session", () =>
+  Effect.gen(function* () {
+    const input = {
+      agent,
+      model,
+      session: { id: sessionID, metadata: {}, permission: [] } as unknown as Session.Info,
+      processor: {
+        message: { id: messageID },
+        updateToolCall: () => Effect.void,
+        completeToolCall: () => Effect.void,
+      } as unknown as Pick<SessionProcessor.Handle, "message" | "updateToolCall" | "completeToolCall">,
+      bypassAgentCheck: false,
+      messages: [],
+      promptOps: {} as never,
+    }
+    const activated = yield* SessionTools.resolve(input).pipe(
+      Effect.provideService(Session.Service, sessionWithActivation(["lazy"])),
+    )
+    const hidden = yield* SessionTools.resolve(input).pipe(
+      Effect.provideService(Session.Service, sessionWithActivation([])),
+    )
+
+    expect(activated.lazy_lookup).toBeDefined()
+    expect(hidden.lazy_lookup).toBeUndefined()
   }),
 )

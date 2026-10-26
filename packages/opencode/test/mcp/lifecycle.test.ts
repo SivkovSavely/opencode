@@ -14,7 +14,7 @@ import {
   type Tool,
 } from "@modelcontextprotocol/sdk/types.js"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
-import { Cause, Effect, Exit } from "effect"
+import { Cause, Effect, Exit, Fiber } from "effect"
 import type { MCP as MCPNS } from "../../src/mcp/index"
 import { MCP } from "../../src/mcp/index"
 import { McpOAuthCallback } from "../../src/mcp/oauth-callback"
@@ -39,10 +39,16 @@ interface LifecycleServerState {
   requestDelay?: number
   roots?: Array<{ uri: string; name?: string }>
   requests: string[]
+  toolLists: number
   aborted: number
 }
 
-function lifecycleServer(input?: { capabilities?: ServerCapabilities; instructions?: string; requestRoots?: boolean }) {
+function lifecycleServer(input?: {
+  capabilities?: ServerCapabilities
+  instructions?: string
+  requestRoots?: boolean
+  requestDelay?: number
+}) {
   const capabilities = input?.capabilities ?? { tools: {}, prompts: {}, resources: {} }
   return Effect.acquireRelease(
     Effect.promise(async () => {
@@ -52,6 +58,7 @@ function lifecycleServer(input?: { capabilities?: ServerCapabilities; instructio
         resources: [],
         resourceTemplates: [],
         requests: [],
+        toolLists: 0,
         aborted: 0,
       }
 
@@ -68,8 +75,11 @@ function lifecycleServer(input?: { capabilities?: ServerCapabilities; instructio
         if (capabilities.tools) {
           protocol.setRequestHandler(ListToolsRequestSchema, (request) => {
             if (state.listToolsError) throw new Error(state.listToolsError)
-            const page = state.toolPages?.[request.params?.cursor ?? "initial"]
-            return Promise.resolve({ tools: page?.items ?? state.tools, nextCursor: page?.nextCursor })
+            state.toolLists++
+            return Bun.sleep(input?.requestDelay ?? 0).then(() => {
+              const page = state.toolPages?.[request.params?.cursor ?? "initial"]
+              return { tools: page?.items ?? state.tools, nextCursor: page?.nextCursor }
+            })
           })
         }
         if (capabilities.prompts) {
@@ -397,6 +407,118 @@ it.instance("disabled server is marked disabled without opening a protocol sessi
 
     expect((yield* mcp.status())["disabled-server"]?.status).toBe("disabled")
     expect(server.state.requests).toEqual([])
+  }),
+)
+
+it.instance("discovers lazy MCP descriptions without connecting or listing tools", () =>
+  Effect.gen(function* () {
+    const server = yield* lifecycleServer()
+    const mcp = yield* MCP.Service
+    yield* mcp.add("lazy-search", { ...remote(server.url), enabled: false, description: "Search project records." })
+
+    expect(yield* mcp.lazyServers()).toEqual([{ name: "lazy-search", description: "Search project records." }])
+    expect(server.state.requests).toEqual([])
+    expect(yield* mcp.tools([])).toEqual({})
+  }),
+)
+
+it.instance("keeps lazy MCP capabilities isolated by activation while globally enabled servers remain visible", () =>
+  Effect.gen(function* () {
+    const lazy = yield* lifecycleServer()
+    lazy.state.resources = [{ name: "private", uri: "lazy://private" }]
+    lazy.state.resourceTemplates = [{ name: "private-template", uriTemplate: "lazy://{id}" }]
+    const global = yield* lifecycleServer()
+    const mcp = yield* MCP.Service
+    yield* mcp.add("lazy", { ...remote(lazy.url), enabled: false })
+    yield* mcp.add("global", remote(global.url))
+    yield* mcp.ensureConnected("lazy")
+
+    expect(Object.keys(yield* mcp.tools([]))).toEqual(["global_test_tool"])
+    expect(Object.keys(yield* mcp.tools(["lazy"]))).toEqual(["global_test_tool", "lazy_test_tool"])
+    expect((yield* mcp.tools(["lazy"])).lazy_test_tool?.server).toBe("lazy")
+    expect(Object.keys(yield* mcp.clients([]))).toEqual(["global"])
+    expect(Object.keys(yield* mcp.clients(["lazy"]))).toEqual(["global", "lazy"])
+    expect(yield* mcp.resources(undefined, [])).toEqual({})
+    expect(Object.keys(yield* mcp.resources(undefined, ["lazy"]))).toEqual(["lazy:lazy://private"])
+    expect(yield* mcp.resourceTemplates(undefined, [])).toEqual({})
+    expect(Object.keys(yield* mcp.resourceTemplates(undefined, ["lazy"]))).toEqual(["lazy:lazy://{id}"])
+    expect(yield* mcp.readResource("lazy", "lazy://private", [])).toBeUndefined()
+    expect((yield* mcp.readResource("lazy", "lazy://private", ["lazy"]))?.contents).toEqual([
+      { uri: "lazy://private", text: "resource result" },
+    ])
+  }),
+)
+
+it.instance("serializes concurrent lazy activation and reuses a connected client", () =>
+  Effect.gen(function* () {
+    const server = yield* lifecycleServer()
+    const mcp = yield* MCP.Service
+    yield* mcp.add("shared-lazy", { ...remote(server.url), enabled: false })
+
+    const statuses = yield* Effect.all(
+      [mcp.ensureConnected("shared-lazy"), mcp.ensureConnected("shared-lazy"), mcp.ensureConnected("shared-lazy")],
+      { concurrency: "unbounded" },
+    )
+    expect(statuses.map((status) => status.status)).toEqual(["connected", "connected", "connected"])
+    const requests = server.state.requests.length
+
+    expect((yield* mcp.ensureConnected("shared-lazy")).status).toBe("connected")
+    expect(server.state.requests.length).toBe(requests)
+    expect((yield* mcp.status())["shared-lazy"]?.status).toBe("connected")
+  }),
+)
+
+it.instance("serializes disconnect with an in-flight lazy activation", () =>
+  Effect.gen(function* () {
+    const server = yield* lifecycleServer({ requestDelay: 50 })
+    const mcp = yield* MCP.Service
+    yield* mcp.add("disconnect-race", { ...remote(server.url), enabled: false })
+
+    const activation = yield* Effect.forkScoped(mcp.ensureConnected("disconnect-race"), { startImmediately: true })
+    yield* pollWithTimeout(
+      Effect.sync(() => server.state.toolLists > 0),
+      "lazy activation did not start its connection",
+    )
+    yield* mcp.disconnect("disconnect-race")
+    expect((yield* Fiber.join(activation)).status).toBe("connected")
+    expect((yield* mcp.status())["disconnect-race"]?.status).toBe("disabled")
+    expect(yield* mcp.tools(["disconnect-race"])).toEqual({})
+  }),
+)
+
+it.instance("keeps lazy MCP prompts hidden unless the session activated their server", () =>
+  Effect.gen(function* () {
+    const server = yield* lifecycleServer()
+    server.state.prompts = [{ name: "private-prompt", description: "Private prompt" }]
+    const mcp = yield* MCP.Service
+    yield* mcp.add("lazy-prompts", { ...remote(server.url), enabled: false })
+    yield* mcp.ensureConnected("lazy-prompts")
+
+    expect(yield* mcp.prompts([])).toEqual({})
+    expect(Object.keys(yield* mcp.prompts(["lazy-prompts"]))).toEqual(["lazy-prompts:private-prompt"])
+    expect(yield* mcp.getPrompt("lazy-prompts", "private-prompt", {}, [])).toBeUndefined()
+    expect((yield* mcp.getPrompt("lazy-prompts", "private-prompt", {}, ["lazy-prompts"]))?.messages).toHaveLength(1)
+  }),
+)
+
+it.instance("uses raw server identity when configured names sanitize to the same tool prefix", () =>
+  Effect.gen(function* () {
+    const dotted = yield* lifecycleServer()
+    const underscored = yield* lifecycleServer()
+    const mcp = yield* MCP.Service
+    yield* mcp.add("server.with.dot", { ...remote(dotted.url), enabled: false })
+    yield* mcp.add("server_with_dot", { ...remote(underscored.url), enabled: false })
+    yield* mcp.ensureConnected("server.with.dot")
+
+    const onlyDotted = yield* mcp.tools(["server.with.dot"])
+    expect(Object.keys(onlyDotted)).toEqual(["server_with_dot_test_tool"])
+    expect(onlyDotted.server_with_dot_test_tool?.server).toBe("server.with.dot")
+    expect(yield* mcp.tools([])).toEqual({})
+
+    yield* mcp.ensureConnected("server_with_dot")
+    const onlyUnderscored = yield* mcp.tools(["server_with_dot"])
+    expect(Object.keys(onlyUnderscored)).toEqual(["server_with_dot_test_tool"])
+    expect(onlyUnderscored.server_with_dot_test_tool?.server).toBe("server_with_dot")
   }),
 )
 

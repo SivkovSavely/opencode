@@ -248,6 +248,22 @@ mcpTest.instance("successful reauthentication commits replacement credentials", 
   }),
 )
 
+mcpTest.instance("disconnect prevents pending OAuth completion from reconnecting the server", () =>
+  Effect.gen(function* () {
+    yield* stopOAuthCallback
+    const server = yield* serveOAuthMcp()
+    const mcp = yield* MCP.Service
+    const name = "test-oauth-disconnect-race"
+
+    yield* mcp.add(name, remote(server.url))
+    expect((yield* mcp.startAuth(name)).authorizationUrl).toContain("/authorize")
+    yield* mcp.disconnect(name)
+
+    expect(yield* mcp.finishAuth(name, "valid-code")).toEqual({ status: "disabled" })
+    expect((yield* mcp.status())[name]?.status).toBe("disabled")
+  }),
+)
+
 mcpTest.instance("auth status only reports credentials stored for the configured server URL", () =>
   Effect.gen(function* () {
     const mcp = yield* MCP.Service

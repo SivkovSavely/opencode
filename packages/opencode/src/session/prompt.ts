@@ -7,6 +7,7 @@ import { SessionID, MessageID, PartID } from "./schema"
 import { MessageV2 } from "./message-v2"
 import { SessionRevert } from "./revert"
 import { Session } from "./session"
+import { McpActivation } from "./mcp-activation"
 import { Agent } from "../agent/agent"
 import { Provider } from "@/provider/provider"
 
@@ -179,9 +180,7 @@ const layer = Layer.effect(
         .pipe(
           Effect.catchCause(() =>
             Effect.logWarning("retrying failed interrupted session release", { sessionID }).pipe(
-              Effect.andThen(
-                runtime.releaseInterrupted(sessionID, fence, status.set(sessionID, { type: "busy" })),
-              ),
+              Effect.andThen(runtime.releaseInterrupted(sessionID, fence, status.set(sessionID, { type: "busy" }))),
             ),
           ),
         )
@@ -1056,7 +1055,10 @@ const layer = Layer.effect(
                 text: `Reading MCP resource: ${part.filename} (${uri})`,
               },
             ]
-            const exit = yield* mcp.readResource(clientName, uri).pipe(Effect.exit)
+            const current = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
+            const exit = yield* mcp
+              .readResource(clientName, uri, McpActivation.names(current.metadata))
+              .pipe(Effect.exit)
             if (Exit.isSuccess(exit)) {
               const content = exit.value
               if (!content) throw new Error(`Resource not found: ${clientName}/${uri}`)
@@ -2338,6 +2340,7 @@ const layer = Layer.effect(
             }).pipe(
               Effect.provideService(Plugin.Service, plugin),
               Effect.provideService(Permission.Service, permission),
+              Effect.provideService(Session.Service, sessions),
               Effect.provideService(ToolRegistry.Service, registry),
               Effect.provideService(MCP.Service, mcp),
               Effect.provideService(Truncate.Service, truncate),
@@ -2358,11 +2361,12 @@ const layer = Layer.effect(
 
             yield* plugin.trigger("experimental.chat.messages.transform", {}, { messages: msgs })
 
+            const currentSession = yield* sessions.get(sessionID).pipe(Effect.orDie)
             const [skills, env, instructions, mcpInstructions, modelMsgs] = yield* Effect.all([
               sys.skills(agent),
               sys.environment(model),
               instruction.system().pipe(Effect.orDie),
-              sys.mcp(agent, session.permission),
+              sys.mcp(agent, session.permission, McpActivation.names(currentSession.metadata)),
               MessageV2.toModelMessagesEffect(msgs, model),
             ])
             const system = [
@@ -2542,9 +2546,10 @@ const layer = Layer.effect(
         command: input.command,
         agent: input.agent,
       })
-      const cmd = yield* commands.get(input.command)
+      const activated = McpActivation.names((yield* sessions.get(input.sessionID).pipe(Effect.orDie)).metadata)
+      const cmd = yield* commands.get(input.command, activated)
       if (!cmd) {
-        const available = (yield* commands.list()).map((c) => c.name)
+        const available = (yield* commands.list(activated)).map((c) => c.name)
         const hint = available.length ? ` Available commands: ${available.join(", ")}` : ""
         const error = new NamedError.Unknown({ message: `Command not found: "${input.command}".${hint}` })
         yield* events.publish(Session.Event.Error, { sessionID: input.sessionID, error: error.toObject() })

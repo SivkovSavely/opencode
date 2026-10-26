@@ -161,6 +161,32 @@ describe("ConfigV2Compat.lower", () => {
     expect(() => lower({ mcp: { servers: { enabled: "false" } } })).toThrow()
   })
 
+  test("preserves MCP descriptions when lowering V2 compatibility config", () => {
+    const config = lower({
+      mcp: {
+        servers: {
+          local: { type: "local", command: ["local-mcp"], description: "Run local searches." },
+          remote: {
+            type: "remote",
+            url: "https://example.com/mcp",
+            enabled: false,
+            description: "Search repositories and issues.",
+          },
+        },
+      },
+    })
+
+    expect(config.mcp).toEqual({
+      local: { type: "local", command: ["local-mcp"], enabled: true, description: "Run local searches." },
+      remote: {
+        type: "remote",
+        url: "https://example.com/mcp",
+        enabled: false,
+        description: "Search repositories and issues.",
+      },
+    })
+  })
+
   test("rejects invalid V1 enablement when flat MCP entries include V2 fields", () => {
     expect(() =>
       lower({ mcp: { invalid: { type: "local", command: ["legacy"], enabled: "false", codemode: false } } }),

@@ -13,6 +13,7 @@ import { LegacyEvent } from "@opencode-ai/schema/legacy-event"
 
 type State = {
   commands: Record<string, Info>
+  bridge: EffectBridge.Shape
 }
 
 export const Event = {
@@ -49,8 +50,8 @@ export const Default = {
 } as const
 
 export interface Interface {
-  readonly get: (name: string) => Effect.Effect<Info | undefined>
-  readonly list: () => Effect.Effect<Info[]>
+  readonly get: (name: string, activated?: readonly string[]) => Effect.Effect<Info | undefined>
+  readonly list: (activated?: readonly string[]) => Effect.Effect<Info[]>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/Command") {}
@@ -61,6 +62,42 @@ const layer = Layer.effect(
     const config = yield* Config.Service
     const mcp = yield* MCP.Service
     const skill = yield* Skill.Service
+
+    const promptCommands = Effect.fnUntraced(function* (bridge: EffectBridge.Shape, activated?: readonly string[]) {
+      const prompts = yield* mcp.prompts(activated)
+      return Object.fromEntries(
+        Object.entries(prompts).map(([name, prompt]) => [
+          name,
+          {
+            name,
+            source: "mcp" as const,
+            description: prompt.description,
+            get template() {
+              return bridge.promise(
+                mcp
+                  .getPrompt(
+                    prompt.client,
+                    prompt.name,
+                    prompt.arguments
+                      ? Object.fromEntries(prompt.arguments.map((argument, i) => [argument.name, `$${i + 1}`]))
+                      : {},
+                    activated,
+                  )
+                  .pipe(
+                    Effect.map(
+                      (template) =>
+                        template?.messages
+                          .map((message) => (message.content.type === "text" ? message.content.text : ""))
+                          .join("\n") || "",
+                    ),
+                  ),
+              )
+            },
+            hints: prompt.arguments?.map((_, i) => `$${i + 1}`) ?? [],
+          } satisfies Info,
+        ]),
+      )
+    })
 
     const init = Effect.fn("Command.state")(function* (ctx: InstanceContext) {
       const cfg = yield* config.get()
@@ -102,34 +139,7 @@ const layer = Layer.effect(
         }
       }
 
-      for (const [name, prompt] of Object.entries(yield* mcp.prompts())) {
-        commands[name] = {
-          name,
-          source: "mcp",
-          description: prompt.description,
-          get template() {
-            return bridge.promise(
-              mcp
-                .getPrompt(
-                  prompt.client,
-                  prompt.name,
-                  prompt.arguments
-                    ? Object.fromEntries(prompt.arguments.map((argument, i) => [argument.name, `$${i + 1}`]))
-                    : {},
-                )
-                .pipe(
-                  Effect.map(
-                    (template) =>
-                      template?.messages
-                        .map((message) => (message.content.type === "text" ? message.content.text : ""))
-                        .join("\n") || "",
-                  ),
-                ),
-            )
-          },
-          hints: prompt.arguments?.map((_, i) => `$${i + 1}`) ?? [],
-        }
-      }
+      Object.assign(commands, yield* promptCommands(bridge))
 
       for (const item of yield* skill.all()) {
         if (commands[item.name]) continue
@@ -153,19 +163,25 @@ const layer = Layer.effect(
 
       return {
         commands,
+        bridge,
       }
     })
 
     const state = yield* InstanceState.make<State>((ctx) => init(ctx))
 
-    const get = Effect.fn("Command.get")(function* (name: string) {
+    const get = Effect.fn("Command.get")(function* (name: string, activated?: readonly string[]) {
       const s = yield* InstanceState.get(state)
-      return s.commands[name]
+      if (s.commands[name]) return s.commands[name]
+      return (yield* promptCommands(s.bridge, activated))[name]
     })
 
-    const list = Effect.fn("Command.list")(function* () {
+    const list = Effect.fn("Command.list")(function* (activated?: readonly string[]) {
       const s = yield* InstanceState.get(state)
-      return Object.values(s.commands)
+      const prompts = yield* promptCommands(s.bridge, activated)
+      return [
+        ...Object.values(s.commands),
+        ...Object.entries(prompts).flatMap(([name, command]) => (s.commands[name] ? [] : [command])),
+      ]
     })
 
     return Service.of({ get, list })

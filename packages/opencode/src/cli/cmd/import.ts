@@ -1,6 +1,7 @@
 import type { Session as SDKSession, Message, Part } from "@opencode-ai/sdk/v2"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { Session } from "@/session/session"
+import { McpActivation } from "@/session/mcp-activation"
 import { MessageV2 } from "../../session/message-v2"
 import { CliError, effectCmd } from "../effect-cmd"
 import { Database } from "@opencode-ai/core/database/database"
@@ -87,6 +88,10 @@ export function transformShareData(shareData: ShareData[]): {
       parts: partMap.get(msg.id) ?? [],
     })),
   }
+}
+
+export function importedInfo(info: SDKSession): SDKSession {
+  return { ...info, metadata: McpActivation.without(info.metadata) }
 }
 
 type ExportData = { info: SDKSession; messages: Array<{ info: Message; parts: Part[] }> }
@@ -177,7 +182,7 @@ const runImport = Effect.fn("Cli.import.body")(function* (file: string, ctx: Ins
   }
 
   const info = Schema.decodeUnknownSync(Session.Info)({
-    ...exportData.info,
+    ...importedInfo(exportData.info),
     projectID: ctx.project.id,
     directory: ctx.directory,
     path: path.relative(path.resolve(ctx.worktree), ctx.directory).replaceAll("\\", "/"),

@@ -122,6 +122,7 @@ function makeMcp(instructions: MCP.ServerInstructions[] = []) {
     MCP.Service.of({
       status: () => Effect.succeed({}),
       clients: () => Effect.succeed({}),
+      lazyServers: () => Effect.succeed([]),
       instructions: () => Effect.succeed(instructions),
       tools: () => Effect.succeed({}),
       prompts: () => Effect.succeed({}),
@@ -129,6 +130,8 @@ function makeMcp(instructions: MCP.ServerInstructions[] = []) {
       resourceTemplates: () => Effect.succeed({}),
       add: () => Effect.succeed({ status: { status: "disabled" as const } }),
       connect: () => Effect.void,
+      ensureConnected: () => Effect.succeed({ status: "failed", error: "unexpected MCP connection" }),
+      configuredServer: () => Effect.succeed(false),
       disconnect: () => Effect.void,
       getPrompt: () => Effect.succeed(undefined),
       readResource: () => Effect.succeed(undefined),
@@ -3432,7 +3435,9 @@ ownedBlockingRuntime.instance(
       }
       expect(yield* runtime.status()).toMatchObject({ active: 0, parked: 1 })
       expect(
-        yield* database.db.get<{ state: string }>(sql`SELECT state FROM runtime_execution WHERE session_id = ${chat.id}`),
+        yield* database.db.get<{ state: string }>(
+          sql`SELECT state FROM runtime_execution WHERE session_id = ${chat.id}`,
+        ),
       ).toEqual({ state: "parked" })
 
       const replacement = RuntimeLifecycle.make(

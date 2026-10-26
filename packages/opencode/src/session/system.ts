@@ -51,7 +51,11 @@ export function provider(model: Provider.Model) {
 export interface Interface {
   readonly environment: (model: Provider.Model) => Effect.Effect<string[]>
   readonly skills: (agent: Agent.Info) => Effect.Effect<string | undefined>
-  readonly mcp: (agent: Agent.Info, permission?: PermissionV1.Ruleset) => Effect.Effect<string | undefined>
+  readonly mcp: (
+    agent: Agent.Info,
+    permission?: PermissionV1.Ruleset,
+    activated?: readonly string[],
+  ) => Effect.Effect<string | undefined>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/SystemPrompt") {}
@@ -116,21 +120,41 @@ const layer = Layer.effect(
         ].join("\n")
       }),
 
-      mcp: Effect.fn("SystemPrompt.mcp")(function* (agent: Agent.Info, permission?: PermissionV1.Ruleset) {
+      mcp: Effect.fn("SystemPrompt.mcp")(function* (
+        agent: Agent.Info,
+        permission?: PermissionV1.Ruleset,
+        activated?: readonly string[],
+      ) {
         const ruleset = Permission.merge(agent.permission, permission ?? [])
-        const instructions = (yield* mcp.instructions()).filter(
+        const lazyServers = (yield* mcp.lazyServers()).filter(
+          (item) => Permission.evaluate("mcp_enable", item.name, ruleset).action !== "deny",
+        )
+        const instructions = (yield* mcp.instructions(activated)).filter(
           (item) => item.tools.length === 0 || Permission.disabled(item.tools, ruleset).size < item.tools.length,
         )
-        if (instructions.length === 0) return
+        if (instructions.length === 0 && lazyServers.length === 0) return
 
         return [
-          "<mcp_instructions>",
-          ...instructions.flatMap((item) => [
-            `  <server name="${item.name}">`,
-            ...item.instructions.split("\n").map((line) => `    ${line}`),
-            "  </server>",
-          ]),
-          "</mcp_instructions>",
+          ...(lazyServers.length === 0
+            ? []
+            : [
+                "Available lazy MCP servers. Call mcp_enable with a server name to activate its tools:",
+                ...lazyServers.map((item) => {
+                  const description = item.description?.trim().replace(/\s+/g, " ").slice(0, 200)
+                  return `- ${item.name}: ${description || "No description provided."}`
+                }),
+              ]),
+          ...(instructions.length === 0
+            ? []
+            : [
+                "<mcp_instructions>",
+                ...instructions.flatMap((item) => [
+                  `  <server name="${item.name}">`,
+                  ...item.instructions.split("\n").map((line) => `    ${line}`),
+                  "  </server>",
+                ]),
+                "</mcp_instructions>",
+              ]),
         ].join("\n")
       }),
     })

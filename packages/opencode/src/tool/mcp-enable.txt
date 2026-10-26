@@ -1,0 +1,3 @@
+Activate a configured MCP server for this session. Its tools become available on the next model step.
+
+Use a server name from the available MCP server catalog in the system prompt.

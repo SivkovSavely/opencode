@@ -6,6 +6,7 @@ import { Deferred, Effect, Exit, Layer } from "effect"
 import { Session as SessionNs } from "@/session/session"
 import { MessageV2 } from "../../src/session/message-v2"
 import { MessageID, PartID, type SessionID } from "../../src/session/schema"
+import { McpActivation } from "../../src/session/mcp-activation"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { provideInstance, tmpdirScoped } from "../fixture/fixture"
 import { testEffect } from "../lib/effect"
@@ -231,10 +232,95 @@ describe("Session", () => {
       const fork = yield* Effect.acquireRelease(session.fork({ sessionID: created.id }), (info) =>
         session.remove(info.id).pipe(Effect.ignore),
       )
-
       expect(saved.metadata).toEqual(meta)
       expect(fork.metadata).toEqual(meta)
       expect(fork.metadata).not.toBe(meta)
+    }),
+  )
+
+  it.instance("persists concurrent MCP activations and does not copy them into forks", () =>
+    Effect.gen(function* () {
+      const session = yield* SessionNs.Service
+      const created = yield* Effect.acquireRelease(
+        session.create({ title: "with-mcp-activation", metadata: { source: "sdk", trace: { id: "abc" } } }),
+        (info) => session.remove(info.id).pipe(Effect.ignore),
+      )
+      yield* Effect.all(
+        ["github", "linear", "docs"].map((name) => session.addMcpActivation({ sessionID: created.id, name })),
+        { concurrency: "unbounded" },
+      )
+      const saved = yield* session.get(created.id)
+      const fork = yield* Effect.acquireRelease(session.fork({ sessionID: created.id }), (info) =>
+        session.remove(info.id).pipe(Effect.ignore),
+      )
+      const child = yield* Effect.acquireRelease(
+        session.create({ parentID: created.id, metadata: { task: { parentSessionId: created.id } } }),
+        (info) => session.remove(info.id).pipe(Effect.ignore),
+      )
+
+      expect(McpActivation.names(saved.metadata)).toEqual(["github", "linear", "docs"])
+      expect(saved.metadata).toMatchObject({ source: "sdk", trace: { id: "abc" } })
+      expect(McpActivation.names(fork.metadata)).toEqual([])
+      expect(fork.metadata).toMatchObject({ source: "sdk", trace: { id: "abc" } })
+      expect(McpActivation.names(child.metadata)).toEqual([])
+      expect(child.metadata).toMatchObject({ task: { parentSessionId: created.id } })
+    }),
+  )
+
+  it.instance("does not accept MCP activation metadata from session creation or metadata updates", () =>
+    Effect.gen(function* () {
+      const session = yield* SessionNs.Service
+      const created = yield* Effect.acquireRelease(
+        session.create({
+          title: "reject-forged-mcp-activation",
+          metadata: {
+            [McpActivation.METADATA_KEY]: ["forged"],
+            "opencode.mcp.activated": ["legacy"],
+            source: "sdk",
+          },
+        }),
+        (info) => session.remove(info.id).pipe(Effect.ignore),
+      )
+
+      expect(McpActivation.names(created.metadata)).toEqual([])
+      expect(created.metadata).not.toHaveProperty("opencode.mcp.activated")
+      yield* session.addMcpActivation({ sessionID: created.id, name: "approved" })
+      yield* session.setMetadata({
+        sessionID: created.id,
+        metadata: { [McpActivation.METADATA_KEY]: ["forged"], source: "updated" },
+      })
+
+      const saved = yield* session.get(created.id)
+      expect(McpActivation.names(saved.metadata)).toEqual(["approved"])
+      expect(saved.metadata).toMatchObject({ source: "updated" })
+
+      const abort = new AbortController()
+      abort.abort()
+      expect(yield* session.addMcpActivation({ sessionID: created.id, name: "cancelled", signal: abort.signal })).toBe(
+        false,
+      )
+      expect(McpActivation.names((yield* session.get(created.id)).metadata)).toEqual(["approved"])
+    }),
+  )
+
+  it.instance("preserves MCP activations across concurrent full-snapshot updates", () =>
+    Effect.gen(function* () {
+      const session = yield* SessionNs.Service
+      const created = yield* Effect.acquireRelease(session.create({ title: "activation-update-race" }), (info) =>
+        session.remove(info.id).pipe(Effect.ignore),
+      )
+
+      yield* Effect.all(
+        [
+          session.addMcpActivation({ sessionID: created.id, name: "lazy" }),
+          session.setTitle({ sessionID: created.id, title: "updated" }),
+        ],
+        { concurrency: "unbounded" },
+      )
+
+      const saved = yield* session.get(created.id)
+      expect(saved.title).toBe("updated")
+      expect(McpActivation.names(saved.metadata)).toEqual(["lazy"])
     }),
   )
 

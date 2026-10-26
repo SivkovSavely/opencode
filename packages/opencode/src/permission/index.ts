@@ -29,7 +29,13 @@ export function evaluate(permission: string, pattern: string, ...rulesets: Permi
   return (
     rulesets
       .flat()
-      .findLast((rule) => Wildcard.match(permission, rule.permission) && Wildcard.match(pattern, rule.pattern)) ?? {
+      .findLast(
+        (rule) =>
+          Wildcard.match(permission, rule.permission) &&
+          (permission === "mcp_enable" && rule.pattern.startsWith("=")
+            ? pattern === rule.pattern.slice(1)
+            : Wildcard.match(pattern, rule.pattern)),
+      ) ?? {
       action: "ask",
       permission,
       pattern: "*",

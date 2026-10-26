@@ -10,6 +10,7 @@ import { Session } from "@/session/session"
 import { Tool } from "@/tool/tool"
 import * as Truncate from "@/tool/truncate"
 import { MessageID, SessionID } from "@/session/schema"
+import { McpActivation } from "@/session/mcp-activation"
 import { Cause, Effect, Exit, Layer, Schema } from "effect"
 
 const ctx: Tool.Context = {
@@ -30,6 +31,7 @@ function mcpTool(
   outputSchema?: Record<string, unknown>,
 ): MCP.McpTool {
   return {
+    server: "",
     def: { name, description: name, inputSchema, ...(outputSchema ? { outputSchema } : {}) } as MCPToolDef,
     client: {
       callTool: async (params: { arguments?: Record<string, unknown> }) => handler(params.arguments ?? {}),
@@ -37,11 +39,25 @@ function mcpTool(
   }
 }
 
+function tagTools(mcpTools: Record<string, MCP.McpTool>, servers: readonly string[]) {
+  const byLongest = [...servers].sort((a, b) => b.length - a.length)
+  return Object.fromEntries(
+    Object.entries(mcpTools).map(([key, item]) => {
+      const server =
+        byLongest.find((name) => key.startsWith(name + "_")) ?? (key.includes("_") ? key.split("_")[0]! : key)
+      const local = key.startsWith(server + "_") ? key.slice(server.length + 1) : key
+      return [key, { ...item, server, def: { ...item.def, name: local } }]
+    }),
+  )
+}
+
 function harness(input: {
   mcpTools: Record<string, MCP.McpTool>
   servers: string[]
   permission?: PermissionV1.Rule[]
   trigger?: Plugin.Interface["trigger"]
+  activated?: string[]
+  lazyOnly?: boolean
 }) {
   return Layer.mergeAll(
     Layer.mock(Plugin.Service, {
@@ -54,10 +70,19 @@ function harness(input: {
       get: () => Effect.succeed({ name: "build", permission: input.permission ?? [] } as any),
     }),
     Layer.mock(Session.Service, {
-      get: () => Effect.succeed({ permission: [] } as any),
+      get: () =>
+        Effect.succeed({
+          permission: [],
+          metadata: { [McpActivation.METADATA_KEY]: input.activated ?? [] },
+        } as any),
     }),
     Layer.mock(MCP.Service, {
-      tools: () => Effect.succeed(input.mcpTools),
+      tools: (activated = []) =>
+        Effect.succeed(
+          input.lazyOnly
+            ? Object.fromEntries(Object.entries(input.mcpTools).filter(([, item]) => activated.includes(item.server)))
+            : input.mcpTools,
+        ),
       clients: () => Effect.succeed(Object.fromEntries(input.servers.map((name) => [name, {} as any]))),
     }),
   )
@@ -72,18 +97,21 @@ function build(
   servers?: string[],
   permission?: PermissionV1.Rule[],
   trigger?: Plugin.Interface["trigger"],
+  activated?: string[],
+  lazyOnly?: boolean,
 ) {
   const names = serverNames(mcpTools, servers)
+  const identified = tagTools(mcpTools, names)
   return Effect.runPromise(
     CodeModeTool.pipe(
       Effect.flatMap(Tool.init),
-      Effect.provide(harness({ mcpTools, servers: names, permission, trigger })),
+      Effect.provide(harness({ mcpTools: identified, servers: names, permission, trigger, activated, lazyOnly })),
     ),
   )
 }
 
 function describeFor(mcpTools: Record<string, MCP.McpTool>, servers?: string[], permission: PermissionV1.Rule[] = []) {
-  return describeCatalog(Permission.visibleTools(mcpTools, permission), serverNames(mcpTools, servers))
+  return describeCatalog(Permission.visibleTools(tagTools(mcpTools, serverNames(mcpTools, servers)), permission))
 }
 
 // Program failures die at the tool boundary; recover the defect for message assertions.
@@ -113,6 +141,27 @@ describe("code mode execute", () => {
     expect(description).toContain("tools.my_server.do_thing(")
   })
 
+  test("groups tools by server provenance instead of their sanitized public key", () => {
+    const tool = { ...mcpTool("find.issues", () => ""), server: "some.server" }
+    const description = describeCatalog({ some_server_find_issues: tool })
+
+    expect(description).toContain("- some_server (1 tool)")
+    expect(description).toContain("tools.some_server.find_issues(")
+  })
+
+  test("does not expose a connected lazy server in Code Mode until this session activates it", async () => {
+    const tools = {
+      lazy_search: mcpTool("search", () => ({ content: [{ type: "text", text: "found" }] })),
+    }
+    const hidden = await build(tools, ["lazy"], undefined, undefined, [], true)
+    const hiddenError = await failure(hidden.execute({ code: "return await tools.lazy.search({})" }, ctx))
+    expect(hiddenError.message).toContain("Unknown tool 'lazy.search'")
+
+    const active = await build(tools, ["lazy"], undefined, undefined, ["lazy"], true)
+    const output = await Effect.runPromise(active.execute({ code: "return await tools.lazy.search({})" }, ctx))
+    expect(output.output).toBe("found")
+  })
+
   test("groupByServer uses the whole key as the server name when it has no underscore", () => {
     const description = describeFor({ standalone: mcpTool("standalone", () => "") }, [])
     expect(description).toContain("- standalone (1 tool)")
@@ -139,7 +188,9 @@ describe("code mode execute", () => {
   test("the static base description carries no catalog; the registry appends it", async () => {
     const tool = await build({ github_list_issues: mcpTool("list_issues", () => "") })
     expect(tool.id).toBe(CODE_MODE_TOOL)
-    expect(tool.description).toBe("Run a confined orchestration script with access to connected MCP tools.")
+    expect(tool.description).toBe(
+      "Run a confined orchestration script with access to MCP tools available to this session.",
+    )
     expect(tool.description).not.toContain("Available tools")
     expect(tool.description).not.toContain("list_issues")
   })
@@ -197,6 +248,7 @@ describe("code mode execute", () => {
     const filler = "a searchable description of this operation that consumes catalog budget ".repeat(3)
     for (let i = 0; i < 150; i++) {
       tools[`alpha_op_${i}`] = {
+        server: "",
         def: {
           name: `op_${i}`,
           description: `${filler}${i}`,

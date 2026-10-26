@@ -26,7 +26,7 @@ import { McpOAuthCallback } from "./oauth-callback"
 import { McpAuth } from "./auth"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { TuiEvent } from "@/server/tui-event"
-import { Cause, Effect, Exit, Layer, Context, Schema, Stream } from "effect"
+import { Cause, Effect, Exit, Layer, Context, Schema, Stream, Semaphore } from "effect"
 import { EffectBridge } from "@/effect/bridge"
 import { InstanceState } from "@/effect/instance-state"
 import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process"
@@ -108,7 +108,10 @@ export type Status = Schema.Schema.Type<typeof Status>
 
 // Store transports for OAuth servers to allow finishing auth
 type TransportWithAuth = StreamableHTTPClientTransport | SSEClientTransport
-const pendingOAuthTransports = new Map<string, { transport: TransportWithAuth; provider?: McpOAuthPendingProvider }>()
+const pendingOAuthTransports = new Map<
+  string,
+  { transport: TransportWithAuth; provider?: McpOAuthPendingProvider; revision: number }
+>()
 
 // Prompt cache types
 type PromptInfo = Awaited<ReturnType<MCPClient["listPrompts"]>>["prompts"][number]
@@ -116,7 +119,7 @@ type ResourceInfo = Awaited<ReturnType<MCPClient["listResources"]>>["resources"]
 type ResourceTemplateInfo = Awaited<ReturnType<MCPClient["listResourceTemplates"]>>["resourceTemplates"][number]
 type McpEntry = NonNullable<ConfigV1.Info["mcp"]>[string]
 
-function isMcpConfigured(entry: McpEntry): entry is ConfigMCPV1.Info {
+function isMcpConfigured(entry: McpEntry | undefined): entry is ConfigMCPV1.Info {
   return typeof entry === "object" && entry !== null && "type" in entry
 }
 
@@ -134,6 +137,7 @@ interface CreateResult {
 interface AuthResult {
   authorizationUrl: string
   oauthState: string
+  revision: number
   client?: MCPClient
 }
 
@@ -145,6 +149,8 @@ interface State {
   clients: Record<string, MCPClient>
   defs: Record<string, MCPToolDef[]>
   instructions: Record<string, string>
+  connectLocks: Map<string, Semaphore.Semaphore>
+  connectRevisions: Record<string, number>
 }
 
 export interface ServerInstructions {
@@ -155,6 +161,8 @@ export interface ServerInstructions {
 
 /** An MCP tool in its native shape; consumers adapt it to their own tool format. */
 export interface McpTool {
+  /** Configured server identity, independent of the sanitized public tool name. */
+  readonly server: string
   /** Shared cached definition; consumers must copy rather than mutate it. */
   readonly def: MCPToolDef
   readonly client: MCPClient
@@ -163,25 +171,34 @@ export interface McpTool {
 
 export interface Interface {
   readonly status: () => Effect.Effect<Record<string, Status>>
-  readonly clients: () => Effect.Effect<Record<string, MCPClient>>
-  readonly instructions: () => Effect.Effect<ServerInstructions[]>
-  readonly tools: () => Effect.Effect<Record<string, McpTool>>
-  readonly prompts: () => Effect.Effect<Record<string, PromptInfo & { client: string }>>
-  readonly resources: (clientName?: string) => Effect.Effect<Record<string, ResourceInfo & { client: string }>>
+  readonly clients: (activated?: readonly string[]) => Effect.Effect<Record<string, MCPClient>>
+  readonly lazyServers: () => Effect.Effect<{ name: string; description?: string }[]>
+  readonly instructions: (activated?: readonly string[]) => Effect.Effect<ServerInstructions[]>
+  readonly tools: (activated?: readonly string[]) => Effect.Effect<Record<string, McpTool>>
+  readonly prompts: (activated?: readonly string[]) => Effect.Effect<Record<string, PromptInfo & { client: string }>>
+  readonly resources: (
+    clientName?: string,
+    activated?: readonly string[],
+  ) => Effect.Effect<Record<string, ResourceInfo & { client: string }>>
   readonly resourceTemplates: (
     clientName?: string,
+    activated?: readonly string[],
   ) => Effect.Effect<Record<string, ResourceTemplateInfo & { client: string }>>
   readonly add: (name: string, mcp: ConfigMCPV1.Info) => Effect.Effect<{ status: Record<string, Status> | Status }>
   readonly connect: (name: string) => Effect.Effect<void, NotFoundError>
+  readonly ensureConnected: (name: string) => Effect.Effect<Status, NotFoundError>
+  readonly configuredServer: (name: string) => Effect.Effect<boolean>
   readonly disconnect: (name: string) => Effect.Effect<void, NotFoundError>
   readonly getPrompt: (
     clientName: string,
     name: string,
     args?: Record<string, string>,
+    activated?: readonly string[],
   ) => Effect.Effect<Awaited<ReturnType<MCPClient["getPrompt"]>> | undefined>
   readonly readResource: (
     clientName: string,
     resourceUri: string,
+    activated?: readonly string[],
   ) => Effect.Effect<Awaited<ReturnType<MCPClient["readResource"]>> | undefined>
   readonly startAuth: (
     mcpName: string,
@@ -236,6 +253,7 @@ const layer = Layer.effect(
     const connectRemote = Effect.fn("MCP.connectRemote")(function* (
       key: string,
       mcp: ConfigMCPV1.Info & { type: "remote" },
+      revision: number,
     ) {
       const oauthDisabled = mcp.oauth === false
       const oauthConfig = typeof mcp.oauth === "object" ? mcp.oauth : undefined
@@ -309,7 +327,7 @@ const layer = Layer.effect(
                   })
                   .pipe(Effect.ignore, Effect.as(undefined))
               } else {
-                pendingOAuthTransports.set(key, { transport })
+                pendingOAuthTransports.set(key, { transport, revision })
                 lastStatus = { status: "needs_auth" as const }
                 return events
                   .publish(TuiEvent.ToastShow, {
@@ -370,14 +388,14 @@ const layer = Layer.effect(
     })
 
     const create = Effect.fn("MCP.create")(
-      function* (key: string, mcp: ConfigMCPV1.Info) {
+      function* (key: string, mcp: ConfigMCPV1.Info, revision = 0) {
         if (mcp.enabled === false) {
           return DISABLED_RESULT
         }
 
         const { client: mcpClient, status } =
           mcp.type === "remote"
-            ? yield* connectRemote(key, mcp as ConfigMCPV1.Info & { type: "remote" })
+            ? yield* connectRemote(key, mcp as ConfigMCPV1.Info & { type: "remote" }, revision)
             : yield* connectLocal(key, mcp as ConfigMCPV1.Info & { type: "local" })
 
         if (!mcpClient) {
@@ -500,6 +518,8 @@ const layer = Layer.effect(
           clients: {},
           defs: {},
           instructions: {},
+          connectLocks: new Map(),
+          connectRevisions: {},
         }
 
         yield* Effect.forEach(
@@ -559,6 +579,40 @@ const layer = Layer.effect(
       }),
     )
 
+    function connectLock(s: State, name: string) {
+      let lock = s.connectLocks.get(name)
+      if (!lock) {
+        lock = Semaphore.makeUnsafe(1)
+        s.connectLocks.set(name, lock)
+      }
+      return lock
+    }
+
+    function connectRevision(s: State, name: string) {
+      return s.connectRevisions[name] ?? 0
+    }
+
+    function bumpConnectRevision(s: State, name: string) {
+      s.connectRevisions[name] = connectRevision(s, name) + 1
+    }
+
+    function configured(s: State, cfg: ConfigV1.Info) {
+      return { ...cfg.mcp, ...s.config } as Record<string, McpEntry>
+    }
+
+    function visibleClients(s: State, config: Record<string, McpEntry>, activated?: readonly string[]) {
+      return Object.fromEntries(
+        Object.entries(s.clients).filter(([name]) => {
+          return s.status[name]?.status === "connected" && visible(name, config, activated)
+        }),
+      )
+    }
+
+    function visible(name: string, config: Record<string, McpEntry>, activated?: readonly string[]) {
+      const entry = config[name]
+      return isMcpConfigured(entry) && (entry.enabled !== false || activated?.includes(name) === true)
+    }
+
     function closeClient(s: State, name: string) {
       const client = s.clients[name]
       delete s.clients[name]
@@ -607,15 +661,25 @@ const layer = Layer.effect(
       return result
     })
 
-    const clients = Effect.fn("MCP.clients")(function* () {
+    const clients = Effect.fn("MCP.clients")(function* (activated?: readonly string[]) {
       const s = yield* InstanceState.get(state)
-      return s.clients
+      return visibleClients(s, configured(s, yield* cfgSvc.get()), activated)
     })
 
-    const instructions = Effect.fn("MCP.instructions")(function* () {
+    const lazyServers = Effect.fn("MCP.lazyServers")(function* () {
       const s = yield* InstanceState.get(state)
+      const config = configured(s, yield* cfgSvc.get())
+      return Object.entries(config)
+        .filter((entry): entry is [string, ConfigMCPV1.Info] => isMcpConfigured(entry[1]) && entry[1].enabled === false)
+        .sort(([a], [b]) => a.localeCompare(b))
+        .map(([name, entry]) => ({ name, description: entry.description }))
+    })
+
+    const instructions = Effect.fn("MCP.instructions")(function* (activated?: readonly string[]) {
+      const s = yield* InstanceState.get(state)
+      const config = configured(s, yield* cfgSvc.get())
       return Object.entries(s.instructions)
-        .filter(([name]) => s.status[name]?.status === "connected")
+        .filter(([name]) => s.status[name]?.status === "connected" && visible(name, config, activated))
         .sort(([a], [b]) => a.localeCompare(b))
         .map(([name, item]) => ({
           name,
@@ -626,7 +690,7 @@ const layer = Layer.effect(
 
     const createAndStore = Effect.fn("MCP.createAndStore")(function* (name: string, mcp: ConfigMCPV1.Info) {
       const s = yield* InstanceState.get(state)
-      const result = yield* create(name, mcp)
+      const result = yield* create(name, mcp, connectRevision(s, name))
 
       s.status[name] = result.status
       if (!result.mcpClient) {
@@ -640,22 +704,55 @@ const layer = Layer.effect(
 
     const add = Effect.fn("MCP.add")(function* (name: string, mcp: ConfigMCPV1.Info) {
       const s = yield* InstanceState.get(state)
-      s.config[name] = mcp
-      yield* createAndStore(name, mcp)
-      return { status: s.status }
+      return yield* connectLock(s, name).withPermits(1)(
+        Effect.gen(function* () {
+          s.config[name] = mcp
+          bumpConnectRevision(s, name)
+          yield* createAndStore(name, mcp)
+          return { status: s.status }
+        }),
+      )
     })
 
     const connect = Effect.fn("MCP.connect")(function* (name: string) {
-      const mcp = yield* requireMcpConfig(name)
-      yield* createAndStore(name, { ...mcp, enabled: true })
+      const s = yield* InstanceState.get(state)
+      yield* connectLock(s, name).withPermits(1)(
+        Effect.gen(function* () {
+          bumpConnectRevision(s, name)
+          const mcp = yield* requireMcpConfig(name)
+          yield* createAndStore(name, { ...mcp, enabled: true })
+        }),
+      )
+    })
+
+    const ensureConnected = Effect.fn("MCP.ensureConnected")(function* (name: string) {
+      const s = yield* InstanceState.get(state)
+      return yield* connectLock(s, name).withPermits(1)(
+        Effect.gen(function* () {
+          if (s.status[name]?.status === "connected" && s.clients[name] && s.defs[name]) return s.status[name]
+          bumpConnectRevision(s, name)
+          const mcp = yield* requireMcpConfig(name)
+          yield* createAndStore(name, { ...mcp, enabled: true })
+          return s.status[name] ?? { status: "failed", error: "MCP connection did not become available" }
+        }),
+      )
+    })
+
+    const configuredServer = Effect.fn("MCP.configuredServer")(function* (name: string) {
+      return !!(yield* getMcpConfig(name))
     })
 
     const disconnect = Effect.fn("MCP.disconnect")(function* (name: string) {
-      yield* requireMcpConfig(name)
       const s = yield* InstanceState.get(state)
-      yield* closeClient(s, name)
-      delete s.clients[name]
-      s.status[name] = { status: "disabled" }
+      yield* connectLock(s, name).withPermits(1)(
+        Effect.gen(function* () {
+          yield* requireMcpConfig(name)
+          bumpConnectRevision(s, name)
+          yield* closeClient(s, name)
+          delete s.clients[name]
+          s.status[name] = { status: "disabled" }
+        }),
+      )
     })
 
     function requestTimeout(s: State, name: string, configured: McpEntry | undefined, fallback?: number) {
@@ -663,16 +760,17 @@ const layer = Layer.effect(
       return s.config[name]?.timeout ?? staticTimeout ?? fallback
     }
 
-    const tools = Effect.fn("MCP.tools")(function* () {
+    const tools = Effect.fn("MCP.tools")(function* (activated?: readonly string[]) {
       const result: Record<string, McpTool> = {}
       const s = yield* InstanceState.get(state)
 
       const cfg = yield* cfgSvc.get()
-      const config = cfg.mcp ?? {}
+      const config = configured(s, cfg)
       const defaultTimeout = cfg.experimental?.mcp_timeout
 
       for (const [clientName, client] of Object.entries(s.clients)) {
         if (s.status[clientName]?.status !== "connected") continue
+        if (!visible(clientName, config, activated)) continue
         const mcpConfig = config[clientName]
         const listed = s.defs[clientName]
         if (!listed) {
@@ -681,7 +779,7 @@ const layer = Layer.effect(
         }
         const timeout = requestTimeout(s, clientName, mcpConfig, defaultTimeout)
         for (const def of listed) {
-          result[McpCatalog.toolName(clientName, def.name)] = { def, client, timeout }
+          result[McpCatalog.toolName(clientName, def.name)] = { server: clientName, def, client, timeout }
         }
       }
       return result
@@ -693,12 +791,16 @@ const layer = Layer.effect(
       label: string,
       key?: (item: T) => string,
       targetClientName?: string,
+      allowedClients?: Set<string>,
     ) {
       return Effect.gen(function* () {
         const cfg = yield* cfgSvc.get()
         return yield* Effect.forEach(
           Object.entries(s.clients).filter(
-            ([name]) => s.status[name]?.status === "connected" && (!targetClientName || name === targetClientName),
+            ([name]) =>
+              s.status[name]?.status === "connected" &&
+              (!targetClientName || name === targetClientName) &&
+              (!allowedClients || allowedClients.has(name)),
           ),
           ([clientName, client]) =>
             McpCatalog.fetch(
@@ -713,27 +815,38 @@ const layer = Layer.effect(
       })
     }
 
-    const prompts = Effect.fn("MCP.prompts")(function* () {
-      return yield* collectFromConnected(yield* InstanceState.get(state), McpCatalog.prompts, "prompts")
+    const prompts = Effect.fn("MCP.prompts")(function* (activated?: readonly string[]) {
+      const s = yield* InstanceState.get(state)
+      const allowed = new Set(Object.keys(visibleClients(s, configured(s, yield* cfgSvc.get()), activated)))
+      return yield* collectFromConnected(s, McpCatalog.prompts, "prompts", undefined, undefined, allowed)
     })
 
-    const resources = Effect.fn("MCP.resources")(function* (clientName?: string) {
+    const resources = Effect.fn("MCP.resources")(function* (clientName?: string, activated?: readonly string[]) {
+      const s = yield* InstanceState.get(state)
+      const allowed = new Set(Object.keys(visibleClients(s, configured(s, yield* cfgSvc.get()), activated)))
       return yield* collectFromConnected(
-        yield* InstanceState.get(state),
+        s,
         McpCatalog.resources,
         "resources",
         (resource) => resource.uri,
         clientName,
+        allowed,
       )
     })
 
-    const resourceTemplates = Effect.fn("MCP.resourceTemplates")(function* (clientName?: string) {
+    const resourceTemplates = Effect.fn("MCP.resourceTemplates")(function* (
+      clientName?: string,
+      activated?: readonly string[],
+    ) {
+      const s = yield* InstanceState.get(state)
+      const allowed = new Set(Object.keys(visibleClients(s, configured(s, yield* cfgSvc.get()), activated)))
       return yield* collectFromConnected(
-        yield* InstanceState.get(state),
+        s,
         McpCatalog.resourceTemplates,
         "resource templates",
         (template) => template.uriTemplate,
         clientName,
+        allowed,
       )
     })
 
@@ -769,7 +882,10 @@ const layer = Layer.effect(
       clientName: string,
       name: string,
       args?: Record<string, string>,
+      activated?: readonly string[],
     ) {
+      const s = yield* InstanceState.get(state)
+      if (!visible(clientName, configured(s, yield* cfgSvc.get()), activated)) return
       return yield* withClient(
         clientName,
         (client, timeout) => client.getPrompt({ name, arguments: args }, { timeout }),
@@ -778,7 +894,13 @@ const layer = Layer.effect(
       )
     })
 
-    const readResource = Effect.fn("MCP.readResource")(function* (clientName: string, resourceUri: string) {
+    const readResource = Effect.fn("MCP.readResource")(function* (
+      clientName: string,
+      resourceUri: string,
+      activated?: readonly string[],
+    ) {
+      const s = yield* InstanceState.get(state)
+      if (!visible(clientName, configured(s, yield* cfgSvc.get()), activated)) return
       return yield* withClient(
         clientName,
         (client, timeout) => client.readResource({ uri: resourceUri }, { timeout }),
@@ -807,6 +929,8 @@ const layer = Layer.effect(
       const mcpConfig = yield* requireMcpConfig(mcpName)
       if (mcpConfig.type !== "remote") throw new Error(`MCP server ${mcpName} is not a remote server`)
       if (mcpConfig.oauth === false) throw new Error(`MCP server ${mcpName} has OAuth explicitly disabled`)
+      const s = yield* InstanceState.get(state)
+      const revision = connectRevision(s, mcpName)
       const url = remoteURL(mcpConfig.url)
       if (!url) throw new Error(`Invalid MCP URL for "${mcpName}"`)
 
@@ -854,15 +978,19 @@ const layer = Layer.effect(
           const client = createClient(directory)
           return client.connect(transport).then(async () => {
             await authProvider.commit()
-            return { authorizationUrl: "", oauthState, client } satisfies AuthResult
+            return { authorizationUrl: "", oauthState, revision, client } satisfies AuthResult
           })
         },
         catch: (error) => error,
       }).pipe(
         Effect.catch((error) => {
           if (error instanceof UnauthorizedError && capturedUrl) {
-            pendingOAuthTransports.set(mcpName, { transport, provider: authProvider })
-            return Effect.succeed({ authorizationUrl: capturedUrl.toString(), oauthState } satisfies AuthResult)
+            pendingOAuthTransports.set(mcpName, { transport, provider: authProvider, revision })
+            return Effect.succeed({
+              authorizationUrl: capturedUrl.toString(),
+              oauthState,
+              revision,
+            } satisfies AuthResult)
           }
           return Effect.die(error)
         }),
@@ -892,7 +1020,15 @@ const layer = Layer.effect(
 
         const s = yield* InstanceState.get(state)
         yield* auth.clearOAuthState(mcpName)
-        return yield* storeClient(s, mcpName, client, listed, client.getInstructions()?.trim(), mcpConfig.timeout)
+        return yield* connectLock(s, mcpName).withPermits(1)(
+          Effect.gen(function* () {
+            if (connectRevision(s, mcpName) !== result.revision) {
+              yield* Effect.tryPromise(() => client.close()).pipe(Effect.ignore)
+              return s.status[mcpName] ?? { status: "disabled" as const }
+            }
+            return yield* storeClient(s, mcpName, client, listed, client.getInstructions()?.trim(), mcpConfig.timeout)
+          }),
+        )
       }
 
       const callbackPromise = McpOAuthCallback.waitForCallback(result.oauthState, mcpName)
@@ -916,29 +1052,38 @@ const layer = Layer.effect(
     })
 
     const finishAuth = Effect.fn("MCP.finishAuth")(function* (mcpName: string, authorizationCode: string) {
-      yield* requireMcpConfig(mcpName)
-      const pending = pendingOAuthTransports.get(mcpName)
-      if (!pending) throw new Error(`No pending OAuth flow for MCP server: ${mcpName}`)
+      const s = yield* InstanceState.get(state)
+      return yield* connectLock(s, mcpName).withPermits(1)(
+        Effect.gen(function* () {
+          yield* requireMcpConfig(mcpName)
+          const pending = pendingOAuthTransports.get(mcpName)
+          if (!pending) throw new Error(`No pending OAuth flow for MCP server: ${mcpName}`)
+          if (connectRevision(s, mcpName) !== pending.revision) {
+            pendingOAuthTransports.delete(mcpName)
+            yield* Effect.tryPromise(() => pending.transport.close()).pipe(Effect.ignore)
+            return s.status[mcpName] ?? { status: "disabled" as const }
+          }
 
-      const error = yield* Effect.tryPromise({
-        try: () => pending.transport.finishAuth(authorizationCode),
-        catch: (error) => error,
-      }).pipe(
-        Effect.match({
-          onFailure: (error) => (error instanceof Error ? error.message : String(error)),
-          onSuccess: () => undefined,
+          const error = yield* Effect.tryPromise({
+            try: () => pending.transport.finishAuth(authorizationCode),
+            catch: (error) => error,
+          }).pipe(
+            Effect.match({
+              onFailure: (error) => (error instanceof Error ? error.message : String(error)),
+              onSuccess: () => undefined,
+            }),
+          )
+
+          if (error) return { status: "failed", error: `OAuth completion failed: ${error}` } satisfies Status
+
+          yield* Effect.promise(() => pending.provider?.commit() ?? Promise.resolve())
+          yield* auth.clearCodeVerifier(mcpName)
+          pendingOAuthTransports.delete(mcpName)
+
+          const mcpConfig = yield* requireMcpConfig(mcpName)
+          return yield* createAndStore(mcpName, { ...mcpConfig, enabled: true })
         }),
       )
-
-      if (error) return { status: "failed", error: `OAuth completion failed: ${error}` } satisfies Status
-
-      yield* Effect.promise(() => pending.provider?.commit() ?? Promise.resolve())
-      yield* auth.clearCodeVerifier(mcpName)
-      pendingOAuthTransports.delete(mcpName)
-
-      const mcpConfig = yield* requireMcpConfig(mcpName)
-
-      return yield* createAndStore(mcpName, { ...mcpConfig, enabled: true })
     })
 
     const removeAuth = Effect.fn("MCP.removeAuth")(function* (mcpName: string) {
@@ -972,6 +1117,7 @@ const layer = Layer.effect(
     return Service.of({
       status,
       clients,
+      lazyServers,
       instructions,
       tools,
       prompts,
@@ -979,6 +1125,8 @@ const layer = Layer.effect(
       resourceTemplates,
       add,
       connect,
+      ensureConnected,
+      configuredServer,
       disconnect,
       getPrompt,
       readResource,

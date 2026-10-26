@@ -1,6 +1,7 @@
 import { test, expect } from "bun:test"
 import {
   formatImportFileError,
+  importedInfo,
   parseShareUrl,
   shouldAttachShareAuthHeaders,
   transformShareData,
@@ -87,4 +88,17 @@ test("returns null for invalid share data", () => {
   expect(transformShareData([])).toBeNull()
   expect(transformShareData([{ type: "message", data: {} as any }])).toBeNull()
   expect(transformShareData([{ type: "session", data: { id: "s" } as any }])).toBeNull() // no messages
+})
+
+test("strips MCP activation metadata from imported sessions", () => {
+  expect(
+    importedInfo({
+      id: "sess-1",
+      title: "Test",
+      metadata: {
+        "opencode.mcp.activated.v1": ["lazy"],
+        keep: true,
+      },
+    } as unknown as Parameters<typeof importedInfo>[0]).metadata,
+  ).toEqual({ keep: true })
 })

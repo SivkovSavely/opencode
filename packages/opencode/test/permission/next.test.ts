@@ -282,6 +282,12 @@ test("evaluate - exact pattern match", () => {
   expect(result.action).toBe("deny")
 })
 
+test("evaluate - mcp_enable exact grant does not expand server-name wildcards", () => {
+  const rules = [{ permission: "mcp_enable", pattern: "=team*", action: "allow" as const }]
+  expect(Permission.evaluate("mcp_enable", "team*", rules).action).toBe("allow")
+  expect(Permission.evaluate("mcp_enable", "team-one", rules).action).toBe("ask")
+})
+
 test("evaluate - wildcard pattern match", () => {
   const result = Permission.evaluate("bash", "rm", [{ permission: "bash", pattern: "*", action: "allow" }])
   expect(result.action).toBe("allow")

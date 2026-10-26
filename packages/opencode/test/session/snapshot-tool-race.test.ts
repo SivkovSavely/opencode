@@ -37,6 +37,7 @@ const mcp = Layer.succeed(
   MCP.Service.of({
     status: () => Effect.succeed({}),
     clients: () => Effect.succeed({}),
+    lazyServers: () => Effect.succeed([]),
     instructions: () => Effect.succeed([]),
     tools: () => Effect.succeed({}),
     prompts: () => Effect.succeed({}),
@@ -44,6 +45,8 @@ const mcp = Layer.succeed(
     resourceTemplates: () => Effect.succeed({}),
     add: () => Effect.succeed({ status: { status: "disabled" as const } }),
     connect: () => Effect.void,
+    ensureConnected: () => Effect.succeed({ status: "failed", error: "unexpected MCP connection" }),
+    configuredServer: () => Effect.succeed(false),
     disconnect: () => Effect.void,
     getPrompt: () => Effect.succeed(undefined),
     readResource: () => Effect.succeed(undefined),

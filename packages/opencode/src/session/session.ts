@@ -38,12 +38,13 @@ import { SessionID, MessageID, PartID } from "./schema"
 
 import type { Provider } from "@/provider/provider"
 import { Global } from "@opencode-ai/core/global"
-import { Effect, Layer, Option, Context, Schema, Types } from "effect"
+import { Effect, Layer, Option, Context, Schema, Types, Semaphore } from "effect"
 import { NonNegativeInt, optional } from "@opencode-ai/core/schema"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { SessionMessage } from "@opencode-ai/schema/session-message"
+import { McpActivation } from "./mcp-activation"
 
 const parentTitlePrefix = "New session - "
 const childTitlePrefix = "Child session - "
@@ -428,6 +429,11 @@ export interface Interface {
   readonly setTitle: (input: { sessionID: SessionID; title: string }) => Effect.Effect<void>
   readonly setArchived: (input: { sessionID: SessionID; time?: number }) => Effect.Effect<void>
   readonly setMetadata: (input: typeof SetMetadataInput.Type) => Effect.Effect<void>
+  readonly addMcpActivation: (input: {
+    sessionID: SessionID
+    name: string
+    signal?: AbortSignal
+  }) => Effect.Effect<boolean>
   readonly setAgentModel: (input: {
     sessionID: SessionID
     agent: string
@@ -495,6 +501,15 @@ const layer: Layer.Layer<
     const background = yield* BackgroundJob.Service
     const events = yield* EventV2Bridge.Service
     const flags = yield* RuntimeFlags.Service
+    const mcpActivationLocks = new Map<string, Semaphore.Semaphore>()
+    const mcpActivationLock = (sessionID: SessionID) => {
+      let lock = mcpActivationLocks.get(sessionID)
+      if (!lock) {
+        lock = Semaphore.makeUnsafe(1)
+        mcpActivationLocks.set(sessionID, lock)
+      }
+      return lock
+    }
 
     const createNext = Effect.fn("Session.createNext")(function* (input: {
       id?: SessionID
@@ -521,7 +536,7 @@ const layer: Layer.Layer<
         title: input.title ?? (input.parentID ? childTitlePrefix : parentTitlePrefix) + new Date().toISOString(),
         agent: input.agent,
         model: input.model,
-        metadata: input.metadata,
+        metadata: McpActivation.without(input.metadata),
         permission: input.permission ? [...input.permission] : undefined,
         cost: 0,
         tokens: EmptyTokens,
@@ -697,7 +712,7 @@ const layer: Layer.Layer<
         path: sessionPath(ctx.worktree, ctx.directory),
         workspaceID: original.workspaceID,
         title,
-        metadata: structuredClone(original.metadata),
+        metadata: McpActivation.without(structuredClone(original.metadata)),
       })
       const msgs = yield* messages({ sessionID: input.sessionID })
       const idMap = new Map<string, MessageID>()
@@ -731,7 +746,7 @@ const layer: Layer.Layer<
       return session
     })
 
-    const patch = (sessionID: SessionID, info: Patch) =>
+    const patchLocked = (sessionID: SessionID, info: Patch) =>
       Effect.gen(function* () {
         const current = yield* get(sessionID)
         const next = {
@@ -746,6 +761,9 @@ const layer: Layer.Layer<
         yield* events.publish(SessionV1.Event.Updated, { sessionID, info: next })
       })
 
+    const patch = (sessionID: SessionID, info: Patch) =>
+      mcpActivationLock(sessionID).withPermits(1)(patchLocked(sessionID, info))
+
     const touch = Effect.fn("Session.touch")(function* (sessionID: SessionID) {
       yield* patch(sessionID, { time: { updated: Date.now() } }).pipe(Effect.orDie)
     })
@@ -759,7 +777,40 @@ const layer: Layer.Layer<
     })
 
     const setMetadata = Effect.fn("Session.setMetadata")(function* (input: typeof SetMetadataInput.Type) {
-      yield* patch(input.sessionID, { metadata: input.metadata, time: { updated: Date.now() } }).pipe(Effect.orDie)
+      return yield* mcpActivationLock(input.sessionID).withPermits(1)(
+        Effect.gen(function* () {
+          const current = yield* get(input.sessionID).pipe(Effect.orDie)
+          const metadata = McpActivation.without(input.metadata)
+          const names = McpActivation.names(current.metadata)
+          yield* patchLocked(input.sessionID, {
+            metadata: names.length > 0 ? { ...metadata, [McpActivation.METADATA_KEY]: names } : metadata,
+            time: { updated: Date.now() },
+          }).pipe(Effect.orDie)
+        }),
+      )
+    })
+
+    const addMcpActivation = Effect.fn("Session.addMcpActivation")(function* (input: {
+      sessionID: SessionID
+      name: string
+      signal?: AbortSignal
+    }) {
+      return yield* mcpActivationLock(input.sessionID).withPermits(1)(
+        Effect.uninterruptible(
+          Effect.gen(function* () {
+            if (input.signal?.aborted) return false
+            const current = yield* get(input.sessionID).pipe(Effect.orDie)
+            const names = McpActivation.names(current.metadata)
+            if (names.includes(input.name)) return true
+            if (input.signal?.aborted) return false
+            yield* patchLocked(input.sessionID, {
+              metadata: { ...current.metadata, [McpActivation.METADATA_KEY]: [...names, input.name] },
+              time: { updated: Date.now() },
+            }).pipe(Effect.orDie)
+            return true
+          }),
+        ),
+      )
     })
 
     const setAgentModel = Effect.fn("Session.setAgentModel")(function* (input: {
@@ -913,6 +964,7 @@ const layer: Layer.Layer<
       setTitle,
       setArchived,
       setMetadata,
+      addMcpActivation,
       setAgentModel,
       setPermission,
       setRevert,

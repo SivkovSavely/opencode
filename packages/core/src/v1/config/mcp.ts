@@ -17,6 +17,9 @@ export const Local = Schema.Struct({
   enabled: Schema.optional(Schema.Boolean).annotate({
     description: "Enable or disable the MCP server on startup",
   }),
+  description: Schema.optional(Schema.String).annotate({
+    description: "Human-readable description of the MCP server",
+  }),
   timeout: Schema.optional(PositiveInt).annotate({
     description: "Timeout in ms for MCP server requests. Defaults to 5000 (5 seconds) if not specified.",
   }),
@@ -46,6 +49,9 @@ export const Remote = Schema.Struct({
   url: Schema.String.annotate({ description: "URL of the remote MCP server" }),
   enabled: Schema.optional(Schema.Boolean).annotate({
     description: "Enable or disable the MCP server on startup",
+  }),
+  description: Schema.optional(Schema.String).annotate({
+    description: "Human-readable description of the MCP server",
   }),
   headers: Schema.optional(Schema.Record(Schema.String, Schema.String)).annotate({
     description: "Headers to send with the request",

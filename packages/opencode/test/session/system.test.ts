@@ -48,6 +48,11 @@ const it = testEffect(
     [
       MCP.node,
       Layer.mock(MCP.Service, {
+        lazyServers: () =>
+          Effect.succeed([
+            { name: "lazy-server", description: "Search private project data." },
+            { name: "missing-description" },
+          ]),
         instructions: () =>
           Effect.succeed([
             {
@@ -136,6 +141,9 @@ describe("session.system", () => {
 
       expect(output).toBe(
         [
+          "Available lazy MCP servers. Call mcp_enable with a server name to activate its tools:",
+          "- lazy-server: Search private project data.",
+          "- missing-description: No description provided.",
           "<mcp_instructions>",
           '  <server name="guide-server">',
           "    Use lookup before mutate.",
@@ -156,6 +164,9 @@ describe("session.system", () => {
 
       expect(output).toBe(
         [
+          "Available lazy MCP servers. Call mcp_enable with a server name to activate its tools:",
+          "- lazy-server: Search private project data.",
+          "- missing-description: No description provided.",
           "<mcp_instructions>",
           '  <server name="guide-server">',
           "    Use lookup before mutate.",
@@ -163,6 +174,16 @@ describe("session.system", () => {
           "</mcp_instructions>",
         ].join("\n"),
       )
+    }),
+  )
+
+  it.effect("does not advertise lazy MCP servers denied by mcp_enable permission", () =>
+    Effect.gen(function* () {
+      const prompt = yield* SystemPrompt.Service
+      const output = yield* prompt.mcp(build, Permission.fromConfig({ mcp_enable: { "lazy-server": "deny" } }))
+
+      expect(output).not.toContain("lazy-server")
+      expect(output).toContain("missing-description")
     }),
   )
 })
