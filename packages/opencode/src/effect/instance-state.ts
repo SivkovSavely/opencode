@@ -1,4 +1,4 @@
-import { Effect, ScopedCache, Scope } from "effect"
+import { Cause, Effect, Exit, ScopedCache, Scope } from "effect"
 import type { InstanceContext } from "@/project/instance-context"
 import { InstanceRef, WorkspaceRef } from "./instance-ref"
 import { registerDisposer } from "./instance-registry"
@@ -27,8 +27,11 @@ export const make = <A, E = never, R = never>(
   init: (ctx: InstanceContext) => Effect.Effect<A, E, R | Scope.Scope>,
 ): Effect.Effect<InstanceState<A, E, Exclude<R, Scope.Scope>>, never, R | Scope.Scope> =>
   Effect.gen(function* () {
-    const cache = yield* ScopedCache.make<string, A, E, R>({
+    const cache = yield* ScopedCache.makeWith<string, A, E, R>({
       capacity: Number.POSITIVE_INFINITY,
+      // A cancelled initializer must not poison the directory until disposal.
+      timeToLive: (exit) =>
+        Exit.isFailure(exit) && Cause.hasInterruptsOnly(exit.cause) ? 0 : Number.POSITIVE_INFINITY,
       lookup: () =>
         Effect.gen(function* () {
           return yield* init(yield* context)

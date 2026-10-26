@@ -2,7 +2,7 @@ import { expect } from "bun:test"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { $ } from "bun"
-import { Context, Deferred, Duration, Effect, Exit, Fiber, Layer } from "effect"
+import { Cause, Context, Deferred, Duration, Effect, Exit, Fiber, Layer } from "effect"
 import { InstanceState } from "@/effect/instance-state"
 import {
   disposeAllInstancesEffect,
@@ -11,7 +11,7 @@ import {
   testInstanceStoreLayer,
   tmpdirScoped,
 } from "../fixture/fixture"
-import { testEffect } from "../lib/effect"
+import { awaitWithTimeout, testEffect } from "../lib/effect"
 
 const it = testEffect(Layer.mergeAll(LayerNode.compile(CrossSpawnSpawner.node), testInstanceStoreLayer))
 
@@ -52,6 +52,150 @@ it.live("InstanceState isolates directories", () =>
     expect(a).toBe(c)
     expect(a).not.toBe(b)
     expect(n).toBe(2)
+  }),
+)
+
+it.live("InstanceState recovers interrupted initialization without affecting other directories", () =>
+  Effect.gen(function* () {
+    const one = yield* tmpdirScoped()
+    const two = yield* tmpdirScoped()
+    const started = yield* Deferred.make<void>()
+    const released: string[] = []
+    let n = 0
+    const state = yield* InstanceState.make((ctx) =>
+      Effect.gen(function* () {
+        const value = yield* Effect.acquireRelease(
+          Effect.sync(() => ({ directory: ctx.directory, n: ++n })),
+          (value) =>
+            Effect.sync(() => {
+              released.push(`${value.directory}:${value.n}`)
+            }),
+        )
+        if (ctx.directory === one && value.n === 1) {
+          yield* Deferred.succeed(started, undefined)
+          yield* Effect.never
+        }
+        return value
+      }),
+    )
+
+    const first = yield* access(state, one).pipe(Effect.forkScoped)
+    yield* Deferred.await(started)
+    const healthy = yield* access(state, two)
+    yield* Fiber.interrupt(first)
+    const interrupted = yield* Fiber.await(first)
+    expect(Exit.isFailure(interrupted) && Cause.hasInterruptsOnly(interrupted.cause)).toBe(true)
+
+    const recovered = yield* access(state, one)
+    expect(recovered).toEqual({ directory: one, n: 3 })
+    expect(released).toEqual([`${one}:1`])
+    expect(yield* access(state, one)).toBe(recovered)
+    expect(yield* access(state, two)).toBe(healthy)
+    expect(n).toBe(3)
+
+    yield* reloadInstance({ directory: one })
+    expect(released).toEqual([`${one}:1`, `${one}:3`])
+    const reloaded = yield* access(state, one)
+    expect(reloaded).not.toBe(recovered)
+    yield* disposeAllInstancesEffect
+    expect(released.sort()).toEqual([`${one}:1`, `${one}:3`, `${one}:4`, `${two}:2`].sort())
+  }),
+)
+
+it.live("InstanceState releases interrupted resources on scope closure without another lookup", () =>
+  Effect.gen(function* () {
+    const dir = yield* tmpdirScoped()
+    const started = yield* Deferred.make<void>()
+    let acquired = 0
+    let released = 0
+
+    yield* Effect.gen(function* () {
+      const state = yield* InstanceState.make(() =>
+        Effect.gen(function* () {
+          yield* Effect.acquireRelease(
+            Effect.sync(() => {
+              acquired += 1
+            }),
+            () =>
+              Effect.sync(() => {
+                released += 1
+              }),
+          )
+          yield* Deferred.succeed(started, undefined)
+          return yield* Effect.never
+        }),
+      )
+      const fiber = yield* access(state, dir).pipe(Effect.forkScoped)
+      yield* Deferred.await(started)
+      yield* Fiber.interrupt(fiber)
+    }).pipe(Effect.scoped)
+
+    expect(acquired).toBe(1)
+    expect(released).toBe(1)
+  }),
+)
+
+it.live("InstanceState keeps ordinary failures and mixed interruption causes cached", () =>
+  Effect.gen(function* () {
+    const dir = yield* tmpdirScoped()
+    const defect = new Error("initialization defect")
+    for (const cause of [
+      Cause.fail("initialization failure"),
+      Cause.die(defect),
+      Cause.combine(Cause.interrupt(), Cause.die(defect)),
+      Cause.combine(Cause.interrupt(), Cause.fail("initialization failure")),
+    ]) {
+      let n = 0
+      const state = yield* InstanceState.make(() =>
+        Effect.gen(function* () {
+          n += 1
+          return yield* Effect.failCause(cause)
+        }),
+      )
+      const first = yield* access(state, dir).pipe(Effect.exit)
+      const second = yield* access(state, dir).pipe(Effect.exit)
+      expect(Exit.isFailure(first)).toBe(true)
+      expect(second).toEqual(first)
+      expect(n).toBe(1)
+    }
+  }),
+)
+
+it.live("InstanceState shares recovery initialization and ignores cancellation of a waiter", () =>
+  Effect.gen(function* () {
+    const dir = yield* tmpdirScoped()
+    const started = yield* Deferred.make<void>()
+    const gate = yield* Deferred.make<void>()
+    let n = 0
+    const state = yield* InstanceState.make(() =>
+      Effect.gen(function* () {
+        n += 1
+        if (n === 1) return yield* Effect.interrupt
+        yield* Deferred.succeed(started, undefined)
+        yield* Deferred.await(gate)
+        return { n }
+      }),
+    )
+
+    yield* Effect.gen(function* () {
+      const interrupted = yield* InstanceState.get(state).pipe(Effect.exit)
+      expect(Exit.isFailure(interrupted) && Cause.hasInterruptsOnly(interrupted.cause)).toBe(true)
+
+      const owner = yield* InstanceState.get(state).pipe(Effect.forkScoped)
+      yield* awaitWithTimeout(Deferred.await(started), "recovery initialization did not start")
+      const waiter = yield* InstanceState.get(state).pipe(Effect.forkScoped({ startImmediately: true }))
+      const cancelled = yield* InstanceState.get(state).pipe(Effect.forkScoped({ startImmediately: true }))
+      yield* Fiber.interrupt(cancelled)
+      const exit = yield* Fiber.await(cancelled)
+      expect(Exit.isFailure(exit) && Cause.hasInterruptsOnly(exit.cause)).toBe(true)
+      expect(n).toBe(2)
+
+      yield* Deferred.succeed(gate, undefined)
+      const value = yield* Fiber.join(owner)
+      expect(yield* Fiber.join(waiter)).toBe(value)
+      expect(yield* InstanceState.get(state)).toBe(value)
+      expect(n).toBe(2)
+    }).pipe(provideInstanceEffect(dir))
   }),
 )
 
