@@ -17,10 +17,15 @@ import { globalHandlers } from "../../src/server/routes/instance/httpapi/handler
 import { authorizationLayer } from "../../src/server/routes/instance/httpapi/middleware/authorization"
 import { schemaErrorLayer } from "../../src/server/routes/instance/httpapi/middleware/schema-error"
 import { testEffect } from "../lib/effect"
+import { transcriptSearchHandlers } from "../../src/server/routes/instance/httpapi/handlers/transcript-search"
+import { TranscriptSearch } from "@opencode-ai/core/session/transcript-search"
+import { Database } from "@opencode-ai/core/database/database"
 
 const apiLayer = HttpRouter.serve(
   HttpApiBuilder.layer(RootHttpApi).pipe(
-    Layer.provide([controlHandlers, controlPlaneHandlers, globalHandlers]),
+    Layer.provide([controlHandlers, controlPlaneHandlers, globalHandlers, transcriptSearchHandlers]),
+    Layer.provide(TranscriptSearch.layer),
+    Layer.provide(Database.layerFromPath(":memory:")),
     Layer.provide([authorizationLayer, schemaErrorLayer]),
     // Raw HttpApi routes expose an opaque handler context at the request boundary.
     // oxlint-disable-next-line typescript-eslint/no-unsafe-type-assertion
@@ -44,7 +49,9 @@ const apiLayer = HttpRouter.serve(
       list: () => Effect.succeed(["/repo"]),
       apply: (operation) =>
         Effect.succeed(
-          operation.type === "add" ? [operation.directory, "/repo"] : GlobalProjectList.applyOperation(["/repo"], operation),
+          operation.type === "add"
+            ? [operation.directory, "/repo"]
+            : GlobalProjectList.applyOperation(["/repo"], operation),
         ),
     }),
   ),
@@ -53,6 +60,84 @@ const apiLayer = HttpRouter.serve(
 const it = testEffect(apiLayer)
 
 describe("global HttpApi", () => {
+  it.live("exposes global transcript readiness, search and historical facets", () =>
+    Effect.gen(function* () {
+      const status = yield* HttpClientRequest.get("/global/transcript/search/status").pipe(HttpClient.execute)
+      expect(status.status).toBe(200)
+      expect(yield* status.json).toEqual({ ready: false, backfillCursor: "" })
+      const search = yield* HttpClientRequest.post("/global/transcript/search").pipe(
+        HttpClientRequest.bodyJsonUnsafe({ query: "literal.*", limit: 5, projectID: "absent" }),
+        HttpClient.execute,
+      )
+      expect([search.status, yield* search.json]).toEqual([
+        200,
+        {
+          hits: [],
+          nextCursor: null,
+          scanned: 0,
+          complete: false,
+          scanLimit: 500,
+          contentLimit: 65536,
+          scanLimited: false,
+          truncatedDocuments: 0,
+          status: { ready: false, backfillCursor: "" },
+        },
+      ])
+      const backfill = yield* HttpClientRequest.post("/global/transcript/search/backfill").pipe(HttpClient.execute)
+      expect(backfill.status).toBe(200)
+      expect(yield* backfill.json).toEqual({ ready: true, backfillCursor: "" })
+      const indexed = yield* HttpClientRequest.get("/global/transcript/search/status").pipe(HttpClient.execute)
+      expect(yield* indexed.json).toEqual({ ready: true, backfillCursor: "" })
+      const facets = yield* HttpClientRequest.get("/global/transcript/search/facets").pipe(HttpClient.execute)
+      expect(facets.status).toBe(200)
+      expect(yield* facets.json).toEqual({
+        projects: [],
+        agents: [],
+        providers: [],
+        models: [],
+        tools: [],
+        agentDetails: [],
+        providerDetails: [],
+        modelDetails: [],
+        toolDetails: [],
+        modelIdentities: [],
+        projectDetails: [],
+        truncated: false,
+      })
+    }),
+  )
+
+  it.live("rejects unsafe regex with a typed public error", () =>
+    Effect.gen(function* () {
+      const response = yield* HttpClientRequest.post("/global/transcript/search").pipe(
+        HttpClientRequest.bodyJsonUnsafe({ query: "(a+)+$", mode: "regex" }),
+        HttpClient.execute,
+      )
+      expect(response.status).toBe(400)
+      expect(yield* response.json).toMatchObject({
+        _tag: "InvalidRequestError",
+        message: expect.stringContaining("quantifiers"),
+      })
+    }),
+  )
+
+  it.live("rejects unbounded transcript search payloads", () =>
+    Effect.gen(function* () {
+      for (const payload of [
+        { query: "" },
+        { query: "x", limit: 101 },
+        { query: "x".repeat(257) },
+        { query: "x", mode: "unknown" },
+      ]) {
+        const response = yield* HttpClientRequest.post("/global/transcript/search").pipe(
+          HttpClientRequest.bodyJsonUnsafe(payload),
+          HttpClient.execute,
+        )
+        expect(response.status).toBe(400)
+      }
+    }),
+  )
+
   it.live("upgrades to the requested version", () =>
     Effect.gen(function* () {
       const response = yield* HttpClientRequest.post(GlobalPaths.upgrade).pipe(

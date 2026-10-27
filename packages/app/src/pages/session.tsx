@@ -878,6 +878,7 @@ export default function Page() {
   let scroller: HTMLDivElement | undefined
   let content: HTMLDivElement | undefined
   let revealMessage = (_id: string) => {}
+  let revealTarget = (_target: { messageID: string; partID?: string }) => {}
   let scrollToEnd = () => {}
   let scrollMark = 0
   let messageMark = 0
@@ -1945,6 +1946,16 @@ export default function Page() {
     sessionID: () => params.id,
     messagesReady,
     visibleUserMessages,
+    messages: timeline.messages,
+    parts: (messageID) => sync().data.part[messageID] ?? [],
+    userMessageForTarget: (target) => {
+      const message = timeline.messages().find((item) => item.id === target.messageID)
+      if (message?.role === "user") return message
+      if (message?.role !== "assistant") return
+      return timeline
+        .messages()
+        .find((item): item is UserMessage => item.role === "user" && item.id === message.parentID)
+    },
     historyMore,
     historyLoading,
     loadMore: async (sessionID) => {
@@ -1964,6 +1975,7 @@ export default function Page() {
     scroller: () => scroller,
     anchor,
     revealMessage: (id) => revealMessage(id),
+    revealTarget: (target) => revealTarget(target),
     scheduleScrollState,
     consumePendingMessage: layout.pendingMessage.consume,
   })
@@ -2133,6 +2145,9 @@ export default function Page() {
                   anchor={anchor}
                   setRevealMessage={(fn) => {
                     revealMessage = fn
+                  }}
+                  setRevealTarget={(fn) => {
+                    revealTarget = fn
                   }}
                   setScrollToEnd={(fn) => {
                     scrollToEnd = fn

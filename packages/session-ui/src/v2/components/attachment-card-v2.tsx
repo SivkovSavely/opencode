@@ -11,12 +11,16 @@ export function AttachmentCardV2(props: {
   /** native title attribute */
   hover?: string
   titleRef?: (element: HTMLSpanElement) => void
+  messageID?: string
+  partID?: string
   onClick?: () => void
   children: JSX.Element
 }) {
   return (
     <div
       data-component="attachment-card-v2"
+      data-timeline-message-id={props.messageID}
+      data-timeline-part-id={props.partID}
       data-active={props.active ? "true" : undefined}
       data-clickable={props.clickable ? "true" : undefined}
       data-wide={props.wide ? "true" : undefined}

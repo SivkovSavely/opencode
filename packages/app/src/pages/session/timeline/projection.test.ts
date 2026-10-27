@@ -2,14 +2,15 @@ import { describe, expect, test } from "bun:test"
 import type { PartGroup } from "@opencode-ai/session-ui/message-part"
 import { reuseTimelineRows } from "./row-reconciliation"
 import { TimelineRow } from "./timeline-row"
+import { partRowIndices } from "./part-row-index"
 
-const context = (key: string, partIDs: string[], userMessageID = "user-1") =>
+const context = (key: string, partIDs: string[], userMessageID = "user-1", messageID = "assistant-1") =>
   new TimelineRow.AssistantPart({
     userMessageID,
     group: {
       key,
       type: "context",
-      refs: partIDs.map((partID) => ({ messageID: "assistant-1", partID })),
+      refs: partIDs.map((partID) => ({ messageID, partID })),
     } satisfies PartGroup,
     previousAssistantPart: false,
   })
@@ -92,5 +93,17 @@ describe("reuseTimelineRows", () => {
     expect(keys(result)).toEqual([...expected])
     expect(new Set(keys(result)).size).toBe(result.length)
     reused.forEach(([resultIndex, previousIndex]) => expect(result[resultIndex]).toBe(previous[previousIndex]))
+  })
+})
+
+describe("partRowIndices", () => {
+  test("keeps repeated part IDs qualified by their message", () => {
+    const indices = partRowIndices([
+      context("first", ["repeated-call"], "user-1", "assistant-1"),
+      context("second", ["repeated-call"], "user-2", "assistant-2"),
+    ])
+
+    expect(indices.get("assistant-1")?.get("repeated-call")).toBe(0)
+    expect(indices.get("assistant-2")?.get("repeated-call")).toBe(1)
   })
 })

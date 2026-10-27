@@ -84,6 +84,21 @@ export default {
         );
       `)
       yield* tx.run(`
+        CREATE TABLE \`transcript_search_state\` (
+          \`id\` integer PRIMARY KEY,
+          \`cursor\` text NOT NULL,
+          \`ready\` integer NOT NULL
+        );
+      `)
+      yield* tx.run(`
+        CREATE TABLE \`transcript_search\` (
+          \`part_id\` text PRIMARY KEY,
+          \`body\` text NOT NULL,
+          \`truncated\` integer NOT NULL,
+          CONSTRAINT \`fk_transcript_search_part_id_part_id_fk\` FOREIGN KEY (\`part_id\`) REFERENCES \`part\`(\`id\`) ON DELETE CASCADE
+        );
+      `)
+      yield* tx.run(`
         CREATE TABLE \`account_state\` (
           \`id\` integer PRIMARY KEY,
           \`active_account_id\` text,

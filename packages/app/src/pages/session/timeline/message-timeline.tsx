@@ -83,6 +83,7 @@ import { DialogJumpToMessage } from "./dialog-jump-to-message"
 import type { useSessionQueue } from "@/context/session-queue"
 import { DialogSessionQueue } from "@/components/dialog-session-queue"
 import "./queue.css"
+import "./search-target.css"
 
 const emptyMessages: MessageType[] = []
 const emptyParts: PartType[] = []
@@ -266,6 +267,7 @@ export function MessageTimeline(props: {
   onJumpDialogOpen: (open: boolean, sessionKey: string, selected?: boolean) => void
   anchor: (id: string) => string
   setRevealMessage?: (fn: (id: string) => void) => void
+  setRevealTarget?: (fn: (target: { messageID: string; partID?: string }) => void) => void
   setScrollToEnd?: (fn: () => void) => void
   setHistoryAnchor?: (handlers: { capture: () => void; restore: (done: boolean) => void; cancel: () => void }) => void
 }) {
@@ -407,6 +409,7 @@ export function MessageTimeline(props: {
   const messageRowIndex = projection.messageRowIndex
   const timelineRowByKey = projection.rowByKey
   const timelineRows = projection.rows
+  const partRowIndex = projection.partRowIndex
 
   let prependAnchor: { key: string; offset: number } | undefined
   let prependAnchorFrame: number | undefined
@@ -563,6 +566,29 @@ export function MessageTimeline(props: {
       if (index === undefined) return
       virtualizer.scrollToIndex(index, { align: "center" })
     })
+    props.setRevealTarget?.((target) => {
+      const message = messageByID().get(target.messageID)
+      const userMessageID =
+        message?.role === "user" ? message.id : message?.role === "assistant" ? message.parentID : undefined
+      if (!userMessageID) return
+      const partIndex = target.partID ? partRowIndex().get(target.messageID)?.get(target.partID) : undefined
+      if (partIndex !== undefined) {
+        const row = timelineRows()[partIndex]
+        if (row?._tag === "AssistantPart") {
+          if (row.group.type === "context") setToolOpen(`context:${row.group.key}`, true)
+          if (getMsgPart(target.messageID, target.partID!)?.type === "tool") setToolOpen(target.partID!, true)
+        }
+        virtualizer.scrollToIndex(partIndex, { align: "center" })
+        return
+      }
+      const errorIndex = timelineRows().findIndex(
+        (row) =>
+          (row._tag === "Error" && row.messageID === target.messageID) ||
+          (row._tag === "TurnDivider" && row.messageID === target.messageID),
+      )
+      const index = errorIndex >= 0 ? errorIndex : messageRowIndex().get(userMessageID)
+      if (index !== undefined) virtualizer.scrollToIndex(index, { align: "center" })
+    })
     props.setScrollToEnd?.(() => virtualizer.scrollToEnd())
     props.setHistoryAnchor?.({
       capture: capturePrependAnchor,
@@ -611,6 +637,7 @@ export function MessageTimeline(props: {
     if (resizePinFrame !== undefined) cancelAnimationFrame(resizePinFrame)
     if (overscanFrame !== undefined) cancelAnimationFrame(overscanFrame)
     props.setRevealMessage?.(() => {})
+    props.setRevealTarget?.(() => {})
     props.setScrollToEnd?.(() => {})
     props.setHistoryAnchor?.({ capture: () => {}, restore: () => {}, cancel: () => {} })
   })
@@ -1129,20 +1156,27 @@ export function MessageTimeline(props: {
   }
 
   function TimelineRowFrame(input: { row: Accessor<FramedTimelineRow>; children: JSX.Element }) {
+    const row = () => input.row()
     const anchor = () => {
-      const row = input.row()
-      return row._tag === "CommentStrip" || (row._tag === "UserMessage" && row.anchor)
+      const value = row()
+      return value._tag === "CommentStrip" || (value._tag === "UserMessage" && value.anchor)
     }
     const previousAssistantPart = () => {
-      const row = input.row()
-      return row._tag === "AssistantPart" && row.previousAssistantPart
+      const value = row()
+      return value._tag === "AssistantPart" && value.previousAssistantPart
+    }
+    const searchMessageID = () => {
+      const value = row()
+      if (value._tag === "Error") return value.messageID
+      if (value._tag === "TurnDivider" && value.label === "interrupted") return value.messageID
     }
 
     return (
       <div
-        id={anchor() ? props.anchor(input.row().userMessageID) : undefined}
-        data-message-id={input.row().userMessageID}
-        data-timeline-row={input.row()._tag}
+        id={anchor() ? props.anchor(row().userMessageID) : undefined}
+        data-message-id={row().userMessageID}
+        data-search-message-id={searchMessageID()}
+        data-timeline-row={row()._tag}
         classList={{
           "min-w-0 w-full max-w-full": true,
           "md:max-w-200 2xl:max-w-[1000px]": props.centered,

@@ -259,6 +259,14 @@ import type {
   ToolIdsResponses,
   ToolListErrors,
   ToolListResponses,
+  TranscriptSearchBackfillErrors,
+  TranscriptSearchBackfillResponses,
+  TranscriptSearchFacetsErrors,
+  TranscriptSearchFacetsResponses,
+  TranscriptSearchSearchErrors,
+  TranscriptSearchSearchResponses,
+  TranscriptSearchStatusErrors,
+  TranscriptSearchStatusResponses,
   TuiAppendPromptErrors,
   TuiAppendPromptResponses,
   TuiClearPromptErrors,
@@ -1510,6 +1518,137 @@ export class Global extends HeyApiClient {
   private _runtime?: Runtime
   get runtime2(): Runtime {
     return (this._runtime ??= new Runtime({ client: this.client }))
+  }
+}
+
+export class TranscriptSearch extends HeyApiClient {
+  /**
+   * Search persisted transcripts
+   *
+   * Read-only search of persisted transcripts, including historical multi-value identities and category-specific tool input/output/errors. Literal queries of at least three characters use SQLite FTS5 trigram candidate selection; shorter literals use the bounded document scan. Dates are inclusive matching-content timestamps in milliseconds. Running includes pending; interrupted requires explicit tool metadata, not error text. Default sort is newest; oldest and session-title use deterministic message/document tie breakers. Opaque cursors are bound to the query and filters, not limit; reset when parameters change or backfill becomes ready. Metadata is live, not snapshot-isolated: edits to sort/filter fields between pages can move documents. Matches at most 500 eligible documents per page; follow nextCursor even on empty pages. complete means the indexed, bounded-content range is exhausted and backfill is ready, not that truncated text was searched. Each content category is limited to 65536 SQLite characters; truncatedDocuments counts capped documents scanned on this page, even without matches. Hit offsets are UTF-16. Assistant errors have no partID. Regex accepts /source/flags or source plus flags (gimsu); g is ignored for first-match search. Supports literals, escapes, dot, classes and anchors, not groups, alternation or quantifiers; regexes require a literal run of at least three characters for candidate selection.
+   */
+  public search<ThrowOnError extends boolean = false>(
+    parameters?: {
+      query?: string
+      mode?: "literal" | "regex"
+      caseSensitive?: boolean
+      cursor?: string
+      limit?: number
+      projectID?: string
+      sessionID?: string
+      role?: "user" | "assistant"
+      agent?: string
+      providerID?: string
+      modelID?: string
+      projectIDs?: Array<string>
+      agents?: Array<string>
+      providerIDs?: Array<string>
+      modelIDs?: Array<string>
+      models?: Array<{
+        providerID: string
+        modelID: string
+      }>
+      roles?: Array<"user" | "assistant">
+      categories?: Array<"text" | "file" | "tool-input" | "tool-output" | "tool-error" | "assistant-error">
+      toolNames?: Array<string>
+      toolStatuses?: Array<"running" | "completed" | "error" | "interrupted">
+      dateFrom?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+      dateTo?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+      sessionKind?: "all" | "root" | "subagent"
+      archived?: "all" | "active" | "archived"
+      sort?: "newest" | "oldest" | "session-title"
+      flags?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "body", key: "query" },
+            { in: "body", key: "mode" },
+            { in: "body", key: "caseSensitive" },
+            { in: "body", key: "cursor" },
+            { in: "body", key: "limit" },
+            { in: "body", key: "projectID" },
+            { in: "body", key: "sessionID" },
+            { in: "body", key: "role" },
+            { in: "body", key: "agent" },
+            { in: "body", key: "providerID" },
+            { in: "body", key: "modelID" },
+            { in: "body", key: "projectIDs" },
+            { in: "body", key: "agents" },
+            { in: "body", key: "providerIDs" },
+            { in: "body", key: "modelIDs" },
+            { in: "body", key: "models" },
+            { in: "body", key: "roles" },
+            { in: "body", key: "categories" },
+            { in: "body", key: "toolNames" },
+            { in: "body", key: "toolStatuses" },
+            { in: "body", key: "dateFrom" },
+            { in: "body", key: "dateTo" },
+            { in: "body", key: "sessionKind" },
+            { in: "body", key: "archived" },
+            { in: "body", key: "sort" },
+            { in: "body", key: "flags" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).post<
+      TranscriptSearchSearchResponses,
+      TranscriptSearchSearchErrors,
+      ThrowOnError
+    >({
+      url: "/global/transcript/search",
+      ...options,
+      ...params,
+      headers: {
+        "Content-Type": "application/json",
+        ...options?.headers,
+        ...params.headers,
+      },
+    })
+  }
+
+  /**
+   * Get transcript search readiness
+   *
+   * Returns durable backfill readiness without advancing it. Use the backfill operation while ready is false; progress resumes after restart.
+   */
+  public status<ThrowOnError extends boolean = false>(options?: Options<never, ThrowOnError>) {
+    return (options?.client ?? this.client).get<
+      TranscriptSearchStatusResponses,
+      TranscriptSearchStatusErrors,
+      ThrowOnError
+    >({ url: "/global/transcript/search/status", ...options })
+  }
+
+  /**
+   * Advance transcript search backfill
+   *
+   * Indexes at most 200 persisted parts or messages. Repeat while ready is false; progress is durable and resumes after restart.
+   */
+  public backfill<ThrowOnError extends boolean = false>(options?: Options<never, ThrowOnError>) {
+    return (options?.client ?? this.client).post<
+      TranscriptSearchBackfillResponses,
+      TranscriptSearchBackfillErrors,
+      ThrowOnError
+    >({ url: "/global/transcript/search/backfill", ...options })
+  }
+
+  /**
+   * Get historical transcript facets
+   *
+   * Lists all historical projects, agents, providers, models and tool names, including removed configurations. Scalar facet details include lastUsed ranking metadata; model identities retain provider/model pairs and project details include worktree paths. Values are discovered independently of the current search query.
+   */
+  public facets<ThrowOnError extends boolean = false>(options?: Options<never, ThrowOnError>) {
+    return (options?.client ?? this.client).get<
+      TranscriptSearchFacetsResponses,
+      TranscriptSearchFacetsErrors,
+      ThrowOnError
+    >({ url: "/global/transcript/search/facets", ...options })
   }
 }
 
@@ -7420,6 +7559,11 @@ export class OpencodeClient extends HeyApiClient {
   private _global?: Global
   get global(): Global {
     return (this._global ??= new Global({ client: this.client }))
+  }
+
+  private _transcriptSearch?: TranscriptSearch
+  get transcriptSearch(): TranscriptSearch {
+    return (this._transcriptSearch ??= new TranscriptSearch({ client: this.client }))
   }
 
   private _event?: Event

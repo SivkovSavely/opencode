@@ -38,6 +38,8 @@ import { tabKey, useTabs } from "@/context/tabs"
 import type { PromptSession } from "@/context/prompt"
 import "./titlebar.css"
 import { newTabTooltipKeybind } from "./command-tooltip-keybind"
+import { useDialog } from "@opencode-ai/ui/context/dialog"
+import { DialogTranscriptSearch } from "./dialog-transcript-search"
 
 const legacyTitlebarHeight = 40
 const v2TitlebarHeight = 36
@@ -64,6 +66,8 @@ export function Titlebar(props: { update?: TitlebarUpdate; debugTools?: { visibl
   const layout = useLayout()
   const platform = usePlatform()
   const command = useCommand()
+  const dialog = useDialog()
+  const openTranscriptSearch = () => dialog.show(() => <DialogTranscriptSearch />)
   const language = useLanguage()
   const settings = useSettings()
   const server = useServer()
@@ -151,6 +155,13 @@ export function Titlebar(props: { update?: TitlebarUpdate; debugTools?: { visibl
   }
 
   command.register(() => [
+    {
+      id: "transcript.search",
+      title: language.t("transcriptSearch.title"),
+      category: language.t("command.category.view"),
+      keybind: "mod+shift+f",
+      onSelect: openTranscriptSearch,
+    },
     {
       id: "common.goBack",
       title: language.t("common.goBack"),
@@ -419,6 +430,17 @@ export function Titlebar(props: { update?: TitlebarUpdate; debugTools?: { visibl
                 </TooltipV2>
                 <div class="flex-1" />
                 <TitlebarV2Right state={v2RightState()} />
+                <TooltipV2 placement="bottom" value={language.t("transcriptSearch.title")}>
+                  <IconButtonV2
+                    type="button"
+                    variant="ghost-muted"
+                    size="large"
+                    class="shrink-0"
+                    icon={<IconV2 name="magnifying-glass" />}
+                    onClick={openTranscriptSearch}
+                    aria-label={language.t("transcriptSearch.title")}
+                  />
+                </TooltipV2>
               </div>
             )
           }}
@@ -569,6 +591,15 @@ export function Titlebar(props: { update?: TitlebarUpdate; debugTools?: { visibl
               data-tauri-drag-region
             >
               <div id="opencode-titlebar-right" class="flex items-center gap-1 shrink-0 justify-end" />
+              <Tooltip placement="bottom" value={language.t("transcriptSearch.title")}>
+                <IconButton
+                  icon="magnifying-glass"
+                  variant="ghost"
+                  class="titlebar-icon shrink-0"
+                  onClick={openTranscriptSearch}
+                  aria-label={language.t("transcriptSearch.title")}
+                />
+              </Tooltip>
               <Show when={windows()}>
                 <div class="shrink-0" style={{ width: windowsControlsWidth() }} />
               </Show>

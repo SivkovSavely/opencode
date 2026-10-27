@@ -1119,7 +1119,11 @@ export function ContextToolGroup(props: {
               const timestamp = createMemo(() => formatToolTimestamp(partAccessor().state, i18n.locale()))
               return (
                 <div data-slot="context-tool-group-item">
-                  <div data-component="tool-part-wrapper">
+                  <div
+                    data-component="tool-part-wrapper"
+                    data-timeline-message-id={partAccessor().messageID}
+                    data-timeline-part-id={partAccessor().id}
+                  >
                     <div data-slot="tool-part-content">
                       <BasicTool
                         icon="mcp"
@@ -1275,6 +1279,8 @@ export function UserMessageDisplay(props: {
                 fallback={
                   <div
                     data-slot="user-message-attachment"
+                    data-timeline-message-id={props.message.id}
+                    data-timeline-part-id={file.id}
                     data-type={type}
                     data-clickable={type === "image" ? "true" : undefined}
                     title={type === "file" ? name : undefined}
@@ -1299,6 +1305,8 @@ export function UserMessageDisplay(props: {
                 <AttachmentCardV2
                   title={getFilename(name)}
                   hover={name}
+                  messageID={props.message.id}
+                  partID={file.id}
                   clickable={!!props.actions?.openAttachment}
                   onClick={() => props.actions?.openAttachment?.(file)}
                 >
@@ -1313,7 +1321,7 @@ export function UserMessageDisplay(props: {
   )
 
   return (
-    <div data-component="user-message" data-timeline-part-id={textPart()?.id}>
+    <div data-component="user-message">
       <Show when={!props.useV2Actions}>{renderAttachments()}</Show>
       <Show
         when={text()}
@@ -1327,6 +1335,8 @@ export function UserMessageDisplay(props: {
           <div
             data-slot="user-message-text"
             dir="auto"
+            data-timeline-message-id={props.message.id}
+            data-timeline-part-id={textPart()?.id}
             data-comments={messageComments().length > 0 ? "true" : undefined}
           >
             <HighlightedText text={text()} references={inlineFiles()} agents={agents()} />
@@ -1565,21 +1575,23 @@ PART_MAPPING["tool"] = function ToolPartDisplay(props) {
   })
 
   const render = createMemo(() => ToolRegistry.render(part().tool) ?? GenericTool)
-  const rawDetails = createMemo(
-    () => () => (
-      <RawToolDetails
-        request={() => rawToolRequest(part())}
-        response={() => rawToolResponse(part())}
-        requestIncomplete={() => part().state.status === "pending"}
-      />
-    ),
-  )
+  const rawDetails = createMemo(() => () => (
+    <RawToolDetails
+      request={() => rawToolRequest(part())}
+      response={() => rawToolResponse(part())}
+      requestIncomplete={() => part().state.status === "pending"}
+    />
+  ))
   const controlledOpen = () => (props.onToolOpenChange ? (props.toolOpen ?? props.defaultOpen) : undefined)
   const handleToolOpenChange = (open: boolean) => props.onToolOpenChange?.(open)
 
   return (
     <Show when={!hideQuestion()}>
-      <div data-component="tool-part-wrapper" data-timeline-part-id={part().id}>
+      <div
+        data-component="tool-part-wrapper"
+        data-timeline-message-id={part().messageID}
+        data-timeline-part-id={part().id}
+      >
         <div data-slot="tool-part-content">
           <Switch>
             <Match when={part().state.status === "error" && (part().state as any).error}>
@@ -1752,7 +1764,7 @@ PART_MAPPING["text"] = function TextPartDisplay(props) {
 
   return (
     <Show when={text()}>
-      <div data-component="text-part" data-timeline-part-id={part().id}>
+      <div data-component="text-part" data-timeline-message-id={props.message.id} data-timeline-part-id={part().id}>
         <div data-slot="text-part-body">
           <PacedMarkdown text={text()} cacheKey={part().id} streaming={streaming()} />
         </div>
@@ -1788,7 +1800,11 @@ PART_MAPPING["reasoning"] = function ReasoningPartDisplay(props) {
 
   return (
     <Show when={text()}>
-      <div data-component="reasoning-part" data-timeline-part-id={part().id}>
+      <div
+        data-component="reasoning-part"
+        data-timeline-message-id={props.message.id}
+        data-timeline-part-id={part().id}
+      >
         <PacedMarkdown text={text()} cacheKey={part().id} streaming={streaming()} />
       </div>
     </Show>

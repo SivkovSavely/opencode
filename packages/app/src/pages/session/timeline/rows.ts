@@ -29,7 +29,7 @@ export type TimelineRowMap = {
   Thinking: { userMessageID: string; reasoningHeading?: string }
   Retry: { userMessageID: string }
   DiffSummary: { userMessageID: string; diffs: SummaryDiff[] }
-  Error: { userMessageID: string; text: string }
+  Error: { userMessageID: string; messageID: string; text: string }
 }
 
 export namespace Timeline {
@@ -117,7 +117,8 @@ export namespace Timeline {
     const compaction = userParts.some((p) => p.type === "compaction")
     const interruptedMessageIndex = assistantMessages.findIndex((m) => m.error?.name === "MessageAbortedError")
     const interrupted = interruptedMessageIndex !== -1
-    const latestError = assistantMessages.at(-1)?.error
+    const latestErrorMessage = assistantMessages.at(-1)
+    const latestError = latestErrorMessage?.error
     const error = latestError?.name === "MessageAbortedError" ? undefined : latestError
 
     const assistantPartRefs = assistantMessages.flatMap((message, messageIndex) =>
@@ -175,6 +176,7 @@ export namespace Timeline {
           new TimelineRow.TurnDivider({
             userMessageID: userMessage.id,
             label: "interrupted",
+            messageID: assistantMessages[interruptedMessageIndex]?.id,
           }),
         )
         return
@@ -221,6 +223,7 @@ export namespace Timeline {
       rows.push(
         new TimelineRow.Error({
           userMessageID: userMessage.id,
+          messageID: latestErrorMessage!.id,
           text: unwrapErrorMessage(
             typeof data === "string" ? data : data === undefined || data === null ? "" : String(data),
           ),

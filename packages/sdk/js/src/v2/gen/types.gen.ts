@@ -7749,6 +7749,215 @@ export type GlobalRuntimeShutdownResponses = {
 
 export type GlobalRuntimeShutdownResponse = GlobalRuntimeShutdownResponses[keyof GlobalRuntimeShutdownResponses]
 
+export type TranscriptSearchSearchData = {
+  body?: {
+    query: string
+    mode?: "literal" | "regex"
+    caseSensitive?: boolean
+    cursor?: string
+    limit?: number
+    projectID?: string
+    sessionID?: string
+    role?: "user" | "assistant"
+    agent?: string
+    providerID?: string
+    modelID?: string
+    projectIDs?: Array<string>
+    agents?: Array<string>
+    providerIDs?: Array<string>
+    modelIDs?: Array<string>
+    models?: Array<{
+      providerID: string
+      modelID: string
+    }>
+    roles?: Array<"user" | "assistant">
+    categories?: Array<"text" | "file" | "tool-input" | "tool-output" | "tool-error" | "assistant-error">
+    toolNames?: Array<string>
+    toolStatuses?: Array<"running" | "completed" | "error" | "interrupted">
+    dateFrom?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    dateTo?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    sessionKind?: "all" | "root" | "subagent"
+    archived?: "all" | "active" | "archived"
+    sort?: "newest" | "oldest" | "session-title"
+    flags?: string
+  }
+  path?: never
+  query?: never
+  url: "/global/transcript/search"
+}
+
+export type TranscriptSearchSearchErrors = {
+  /**
+   * InvalidRequestError
+   */
+  400: InvalidRequestError
+}
+
+export type TranscriptSearchSearchError = TranscriptSearchSearchErrors[keyof TranscriptSearchSearchErrors]
+
+export type TranscriptSearchSearchResponses = {
+  /**
+   * Success
+   */
+  200: {
+    hits: Array<{
+      partID?: string
+      documentID: string
+      messageID: string
+      navigationMessageID?: string
+      sessionID: string
+      projectID: string
+      projectPath: string
+      title: string
+      directory: string
+      role: string
+      type: string
+      category: "text" | "file" | "tool-input" | "tool-output" | "tool-error" | "assistant-error"
+      agent?: string
+      providerID?: string
+      modelID?: string
+      toolName?: string
+      toolStatus?: string
+      parentID?: string
+      archived: boolean
+      timeCreated: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+      excerpt: string
+      excerptOffset: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+      offset: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+      matchLength: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+      truncated: boolean
+    }>
+    nextCursor?: string
+    scanned: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    complete: boolean
+    scanLimit: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    contentLimit: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    scanLimited: boolean
+    truncatedDocuments: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    status: {
+      ready: boolean
+      backfillCursor: string
+    }
+  }
+}
+
+export type TranscriptSearchSearchResponse = TranscriptSearchSearchResponses[keyof TranscriptSearchSearchResponses]
+
+export type TranscriptSearchStatusData = {
+  body?: never
+  path?: never
+  query?: never
+  url: "/global/transcript/search/status"
+}
+
+export type TranscriptSearchStatusErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+}
+
+export type TranscriptSearchStatusError = TranscriptSearchStatusErrors[keyof TranscriptSearchStatusErrors]
+
+export type TranscriptSearchStatusResponses = {
+  /**
+   * Success
+   */
+  200: {
+    ready: boolean
+    backfillCursor: string
+  }
+}
+
+export type TranscriptSearchStatusResponse = TranscriptSearchStatusResponses[keyof TranscriptSearchStatusResponses]
+
+export type TranscriptSearchBackfillData = {
+  body?: never
+  path?: never
+  query?: never
+  url: "/global/transcript/search/backfill"
+}
+
+export type TranscriptSearchBackfillErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+}
+
+export type TranscriptSearchBackfillError = TranscriptSearchBackfillErrors[keyof TranscriptSearchBackfillErrors]
+
+export type TranscriptSearchBackfillResponses = {
+  /**
+   * Success
+   */
+  200: {
+    ready: boolean
+    backfillCursor: string
+  }
+}
+
+export type TranscriptSearchBackfillResponse =
+  TranscriptSearchBackfillResponses[keyof TranscriptSearchBackfillResponses]
+
+export type TranscriptSearchFacetsData = {
+  body?: never
+  path?: never
+  query?: never
+  url: "/global/transcript/search/facets"
+}
+
+export type TranscriptSearchFacetsErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+}
+
+export type TranscriptSearchFacetsError = TranscriptSearchFacetsErrors[keyof TranscriptSearchFacetsErrors]
+
+export type TranscriptSearchFacetsResponses = {
+  /**
+   * Success
+   */
+  200: {
+    projects: Array<string>
+    agents: Array<string>
+    providers: Array<string>
+    models: Array<string>
+    tools: Array<string>
+    agentDetails: Array<{
+      value: string
+      lastUsed: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    }>
+    providerDetails: Array<{
+      value: string
+      lastUsed: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    }>
+    modelDetails: Array<{
+      value: string
+      lastUsed: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    }>
+    toolDetails: Array<{
+      value: string
+      lastUsed: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    }>
+    modelIdentities: Array<{
+      providerID: string
+      modelID: string
+      lastUsed: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    }>
+    projectDetails: Array<{
+      id: string
+      path: string
+      lastUsed: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    }>
+    truncated: boolean
+  }
+}
+
+export type TranscriptSearchFacetsResponse = TranscriptSearchFacetsResponses[keyof TranscriptSearchFacetsResponses]
+
 export type EventSubscribeData = {
   body?: never
   path?: never

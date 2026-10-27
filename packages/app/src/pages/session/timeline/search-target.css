@@ -1,0 +1,8 @@
+[data-timeline-part-id].timeline-search-target,
+[data-search-message-id].timeline-search-target {
+  outline: 2px solid var(--border-focus);
+  outline-offset: 2px;
+  border-radius: 6px;
+  background: var(--surface-warning-base);
+  transition: background-color 1.8s ease-out;
+}

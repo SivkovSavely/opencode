@@ -1,6 +1,7 @@
 import type { SessionMessageInfo } from "@opencode-ai/client/promise"
 import type { AssistantMessage, Message, Part, SessionStatus, UserMessage } from "@opencode-ai/sdk/v2"
 import { createMemo, type Accessor } from "solid-js"
+import { partRowIndices } from "./part-row-index"
 import { reuseTimelineRows } from "./row-reconciliation"
 import { Timeline, TimelineRow } from "./rows"
 
@@ -60,6 +61,7 @@ export function createTimelineProjection(input: {
     })
     return result
   })
+  const partRowIndex = createMemo(() => partRowIndices(rows()))
   const lastAssistantGroupKey = createMemo(() => {
     const result = new Map<string, string>()
     rows().forEach((row) => {
@@ -75,6 +77,7 @@ export function createTimelineProjection(input: {
     messageByID,
     messageRowIndex,
     messageLastRowIndex,
+    partRowIndex,
     rowByKey,
     rows,
   }

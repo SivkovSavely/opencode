@@ -204,4 +204,35 @@ describe("current session timeline rows", () => {
 
     expect(result.rows.map((row) => row._tag)).toEqual(["UserMessage", "AssistantPart"])
   })
+
+  test("keeps an interrupted assistant message identifiable on its divider", () => {
+    const source = [
+      { id: "msg_user", type: "user", text: "stop", time: { created: 1 } },
+      {
+        id: "msg_aborted",
+        type: "assistant",
+        agent: "build",
+        model: { id: "model", providerID: "provider" },
+        content: [],
+        error: { type: "MessageAbortedError", message: "stopped" },
+        time: { created: 2, completed: 3 },
+      },
+    ] satisfies SessionMessageInfo[]
+    const normalized = normalizeSessionMessages("ses_1", source)
+    const messages = new Map(normalized.messages.map((message) => [message.id, message]))
+
+    const result = Timeline.constructSessionMessageRows(
+      source,
+      (messageID) => messages.get(messageID),
+      (messageID) => normalized.parts.get(messageID) ?? [],
+      true,
+      "idle",
+      true,
+      normalized.messages.filter((message) => message.role === "user"),
+    )
+
+    expect(result.rows.find((row) => row._tag === "TurnDivider" && row.label === "interrupted")).toMatchObject({
+      messageID: "msg_aborted",
+    })
+  })
 })

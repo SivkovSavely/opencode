@@ -18,6 +18,7 @@ export namespace TimelineRow {
   export class TurnDivider extends Data.TaggedClass("TurnDivider")<{
     userMessageID: string
     label: "compaction" | "interrupted"
+    messageID?: string
   }> {}
   export class AssistantPart extends Data.TaggedClass("AssistantPart")<{
     userMessageID: string
@@ -34,6 +35,7 @@ export namespace TimelineRow {
   }> {}
   export class Error extends Data.TaggedClass("Error")<{
     userMessageID: string
+    messageID: string
     text: string
   }> {}
   export class Retry extends Data.TaggedClass("Retry")<{
@@ -60,7 +62,7 @@ export namespace TimelineRow {
       case "UserMessage":
         return `user-message:${row.userMessageID}`
       case "TurnDivider":
-        return `turn-divider:${row.userMessageID}:${row.label}`
+        return `turn-divider:${row.userMessageID}:${row.label}${row.messageID ? `:${row.messageID}` : ""}`
       case "AssistantPart":
         return `assistant-part:${row.userMessageID}:${row.group.key}`
       case "Thinking":
@@ -68,7 +70,7 @@ export namespace TimelineRow {
       case "DiffSummary":
         return `diff-summary:${row.userMessageID}`
       case "Error":
-        return `error:${row.userMessageID}`
+        return `error:${row.userMessageID}:${row.messageID}`
       case "Retry":
         return `retry:${row.userMessageID}`
     }
