@@ -4,7 +4,7 @@ import { createCompatibleApi } from "./server-compat"
 
 function setup(
   protocol: "v1" | "v2" | Promise<"v1" | "v2"> | (() => Promise<"v1" | "v2">),
-  responses?: { vcs?: { branch: string; default_branch: string } },
+  responses?: { vcs?: { branch: string; default_branch: string }; sessions?: unknown[] },
 ) {
   const requests: Request[] = []
   const fetcher = Object.assign(
@@ -37,6 +37,8 @@ function setup(
       }
       if (request.method === "GET" && new URL(request.url).pathname === "/vcs")
         return Response.json(responses?.vcs ?? {})
+      if (request.method === "GET" && new URL(request.url).pathname === "/session")
+        return Response.json(responses?.sessions ?? [])
       if (request.method === "GET") return Response.json([])
       return new Response(undefined, { status: 204 })
     },
@@ -111,6 +113,25 @@ describe("createCompatibleApi", () => {
     expect(body.parts[2]).not.toHaveProperty("source")
   })
 
+  test("preserves session bookmarks when projecting legacy session lists", async () => {
+    const { api } = setup("v1", {
+      sessions: [
+        {
+          id: "ses_1",
+          projectID: "project",
+          directory: "/repo",
+          bookmarked: true,
+          cost: 0,
+          tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+          time: { created: 1, updated: 1 },
+          title: "Bookmarked",
+        },
+      ],
+    })
+
+    await expect(api.session.list()).resolves.toMatchObject({ data: [{ id: "ses_1", bookmarked: true }] })
+  })
+
   test("preserves original parts for V1 optimistic reconciliation", async () => {
     const { api, requests } = setup("v1")
     await api.session.prompt({
@@ -179,9 +200,12 @@ describe("createCompatibleApi", () => {
     await api.session.list()
     protocol = "v2"
     await api.session.prompt({ sessionID: "ses_1", text: "hello" })
+    protocol = "v1"
+    await api.session.prompt({ sessionID: "ses_1", text: "hello again" })
 
     expect(new URL(requests[0]!.url).pathname).toBe("/session")
     expect(new URL(requests[1]!.url).pathname).toBe("/api/session/ses_1/prompt")
+    expect(new URL(requests[2]!.url).pathname).toBe("/session/ses_1/prompt_async")
   })
 
   test("waits for protocol detection before issuing API requests", async () => {

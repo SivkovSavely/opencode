@@ -63,6 +63,7 @@ function sessionInfo(session: Session): SessionInfo {
     id: session.id,
     parentID: session.parentID,
     projectID: session.projectID,
+    ...(session.bookmarked === undefined ? {} : { bookmarked: session.bookmarked }),
     agent: session.agent,
     model: session.model && {
       id: session.model.id,
