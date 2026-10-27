@@ -32,7 +32,9 @@ Unix milliseconds. Tool statuses distinguish running, completed, error, and
 explicitly interrupted calls; ordinary assistant errors are a separate content
 category. Search facets are discovered from full historical persisted content,
 independent of the query page, and include last-used timestamps. The dialog
-unions those values with currently available project, model, and agent options.
+unions those values with currently available project, model, agent, and tool options.
+Options used within the last 30 days rank first, followed by configured options,
+then older historical-only options. Ties use server-qualified labels and identity.
 
 ## Pagination and navigation
 

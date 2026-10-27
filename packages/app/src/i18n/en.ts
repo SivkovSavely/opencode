@@ -54,6 +54,7 @@ export const dict = {
   "transcriptSearch.complete":
     "The indexed search range is complete. Text beyond the per-category limit may be omitted.",
   "transcriptSearch.serverFailures": "Some servers could not be searched: {{servers}}.",
+  "transcriptSearch.excludeFailedServers": "Search available servers only",
   "transcriptSearch.partialFailure": "Some selected servers could not be searched.",
   "transcriptSearch.userText": "User text",
   "transcriptSearch.assistantText": "Assistant text",

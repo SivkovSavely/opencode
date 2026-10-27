@@ -14,21 +14,18 @@ import { ServerConnection, serverName, useServer } from "@/context/server"
 import { useTabs } from "@/context/tabs"
 import { sessionHref } from "@/utils/session-route"
 import {
-  appendTranscriptHits,
-  sortTranscriptHits,
+  createTranscriptPagination,
+  rankTranscriptFacets,
   transcriptPreview,
   transcriptQuery,
-  transcriptSearchComplete,
-  transcriptServersToFetch,
   toggleTranscriptFilter,
-  type TranscriptHit,
   type TranscriptResult,
 } from "./transcript-search"
 import "./dialog-transcript-search.css"
 
 type ModelIdentity = { providerID: string; modelID: string }
 type FilterOption = { key: string; label: string }
-type SearchResult = { server: string; hit: TranscriptHit }
+type FacetOption = FilterOption & { lastUsed?: number; configured?: boolean }
 type DatePreset = "all" | "24h" | "7d" | "30d" | "custom"
 type RoleFilter = "user" | "assistant"
 type ContentFilter = "user-text" | "assistant-text" | "tool-input" | "tool-output" | "errors"
@@ -168,13 +165,14 @@ export function DialogTranscriptSearch() {
     active: 0,
     loading: false,
     error: false,
+    metadataError: false,
     failedServers: [] as string[],
     errorMessage: "",
     visibleCount: 40,
     complete: false,
     scanLimited: false,
     truncatedDocuments: 0,
-    cursors: {} as Record<string, string | null | undefined>,
+    more: false,
     refresh: 0,
   })
 
@@ -190,67 +188,95 @@ export function DialogTranscriptSearch() {
     }),
   )
   const projectOptions = createMemo<FilterOption[]>(() => {
-    const options = new Map<string, string>()
+    const options: FacetOption[] = []
     for (const { key, facets } of allFacets()) {
-      const conn = global.servers.list().find((item) => ServerConnection.key(item) === key)
       const serverLabel = displayServer(key)
       for (const project of facets.projectDetails) {
-        const identity = selectedLabel(key, project.id)
-        options.set(identity, `${serverLabel}${project.path ? ` · ${project.path}` : ""} · ${project.id}`)
-      }
-      if (!conn) continue
-      const ctx = global.ensureServerCtx(conn)
-      for (const project of ctx.sync.data.project) {
-        options.set(selectedLabel(key, project.id), `${serverName(conn)} · ${project.worktree} · ${project.id}`)
+        options.push({
+          key: selectedLabel(key, project.id),
+          label: `${serverLabel}${project.path ? ` · ${project.path}` : ""} · ${project.id}`,
+          lastUsed: Number(project.lastUsed),
+        })
       }
     }
-    return Array.from(options, ([key, label]) => ({ key, label }))
+    for (const conn of global.servers.list()) {
+      const key = ServerConnection.key(conn)
+      const ctx = global.ensureServerCtx(conn)
+      for (const project of ctx.sync.data.project) {
+        options.push({
+          key: selectedLabel(key, project.id),
+          label: `${displayServer(key)} · ${project.worktree} · ${project.id}`,
+          configured: true,
+        })
+      }
+    }
+    return rankTranscriptFacets(options)
   })
   const modelOptions = createMemo<FilterOption[]>(() => {
-    const options = new Map<string, string>()
+    const options: FacetOption[] = []
     for (const { key, facets } of allFacets()) {
-      const conn = global.servers.list().find((item) => ServerConnection.key(item) === key)
       const serverLabel = displayServer(key)
       for (const model of facets.modelIdentities) {
-        const identity = selectedModelLabel(key, model)
-        options.set(identity, `${serverLabel} · ${model.providerID}/${model.modelID}`)
+        options.push({
+          key: selectedModelLabel(key, model),
+          label: `${serverLabel} · ${model.providerID}/${model.modelID}`,
+          lastUsed: Number(model.lastUsed),
+        })
       }
-      if (!conn) continue
+    }
+    for (const conn of global.servers.list()) {
+      const key = ServerConnection.key(conn)
+      const serverLabel = displayServer(key)
       const providers = global.ensureServerCtx(conn).sync.data.provider?.all
       if (!providers) continue
       for (const [providerID, provider] of providers) {
         for (const model of Object.values(provider.models)) {
-          const identity = selectedModelLabel(key, { providerID, modelID: model.id })
-          options.set(identity, `${serverLabel} · ${providerID}/${model.id}`)
+          options.push({
+            key: selectedModelLabel(key, { providerID, modelID: model.id }),
+            label: `${serverLabel} · ${providerID}/${model.id}`,
+            configured: true,
+          })
         }
       }
     }
-    return Array.from(options, ([key, label]) => ({ key, label }))
+    return rankTranscriptFacets(options)
   })
   const agentOptions = createMemo<FilterOption[]>(() => {
-    const options = new Map<string, string>()
+    const options: FacetOption[] = []
     for (const { key, facets } of allFacets()) {
-      const conn = global.servers.list().find((item) => ServerConnection.key(item) === key)
       const serverLabel = displayServer(key)
-      for (const value of facets.agents) options.set(selectedLabel(key, value), `${serverLabel} · ${value}`)
-      if (!conn) continue
-      for (const name of Object.keys(global.ensureServerCtx(conn).sync.data.config.agent ?? {}))
-        options.set(selectedLabel(key, name), `${serverLabel} · ${name}`)
+      for (const agent of facets.agentDetails)
+        options.push({
+          key: selectedLabel(key, agent.value),
+          label: `${serverLabel} · ${agent.value}`,
+          lastUsed: Number(agent.lastUsed),
+        })
     }
-    return Array.from(options, ([key, label]) => ({ key, label }))
+    for (const conn of global.servers.list()) {
+      const key = ServerConnection.key(conn)
+      for (const name of Object.keys(global.ensureServerCtx(conn).sync.data.config.agent ?? {}))
+        options.push({ key: selectedLabel(key, name), label: `${displayServer(key)} · ${name}`, configured: true })
+    }
+    return rankTranscriptFacets(options)
   })
   const toolOptions = createMemo<FilterOption[]>(() => {
-    const options = new Map<string, string>()
+    const options: FacetOption[] = []
     for (const { key, facets } of allFacets()) {
-      const conn = global.servers.list().find((item) => ServerConnection.key(item) === key)
       const serverLabel = displayServer(key)
-      for (const value of facets.tools) options.set(selectedLabel(key, value), `${serverLabel} · ${value}`)
-      if (!conn) continue
+      for (const tool of facets.toolDetails)
+        options.push({
+          key: selectedLabel(key, tool.value),
+          label: `${serverLabel} · ${tool.value}`,
+          lastUsed: Number(tool.lastUsed),
+        })
+    }
+    for (const conn of global.servers.list()) {
+      const key = ServerConnection.key(conn)
       for (const agent of Object.values(global.ensureServerCtx(conn).sync.data.config.agent ?? {}))
         for (const value of Object.keys(agent?.tools ?? {}))
-          options.set(selectedLabel(key, value), `${serverLabel} · ${value}`)
+          options.push({ key: selectedLabel(key, value), label: `${displayServer(key)} · ${value}`, configured: true })
     }
-    return Array.from(options, ([key, label]) => ({ key, label }))
+    return rankTranscriptFacets(options)
   })
   const serverOptions = createMemo(() =>
     global.servers
@@ -346,12 +372,7 @@ export function DialogTranscriptSearch() {
     })
     return { requests: serverRequests.filter((item) => !item.skip), contradictory }
   })
-  const sort = createMemo(() => state.filters.sort)
-  const hasMore = createMemo(
-    () =>
-      Object.values(state.cursors).some((cursor) => typeof cursor === "string" && cursor.length > 0) ||
-      state.failedServers.length > 0,
-  )
+  const hasMore = createMemo(() => state.more || state.failedServers.length > 0)
   const visibleHits = createMemo(() => state.hits.slice(0, state.visibleCount))
   let resultsViewport: HTMLDivElement | undefined
   const virtualizer = createVirtualizer<HTMLDivElement, HTMLButtonElement>({
@@ -385,6 +406,7 @@ export function DialogTranscriptSearch() {
         const keys = selectedServers()
         const controller = new AbortController()
         const timers = new Map<string, ReturnType<typeof setTimeout>>()
+        setState("metadataError", false)
         for (const key of keys) {
           let hasFacets = state.facets[key] !== undefined
           let wasIndexing = false
@@ -419,12 +441,11 @@ export function DialogTranscriptSearch() {
                 await facets()
               }
             } catch {
-              if (!controller.signal.aborted)
-                setState("failedServers", (values) => Array.from(new Set([...values, key])))
+              if (!controller.signal.aborted) setState("metadataError", true)
             }
           }
           void facets().catch(() => {
-            if (!controller.signal.aborted) setState("failedServers", (values) => Array.from(new Set([...values, key])))
+            if (!controller.signal.aborted) setState("metadataError", true)
           })
           void poll()
         }
@@ -440,12 +461,9 @@ export function DialogTranscriptSearch() {
     on([() => JSON.stringify(queryFilters()), () => state.refresh], () => {
       const { requests, contradictory } = queryFilters()
       const controller = new AbortController()
-      const cursors: Record<string, string | null | undefined> = {}
-      const failures = new Set<string>()
-      let busy = false
       setState({
         hits: [],
-        cursors: {},
+        more: false,
         error: false,
         errorMessage: "",
         failedServers: [],
@@ -456,71 +474,44 @@ export function DialogTranscriptSearch() {
         truncatedDocuments: 0,
         loading: false,
       })
-      const fetch = async (more: boolean) => {
-        if (busy || controller.signal.aborted || !search().parameters || contradictory) return
-        busy = true
+      const next = createTranscriptPagination(
+        requests.map((item) => item.key),
+        state.filters.sort,
+        controller.signal,
+        async (key, cursor) => {
+          const request = requests.find((item) => item.key === key)!.request
+          const conn = global.servers.list().find((item) => ServerConnection.key(item) === key)
+          if (!conn) throw new Error(key)
+          const result = await global
+            .ensureServerCtx(conn)
+            .sdk.client.transcriptSearch.search(
+              { ...request, cursor, limit: 40 },
+              { signal: controller.signal, throwOnError: true },
+            )
+          return result.data
+        },
+      )
+      const fetch = async () => {
+        if (state.loading || controller.signal.aborted || !search().parameters || contradictory) return
         setState("loading", true)
-        const available = transcriptServersToFetch(requests, cursors, failures, more)
-        const results = await Promise.allSettled(
-          available.map(async ({ key, request }) => {
-            const conn = global.servers.list().find((item) => ServerConnection.key(item) === key)
-            if (!conn) throw new Error(key)
-            const result = await global
-              .ensureServerCtx(conn)
-              .sdk.client.transcriptSearch.search(
-                { ...request, cursor: more ? (cursors[key] ?? undefined) : undefined, limit: 40 },
-                { signal: controller.signal, throwOnError: true },
-              )
-            return { key, data: result.data }
-          }),
-        )
-        if (controller.signal.aborted) return
-        const incoming: SearchResult[] = []
-        const failed: string[] = []
-        let complete = true
-        let scanLimited = false
-        let truncatedDocuments = 0
-        let firstError = ""
-        results.forEach((result, index) => {
-          const key = available[index]?.key
-          if (!key) return
-          if (result.status === "rejected") {
-            failures.add(key)
-            firstError ||= result.reason instanceof Error ? result.reason.message : String(result.reason)
-            return
-          }
-          failures.delete(key)
-          const { data } = result.value
-          cursors[key] = data.nextCursor
-          setState("cursors", key, data.nextCursor)
-          incoming.push(...data.hits.map((hit) => ({ server: key, hit })))
-          scanLimited ||= data.scanLimited
-          truncatedDocuments += Number(data.truncatedDocuments)
-          setState("ready", key, data.status.ready)
-        })
-        failed.push(...failures)
-        complete = transcriptSearchComplete(requests, cursors, failures, state.ready)
-        setState("hits", (existing) => sortTranscriptHits(appendTranscriptHits(more ? existing : [], incoming), sort()))
-        if (more) setState("visibleCount", (count) => count + 40)
+        const result = await next()
+        if (!result || controller.signal.aborted) return
+        for (const [key, ready] of Object.entries(result.ready)) setState("ready", key, ready)
+        setState("hits", (existing) => [...existing, ...result.hits])
         setState({
-          failedServers: failed,
-          error: failed.length > 0 && incoming.length === 0 && state.hits.length === 0,
-          errorMessage: firstError,
-          complete,
-          scanLimited,
-          truncatedDocuments,
+          failedServers: result.failed,
+          error: result.failed.length > 0 && state.hits.length === 0,
+          errorMessage: result.error instanceof Error ? result.error.message : String(result.error ?? ""),
+          more: result.more,
+          complete: result.complete,
+          scanLimited: result.scanLimited,
+          truncatedDocuments: result.truncatedDocuments,
+          visibleCount: state.visibleCount + 40,
+          loading: false,
         })
-        busy = false
-        setState("loading", false)
       }
-      loadMore = () => {
-        if (hasMore()) {
-          void fetch(true)
-          return
-        }
-        setState("visibleCount", (count) => count + 40)
-      }
-      const timer = setTimeout(() => void fetch(false), 250)
+      loadMore = () => void fetch()
+      const timer = setTimeout(() => void fetch(), 250)
       onCleanup(() => {
         controller.abort()
         clearTimeout(timer)
@@ -545,7 +536,13 @@ export function DialogTranscriptSearch() {
         partID: result.hit.partID ?? null,
       }),
     )
-    navigate(`${sessionHref(ServerConnection.Key.make(result.server), result.hit.sessionID)}#search:${target}`)
+    const href = `${sessionHref(ServerConnection.Key.make(result.server), result.hit.sessionID)}#search:${target}`
+    if (window.location.pathname + window.location.search + window.location.hash === href) {
+      window.dispatchEvent(new Event("opencode:repeat-search-navigation"))
+      dialog.close()
+      return
+    }
+    navigate(href)
     dialog.close()
   }
   const keydown = (event: KeyboardEvent) => {
@@ -846,7 +843,7 @@ export function DialogTranscriptSearch() {
             <Show when={state.errorMessage}>
               <span> {state.errorMessage}</span>
             </Show>{" "}
-            <button type="button" onClick={() => setState("refresh", (value) => value + 1)}>
+            <button type="button" onClick={() => loadMore()} disabled={state.loading}>
               {language.t("transcriptSearch.retry")}
             </button>
           </p>
@@ -857,6 +854,18 @@ export function DialogTranscriptSearch() {
               servers: state.failedServers.map(displayServer).join(", "),
             })}
           </p>
+        </Show>
+        <Show when={state.failedServers.length > 0 && selectedServers().some((key) => !state.failedServers.includes(key))}>
+          <button
+            type="button"
+            disabled={state.loading}
+            onClick={() => setState("filters", "servers", selectedServers().filter((key) => !state.failedServers.includes(key)))}
+          >
+            {language.t("transcriptSearch.excludeFailedServers")}
+          </button>
+        </Show>
+        <Show when={state.metadataError}>
+          <p role="status">{language.t("transcriptSearch.metadataFailed")}</p>
         </Show>
         <Show when={allFacets().some(({ facets }) => facets.truncated)}>
           <p role="status">{language.t("transcriptSearch.facetsTruncated")}</p>
@@ -886,7 +895,12 @@ export function DialogTranscriptSearch() {
         </Show>
         <Show
           when={
-            !state.loading && !state.error && state.query.trim() && !queryFilters().contradictory && !state.hits.length
+            !state.loading &&
+            !state.error &&
+            !hasMore() &&
+            state.query.trim() &&
+            !queryFilters().contradictory &&
+            !state.hits.length
           }
         >
           <p role="status">

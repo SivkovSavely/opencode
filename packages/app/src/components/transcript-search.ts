@@ -5,30 +5,128 @@ export type TranscriptHit = TranscriptSearchSearchResponse["hits"][number]
 export type TranscriptResult = { server: string; hit: TranscriptHit }
 const utf8 = new TextEncoder()
 
-export function transcriptServersToFetch<T extends { key: string }>(
-  requests: T[],
-  cursors: Record<string, string | null | undefined>,
-  failed: Set<string>,
-  more: boolean,
+export function createTranscriptPagination(
+  keys: string[],
+  sort: "newest" | "oldest" | "session-title",
+  signal: AbortSignal,
+  fetch: (key: string, cursor: string | undefined) => Promise<TranscriptSearchSearchResponse>,
 ) {
-  return more
-    ? requests.filter((request) => typeof cursors[request.key] === "string" || failed.has(request.key))
-    : requests
-}
+  const servers = keys.map((key) => ({
+    key,
+    cursor: undefined as string | undefined,
+    started: false,
+    exhausted: false,
+    buffer: [] as TranscriptResult[],
+    cursors: new Set<string>(),
+    error: undefined as unknown,
+    ready: false,
+  }))
+  const seen = new Set<string>()
+  let scanLimited = false
+  let truncatedDocuments = 0
+  let busy = false
 
-export function transcriptSearchComplete<T extends { key: string }>(
-  requests: T[],
-  cursors: Record<string, string | null | undefined>,
-  failed: Set<string>,
-  ready: Record<string, boolean | undefined>,
-) {
-  return failed.size === 0 && requests.every(({ key }) => ready[key] === true && !cursors[key])
+  return async (limit = 40) => {
+    if (busy || signal.aborted) return
+    busy = true
+    const hits: TranscriptResult[] = []
+    const attempts = new Map<string, number>()
+    try {
+      while (hits.length < limit && !signal.aborted) {
+        const missing = servers.filter((server) => !server.exhausted && server.buffer.length === 0)
+        if (missing.length) {
+          // Bound work per invocation even when a server returns many empty scan-limited pages.
+          if (missing.some((server) => (attempts.get(server.key) ?? 0) >= 8)) break
+          const results = await Promise.allSettled(
+            missing.map((server) => {
+              attempts.set(server.key, (attempts.get(server.key) ?? 0) + 1)
+              return fetch(server.key, server.cursor)
+            }),
+          )
+          if (signal.aborted) return
+          results.forEach((result, index) => {
+            const server = missing[index]!
+            if (result.status === "rejected") {
+              server.error = result.reason ?? new Error()
+              return
+            }
+            const data = result.value
+            if (data.nextCursor !== undefined && (!data.nextCursor || server.cursors.has(data.nextCursor))) {
+              server.error = new Error()
+              return
+            }
+            server.error = undefined
+            server.started = true
+            server.cursor = data.nextCursor
+            if (data.nextCursor !== undefined) server.cursors.add(data.nextCursor)
+            server.exhausted = data.nextCursor === undefined
+            server.buffer = data.hits.map((hit) => ({ server: server.key, hit }))
+            server.ready = data.status.ready
+            scanLimited ||= data.scanLimited
+            truncatedDocuments += Number(data.truncatedDocuments)
+          })
+          if (missing.some((server) => server.error !== undefined)) break
+          continue
+        }
+        const heads = servers.flatMap((server) => (server.buffer.length ? [server.buffer[0]!] : []))
+        if (!heads.length) break
+        const first = sortTranscriptHits(heads, sort)[0]!
+        servers.find((server) => server.key === first.server)!.buffer.shift()
+        const identity = `${first.server}\0${first.hit.documentID}:${first.hit.offset}`
+        if (seen.has(identity)) continue
+        seen.add(identity)
+        hits.push(first)
+      }
+      if (signal.aborted) return
+      return {
+        hits,
+        failed: servers.filter((server) => server.error !== undefined).map((server) => server.key),
+        error: servers.find((server) => server.error !== undefined)?.error,
+        more: servers.some((server) => !server.exhausted || server.buffer.length > 0),
+        complete: servers.every((server) => server.started && server.exhausted && !server.buffer.length && server.ready),
+        ready: Object.fromEntries(servers.filter((server) => server.started).map((server) => [server.key, server.ready])),
+        scanLimited: scanLimited && servers.some((server) => !server.exhausted),
+        truncatedDocuments,
+      }
+    } finally {
+      busy = false
+    }
+  }
 }
 
 export function toggleTranscriptFilter(selected: string[], key: string, limit = 100) {
   if (selected.includes(key)) return selected.filter((value) => value !== key)
   if (selected.length >= limit) return selected
   return [...selected, key]
+}
+
+export function rankTranscriptFacets(
+  options: { key: string; label: string; lastUsed?: number; configured?: boolean }[],
+  now = Date.now(),
+) {
+  const merged = new Map<string, { key: string; label: string; lastUsed?: number; configured: boolean }>()
+  for (const option of options) {
+    const previous = merged.get(option.key)
+    const lastUsed = Math.max(
+      previous?.lastUsed ?? -Infinity,
+      option.lastUsed !== undefined && Number.isFinite(option.lastUsed) ? option.lastUsed : -Infinity,
+    )
+    const configured = previous?.configured || option.configured === true
+    const label = !previous
+      ? option.label
+      : previous.configured !== (option.configured === true)
+        ? previous.configured ? previous.label : option.label
+        : compareText(previous.label, option.label) <= 0 ? previous.label : option.label
+    merged.set(option.key, { key: option.key, label, lastUsed: lastUsed === -Infinity ? undefined : lastUsed, configured })
+  }
+  const recentSince = now - 30 * 24 * 60 * 60 * 1000
+  return Array.from(merged.values()).sort((left, right) => {
+    const leftRank = left.lastUsed !== undefined && left.lastUsed >= recentSince ? 0 : left.configured ? 1 : 2
+    const rightRank = right.lastUsed !== undefined && right.lastUsed >= recentSince ? 0 : right.configured ? 1 : 2
+    if (leftRank !== rightRank) return leftRank - rightRank
+    if (left.lastUsed !== right.lastUsed) return (right.lastUsed ?? -Infinity) - (left.lastUsed ?? -Infinity)
+    return compareText(left.label, right.label) || compareText(left.key, right.key)
+  })
 }
 
 export function transcriptQuery(query: string, caseSensitive: boolean) {

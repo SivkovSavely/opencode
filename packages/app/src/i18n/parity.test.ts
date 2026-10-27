@@ -112,6 +112,7 @@ const appFallbackKeys = new Set([
   "transcriptSearch.contentLimitWarning",
   "transcriptSearch.complete",
   "transcriptSearch.serverFailures",
+  "transcriptSearch.excludeFailedServers",
   "transcriptSearch.partialFailure",
   "transcriptSearch.userText",
   "transcriptSearch.assistantText",

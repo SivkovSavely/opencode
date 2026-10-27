@@ -122,7 +122,9 @@
   box-shadow: 0 8px 28px rgb(0 0 0 / 18%);
 }
 .transcript-search-more-menu .transcript-search-filter-menu {
-  position: fixed;
+  position: static;
+  width: 100%;
+  max-height: min(200px, 30dvh);
 }
 .transcript-search-date input[type="date"] {
   min-width: 0;

@@ -1,6 +1,6 @@
 import type { Message, Part, UserMessage } from "@opencode-ai/sdk/v2"
 import { useLocation, useNavigate } from "@solidjs/router"
-import { createEffect, createMemo, onCleanup, onMount } from "solid-js"
+import { createEffect, createMemo, createSignal, onCleanup, onMount } from "solid-js"
 import { messageIdFromHash, searchMessageTargetFromHash, type SearchMessageTarget } from "./message-id-from-hash"
 
 export const useSessionHashScroll = (input: {
@@ -31,7 +31,11 @@ export const useSessionHashScroll = (input: {
   let pendingKey = ""
   let clearing = false
   let navigation = 0
-  const searchHistoryRequests = new Map<string, { count: number; attempts: number }>()
+  const searchHistoryRequests = new Map<
+    string,
+    { count: number; attempts: number; inFlight: boolean; retry: boolean }
+  >()
+  const [historyRetry, setHistoryRetry] = createSignal(0)
 
   const location = useLocation()
   const navigate = useNavigate()
@@ -244,6 +248,7 @@ export const useSessionHashScroll = (input: {
   })
 
   createEffect(() => {
+    historyRetry()
     const sessionID = input.sessionID()
     if (!sessionID || !input.messagesReady()) return
 
@@ -259,20 +264,26 @@ export const useSessionHashScroll = (input: {
       const requestKey = `${sessionKey}\0${searchTarget.messageID}\0${searchTarget.partID ?? ""}`
       const count = input.messages?.().length ?? 0
       const previous = searchHistoryRequests.get(requestKey)
+      if (previous?.inFlight) return
       if (previous && count <= previous.count && previous.attempts >= 2) return
       const attempts = previous && count <= previous.count ? previous.attempts + 1 : 1
-      searchHistoryRequests.set(requestKey, { count, attempts })
+      const request = { count, attempts, inFlight: true, retry: false }
+      searchHistoryRequests.set(requestKey, request)
       void input.loadMore(sessionID).then(
         () => {
-          if (input.sessionKey() !== sessionKey) return
-          if ((input.messages?.().length ?? 0) > count) {
-            searchHistoryRequests.delete(requestKey)
-            return
+          if (searchHistoryRequests.get(requestKey) === request) {
+            if (request.retry || (input.sessionKey() === sessionKey && (input.messages?.().length ?? 0) > count))
+              searchHistoryRequests.delete(requestKey)
+            else searchHistoryRequests.set(requestKey, { count, attempts, inFlight: false, retry: false })
           }
-          searchHistoryRequests.set(requestKey, { count, attempts })
+          if (input.sessionKey() === sessionKey) setHistoryRetry((value) => value + 1)
         },
         () => {
-          if (input.sessionKey() === sessionKey) searchHistoryRequests.set(requestKey, { count, attempts: 2 })
+          if (searchHistoryRequests.get(requestKey) === request) {
+            if (request.retry) searchHistoryRequests.delete(requestKey)
+            else searchHistoryRequests.set(requestKey, { count, attempts: 2, inFlight: false, retry: false })
+          }
+          if (input.sessionKey() === sessionKey) setHistoryRetry((value) => value + 1)
         },
       )
       return
@@ -291,9 +302,30 @@ export const useSessionHashScroll = (input: {
     if (typeof window !== "undefined" && "scrollRestoration" in window.history) {
       window.history.scrollRestoration = "manual"
     }
+    const repeatSearchNavigation = () => {
+      const target = searchMessageTargetFromHash(location.hash)
+      if (!target) return
+      const generation = ++navigation
+      const sessionKey = input.sessionKey()
+      const hash = location.hash
+      cancel()
+      if (!input.sessionID() || !input.messagesReady()) return
+      const requestKey = `${sessionKey}\0${target.messageID}\0${target.partID ?? ""}`
+      const request = searchHistoryRequests.get(requestKey)
+      if (request?.inFlight) request.retry = true
+      else searchHistoryRequests.delete(requestKey)
+      setHistoryRetry((value) => value + 1)
+      queue(() => {
+        if (generation !== navigation || input.sessionKey() !== sessionKey || location.hash !== hash) return
+        applyHash("auto", generation, sessionKey)
+      })
+    }
+    window.addEventListener("opencode:repeat-search-navigation", repeatSearchNavigation)
+    onCleanup(() => window.removeEventListener("opencode:repeat-search-navigation", repeatSearchNavigation))
   })
 
   onCleanup(() => {
+    navigation++
     cancel()
     if (highlightTimer !== undefined) window.clearTimeout(highlightTimer)
     highlightedElement?.classList.remove("timeline-search-target")

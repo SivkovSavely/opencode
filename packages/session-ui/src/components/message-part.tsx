@@ -1202,11 +1202,15 @@ export function UserMessageDisplay(props: {
   const copied = () => state.copied
   const busy = () => state.busy
 
-  const textPart = createMemo(
-    () => props.parts?.find((p) => p.type === "text" && !(p as TextPart).synthetic) as TextPart | undefined,
+  const textParts = createMemo(() =>
+    props.parts.filter((part): part is TextPart => part.type === "text" && !part.synthetic),
   )
 
-  const text = createMemo(() => textPart()?.text || "")
+  const text = createMemo(() =>
+    textParts()
+      .map((part) => part.text)
+      .join(""),
+  )
 
   const files = createMemo(() => (props.parts?.filter((p) => p.type === "file") as FilePart[]) ?? [])
 
@@ -1217,6 +1221,13 @@ export function UserMessageDisplay(props: {
   const inlineFiles = createMemo(() => files().filter(inline))
 
   const agents = createMemo(() => (props.parts?.filter((p) => p.type === "agent") as AgentPart[]) ?? [])
+
+  const belongsTo = (source: { start: number; end: number; value: string } | undefined, part: TextPart) => {
+    if (!source || !source.value || !Number.isInteger(source.start) || !Number.isInteger(source.end)) return false
+    if (source.start < 0 || source.end <= source.start) return false
+    // Source ranges have no part ID, so apply them to every exact matching occurrence.
+    return source.end <= part.text.length && part.text.slice(source.start, source.end) === source.value
+  }
 
   const model = createMemo(() => {
     const providerID = props.message.model?.providerID
@@ -1335,11 +1346,26 @@ export function UserMessageDisplay(props: {
           <div
             data-slot="user-message-text"
             dir="auto"
-            data-timeline-message-id={props.message.id}
-            data-timeline-part-id={textPart()?.id}
+            data-timeline-message-id={textParts().length === 1 ? props.message.id : undefined}
+            data-timeline-part-id={textParts().length === 1 ? textParts()[0]?.id : undefined}
             data-comments={messageComments().length > 0 ? "true" : undefined}
           >
-            <HighlightedText text={text()} references={inlineFiles()} agents={agents()} />
+            <Show
+              when={textParts().length > 1}
+              fallback={<HighlightedText text={text()} references={inlineFiles()} agents={agents()} />}
+            >
+              <For each={textParts()}>
+                {(part) => (
+                  <span data-timeline-message-id={props.message.id} data-timeline-part-id={part.id}>
+                    <HighlightedText
+                      text={part.text}
+                      references={inlineFiles().filter((file) => belongsTo(file.source?.text, part))}
+                      agents={agents().filter((agent) => belongsTo(agent.source, part))}
+                    />
+                  </span>
+                )}
+              </For>
+            </Show>
             <Show when={messageComments().length > 0}>
               <UserMessageComments comments={messageComments()} bounded />
             </Show>
