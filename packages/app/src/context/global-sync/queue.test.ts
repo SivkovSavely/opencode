@@ -67,6 +67,9 @@ describe("createRefreshQueue", () => {
           return new Response("", { status: available ? 404 : 503 })
         }
         if (path === "/api/location") return new Response("", { status: 404 })
+        if (path === "/api/project" || path === "/api/model/default") return new Response("", { status: 404 })
+        if (path === "/project")
+          return new Response("[]", { headers: { "content-type": "application/json" } })
         probe()
         return new Response("", { status: 503 })
       },

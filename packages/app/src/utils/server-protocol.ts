@@ -3,7 +3,6 @@ import { authTokenFromCredentials } from "./server"
 
 export type ServerProtocol = "v1" | "v2"
 export type ServerProtocolSource = Promise<ServerProtocol> | (() => Promise<ServerProtocol>)
-type ProbeResponse = { status: number; json: boolean; value?: unknown }
 
 type DetectionOptions = {
   signal?: AbortSignal
@@ -16,7 +15,7 @@ type ServerProtocolOptions = DetectionOptions & {
 }
 
 function headers(server: ServerConnection.HttpBase) {
-  if (!server.password) return
+  if (!server.password) return undefined
   return {
     Authorization: `Basic ${authTokenFromCredentials({ username: server.username, password: server.password })}`,
   }
@@ -67,24 +66,70 @@ export async function detectServerProtocol(
   )
   if (!health) return undefined
 
-  const location = await probe(server, fetch, "/api/location", options).catch(() => undefined)
+  const [location, projects, defaultModel] = await Promise.all([
+    probe(server, fetch, "/api/location", options).catch(() => undefined),
+    probe(server, fetch, "/api/project", options).catch(() => undefined),
+    probe(server, fetch, "/api/model/default", options).catch(() => undefined),
+  ])
   if (options?.signal?.aborted) return undefined
+  const locationValid = location?.status === 200 && location.json && isLocation(location.value)
+  const projectsValid = projects?.status === 200 && projects.json && isProjectList(projects.value)
+  const defaultModelValid = defaultModel?.status === 200 && defaultModel.json && isDefaultModel(defaultModel.value)
+  if (locationValid && projectsValid && defaultModelValid) return "v2"
+
   if (
-    location?.status === 200 &&
-    location.json &&
-    isRecord(location.value) &&
-    typeof location.value.directory === "string" &&
-    isRecord(location.value.project) &&
-    typeof location.value.project.id === "string" &&
-    typeof location.value.project.directory === "string"
-  ) {
-    return "v2"
-  }
-  if (location?.status === 404 || (location?.status === 200 && !location.json)) return "v1"
+    (location?.status !== 404 && !locationValid) ||
+    (projects?.status !== 404 && !projectsValid) ||
+    (defaultModel?.status !== 404 && !defaultModelValid)
+  )
+    return undefined
+  const legacyProjects = await probe(server, fetch, "/project", options).catch(() => undefined)
+  if (options?.signal?.aborted) return undefined
+  if (legacyProjects?.status === 200 && legacyProjects.json && isProjectList(legacyProjects.value)) return "v1"
+  return undefined
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value)
+}
+
+function isLocation(value: unknown) {
+  return (
+    isRecord(value) &&
+    typeof value.directory === "string" &&
+    isRecord(value.project) &&
+    typeof value.project.id === "string" &&
+    typeof value.project.directory === "string"
+  )
+}
+
+function isProjectList(value: unknown) {
+  return (
+    Array.isArray(value) &&
+    value.every(
+      (project) =>
+        isRecord(project) &&
+        typeof project.id === "string" &&
+        typeof project.worktree === "string" &&
+        isRecord(project.time) &&
+        typeof project.time.created === "number" &&
+        Number.isInteger(project.time.created) &&
+        project.time.created >= 0 &&
+        typeof project.time.updated === "number" &&
+        Number.isInteger(project.time.updated) &&
+        project.time.updated >= 0 &&
+        Array.isArray(project.sandboxes) &&
+        project.sandboxes.every((sandbox) => typeof sandbox === "string"),
+    )
+  )
+}
+
+function isDefaultModel(value: unknown) {
+  return (
+    isRecord(value) &&
+    (value.data === null ||
+      (isRecord(value.data) && typeof value.data.id === "string" && typeof value.data.providerID === "string"))
+  )
 }
 
 export function resolveServerProtocol(source?: ServerProtocolSource) {
