@@ -1,6 +1,5 @@
 import { useNavigate } from "@solidjs/router"
 import { createSignal } from "solid-js"
-import { produce } from "solid-js/store"
 import { useCommand, type CommandOption } from "@/context/command"
 import { useDialog } from "@opencode-ai/ui/context/dialog"
 import { previewSelectedLines } from "@opencode-ai/session-ui/pierre/selection-bridge"
@@ -16,7 +15,7 @@ import { useSync } from "@/context/sync"
 import { useTerminal } from "@/context/terminal"
 import { showToast } from "@/utils/toast"
 import { downloadSessionExport, fetchSessionExport, sessionExportFilename } from "@/utils/session-export"
-import { sessionBookmarkRollback } from "@/utils/session-bookmark"
+import { sessionBookmarkRollback, updateSessionBookmark, updateSessionBookmarkPending } from "@/utils/session-bookmark"
 import { findLast } from "@opencode-ai/core/util/array"
 import { createSessionTabs } from "@/pages/session/helpers"
 import { extractPromptFromParts } from "@/utils/prompt"
@@ -88,19 +87,16 @@ export const useSessionCommands = (actions: SessionCommandContext) => {
     const sessionSync = sync()
     const current = sessionSync.session.get(sessionID)
     if (!current || current.parentID) return
-    setBookmarkPending((pending) => new Set(pending).add(sessionID))
     const bookmarkRevision = sessionSync.data.bookmark_revision[sessionID] ?? 0
     const bookmarked = !current.bookmarked
+    const optimistic = updateSessionBookmark({ session: sessionSync.session, sessionID, bookmarked })
+    if (!optimistic) return
+    const previous = optimistic.previous
+    setBookmarkPending((pending) => updateSessionBookmarkPending(pending, sessionID, true))
     const client = serverSDK().client
     const input = { sessionID: current.id, directory: current.directory, bookmarked }
     const setBookmarkedLocal = (value: boolean) =>
-      sessionSync.set(
-        produce((draft) => {
-          const session = draft.session.find((item) => item.id === current.id)
-          if (session) session.bookmarked = value
-        }),
-      )
-    setBookmarkedLocal(bookmarked)
+      updateSessionBookmark({ session: sessionSync.session, sessionID, bookmarked: value })
     try {
       await client.session.update(input, { throwOnError: true })
     } catch (error) {
@@ -112,7 +108,7 @@ export const useSessionCommands = (actions: SessionCommandContext) => {
         expectedRevision: bookmarkRevision,
         currentRevision: sessionSync.data.bookmark_revision[sessionID] ?? 0,
         persisted,
-        previous: current.bookmarked,
+        previous,
       })
       if (rollback !== undefined) setBookmarkedLocal(rollback)
       showToast({
@@ -120,11 +116,7 @@ export const useSessionCommands = (actions: SessionCommandContext) => {
         description: error instanceof Error ? error.message : language.t("common.requestFailed"),
       })
     } finally {
-      setBookmarkPending((pending) => {
-        const next = new Set(pending)
-        next.delete(sessionID)
-        return next
-      })
+      setBookmarkPending((pending) => updateSessionBookmarkPending(pending, sessionID, false))
     }
   }
   const hasReview = () => !!params.id
