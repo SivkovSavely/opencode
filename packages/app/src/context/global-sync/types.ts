@@ -44,6 +44,7 @@ export type State = {
   path: Path
   session: Session[]
   sessionTotal: number
+  bookmark_revision: { [sessionID: string]: number }
   session_status: {
     [sessionID: string]: SessionStatus
   }

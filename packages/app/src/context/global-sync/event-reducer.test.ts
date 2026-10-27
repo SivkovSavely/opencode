@@ -3,6 +3,7 @@ import type { Message, Part, PermissionRequest, Project, QuestionRequest, Sessio
 import { createStore } from "solid-js/store"
 import type { State } from "./types"
 import { applyDirectoryEvent, applyGlobalEvent, cleanupDroppedSessionCaches } from "./event-reducer"
+import { sessionBookmarkRollback } from "@/utils/session-bookmark"
 
 const rootSession = (input: { id: string; parentID?: string; archived?: number }) =>
   ({
@@ -70,6 +71,7 @@ const baseState = (input: Partial<State> = {}) =>
     path: { directory: "/tmp" } as State["path"],
     session: [],
     sessionTotal: 0,
+    bookmark_revision: {},
     session_status: {},
     session_diff: {},
     todo: {},
@@ -258,6 +260,38 @@ describe("applyDirectoryEvent", () => {
 
     expect(store.session).toEqual([])
     expect(store.sessionTotal).toBe(0)
+  })
+
+  test("applies bookmark-only updates without replacing the session snapshot", () => {
+    const current = { ...rootSession({ id: "ses_1" }), title: "current", cost: 12, bookmarked: false } as Session
+    const [store, setStore] = createStore(baseState({ session: [current] }))
+    const bookmarkRevision = store.bookmark_revision.ses_1 ?? 0
+
+    applyDirectoryEvent({
+      event: {
+        type: "session.updated",
+        properties: {
+          info: { ...current, title: "stale", cost: 0, bookmarked: true },
+          updatedFields: ["bookmarked"],
+        },
+      },
+      store,
+      setStore,
+      push() {},
+      directory: "/tmp",
+      loadLsp() {},
+    })
+
+    expect(store.session[0]).toMatchObject({ title: "current", cost: 12, bookmarked: true })
+    expect(store.bookmark_revision.ses_1).toBe(1)
+    expect(
+      sessionBookmarkRollback({
+        expectedRevision: bookmarkRevision,
+        currentRevision: store.bookmark_revision.ses_1 ?? 0,
+        persisted: false,
+        previous: false,
+      }),
+    ).toBeUndefined()
   })
 
   test("cleans session caches when deleted and decrements only root totals", () => {

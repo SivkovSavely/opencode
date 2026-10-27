@@ -544,6 +544,7 @@ export const SessionInfo = Schema.Struct({
   id: SessionID,
   slug: Schema.String,
   projectID: Project.ID,
+  bookmarked: Schema.Boolean.pipe(Schema.optional, Schema.withDecodingDefault(Effect.succeed(false))),
   workspaceID: optional(WorkspaceID),
   directory: Schema.String,
   path: optional(Schema.String),
@@ -583,6 +584,7 @@ const events = {
     schema: {
       sessionID: SessionID,
       info: SessionInfo,
+      updatedFields: optional(Schema.Array(Schema.Literal("bookmarked"))),
     },
   }),
   Deleted: define({

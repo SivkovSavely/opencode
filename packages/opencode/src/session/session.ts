@@ -80,6 +80,7 @@ export function fromRow(row: SessionRow): Info {
     id: row.id,
     slug: row.slug,
     projectID: row.project_id,
+    bookmarked: row.bookmarked,
     workspaceID: row.workspace_id ?? undefined,
     directory: row.directory,
     path: row.path ?? undefined,
@@ -137,6 +138,7 @@ export function toRow(info: Info) {
     summary_files: info.summary?.files,
     summary_diffs: info.summary?.diffs,
     metadata: info.metadata,
+    bookmarked: info.bookmarked,
     cost: info.cost ?? 0,
     tokens_input: (info.tokens ?? EmptyTokens).input,
     tokens_output: (info.tokens ?? EmptyTokens).output,
@@ -226,6 +228,7 @@ export const Info = Schema.Struct({
   id: SessionID,
   slug: Schema.String,
   projectID: ProjectV2.ID,
+  bookmarked: Schema.Boolean.pipe(Schema.optional, Schema.withDecodingDefault(Effect.succeed(false))),
   workspaceID: optional(WorkspaceV2.ID),
   directory: Schema.String,
   path: optional(Schema.String),
@@ -427,6 +430,7 @@ export interface Interface {
   readonly touch: (sessionID: SessionID) => Effect.Effect<void>
   readonly get: (id: SessionID) => Effect.Effect<Info, NotFound>
   readonly setTitle: (input: { sessionID: SessionID; title: string }) => Effect.Effect<void>
+  readonly setBookmarked: (input: { sessionID: SessionID; bookmarked: boolean }) => Effect.Effect<void>
   readonly setArchived: (input: { sessionID: SessionID; time?: number }) => Effect.Effect<void>
   readonly setMetadata: (input: typeof SetMetadataInput.Type) => Effect.Effect<void>
   readonly addMcpActivation: (input: {
@@ -529,6 +533,7 @@ const layer: Layer.Layer<
         slug: Slug.create(),
         version: InstallationVersion,
         projectID: ctx.project.id,
+        bookmarked: false,
         directory: input.directory,
         path: input.path,
         workspaceID: input.workspaceID,
@@ -746,7 +751,7 @@ const layer: Layer.Layer<
       return session
     })
 
-    const patchLocked = (sessionID: SessionID, info: Patch) =>
+    const patchLocked = (sessionID: SessionID, info: Patch, updatedFields?: Array<"bookmarked">) =>
       Effect.gen(function* () {
         const current = yield* get(sessionID)
         const next = {
@@ -758,7 +763,11 @@ const layer: Layer.Layer<
           revert: info.revert === null ? undefined : (info.revert ?? current.revert),
           permission: info.permission === null ? undefined : (info.permission ?? current.permission),
         } as Info
-        yield* events.publish(SessionV1.Event.Updated, { sessionID, info: next })
+        yield* events.publish(SessionV1.Event.Updated, {
+          sessionID,
+          info: next,
+          ...(updatedFields ? { updatedFields } : {}),
+        })
       })
 
     const patch = (sessionID: SessionID, info: Patch) =>
@@ -770,6 +779,19 @@ const layer: Layer.Layer<
 
     const setTitle = Effect.fn("Session.setTitle")(function* (input: { sessionID: SessionID; title: string }) {
       yield* patch(input.sessionID, { title: input.title }).pipe(Effect.orDie)
+    })
+
+    const setBookmarked = Effect.fn("Session.setBookmarked")(function* (input: {
+      sessionID: SessionID
+      bookmarked: boolean
+    }) {
+      yield* mcpActivationLock(input.sessionID).withPermits(1)(
+        Effect.gen(function* () {
+          const current = yield* get(input.sessionID).pipe(Effect.orDie)
+          if (current.bookmarked === input.bookmarked) return
+          yield* patchLocked(input.sessionID, { bookmarked: input.bookmarked }, ["bookmarked"]).pipe(Effect.orDie)
+        }),
+      )
     })
 
     const setArchived = Effect.fn("Session.setArchived")(function* (input: { sessionID: SessionID; time?: number }) {
@@ -962,6 +984,7 @@ const layer: Layer.Layer<
       touch,
       get,
       setTitle,
+      setBookmarked,
       setArchived,
       setMetadata,
       addMcpActivation,

@@ -110,6 +110,11 @@ const appFallbackKeys = new Set([
   "session.jumpToMessage.count.other",
   "session.jumpToMessage.loadedCount.one",
   "session.jumpToMessage.loadedCount.other",
+  "home.bookmarks",
+  "home.bookmarks.empty",
+  "home.bookmarks.empty.description",
+  "session.bookmark.add",
+  "session.bookmark.remove",
 ])
 const pluralCategories = new Map(
   appLocales.map(

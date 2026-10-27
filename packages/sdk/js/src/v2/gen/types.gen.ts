@@ -173,6 +173,7 @@ export type Session = {
   id: string
   slug: string
   projectID: string
+  bookmarked?: boolean
   workspaceID?: string
   directory: string
   path?: string
@@ -776,6 +777,7 @@ export type GlobalEvent = {
         properties: {
           sessionID: string
           info: Session
+          updatedFields?: Array<"bookmarked">
         }
       }
     | {
@@ -2226,6 +2228,7 @@ export type GlobalSession = {
   id: string
   slug: string
   projectID: string
+  bookmarked?: boolean
   workspaceID?: string
   directory: string
   path?: string
@@ -3249,6 +3252,7 @@ export type SyncEventSessionUpdated = {
     data: {
       sessionID: string
       info: Session
+      updatedFields?: Array<"bookmarked">
     }
   }
 }
@@ -4032,6 +4036,7 @@ export type SessionV2Info = {
   id: string
   parentID?: string
   projectID: string
+  bookmarked?: boolean
   agent?: string
   model?: ModelRef
   cost: number
@@ -5248,6 +5253,7 @@ export type SessionUpdated = {
   data: {
     sessionID: string
     info: Session
+    updatedFields?: Array<"bookmarked">
   }
 }
 
@@ -6359,6 +6365,7 @@ export type EventSessionUpdated = {
   properties: {
     sessionID: string
     info: Session
+    updatedFields?: Array<"bookmarked">
   }
 }
 
@@ -9970,6 +9977,7 @@ export type SessionGetResponse = SessionGetResponses[keyof SessionGetResponses]
 export type SessionUpdateData = {
   body?: {
     title?: string
+    bookmarked?: boolean
     metadata?: {
       [key: string]: unknown
     }

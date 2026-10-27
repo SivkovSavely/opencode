@@ -7,7 +7,7 @@ export const HOME_V2_SESSION_PAGE_LIMIT = 5_000
 
 export type HomeSessionEvent = {
   type: "session.created" | "session.updated" | "session.deleted"
-  properties: { sessionID: string; info: Session }
+  properties: { sessionID: string; info: Session; updatedFields?: Array<"bookmarked"> }
 }
 export type HomeSessionEvents = {
   sequence: number
@@ -143,10 +143,18 @@ export function createHomeSessionIndexCache(queryClient: QueryClient, server: st
 // Once released, use client.v2.project.list() and client.v2.session.list({
 // parentID: null, order: "desc" }), then remove this adapter and its V1 fields.
 export function parseHomeSessionIndex(sessions: SessionV2Info[]): Session[] {
-  return sessions.flatMap((item) => {
-    if (item.parentID || typeof item.time.archived === "number") return []
-    return [toLegacySummary(item)]
-  })
+  return [
+    ...new Map(
+      sessions.flatMap((item) => {
+        if (item.parentID || typeof item.time.archived === "number") return []
+        return [[item.id, toLegacySummary(item)] as const]
+      }),
+    ).values(),
+  ]
+}
+
+export function bookmarkedHomeSessions(sessions: Session[]) {
+  return sessions.filter((session) => session.bookmarked)
 }
 
 export function retainHomeSessions(sessions: Session[], limit: number, now: number) {
@@ -157,6 +165,10 @@ export function retainHomeSessions(sessions: Session[], limit: number, now: numb
 export function applyHomeSessionEvent(sessions: Session[], event: HomeSessionEvent) {
   const info = event.properties.info
   const index = sessions.findIndex((session) => session.id === info.id)
+  if (event.properties.updatedFields?.includes("bookmarked")) {
+    if (index === -1) return sessions
+    return sessions.with(index, { ...sessions[index]!, bookmarked: info.bookmarked })
+  }
   if (event.type === "session.deleted" || info.parentID || typeof info.time.archived === "number") {
     if (index === -1) return sessions
     return sessions.toSpliced(index, 1)
@@ -171,6 +183,7 @@ function toLegacySummary(session: SessionV2Info): Session {
     id: session.id,
     slug: session.id,
     projectID: session.projectID,
+    bookmarked: session.bookmarked,
     workspaceID: session.location.workspaceID,
     directory: session.location.directory,
     path: session.subpath,

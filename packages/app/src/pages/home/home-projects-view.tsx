@@ -50,6 +50,7 @@ export type HomeProjectsViewProps = {
   onRemoveServer: (server: ServerConnection.Any) => void
   onMoveProject: (server: ServerConnection.Any, worktree: string, index: number) => void
   onSelectProject: (server: ServerConnection.Any, directory: string) => void
+  onSelectBookmarks: (server: ServerConnection.Any) => void
   onAddProjects: (server: ServerConnection.Any, directories: string[]) => void
   onOpenProjectNewSession: (server: ServerConnection.Any, directory: string) => void
   onEditProject: (server: ServerConnection.Any, project: LocalProject) => void
@@ -102,6 +103,13 @@ export function HomeProjectsView(props: HomeProjectsViewProps) {
           when={props.servers().length > 1}
           fallback={
             <div class="pr-3">
+              <HomeBookmarksRow
+                language={props.language}
+                selection={props.selection}
+                serverHealth={props.serverHealth}
+                onSelectBookmarks={props.onSelectBookmarks}
+                server={props.servers()[0]}
+              />
               <Show
                 when={props.projects().length > 0}
                 fallback={<HomeProjectEmpty {...props} server={props.servers()[0]} items={props.recentlyClosed()} />}
@@ -129,13 +137,26 @@ export function HomeProjectsView(props: HomeProjectsViewProps) {
                       server={item}
                       {...props}
                       {...contextMenuProps}
-                      selected={props.selection().server === ServerConnection.key(item) && !props.selection().directory}
+                      selected={
+                        props.selection().server === ServerConnection.key(item) &&
+                        !props.selection().directory &&
+                        props.selection().view !== "bookmarks"
+                      }
                       collapsed={collapsed()}
                       health={props.serverHealth(item)}
                     />
-                    <Show when={healthy() && hasProjects() && !collapsed()}>
-                      <div class="mx-3 h-px bg-v2-border-border-base" />
-                      <HomeProjectList {...props} {...contextMenuProps} server={item} items={projects()} />
+                    <HomeBookmarksRow
+                      language={props.language}
+                      selection={props.selection}
+                      serverHealth={props.serverHealth}
+                      onSelectBookmarks={props.onSelectBookmarks}
+                      server={item}
+                    />
+                    <Show when={!collapsed()}>
+                      <Show when={healthy() && hasProjects()}>
+                        <div class="mx-3 h-px bg-v2-border-border-base" />
+                        <HomeProjectList {...props} {...contextMenuProps} server={item} items={projects()} />
+                      </Show>
                     </Show>
                   </div>
                 )
@@ -151,6 +172,30 @@ export function HomeProjectsView(props: HomeProjectsViewProps) {
         language={props.language}
       />
     </aside>
+  )
+}
+
+function HomeBookmarksRow(props: {
+  language: HomeProjectsViewProps["language"]
+  selection: HomeProjectsViewProps["selection"]
+  serverHealth: HomeProjectsViewProps["serverHealth"]
+  onSelectBookmarks: HomeProjectsViewProps["onSelectBookmarks"]
+  server: ServerConnection.Any
+}) {
+  const selected = () =>
+    props.selection().server === ServerConnection.key(props.server) && props.selection().view === "bookmarks"
+  return (
+    <HomeProjectNavButton
+      type="button"
+      data-component="home-bookmarks-row"
+      data-selected={selected() ? "" : undefined}
+      aria-current={selected() ? "page" : undefined}
+      disabled={props.serverHealth(props.server)?.healthy === false}
+      onClick={() => props.onSelectBookmarks(props.server)}
+    >
+      <IconV2 name="bookmark" size="small" class="text-v2-icon-icon-muted" />
+      <span class={HOME_PROJECT_NAV_LABEL}>{props.language.t("home.bookmarks")}</span>
+    </HomeProjectNavButton>
   )
 }
 

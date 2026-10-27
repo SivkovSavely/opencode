@@ -1,10 +1,13 @@
 import { useNavigate } from "@solidjs/router"
+import { createSignal } from "solid-js"
+import { produce } from "solid-js/store"
 import { useCommand, type CommandOption } from "@/context/command"
 import { useDialog } from "@opencode-ai/ui/context/dialog"
 import { previewSelectedLines } from "@opencode-ai/session-ui/pierre/selection-bridge"
 import { useFile, selectionFromLines, type FileSelection, type SelectedLineRange } from "@/context/file"
 import { useLanguage } from "@/context/language"
 import { useLayout } from "@/context/layout"
+import { useServerSDK } from "@/context/server-sdk"
 import { usePermission } from "@/context/permission"
 import { usePrompt } from "@/context/prompt"
 import { useSDK } from "@/context/sdk"
@@ -13,6 +16,7 @@ import { useSync } from "@/context/sync"
 import { useTerminal } from "@/context/terminal"
 import { showToast } from "@/utils/toast"
 import { downloadSessionExport, fetchSessionExport, sessionExportFilename } from "@/utils/session-export"
+import { sessionBookmarkRollback } from "@/utils/session-bookmark"
 import { findLast } from "@opencode-ai/core/util/array"
 import { createSessionTabs } from "@/pages/session/helpers"
 import { extractPromptFromParts } from "@/utils/prompt"
@@ -45,6 +49,7 @@ export const useSessionCommands = (actions: SessionCommandContext) => {
   const permission = usePermission()
   const prompt = usePrompt()
   const sdk = useSDK()
+  const serverSDK = useServerSDK()
   const settings = useSettings()
   const sync = useSync()
   const terminal = useTerminal()
@@ -75,6 +80,52 @@ export const useSessionCommands = (actions: SessionCommandContext) => {
     const id = params.id
     if (!id) return
     return sync().session.get(id)
+  }
+  const [bookmarkPending, setBookmarkPending] = createSignal(new Set<string>())
+  const toggleBookmark = async () => {
+    const sessionID = params.id
+    if (!sessionID || bookmarkPending().has(sessionID)) return
+    const sessionSync = sync()
+    const current = sessionSync.session.get(sessionID)
+    if (!current || current.parentID) return
+    setBookmarkPending((pending) => new Set(pending).add(sessionID))
+    const bookmarkRevision = sessionSync.data.bookmark_revision[sessionID] ?? 0
+    const bookmarked = !current.bookmarked
+    const client = serverSDK().client
+    const input = { sessionID: current.id, directory: current.directory, bookmarked }
+    const setBookmarkedLocal = (value: boolean) =>
+      sessionSync.set(
+        produce((draft) => {
+          const session = draft.session.find((item) => item.id === current.id)
+          if (session) session.bookmarked = value
+        }),
+      )
+    setBookmarkedLocal(bookmarked)
+    try {
+      await client.session.update(input, { throwOnError: true })
+    } catch (error) {
+      const persisted = await client.session
+        .get({ sessionID: current.id }, { throwOnError: true })
+        .then((result) => result.data?.bookmarked)
+        .catch(() => undefined)
+      const rollback = sessionBookmarkRollback({
+        expectedRevision: bookmarkRevision,
+        currentRevision: sessionSync.data.bookmark_revision[sessionID] ?? 0,
+        persisted,
+        previous: current.bookmarked,
+      })
+      if (rollback !== undefined) setBookmarkedLocal(rollback)
+      showToast({
+        title: language.t("common.requestFailed"),
+        description: error instanceof Error ? error.message : language.t("common.requestFailed"),
+      })
+    } finally {
+      setBookmarkPending((pending) => {
+        const next = new Set(pending)
+        next.delete(sessionID)
+        return next
+      })
+    }
   }
   const hasReview = () => !!params.id
   const normalizeTab = (tab: string) => {
@@ -508,6 +559,12 @@ export const useSessionCommands = (actions: SessionCommandContext) => {
         const id = params.id
         if (id) void sessionArchive.archive(id)
       },
+    }),
+    sessionCommand({
+      id: "session.bookmark",
+      title: info()?.bookmarked ? language.t("session.bookmark.remove") : language.t("session.bookmark.add"),
+      disabled: !params.id || !!info()?.parentID || bookmarkPending().has(params.id),
+      onSelect: toggleBookmark,
     }),
   ]
 

@@ -340,6 +340,7 @@ describe("DatabaseMigration", () => {
               id: SessionSchema.ID.make("session"),
               slug: "session",
               projectID: ProjectV2.ID.global,
+              bookmarked: false,
               directory: "/project",
               title: "After",
               version: "test",

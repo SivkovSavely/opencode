@@ -353,6 +353,7 @@ function child(id: string): SessionChild {
     id,
     slug: id,
     projectID: "project-1",
+    bookmarked: false,
     directory: "/tmp",
     title: id,
     version: "1",

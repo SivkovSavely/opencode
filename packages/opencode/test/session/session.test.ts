@@ -133,6 +133,33 @@ describe("session.created event", () => {
   )
 })
 
+describe("session bookmarks", () => {
+  it.instance("persists concurrent, repeated bookmark changes without affecting archive state", () =>
+    Effect.gen(function* () {
+      const session = yield* SessionNs.Service
+      const info = yield* session.create({})
+
+      yield* Effect.all(
+        [
+          session.setBookmarked({ sessionID: info.id, bookmarked: true }),
+          session.setBookmarked({ sessionID: info.id, bookmarked: true }),
+        ],
+        { concurrency: "unbounded" },
+      )
+      yield* session.setBookmarked({ sessionID: info.id, bookmarked: true })
+      yield* session.setArchived({ sessionID: info.id, time: 1 })
+
+      const persisted = yield* session.get(info.id)
+      expect(persisted.bookmarked).toBe(true)
+      expect(persisted.time.archived).toBe(1)
+
+      yield* session.setBookmarked({ sessionID: info.id, bookmarked: false })
+      expect((yield* session.get(info.id)).bookmarked).toBe(false)
+      yield* session.remove(info.id)
+    }),
+  )
+})
+
 describe("step-finish token propagation via event", () => {
   it.instance(
     "non-zero tokens propagate through PartUpdated event",

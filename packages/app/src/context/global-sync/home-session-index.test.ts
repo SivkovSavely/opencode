@@ -9,6 +9,7 @@ import {
   loadHomeSessionIndex,
   homeSessionIndexSessions,
   homeSessionIndexRefresh,
+  bookmarkedHomeSessions,
   parseHomeSessionIndex,
   retainHomeSessions,
 } from "./home-session-index"
@@ -18,11 +19,13 @@ const session = (input: {
   directory?: string
   parentID?: string
   archived?: number
+  bookmarked?: boolean
   updated?: number
 }) => ({
   id: input.id,
   parentID: input.parentID,
   projectID: "project",
+  bookmarked: input.bookmarked ?? false,
   cost: 0,
   tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
   time: { created: 1, updated: input.updated ?? 1, archived: input.archived },
@@ -101,6 +104,48 @@ describe("Home V2 session index", () => {
         time: { created: 1, updated: 20, archived: null },
       }),
     ])
+  })
+
+  test("retains only unique bookmarked roots, including old sessions across closed projects", () => {
+    const sessions = parseHomeSessionIndex([
+      session({ id: "old", directory: "/closed-project", bookmarked: true, updated: 1 }),
+      session({ id: "new", directory: "/open-project", bookmarked: true, updated: 100 }),
+      session({ id: "plain", bookmarked: false, updated: 200 }),
+      session({ id: "child", parentID: "old", bookmarked: true, updated: 300 }),
+      session({ id: "archived", archived: 400, bookmarked: true, updated: 400 }),
+      session({ id: "new", directory: "/open-project", bookmarked: true, updated: 100 }),
+    ])
+
+    expect(bookmarkedHomeSessions(sessions).map((item) => item.id)).toEqual(["old", "new"])
+  })
+
+  test("replays bookmark changes independently for each server when session IDs overlap", () => {
+    const queryClient = new QueryClient()
+    const first = createHomeSessionIndexCache(queryClient, "server-a")
+    const second = createHomeSessionIndexCache(queryClient, "server-b")
+    const sessionInfo = parseHomeSessionIndex([session({ id: "shared-id" })])[0]!
+    queryClient.setQueryData(first.indexKey, { sessions: [sessionInfo], eventSequence: 0 })
+    queryClient.setQueryData(second.indexKey, { sessions: [sessionInfo], eventSequence: 0 })
+
+    first.apply({
+      type: "session.updated",
+      properties: { sessionID: sessionInfo.id, info: { ...sessionInfo, bookmarked: true } },
+    })
+
+    expect(queryClient.getQueryData<{ sessions: Session[] }>(first.indexKey)?.sessions[0]?.bookmarked).toBe(true)
+    expect(queryClient.getQueryData<{ sessions: Session[] }>(second.indexKey)?.sessions[0]?.bookmarked).toBe(false)
+  })
+
+  test("replays bookmark-only updates without replacing the rest of the session", () => {
+    const current = { ...parseHomeSessionIndex([session({ id: "session" })])[0]!, title: "current", cost: 12 }
+    const stale = { ...current, title: "stale", cost: 0, bookmarked: true }
+
+    expect(
+      applyHomeSessionEvent([current], {
+        type: "session.updated",
+        properties: { sessionID: current.id, info: stale, updatedFields: ["bookmarked"] },
+      }),
+    ).toEqual([{ ...current, bookmarked: true }])
   })
 
   test("preserves the per-directory Home retention limit", () => {

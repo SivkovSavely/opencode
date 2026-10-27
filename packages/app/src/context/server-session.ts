@@ -1007,7 +1007,13 @@ export function createServerSession(
         remember((event.properties as { info: Session }).info)
         return
       case "session.updated": {
-        const info = (event.properties as { info: Session }).info
+        const properties = event.properties as { info: Session; updatedFields?: Array<"bookmarked"> }
+        const current = data.info[properties.info.id]
+        const info =
+          properties.updatedFields?.includes("bookmarked") && current
+            ? { ...current, bookmarked: properties.info.bookmarked }
+            : properties.info
+        if (properties.updatedFields?.includes("bookmarked") && !current) return
         remember(info)
         if (info.time.archived) evict([info.id])
         return

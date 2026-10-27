@@ -8,6 +8,7 @@ const info = {
   id: SessionID.descending(),
   slug: "test-session",
   projectID: ProjectV2.ID.global,
+  bookmarked: false,
   workspaceID: undefined,
   directory: "/tmp/opencode",
   parentID: undefined,

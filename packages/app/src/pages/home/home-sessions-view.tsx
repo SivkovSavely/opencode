@@ -15,9 +15,9 @@ import {
   HomeSessionStatusController,
   homeSessionSearchKey,
   type HomeSessionGroup,
-  type HomeSessionRecord,
   type OpenSessionOptions,
 } from "./home-sessions-controller"
+import type { HomeSessionRecord } from "./home-session-records"
 
 const SHOW_HOME_SESSION_ARCHIVE = false
 const HOME_SECTION_LABEL = "text-v2-text-text-muted [font-weight:440]"
@@ -39,6 +39,7 @@ function isBackgroundOpen(event: MouseEvent) {
 export type HomeSessionsViewProps = {
   language: ReturnType<typeof useLanguage>
   groups: Accessor<HomeSessionGroup[]>
+  bookmarks: Accessor<boolean>
   showProjectName: Accessor<boolean>
   server: Accessor<ServerConnection.Key>
   canCreateSession: Accessor<boolean>
@@ -76,7 +77,7 @@ export function HomeSessionsView(props: HomeSessionsViewProps) {
     <section
       ref={props.onSetHoverTarget}
       class="min-h-0 min-w-0 flex-1 flex flex-col"
-      aria-label={props.language.t("sidebar.project.recentSessions")}
+      aria-label={props.language.t(props.bookmarks() ? "home.bookmarks" : "sidebar.project.recentSessions")}
     >
       <div class="sticky top-0 z-30 shrink-0 bg-v2-background-bg-base pb-3 pt-6 lg:pt-12" onWheel={props.onWheel}>
         <HomeSessionSearch {...props} />
@@ -115,10 +116,14 @@ export function HomeSessionsView(props: HomeSessionsViewProps) {
           <Show
             when={props.groups().length > 0}
             fallback={
-              <HomeSessionsEmpty
-                onNewSession={props.canCreateSession() ? props.onCreateSession : undefined}
-                language={props.language}
-              />
+              props.bookmarks() ? (
+                <HomeBookmarksEmpty language={props.language} />
+              ) : (
+                <HomeSessionsEmpty
+                  onNewSession={props.canCreateSession() ? props.onCreateSession : undefined}
+                  language={props.language}
+                />
+              )
             }
           >
             <div ref={props.onSetContent} class="flex flex-col pt-3 pr-3 pb-16">
@@ -383,7 +388,12 @@ function HomeSessionSearchResultRow(
         revealProjectOnHover={!!showProjectName()}
       />
       <div class="flex min-w-0 flex-1 items-center gap-1.5">
-        <HomeSessionTitle title={title()} showProjectName={!!showProjectName()} search />
+        <HomeSessionTitle
+          title={title()}
+          showProjectName={!!showProjectName()}
+          search
+          bookmarked={!!props.record.session.bookmarked}
+        />
         <Show when={showProjectName()}>
           <HomeSessionProjectName name={props.record.projectName} search />
         </Show>
@@ -448,7 +458,11 @@ function HomeSessionRow(props: HomeSessionsViewProps & { record: HomeSessionReco
           record={props.record}
           revealProjectOnHover={!!showProjectName()}
         />
-        <HomeSessionTitle title={title()} showProjectName={!!showProjectName()} />
+        <HomeSessionTitle
+          title={title()}
+          showProjectName={!!showProjectName()}
+          bookmarked={!!props.record.session.bookmarked}
+        />
         <Show when={showProjectName()}>
           <HomeSessionProjectName name={props.record.projectName} />
         </Show>
@@ -480,17 +494,20 @@ function HomeSessionRow(props: HomeSessionsViewProps & { record: HomeSessionReco
   )
 }
 
-function HomeSessionTitle(props: { title: string; showProjectName: boolean; search?: boolean }) {
+function HomeSessionTitle(props: { title: string; showProjectName: boolean; search?: boolean; bookmarked: boolean }) {
   return (
     <span
-      class="min-w-0 overflow-hidden text-ellipsis whitespace-nowrap text-v2-text-text-base [font-weight:530]"
+      class="flex min-w-0 items-center gap-1.5 overflow-hidden text-v2-text-text-base [font-weight:530]"
       classList={{
         "text-[13px] leading-4 tracking-[-0.04px]": !!props.search,
         "max-w-[min(70%,480px)] flex-[0_1_auto]": props.showProjectName,
         "flex-[1_1_auto]": !props.showProjectName,
       }}
     >
-      {props.title}
+      <span class="min-w-0 overflow-hidden text-ellipsis whitespace-nowrap">{props.title}</span>
+      <Show when={props.bookmarked}>
+        <IconV2 name="bookmark" size="small" class="pointer-events-none shrink-0 text-v2-icon-icon-muted" />
+      </Show>
     </span>
   )
 }
@@ -532,6 +549,19 @@ function HomeSessionsEmpty(props: { onNewSession?: () => void; language: ReturnT
           </ButtonV2>
         )}
       </Show>
+    </div>
+  )
+}
+
+function HomeBookmarksEmpty(props: { language: ReturnType<typeof useLanguage> }) {
+  return (
+    <div class="flex min-h-full flex-col items-center gap-4 px-6 pt-[52px] text-center">
+      <div class="shrink-0 text-[13px] leading-[13px] tracking-[-0.04px] text-v2-text-text-base [font-weight:530]">
+        {props.language.t("home.bookmarks.empty")}
+      </div>
+      <p class="mb-1 text-center text-[13px] leading-5 tracking-[-0.04px] text-v2-text-text-muted [font-weight:440]">
+        {props.language.t("home.bookmarks.empty.description")}
+      </p>
     </div>
   )
 }

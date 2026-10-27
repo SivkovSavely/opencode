@@ -15,6 +15,7 @@ import { SessionV2 } from "@opencode-ai/core/session"
 import { SessionEvent } from "@opencode-ai/core/session/event"
 import { SessionMessage } from "@opencode-ai/core/session/message"
 import { Prompt } from "@opencode-ai/core/session/prompt"
+import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { SessionMessageUpdater } from "@opencode-ai/core/session/message-updater"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { SessionExecution } from "@opencode-ai/core/session/execution"
@@ -45,6 +46,52 @@ const assistantRow = (
 }
 
 describe("SessionProjector", () => {
+  it.effect("projects bookmark updates without overwriting usage totals", () =>
+    Effect.gen(function* () {
+      const { db } = yield* Database.Service
+      yield* db
+        .insert(ProjectTable)
+        .values({ id: Project.ID.global, worktree: AbsolutePath.make("/project"), sandboxes: [] })
+        .run()
+      yield* db
+        .insert(SessionTable)
+        .values({
+          id: sessionID,
+          project_id: Project.ID.global,
+          slug: "test",
+          directory: "/project",
+          title: "test",
+          version: "test",
+          cost: 12,
+          tokens_input: 34,
+        })
+        .run()
+      const events = yield* EventV2.Service
+      yield* events.publish(SessionV1.Event.Updated, {
+        sessionID,
+        info: SessionV1.SessionInfo.make({
+          id: sessionID,
+          slug: "test",
+          version: "test",
+          projectID: Project.ID.global,
+          bookmarked: true,
+          directory: "/project",
+          title: "test",
+          cost: 0,
+          tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+          time: { created: 0, updated: 0 },
+        }),
+        updatedFields: ["bookmarked"],
+      })
+
+      expect(
+        yield* db.select({ bookmarked: SessionTable.bookmarked, cost: SessionTable.cost, tokens: SessionTable.tokens_input })
+          .from(SessionTable)
+          .get(),
+      ).toEqual({ bookmarked: true, cost: 12, tokens: 34 })
+    }),
+  )
+
   it.effect("projects moved sessions without the transitional context epoch table", () =>
     Effect.gen(function* () {
       const { db } = yield* Database.Service

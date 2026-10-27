@@ -535,6 +535,7 @@ export type Session = {
   projectID: string
   directory: string
   parentID?: string
+  bookmarked?: boolean
   summary?: {
     additions: number
     deletions: number
@@ -570,6 +571,7 @@ export type EventSessionUpdated = {
   type: "session.updated"
   properties: {
     info: Session
+    updatedFields?: Array<"bookmarked">
   }
 }
 
@@ -2207,6 +2209,7 @@ export type SessionGetResponse = SessionGetResponses[keyof SessionGetResponses]
 export type SessionUpdateData = {
   body?: {
     title?: string
+    bookmarked?: boolean
   }
   path: {
     id: string

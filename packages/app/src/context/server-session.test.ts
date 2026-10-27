@@ -1653,6 +1653,18 @@ describe("server session", () => {
     expect(ctx.get).toEqual([])
   })
 
+  test("applies bookmark-only updates without replacing the session snapshot", () => {
+    const ctx = setup({})
+    const current = { ...session("root"), cost: 12, bookmarked: false }
+    ctx.store.apply({ type: "session.created", properties: { sessionID: current.id, info: current } })
+    ctx.store.apply({
+      type: "session.updated",
+      properties: { info: { ...current, cost: 0, bookmarked: true }, updatedFields: ["bookmarked"] },
+    })
+
+    expect(ctx.store.get("root")).toMatchObject({ cost: 12, bookmarked: true })
+  })
+
   test("preserves pinned session content under server-wide cache pressure", () => {
     const ctx = setup({})
     ctx.store.pin("active")

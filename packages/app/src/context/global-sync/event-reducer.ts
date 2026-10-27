@@ -144,8 +144,15 @@ export function applyDirectoryEvent(input: {
       break
     }
     case "session.updated": {
-      const info = (event.properties as { info: Session }).info
+      const properties = event.properties as { info: Session; updatedFields?: Array<"bookmarked"> }
+      const info = properties.info
       const result = Binary.search(input.store.session, info.id, (s) => s.id)
+      if (properties.updatedFields?.includes("bookmarked")) {
+        input.setStore("bookmark_revision", info.id, (revision = 0) => revision + 1)
+        if (!result.found) break
+        input.setStore("session", result.index, (session) => ({ ...session, bookmarked: info.bookmarked }))
+        break
+      }
       if (info.time.archived) {
         if (!result.found) break
         if (input.store.session[result.index]!.time.archived === info.time.archived) break

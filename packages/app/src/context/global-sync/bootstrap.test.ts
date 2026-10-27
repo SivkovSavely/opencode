@@ -53,6 +53,7 @@ function directoryState() {
     path: { state: "", config: "", worktree: "/project", directory: "/project", home: "/home" },
     session: [],
     sessionTotal: 0,
+    bookmark_revision: {},
     session_status: {},
     session_working(id: string) {
       return this.session_status[id]?.type !== "idle"

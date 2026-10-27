@@ -61,6 +61,7 @@ import { useFileComponent } from "@opencode-ai/ui/context/file"
 import { shouldMarkBoundaryGesture, normalizeWheelDelta } from "@/pages/session/message-gesture"
 import { SessionContextUsage } from "@/components/session-context-usage"
 import { useDialog } from "@opencode-ai/ui/context/dialog"
+import { useCommand } from "@/context/command"
 import { useLanguage } from "@/context/language"
 import { useLayout } from "@/context/layout"
 import { useSessionKey } from "@/pages/session/session-layout"
@@ -276,6 +277,7 @@ export function MessageTimeline(props: {
   const sync = useSync()
   const settings = useSettings()
   const dialog = useDialog()
+  const command = useCommand()
   const sessionArchive = useSessionArchive()
   const language = useLanguage()
   const layout = useLayout()
@@ -562,7 +564,11 @@ export function MessageTimeline(props: {
       virtualizer.scrollToIndex(index, { align: "center" })
     })
     props.setScrollToEnd?.(() => virtualizer.scrollToEnd())
-    props.setHistoryAnchor?.({ capture: capturePrependAnchor, restore: restorePrependAnchor, cancel: clearPrependAnchor })
+    props.setHistoryAnchor?.({
+      capture: capturePrependAnchor,
+      restore: restorePrependAnchor,
+      cancel: clearPrependAnchor,
+    })
   })
 
   let overscanFrame: number | undefined
@@ -719,11 +725,14 @@ export function MessageTimeline(props: {
   const retryNow = async (id: string, retry: { attempt: number; next: number }) => {
     const client = sdk().client
     try {
-      const result = await client.session.retry({
-        sessionID: id,
-        attempt: retry.attempt,
-        next: retry.next,
-      }, { throwOnError: true })
+      const result = await client.session.retry(
+        {
+          sessionID: id,
+          attempt: retry.attempt,
+          next: retry.next,
+        },
+        { throwOnError: true },
+      )
       return result.data.accepted === true
     } catch (err) {
       const current = sessionStatus()
@@ -1283,13 +1292,15 @@ export function MessageTimeline(props: {
                 status={sessionStatus()}
                 show={activeMessageID() === retryRow().userMessageID}
                 retryKey={sessionID()}
-                onRetry={sessionID()
-                  ? (current) => {
-                      const id = sessionID()
-                      if (!id) return Promise.resolve(false)
-                      return retryNow(id, { attempt: current.attempt, next: current.next })
-                    }
-                  : undefined}
+                onRetry={
+                  sessionID()
+                    ? (current) => {
+                        const id = sessionID()
+                        if (!id) return Promise.resolve(false)
+                        return retryNow(id, { attempt: current.attempt, next: current.next })
+                      }
+                    : undefined
+                }
               />
             </div>
           </TimelineRowFrame>
@@ -1631,6 +1642,13 @@ export function MessageTimeline(props: {
                                 >
                                   <DropdownMenu.ItemLabel>{language.t("common.rename")}</DropdownMenu.ItemLabel>
                                 </DropdownMenu.Item>
+                                <DropdownMenu.Item onSelect={() => command.trigger("session.bookmark")}>
+                                  <DropdownMenu.ItemLabel>
+                                    {language.t(
+                                      info()?.bookmarked ? "session.bookmark.remove" : "session.bookmark.add",
+                                    )}
+                                  </DropdownMenu.ItemLabel>
+                                </DropdownMenu.Item>
                                 <Show when={shareEnabled()}>
                                   <DropdownMenu.Item
                                     onSelect={() => {
@@ -1649,7 +1667,9 @@ export function MessageTimeline(props: {
                                   <DropdownMenu.ItemLabel>{language.t("common.export")}...</DropdownMenu.ItemLabel>
                                 </DropdownMenu.Item>
                                 <DropdownMenu.Item onSelect={() => openJumpToMessage(id)}>
-                                  <DropdownMenu.ItemLabel>{language.t("session.jumpToMessage.menu")}</DropdownMenu.ItemLabel>
+                                  <DropdownMenu.ItemLabel>
+                                    {language.t("session.jumpToMessage.menu")}
+                                  </DropdownMenu.ItemLabel>
                                 </DropdownMenu.Item>
                                 <DropdownMenu.Item onSelect={() => void sessionArchive.archive(id)}>
                                   <DropdownMenu.ItemLabel>{language.t("common.archive")}</DropdownMenu.ItemLabel>
@@ -1712,6 +1732,9 @@ export function MessageTimeline(props: {
                                 }}
                               >
                                 {language.t("common.rename")}
+                              </MenuV2.Item>
+                              <MenuV2.Item onSelect={() => command.trigger("session.bookmark")}>
+                                {language.t(info()?.bookmarked ? "session.bookmark.remove" : "session.bookmark.add")}
                               </MenuV2.Item>
                               <Show when={shareEnabled()}>
                                 <MenuV2.Item

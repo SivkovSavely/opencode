@@ -153,6 +153,7 @@ describe("SessionV2.create", () => {
           slug: "updated",
           version: "test",
           projectID: created.projectID,
+          bookmarked: false,
           directory: created.location.directory,
           title: "updated",
           agent: "build",

@@ -27,6 +27,7 @@ export function HomeProjects(props: { projects: HomeProjectsController; scroll: 
       onRemoveServer={props.projects.server.remove}
       onMoveProject={props.projects.project.move}
       onSelectProject={props.projects.project.select}
+      onSelectBookmarks={props.projects.project.selectBookmarks}
       onAddProjects={props.projects.project.add}
       onOpenProjectNewSession={props.projects.project.openNewSession}
       onEditProject={props.projects.project.edit}

@@ -6,7 +6,8 @@ import { makeEventListener } from "@solid-primitives/event-listener"
 import { createMemo, onCleanup } from "solid-js"
 import { createStore } from "solid-js/store"
 import type { HomeController } from "./home-controller"
-import { homeSessionSearchKey, type HomeSessionRecord, type HomeSessionsController } from "./home-sessions-controller"
+import { homeSessionSearchKey, type HomeSessionsController } from "./home-sessions-controller"
+import type { HomeSessionRecord } from "./home-session-records"
 
 type HomeSessionSearchSource = Pick<HomeSessionsController, "data" | "session">
 

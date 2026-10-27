@@ -895,15 +895,51 @@ describe("session HttpApi", () => {
         const updated = yield* requestJson<Session.Info>(pathFor(SessionPaths.update, { sessionID: created.id }), {
           method: "PATCH",
           headers,
-          body: JSON.stringify({ title: "updated", time: { archived: 1 } }),
+          body: JSON.stringify({ title: "updated", bookmarked: true, time: { archived: 1 } }),
         })
-        expect(updated).toMatchObject({ id: created.id, title: "updated", time: { archived: 1 } })
+        expect(updated).toMatchObject({
+          id: created.id,
+          title: "updated",
+          bookmarked: true,
+          time: { archived: 1 },
+        })
+
+        const repeated = yield* requestJson<Session.Info>(pathFor(SessionPaths.update, { sessionID: created.id }), {
+          method: "PATCH",
+          headers,
+          body: JSON.stringify({ bookmarked: true }),
+        })
+        expect(repeated.bookmarked).toBe(true)
+        expect(
+          yield* requestJson<Session.Info>(pathFor(SessionPaths.get, { sessionID: created.id }), { headers }),
+        ).toMatchObject({ bookmarked: true, time: { archived: 1 } })
+
+        const parent = yield* requestJson<Session.Info>(SessionPaths.create, {
+          method: "POST",
+          headers,
+          body: JSON.stringify({ title: "bookmark parent" }),
+        })
+        const child = yield* requestJson<Session.Info>(SessionPaths.create, {
+          method: "POST",
+          headers,
+          body: JSON.stringify({ title: "bookmark child", parentID: parent.id }),
+        })
+        const childBookmark = yield* request(pathFor(SessionPaths.update, { sessionID: child.id }), {
+          method: "PATCH",
+          headers,
+          body: JSON.stringify({ bookmarked: true }),
+        })
+        expect(childBookmark.status).toBe(400)
+        expect(
+          yield* requestJson<Session.Info>(pathFor(SessionPaths.get, { sessionID: child.id }), { headers }),
+        ).toMatchObject({ bookmarked: false, parentID: parent.id })
 
         const forked = yield* requestJson<Session.Info>(pathFor(SessionPaths.fork, { sessionID: created.id }), {
           method: "POST",
           headers,
         })
         expect(forked.id).not.toBe(created.id)
+        expect(forked.bookmarked).toBe(false)
 
         const forkedWithoutContentType = yield* requestJson<Session.Info>(
           pathFor(SessionPaths.fork, { sessionID: created.id }),
@@ -944,6 +980,7 @@ describe("session HttpApi", () => {
             headers,
           }),
         ).toBe(true)
+        expect((yield* request(pathFor(SessionPaths.get, { sessionID: created.id }), { headers })).status).toBe(404)
       }),
     { git: true, config: { formatter: false, lsp: false, share: "disabled" } },
   )

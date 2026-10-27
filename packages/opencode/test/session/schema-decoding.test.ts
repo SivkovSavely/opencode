@@ -43,7 +43,7 @@ describe("Session.Info", () => {
       version: "0.1.0",
       time: { created: 1, updated: 2 },
     }
-    expect(decode(input)).toEqual(input)
+    expect(decode(input)).toEqual({ ...input, bookmarked: false })
   })
 
   test("round-trips every optional field", () => {
@@ -51,6 +51,7 @@ describe("Session.Info", () => {
       id: sessionID,
       slug: "fullshape",
       projectID,
+      bookmarked: false,
       workspaceID,
       directory: "/tmp/proj",
       path: "packages/opencode",
@@ -82,6 +83,7 @@ describe("Session.Info", () => {
       id: sessionID,
       slug: "legacy-diff",
       projectID,
+      bookmarked: false,
       directory: "/tmp/proj",
       title: "Legacy diff",
       version: "0.1.0",
@@ -126,6 +128,7 @@ describe("Session.GlobalInfo", () => {
       id: sessionID,
       slug: "global",
       projectID,
+      bookmarked: false,
       directory: "/tmp/proj",
       title: "global",
       version: "0",
@@ -140,6 +143,7 @@ describe("Session.GlobalInfo", () => {
       id: sessionID,
       slug: "global",
       projectID,
+      bookmarked: false,
       directory: "/tmp/proj",
       title: "global",
       version: "0",

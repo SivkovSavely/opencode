@@ -14,6 +14,7 @@ export function normalizeSessionInfo(input: SessionInfo | Session): Session {
     parentID: input.parentID,
     cost: input.cost,
     tokens: input.tokens,
+    bookmarked: "bookmarked" in input && input.bookmarked === true,
     title: withTimestampedFallback(input),
     agent: input.agent,
     model: input.model,

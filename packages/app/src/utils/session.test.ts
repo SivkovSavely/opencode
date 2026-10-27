@@ -28,6 +28,7 @@ describe("normalizeSessionInfo", () => {
       parentID: undefined,
       cost: 0,
       tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+      bookmarked: false,
       title: "New session",
       agent: "build",
       model: { id: "gpt-5", providerID: "openai", variant: "high" },
@@ -35,6 +36,12 @@ describe("normalizeSessionInfo", () => {
       time: { created: 1, updated: 1 },
       revert: { messageID: "message-1", partID: "part-1", snapshot: "snapshot" },
     })
+  })
+
+  test("preserves the bookmark flag when adapting current session data", () => {
+    const info = { ...currentSession("session-1"), bookmarked: true } as SessionInfo & { bookmarked: boolean }
+
+    expect(normalizeSessionInfo(info).bookmarked).toBe(true)
   })
 
   test("supplies timestamped titles for untitled current sessions", () => {

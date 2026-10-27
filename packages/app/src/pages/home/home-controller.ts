@@ -53,6 +53,10 @@ export function createHomeController() {
     void tabs.newDraft({ server: ServerConnection.key(conn), directory })
   }
 
+  function selectBookmarks(conn: ServerConnection.Any) {
+    setSelection({ server: ServerConnection.key(conn), view: "bookmarks" })
+  }
+
   return {
     selection: {
       value: selection,
@@ -113,6 +117,7 @@ export function createHomeController() {
         if (!conn || !project) return
         openProjectNewSession(conn, project.worktree)
       },
+      selectBookmarks,
       openProjectNewSession,
     },
   }

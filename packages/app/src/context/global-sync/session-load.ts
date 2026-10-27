@@ -19,10 +19,10 @@ export async function loadRootSessions(input: { api: Pick<SessionApi, "list">; d
 export async function loadRootSessionsV1(input: { client: OpencodeClient; directory: string; limit: number }) {
   try {
     const result = await input.client.session.list({ directory: input.directory, roots: true, limit: input.limit })
-    return { data: result.data, limit: input.limit, limited: true } as const
+    return { data: (result.data ?? []).map(normalizeSessionInfo), limit: input.limit, limited: true } as const
   } catch {
     const result = await input.client.session.list({ directory: input.directory, roots: true })
-    return { data: result.data, limit: input.limit, limited: false } as const
+    return { data: (result.data ?? []).map(normalizeSessionInfo), limit: input.limit, limited: false } as const
   }
 }
 

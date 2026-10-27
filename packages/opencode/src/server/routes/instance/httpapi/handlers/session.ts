@@ -197,8 +197,12 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       payload: typeof UpdatePayload.Type
     }) {
       const current = yield* requireSession(ctx.params.sessionID)
+      if (ctx.payload.bookmarked === true && current.parentID) return yield* new HttpApiError.BadRequest({})
       if (ctx.payload.title !== undefined) {
         yield* session.setTitle({ sessionID: ctx.params.sessionID, title: ctx.payload.title })
+      }
+      if (ctx.payload.bookmarked !== undefined) {
+        yield* session.setBookmarked({ sessionID: ctx.params.sessionID, bookmarked: ctx.payload.bookmarked })
       }
       if (ctx.payload.metadata !== undefined) {
         yield* session.setMetadata({ sessionID: ctx.params.sessionID, metadata: ctx.payload.metadata })
