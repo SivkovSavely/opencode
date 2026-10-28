@@ -10609,7 +10609,7 @@ export type SessionRetireResponses = {
   200: {
     rootSessionID: string
     sessionIDs: Array<string>
-    commandStatus: "unknown"
+    commandStatus: "draining" | "drained" | "unknown"
   }
 }
 

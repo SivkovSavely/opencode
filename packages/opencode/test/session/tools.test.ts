@@ -23,6 +23,7 @@ const callID = "call-test"
 const sessionID = SessionID.make("ses_test")
 const messageID = MessageID.ascending()
 const partID = PartID.ascending()
+const observed = { fence: undefined as number | undefined }
 
 const agent: Agent.Info = {
   name: "build",
@@ -100,6 +101,7 @@ const layer = Layer.mergeAll(
             jsonSchema: { type: "object", properties: {} },
             execute: (_args, ctx) =>
               Effect.gen(function* () {
+                observed.fence = ctx.executionFence
                 yield* ctx.metadata({ metadata: { output: "first" } })
                 yield* ctx.metadata({ metadata: { output: "second" } })
                 return { title: "timing", metadata: {}, output: "done" }
@@ -170,6 +172,7 @@ it.effect("preserves running tool start time across metadata updates", () =>
       bypassAgentCheck: false,
       messages: [],
       promptOps: {} as never,
+      executionFence: 42,
     })
     const execute = tools.timing.execute
     if (!execute) throw new Error("timing tool is missing execute")
@@ -186,6 +189,7 @@ it.effect("preserves running tool start time across metadata updates", () =>
     )
 
     expect(updates).toEqual([100, 100])
+    expect(observed.fence).toBe(42)
     expect(state.state.status).toBe("running")
     if (state.state.status === "running") {
       expect(state.state.time.start).toBe(100)

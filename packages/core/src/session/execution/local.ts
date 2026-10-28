@@ -9,6 +9,7 @@ import { SessionExecution } from "../execution"
 import { Database } from "../../database/database"
 import { SessionRetirement } from "../retirement"
 import { RuntimeRetirement } from "../../runtime-retirement"
+import { SessionInput } from "../input"
 
 /** Current-process routing for implicit-local Locations. Future remote placement belongs here. */
 const layer = Layer.effect(
@@ -19,6 +20,7 @@ const layer = Layer.effect(
     const locations = yield* LocationServiceMap.Service
     const coordinator = yield* SessionRunCoordinator.make<SessionSchema.ID, SessionRunner.RunError>({
       drain: Effect.fnUntraced(function* (sessionID: SessionSchema.ID, force) {
+        yield* SessionInput.guardManagedProfile
         if (yield* SessionRetirement.isRetired(database.db, sessionID)) return
         const session = yield* store.get(sessionID)
         if (!session) return yield* Effect.die(`Session not found: ${sessionID}`)
@@ -41,8 +43,8 @@ const layer = Layer.effect(
     return SessionExecution.Service.of({
       active: coordinator.active,
       interrupt: coordinator.interrupt,
-      resume: coordinator.run,
-      wake: coordinator.wake,
+      resume: (sessionID) => SessionInput.guardManagedProfile.pipe(Effect.andThen(coordinator.run(sessionID))),
+      wake: (sessionID) => SessionInput.guardManagedProfile.pipe(Effect.andThen(coordinator.wake(sessionID))),
     })
   }),
 )

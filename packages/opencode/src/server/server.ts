@@ -98,15 +98,19 @@ export async function listen(opts: ListenOptions): Promise<Listener> {
 const listenEffect: (opts: ListenOptions) => Effect.Effect<EffectListener, unknown> = Effect.fn("Server.listen")(
   function* (opts: ListenOptions) {
     yield* Effect.sync(startHangDiagnostics)
+    const runtimeScope = Scope.makeUnsafe()
     const lifecycle = RuntimeLifecycle.make(
       {
         lineage: process.env.OPENCODE_RUNTIME_LINEAGE ?? runtimeLineage(opts),
         restartSupported: process.env.OPENCODE_RUNTIME_RESTART === "1" || process.env.INVOCATION_ID !== undefined,
         startupRecovery: true,
       },
-      Scope.makeUnsafe(),
+      runtimeScope,
     )
-    const state = yield* startWithPortFallback(opts, lifecycle)
+    const state = yield* startWithPortFallback(opts, lifecycle).pipe(
+      Effect.onError(() => Scope.close(runtimeScope, Exit.void).pipe(Effect.ignore)),
+    )
+    yield* Scope.addFinalizer(state.scope, Scope.close(runtimeScope, Exit.void))
     const address = yield* tcpAddress(state)
     const listenerUrl = makeURL(opts.hostname, address.port)
     const unpublishMdns = yield* setupMdns(opts, address.port, state.scope)

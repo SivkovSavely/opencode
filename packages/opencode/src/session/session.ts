@@ -45,6 +45,7 @@ import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { SessionMessage } from "@opencode-ai/schema/session-message"
 import { McpActivation } from "./mcp-activation"
+import { ManagedCommand } from "@opencode-ai/core/managed-command"
 
 const parentTitlePrefix = "New session - "
 const childTitlePrefix = "Child session - "
@@ -552,7 +553,9 @@ const layer: Layer.Layer<
       }
       yield* Effect.logInfo("created", result)
 
-      yield* events.publish(SessionV1.Event.Created, { sessionID: result.id, info: result })
+      yield* events.publish(SessionV1.Event.Created, { sessionID: result.id, info: result }, {
+        commit: () => input.parentID ? Effect.void : ManagedCommand.enrollCreatedRoot(database, result.id),
+      })
 
       return result
     })

@@ -718,6 +718,38 @@ describe("session HttpApi", () => {
   )
 
   it.instance(
+    "rejects v2 prompt admission in managed profile",
+    () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        const session = yield* createSession({ title: "managed v2 prompt" })
+        const previous = process.env.OPENCODE_MANAGED_PROFILE
+        yield* Effect.gen(function* () {
+          process.env.OPENCODE_MANAGED_PROFILE = "1"
+          const response = yield* request(`/api/session/${session.id}/prompt`, {
+            method: "POST",
+            headers: { "x-opencode-directory": test.directory, "content-type": "application/json" },
+            body: JSON.stringify({ id: "msg_managed_http", prompt: { text: "hello" }, resume: false }),
+          })
+          expect(response.status).toBe(409)
+          expect(yield* responseJson(response)).toEqual({
+            _tag: "ConflictError",
+            message: "V2 session execution is unavailable in managed profile",
+            resource: session.id,
+          })
+          const admitted = yield* Database.Service.use(({ db }) =>
+            db.select().from(SessionInputTable).where(eq(SessionInputTable.id, SessionMessage.ID.make("msg_managed_http"))).get().pipe(Effect.orDie),
+          )
+          expect(admitted).toBeUndefined()
+        }).pipe(Effect.ensuring(Effect.sync(() => {
+          if (previous === undefined) delete process.env.OPENCODE_MANAGED_PROFILE
+          else process.env.OPENCODE_MANAGED_PROFILE = previous
+        })))
+      }),
+    { git: true, config: { formatter: false, lsp: false } },
+  )
+
+  it.instance(
     "durably records one v2 prompt for exact message-ID retries",
     () =>
       Effect.gen(function* () {

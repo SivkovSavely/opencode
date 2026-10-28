@@ -26,6 +26,7 @@ import { SessionStore } from "@opencode-ai/core/session/store"
 import { WorkspaceV2 } from "@opencode-ai/core/workspace"
 import { testEffect } from "./lib/effect"
 import { tmpdir } from "./fixture/tmpdir"
+import { ManagedCommand } from "../src/managed-command"
 
 const projects = Layer.succeed(
   ProjectV2.Service,
@@ -48,6 +49,50 @@ const location = Location.Ref.make({ directory: AbsolutePath.make("/project") })
 const id = SessionV2.ID.create()
 
 describe("SessionV2.create", () => {
+  it.effect("enrolls a managed root before notifying subscribers but never upgrades an existing identity", () =>
+    Effect.gen(function* () {
+      const previous = {
+        profile: process.env.OPENCODE_MANAGED_PROFILE,
+        plugins: process.env.OPENCODE_MANAGED_PLUGIN_ALLOWLIST,
+      }
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          if (previous.profile === undefined) delete process.env.OPENCODE_MANAGED_PROFILE
+          else process.env.OPENCODE_MANAGED_PROFILE = previous.profile
+          if (previous.plugins === undefined) delete process.env.OPENCODE_MANAGED_PLUGIN_ALLOWLIST
+          else process.env.OPENCODE_MANAGED_PLUGIN_ALLOWLIST = previous.plugins
+        }),
+      )
+      const session = yield* SessionV2.Service
+      const database = yield* Database.Service
+      const events = yield* EventV2.Service
+      process.env.OPENCODE_MANAGED_PROFILE = "0"
+      const old = yield* session.create({ location })
+      process.env.OPENCODE_MANAGED_PROFILE = "1"
+      process.env.OPENCODE_MANAGED_PLUGIN_ALLOWLIST = "[]"
+      yield* session.create({ id: old.id, location })
+      expect(yield* ManagedCommand.status(database, old.id)).toBe("unknown")
+      const observed: ManagedCommand.Status[] = []
+      const unsubscribe = yield* events.listen((event) =>
+        event.type === SessionV1.Event.Created.type && event.durable
+          ? ManagedCommand.status(database, event.durable.aggregateID).pipe(
+              Effect.tap((status) =>
+                Effect.sync(() => {
+                  observed.push(status)
+                }),
+              ),
+              Effect.asVoid,
+              Effect.orDie,
+            )
+          : Effect.void,
+      )
+      yield* Effect.addFinalizer(() => unsubscribe)
+      const fresh = yield* session.create({ location })
+      expect(yield* ManagedCommand.status(database, fresh.id)).toBe("drained")
+      expect(observed).toEqual(["drained"])
+    }),
+  )
+
   it.effect("creates a fresh projected session when the ID is omitted", () =>
     Effect.gen(function* () {
       const session = yield* SessionV2.Service

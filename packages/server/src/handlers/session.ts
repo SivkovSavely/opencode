@@ -170,6 +170,9 @@ export const SessionHandler = HttpApiBuilder.group(Api, "server.session", (handl
                     new ConflictError({ message: `Session is retired: ${error.sessionID}`, resource: error.sessionID }),
                   ),
                 ),
+                Effect.catchTag("SessionInput.ManagedProfile", () =>
+                  Effect.fail(new ConflictError({ message: "V2 session execution is unavailable in managed profile", resource: ctx.params.sessionID })),
+                ),
               ),
           }
         }),

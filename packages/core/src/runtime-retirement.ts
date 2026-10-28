@@ -47,6 +47,8 @@ export const retireRoot = Effect.fn("RuntimeRetirement.retireRoot")(function* (
           UNION
           SELECT session_id FROM runtime_retirement_member WHERE root_session_id = ${sessionID}
           UNION
+          SELECT session_id FROM managed_command WHERE root_session_id = ${sessionID}
+          UNION
           SELECT child.id FROM session child JOIN descendants parent ON child.parent_id = parent.session_id
           UNION
           SELECT child.session_id FROM runtime_execution child

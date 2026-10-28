@@ -119,7 +119,7 @@ export interface Interface {
     task?: TaskAdmission,
   ) => Effect.Effect<SessionV1.WithParts, Image.Error | RuntimeLifecycle.RuntimeDrainingError>
   readonly loop: (input: LoopInput) => Effect.Effect<SessionV1.WithParts>
-  readonly recover: (sessionID: SessionID) => Effect.Effect<SessionV1.WithParts>
+  readonly recover: (sessionID: SessionID, executionFence?: number) => Effect.Effect<SessionV1.WithParts>
   readonly shell: (
     input: ShellInput,
   ) => Effect.Effect<SessionV1.WithParts, Session.BusyError | RuntimeLifecycle.RuntimeDrainingError>
@@ -229,9 +229,11 @@ const layer = Layer.effect(
         )
       const flush = yield* InstanceState.get(queueState)
       flush.delete(sessionID)
-      const owner = yield* runtime.cancel(sessionID)
-      if (!owner) return yield* runtime.waitCancel(sessionID)
-      yield* state.cancel(sessionID).pipe(Effect.ensuring(runtime.finishCancel(sessionID)))
+      yield* Effect.acquireUseRelease(
+        runtime.cancel(sessionID),
+        (owner) => (owner ? state.cancel(sessionID) : runtime.waitCancel(sessionID)),
+        (owner) => (owner ? runtime.finishCancel(sessionID) : Effect.void),
+      )
     })
 
     const cancelTask = Effect.fn("SessionPrompt.cancelTask")(function* (sessionID: SessionID) {
@@ -244,9 +246,11 @@ const layer = Layer.effect(
         )
       const flush = yield* InstanceState.get(queueState)
       flush.delete(sessionID)
-      const owner = yield* runtime.cancel(sessionID)
-      if (!owner) return yield* state.cancel(sessionID)
-      yield* state.cancel(sessionID).pipe(Effect.ensuring(runtime.finishCancel(sessionID)))
+      yield* Effect.acquireUseRelease(
+        runtime.cancel(sessionID),
+        () => state.cancel(sessionID),
+        (owner) => (owner ? runtime.finishCancel(sessionID) : Effect.void),
+      )
     })
 
     const resolvePromptParts = Effect.fn("SessionPrompt.resolvePromptParts")(function* (template: string) {
@@ -1581,6 +1585,7 @@ const layer = Layer.effect(
               admission.manualRecovery,
               admission.manualRecovery,
               true,
+              admission.fence,
             ).pipe(
               Effect.onExit((exit) =>
                 Effect.sync(() => (interrupted = Exit.isFailure(exit) && Cause.hasInterrupts(exit.cause))),
@@ -1822,11 +1827,11 @@ const layer = Layer.effect(
                 ),
             )
           if (!admission) return
-          if (steer) return { steer: true }
+          if (steer) return { steer: true, fence: admission.fence }
           const entry = yield* claimQueue(sessionID, flush.get(sessionID))
           if (entry) {
             flush.get(sessionID)?.delete(entry.id)
-            return { steer: false, entry }
+            return { steer: false, entry, fence: admission.fence }
           }
           flush.delete(sessionID)
         }).pipe(
@@ -1845,7 +1850,7 @@ const layer = Layer.effect(
           const start = yield* prepare
           if (!start) return yield* Effect.die("Missing queue admission")
           if (start.entry) yield* materialize(start.entry).pipe(Effect.orDie)
-          return yield* runLoop(sessionID, false, false, false, true)
+          return yield* runLoop(sessionID, false, false, false, true, start.fence)
         }).pipe(
           Effect.onExit((exit) =>
             Effect.sync(() => {
@@ -2149,6 +2154,7 @@ const layer = Layer.effect(
       reconcile?: boolean,
       manualRecovery?: boolean,
       deferInterruptedPark?: boolean,
+      executionFence?: number,
     ) => Effect.Effect<SessionV1.WithParts> = Effect.fn("SessionPrompt.run")(
       function* (
         sessionID: SessionID,
@@ -2156,6 +2162,7 @@ const layer = Layer.effect(
         reconcile = false,
         manualRecovery = false,
         deferInterruptedPark = false,
+        executionFence?: number,
       ) {
         const ctx = yield* InstanceState.context
         let structured: unknown
@@ -2369,6 +2376,8 @@ const layer = Layer.effect(
               bypassAgentCheck,
               messages: msgs,
               promptOps,
+              executionFence,
+              managedRuntime: runtime,
             }).pipe(
               Effect.provideService(Plugin.Service, plugin),
               Effect.provideService(Permission.Service, permission),
@@ -2531,11 +2540,11 @@ const layer = Layer.effect(
       return yield* state.ensureRunning(
         input.sessionID,
         lastAssistant(input.sessionID),
-        runLoop(input.sessionID, input.recovery, input.reconcile, input.manualRecovery),
+        runLoop(input.sessionID, input.recovery, input.reconcile, input.manualRecovery, false, input.executionFence),
       )
     })
 
-    const recover = Effect.fn("SessionPrompt.recover")(function* (sessionID: SessionID) {
+    const recover = Effect.fn("SessionPrompt.recover")(function* (sessionID: SessionID, executionFence?: number) {
       yield* queue.block(sessionID).pipe(Effect.orDie)
       return yield* state.ensureRunning(
         sessionID,
@@ -2543,7 +2552,7 @@ const layer = Layer.effect(
         Effect.gen(function* () {
           yield* reconcileCrashTools(sessionID)
           yield* runtime.recoveryPrepared(sessionID)
-          return yield* runLoop(sessionID, true, false, false, true)
+          return yield* runLoop(sessionID, true, false, false, true, executionFence)
         }),
       )
     })
@@ -2815,6 +2824,7 @@ export type PromptInput = Schema.Schema.Type<typeof PromptInput>
 
 export class LoopInput extends Schema.Class<LoopInput>("SessionPrompt.LoopInput")({
   sessionID: SessionID,
+  executionFence: Schema.optional(Schema.Number),
   recovery: Schema.optional(Schema.Boolean),
   reconcile: Schema.optional(Schema.Boolean),
   manualRecovery: Schema.optional(Schema.Boolean),

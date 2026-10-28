@@ -631,6 +631,23 @@ const verifyPartialFlushOnInterruption = (kind: FragmentKind) =>
   })
 
 describe("SessionRunnerLLM", () => {
+  it.effect("rejects direct execution in managed profile before promoting pending work", () =>
+    Effect.gen(function* () {
+      yield* setup
+      const session = yield* SessionV2.Service
+      const runner = yield* SessionRunner.Service
+      yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "pending" }), resume: false })
+      const previous = process.env.OPENCODE_MANAGED_PROFILE
+      yield* Effect.gen(function* () {
+        process.env.OPENCODE_MANAGED_PROFILE = "1"
+        expect((yield* runner.run({ sessionID, force: true }).pipe(Effect.flip))._tag).toBe("SessionInput.ManagedProfile")
+        expect(yield* session.messages({ sessionID })).toEqual([])
+      }).pipe(Effect.ensuring(Effect.sync(() => {
+        if (previous === undefined) delete process.env.OPENCODE_MANAGED_PROFILE
+        else process.env.OPENCODE_MANAGED_PROFILE = previous
+      })))
+    }),
+  )
   it.effect("advertises and executes a globally attached application tool", () =>
     Effect.gen(function* () {
       yield* setup

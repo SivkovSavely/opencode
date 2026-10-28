@@ -7,6 +7,7 @@ import type { Permission } from "../permission"
 import type { SessionID, MessageID } from "../session/schema"
 import * as Truncate from "./truncate"
 import { Agent } from "@/agent/agent"
+import type { RuntimeLifecycle } from "@/server/runtime-lifecycle"
 
 interface Metadata {
   [key: string]: any
@@ -39,6 +40,8 @@ export type Context<M extends Metadata = Metadata> = {
   agent: string
   abort: AbortSignal
   callID?: string
+  managedRuntime?: Pick<RuntimeLifecycle.Interface, "runManagedCommand">
+  executionFence?: number
   extra?: { [key: string]: unknown }
   messages: SessionV1.WithParts[]
   metadata(input: { title?: string; metadata?: M }): Effect.Effect<void>

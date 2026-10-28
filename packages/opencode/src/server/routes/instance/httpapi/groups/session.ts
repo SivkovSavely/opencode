@@ -282,7 +282,7 @@ export const SessionApi = HttpApi.make("session")
           success: Schema.Struct({
             rootSessionID: Schema.String,
             sessionIDs: Schema.Array(Schema.String),
-            commandStatus: Schema.Literal("unknown"),
+            commandStatus: Schema.Literals(["draining", "drained", "unknown"]),
           }),
           error: [SessionNotFoundError, ConflictError, HttpApiError.ServiceUnavailable],
         }).annotateMerge(

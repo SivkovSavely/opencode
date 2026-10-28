@@ -353,7 +353,7 @@ export const initialize = Effect.fn("ServerRecovery.initialize")(function* () {
                 if (result && record.parentMode === "background") yield* notifyBackground(record, result)
                 return
               }
-              const result = yield* prompt.recover(SessionID.make(record.sessionID))
+              const result = yield* prompt.recover(SessionID.make(record.sessionID), record.fence)
               if (record.parentMode === "foreground") yield* settleForeground({ database, sessions, record, result })
             }),
           ),

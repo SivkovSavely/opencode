@@ -21,7 +21,7 @@ import { ChildProcess } from "effect/unstable/process"
 import { ChildProcessSpawner } from "effect/unstable/process/ChildProcessSpawner"
 import { ShellPrompt, type Parameters } from "./shell/prompt"
 import { BashArity } from "@/permission/arity"
-import { requireUnmanagedShell } from "@/util/managed-shell"
+import { realpath } from "node:fs/promises"
 
 export { Parameters } from "./shell/prompt"
 
@@ -601,37 +601,119 @@ export const ShellTool = Tool.define(
     return () =>
       Effect.gen(function* () {
         const cfg = yield* config.get()
-        const shell = Shell.acceptable(cfg.shell)
+        const shell = process.env.OPENCODE_MANAGED_PROFILE === "1" ? "/bin/sh" : Shell.acceptable(cfg.shell)
         const name = Shell.name(shell)
         const limits = yield* trunc.limits()
         const prompt = ShellPrompt.render(name, process.platform, limits, defaultTimeoutMs)
         yield* Effect.logInfo("shell tool using shell", { shell })
 
         return {
-          description: prompt.description,
+          description:
+            process.env.OPENCODE_MANAGED_PROFILE === "1"
+              ? prompt.description.replace(
+                  /- If the output exceeds[^\n]*/g,
+                  "- Output is bounded; discarded output is not saved.",
+                )
+              : prompt.description,
           parameters: prompt.parameters,
           execute: (params: Parameters, ctx: Tool.Context) =>
             Effect.gen(function* () {
-              requireUnmanagedShell()
+              const managed = process.env.OPENCODE_MANAGED_PROFILE === "1"
               const instanceCtx = yield* InstanceState.context
+              const executionShell = managed ? "/bin/sh" : shell
               const cwd = params.workdir
-                ? yield* resolvePath(params.workdir, instanceCtx.directory, shell)
+                ? yield* resolvePath(params.workdir, instanceCtx.directory, executionShell)
                 : instanceCtx.directory
               if (params.timeout !== undefined && params.timeout < 0) {
                 throw new Error(`Invalid timeout value: ${params.timeout}. Timeout must be a positive number.`)
               }
               const timeout = params.timeout ?? defaultTimeoutMs
-              const ps = Shell.ps(shell)
+              if (managed && (!Number.isSafeInteger(timeout) || timeout <= 0 || timeout > 2 ** 31 - 1)) {
+                throw new Error(`Invalid managed timeout value: ${timeout}`)
+              }
+              const ps = Shell.ps(executionShell)
               yield* Effect.scoped(
                 Effect.gen(function* () {
                   const tree = yield* Effect.acquireRelease(parse(params.command, ps), (tree) =>
                     Effect.sync(() => tree.delete()),
                   )
-                  const scan = yield* collect(tree.rootNode, cwd, ps, shell, instanceCtx)
+                  const scan = yield* collect(tree.rootNode, cwd, ps, executionShell, instanceCtx)
                   if (!containsPath(cwd, instanceCtx)) scan.dirs.add(cwd)
                   yield* ask(ctx, scan, params)
                 }),
               )
+
+              if (managed) {
+                if (!ctx.managedRuntime) throw new Error("Managed shell requires a tracked runtime")
+                if (ctx.executionFence === undefined) throw new Error("Managed shell requires an execution fence")
+                const workspace = yield* Effect.promise(() => realpath(instanceCtx.directory))
+                const working = yield* Effect.promise(() => realpath(cwd))
+                if (!FSUtil.contains(workspace, working))
+                  throw new Error("Managed shell workdir must be inside the instance directory")
+                if (workspace === "/work" || workspace.startsWith("/work/"))
+                  throw new Error("Managed shell workspace conflicts with the sandbox mount")
+                const { ManagedLinux } = yield* Effect.promise(() => import("./shell/managed-linux"))
+                const limits = yield* trunc.limits()
+                const abort = Effect.callback<null>((resume) => {
+                  if (ctx.abort.aborted) return resume(Effect.succeed(null))
+                  const handler = () => resume(Effect.succeed(null))
+                  ctx.abort.addEventListener("abort", handler, { once: true })
+                  return Effect.sync(() => ctx.abort.removeEventListener("abort", handler))
+                })
+                const result = yield* Effect.raceFirst(
+                  ctx.managedRuntime
+                    .runManagedCommand(
+                      ctx.sessionID,
+                      async (authorize) => {
+                        const handle = await ManagedLinux.prepare({
+                          workspace,
+                          rustToolchain: process.env.OPENCODE_MANAGED_RUST_TOOLCHAIN || undefined,
+                          argv: [
+                            "/bin/sh",
+                            "-c",
+                              'mkdir -p -- "$1" && ln -sT -- /work "$2" && cd "$3" || exit 125; exec /bin/sh -c "$4"',
+                            "managed-shell",
+                            path.dirname(workspace),
+                            workspace,
+                            working,
+                            params.command,
+                          ],
+                          timeoutMs: timeout,
+                          outputBytes: Math.min(limits.maxBytes, 16 * 1024 * 1024),
+                          authorize,
+                        })
+                        return handle
+                      },
+                      ctx.executionFence,
+                    )
+                    .pipe(Effect.orDie),
+                  abort,
+                )
+                if (!result)
+                  return {
+                    title: params.command,
+                    metadata: { output: "", exit: null, truncated: false },
+                    output: "User aborted the command",
+                  }
+                const raw = [result.stdout.toString("utf8"), result.stderr.toString("utf8")].filter(Boolean).join("\n")
+                const end = tail(raw, limits.maxLines, limits.maxBytes)
+                const cut = result.truncated || end.cut
+                const notes = [
+                  ...(cut ? ["Output truncated; discarded output was not saved."] : []),
+                  ...(result.reason !== "exit" ? [`Managed command: ${result.reason}.`] : []),
+                  ...(result.cleanup === "failed"
+                    ? [`Managed command cleanup failed: ${result.cleanupError ?? "unknown error"}.`]
+                    : []),
+                ]
+                const output =
+                  (end.text || "(no output)") +
+                  (notes.length ? `\n\n<shell_metadata>\n${notes.join("\n")}\n</shell_metadata>` : "")
+                return {
+                  title: params.command,
+                  metadata: { output: preview(output), exit: result.shellStatus, truncated: cut },
+                  output,
+                }
+              }
 
               return yield* run(
                 {

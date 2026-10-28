@@ -51,5 +51,9 @@ export const migrations = (
     import("./migration/20261028141815_runtime_retirement_table"),
     import("./migration/20261028141816_runtime_retirement_guards"),
     import("./migration/20261028143259_runtime_retirement_members"),
+    import("./migration/20261028171804_managed_command_ownership"),
+    import("./migration/20261028171900_managed_command_eligibility"),
+    import("./migration/20261028173819_managed_command_generation"),
+    import("./migration/20261028174200_managed_command_ancestry"),
   ])
 ).map((module) => module.default) satisfies DatabaseMigration.Migration[]

@@ -2,11 +2,14 @@ import { describe, expect } from "bun:test"
 import { Database } from "@opencode-ai/core/database/database"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { RuntimeRetirement } from "@opencode-ai/core/runtime-retirement"
+import { ManagedCommand } from "@opencode-ai/core/managed-command"
 import { sql } from "drizzle-orm"
 import { Deferred, Effect, Exit, Fiber, Scope } from "effect"
 import { randomUUID } from "node:crypto"
 import { RuntimeLifecycle } from "../../src/server/runtime-lifecycle"
-import { testEffect } from "../lib/effect"
+import { ManagedLinux } from "../../src/tool/shell/managed-linux"
+import { Server } from "../../src/server/server"
+import { awaitWithTimeout, testEffect } from "../lib/effect"
 
 const it = testEffect(LayerNode.compile(LayerNode.group([Database.node])))
 
@@ -25,6 +28,564 @@ const seedSession = Effect.fnUntraced(function* (database: Database.Interface, p
 })
 
 describe("durable root retirement", () => {
+  it.live("foreign no-row cancellation durably denies a pending gate even after its local marker clears", () =>
+    Effect.gen(function* () {
+      const database = yield* Database.Service
+      const root = yield* seedSession(database)
+      yield* ManagedCommand.coverRoot(database, root)
+      const owner = RuntimeLifecycle.make({ lineage: randomUUID() }, yield* Effect.scope, database)
+      const other = RuntimeLifecycle.make({ lineage: randomUUID() }, yield* Effect.scope, database)
+      const prepared = Promise.withResolvers<RuntimeLifecycle.ManagedAuthorization>()
+      const ready = Promise.withResolvers<void>()
+      yield* Effect.addFinalizer(() => Effect.sync(() => ready.resolve()))
+      const opened = { value: false }
+      const worker = yield* owner
+        .runManagedCommand(root, async (authorize) => {
+          prepared.resolve(authorize)
+          await ready.promise
+          return {
+            start: async () => {
+              expect(
+                await authorize(() => {
+                  opened.value = true
+                }),
+              ).toBe(false)
+              return { cleanup: "confirmed" as const }
+            },
+            cancel: async () => ({ cleanup: "confirmed" as const }),
+          }
+        })
+        .pipe(Effect.forkScoped)
+      const authorize = yield* Effect.promise(() => prepared.promise)
+      expect(yield* other.cancel(root)).toBe(true)
+      yield* other.finishCancel(root)
+      expect(
+        yield* Effect.promise(() =>
+          authorize(() => {
+            opened.value = true
+          }),
+        ),
+      ).toBe(false)
+      ready.resolve()
+      yield* Fiber.join(worker)
+      expect(opened.value).toBe(false)
+      expect(yield* owner.commandStatus(root)).toBe("unknown")
+    }),
+  )
+
+  for (const revocation of ["cancel", "fence", "deleted-row", "no-row"] as const) {
+    it.live(`cancels a running owned handle after foreign ${revocation} without retirement`, () =>
+      Effect.gen(function* () {
+        const database = yield* Database.Service
+        const root = yield* seedSession(database)
+        yield* ManagedCommand.coverRoot(database, root)
+        const lineage = randomUUID()
+        const owner = RuntimeLifecycle.make({ lineage }, yield* Effect.scope, database)
+        const other = RuntimeLifecycle.make({ lineage }, yield* Effect.scope, database)
+        const lease = revocation === "no-row" ? undefined : yield* owner.admit({ sessionID: root, directory: "/tmp" })
+        const started = Promise.withResolvers<void>()
+        const cancelled = Promise.withResolvers<void>()
+        const cleanup = Promise.withResolvers<{ cleanup: "confirmed" }>()
+        yield* Effect.addFinalizer(() => Effect.sync(() => cleanup.resolve({ cleanup: "confirmed" })))
+        const worker = yield* owner
+          .runManagedCommand(
+            root,
+            async (authorize) => ({
+              start: async () => {
+                expect(await authorize(() => started.resolve())).toBe(true)
+                return cleanup.promise
+              },
+              cancel: () => {
+                cancelled.resolve()
+                return cleanup.promise
+              },
+            }),
+            lease?.fence,
+          )
+          .pipe(Effect.forkScoped)
+        yield* Effect.promise(() => started.promise)
+        if (revocation === "cancel" || revocation === "no-row") {
+          expect(yield* other.cancel(root)).toBe(true)
+          yield* other.finishCancel(root)
+        }
+        if (revocation === "fence")
+          yield* database.db.run(sql`UPDATE runtime_execution SET fence = fence + 1 WHERE session_id = ${root}`)
+        if (revocation === "deleted-row")
+          yield* database.db.run(sql`DELETE FROM runtime_execution WHERE session_id = ${root}`)
+        yield* awaitWithTimeout(
+          Effect.promise(() => cancelled.promise),
+          "managed owner ignored revoked generation",
+        )
+        expect(yield* owner.commandStatus(root)).toBe("draining")
+        cleanup.resolve({ cleanup: "confirmed" })
+        yield* Fiber.join(worker)
+        if (lease) yield* owner.release(root, lease.fence)
+        expect(yield* owner.commandStatus(root)).toBe("unknown")
+      }),
+    )
+  }
+
+  for (const ancestry of ["projected", "execution"] as const) {
+    it.live(`rejects admission below an intermediate cancelling ${ancestry} ancestor`, () =>
+      Effect.gen(function* () {
+        const database = yield* Database.Service
+        const root = yield* seedSession(database)
+        const middle = yield* seedSession(database, root)
+        const leaf = yield* seedSession(database, ancestry === "projected" ? middle : root)
+        const runtime = RuntimeLifecycle.make({ lineage: randomUUID() }, yield* Effect.scope, database)
+        const lease =
+          ancestry === "execution"
+            ? yield* runtime.admit({ sessionID: leaf, directory: "/tmp", parentSessionID: middle })
+            : undefined
+        expect(yield* runtime.cancel(middle)).toBe(true)
+        expect(
+          yield* runtime
+            .runManagedCommand(
+              leaf,
+              async () => {
+                throw new Error("cancelled ancestor allowed preparation")
+              },
+              lease?.fence,
+            )
+            .pipe(Effect.flip),
+        ).toBeInstanceOf(ManagedCommand.AdmissionError)
+        yield* runtime.finishCancel(middle)
+        if (lease) yield* runtime.release(leaf, lease.fence)
+      }),
+    )
+  }
+
+  it.live("listener stop closes its runtime scope, cancels managed handles and rejects new admission", () =>
+    Effect.gen(function* () {
+      const database = yield* Database.Service
+      const root = yield* seedSession(database)
+      const listener = yield* Effect.acquireRelease(
+        Effect.promise(() => Server.listen({ hostname: "127.0.0.1", port: 0 })),
+        (listener) => Effect.promise(() => listener.stop(true)),
+      )
+      yield* Effect.addFinalizer(() => Effect.sync(() => RuntimeLifecycle.setCurrent(RuntimeLifecycle.unavailable())))
+      listener.lifecycle.bindDatabase(database)
+      const started = Promise.withResolvers<void>()
+      const cancelled = Promise.withResolvers<void>()
+      const cleanup = Promise.withResolvers<{ cleanup: "confirmed" }>()
+      yield* Effect.addFinalizer(() => Effect.sync(() => cleanup.resolve({ cleanup: "confirmed" })))
+      const worker = yield* listener.lifecycle
+        .runManagedCommand(root, async (authorize) => ({
+          start: async () => {
+            expect(await authorize(() => started.resolve())).toBe(true)
+            return cleanup.promise
+          },
+          cancel: () => {
+            cancelled.resolve()
+            return cleanup.promise
+          },
+        }))
+        .pipe(Effect.forkScoped)
+      yield* Effect.promise(() => started.promise)
+      yield* awaitWithTimeout(
+        Effect.promise(() => listener.stop(true)),
+        "listener stop waited for command cleanup",
+      )
+      yield* awaitWithTimeout(
+        Effect.promise(() => cancelled.promise),
+        "listener stop did not cancel the managed handle",
+      )
+      expect(
+        yield* listener.lifecycle
+          .runManagedCommand(root, async () => {
+            throw new Error("stopped listener admitted work")
+          })
+          .pipe(Effect.flip),
+      ).toBeInstanceOf(ManagedCommand.AdmissionError)
+      expect((yield* listener.lifecycle.status()).active).toBe(1)
+      cleanup.resolve({ cleanup: "confirmed" })
+      yield* Fiber.join(worker)
+      expect(yield* awaitWithTimeout(listener.lifecycle.awaitStop, "closed runtime did not finish shutdown")).toEqual({
+        action: "shutdown",
+      })
+    }),
+  )
+
+  for (const processFree of [true, false]) {
+    it.live(
+      `settles rejected launcher preparation as ${processFree ? "confirmed with proof" : "unknown without proof"}`,
+      () =>
+        Effect.gen(function* () {
+          const database = yield* Database.Service
+          const root = yield* seedSession(database)
+          yield* ManagedCommand.coverRoot(database, root)
+          const runtime = RuntimeLifecycle.make({ lineage: randomUUID() }, yield* Effect.scope, database)
+          const result = yield* runtime
+            .runManagedCommand(
+              root,
+              (authorize) => ManagedLinux.prepare({ workspace: "/", argv: ["/bin/true"], timeoutMs: 0, authorize }),
+              undefined,
+              processFree ? { preparation: "process-free" } : undefined,
+            )
+            .pipe(Effect.exit)
+          expect(Exit.isFailure(result)).toBe(true)
+          expect(
+            yield* database.db.get<{ state: string }>(sql`
+          SELECT state FROM managed_command WHERE root_session_id = ${root}
+        `),
+          ).toEqual({ state: processFree ? "confirmed" : "unknown" })
+          yield* runtime.retireRoot(root)
+          expect(yield* runtime.commandStatus(root)).toBe(processFree ? "drained" : "unknown")
+          expect((yield* runtime.status()).active).toBe(0)
+        }),
+    )
+  }
+
+  it.live("keeps unknown when an arbitrary preparation callback launches a process and rejects without a handle", () =>
+    Effect.gen(function* () {
+      const database = yield* Database.Service
+      const root = yield* seedSession(database)
+      yield* ManagedCommand.coverRoot(database, root)
+      const runtime = RuntimeLifecycle.make({ lineage: randomUUID() }, yield* Effect.scope, database)
+      const children: ReturnType<typeof Bun.spawn>[] = []
+      yield* Effect.addFinalizer(() =>
+        Effect.promise(async () => {
+          await Promise.all(
+            children.map(async (child) => {
+              child.kill()
+              await child.exited
+            }),
+          )
+        }),
+      )
+      const result = yield* runtime
+        .runManagedCommand(root, async () => {
+          children.push(
+            Bun.spawn([process.execPath, "-e", "setInterval(() => {}, 1000)"], {
+              stdin: "ignore",
+              stdout: "ignore",
+              stderr: "pipe",
+            }),
+          )
+          throw new Error("Preparation lost its process handle")
+        })
+        .pipe(Effect.exit)
+      expect(Exit.isFailure(result)).toBe(true)
+      expect(children).toHaveLength(1)
+      yield* runtime.retireRoot(root)
+      expect(yield* runtime.commandStatus(root)).toBe("unknown")
+      // External test cleanup is not proof supplied to the command registry.
+      for (const child of children) {
+        child.kill()
+        yield* Effect.promise(() => child.exited)
+      }
+      expect(yield* runtime.commandStatus(root)).toBe("unknown")
+    }),
+  )
+
+  it.live("retains interrupted process-free preparation until its late rejection proves no process was launched", () =>
+    Effect.gen(function* () {
+      const database = yield* Database.Service
+      const root = yield* seedSession(database)
+      yield* ManagedCommand.coverRoot(database, root)
+      const runtime = RuntimeLifecycle.make({ lineage: randomUUID() }, yield* Effect.scope, database)
+      const preparing = Promise.withResolvers<void>()
+      const reject = Promise.withResolvers<void>()
+      const worker = yield* runtime
+        .runManagedCommand(
+          root,
+          async (authorize) => {
+            preparing.resolve()
+            await reject.promise
+            return ManagedLinux.prepare({ workspace: "/", argv: ["/bin/true"], timeoutMs: 0, authorize })
+          },
+          undefined,
+          { preparation: "process-free" },
+        )
+        .pipe(Effect.forkScoped)
+      yield* Effect.promise(() => preparing.promise)
+      yield* Fiber.interrupt(worker)
+      yield* runtime.retireRoot(root)
+      expect(yield* runtime.commandStatus(root)).toBe("draining")
+      expect(yield* runtime.request("shutdown")).toMatchObject({ state: "draining", active: 1 })
+      reject.resolve()
+      yield* awaitWithTimeout(runtime.awaitDrain, "late preparation rejection was not settled")
+      expect(yield* runtime.commandStatus(root)).toBe("drained")
+    }),
+  )
+
+  it.live("does not accept process-free proof after preparation attempts gate authorization", () =>
+    Effect.gen(function* () {
+      const database = yield* Database.Service
+      const root = yield* seedSession(database)
+      yield* ManagedCommand.coverRoot(database, root)
+      const runtime = RuntimeLifecycle.make({ lineage: randomUUID() }, yield* Effect.scope, database)
+      const result = yield* runtime
+        .runManagedCommand(
+          root,
+          async (authorize) => {
+            expect(await authorize(() => {})).toBe(true)
+            throw new Error("Preparation failed after a possible launch")
+          },
+          undefined,
+          { preparation: "process-free" },
+        )
+        .pipe(Effect.exit)
+      expect(Exit.isFailure(result)).toBe(true)
+      yield* runtime.retireRoot(root)
+      expect(yield* runtime.commandStatus(root)).toBe("unknown")
+    }),
+  )
+
+  it.live("still requires handle cleanup proof when start fails after process-free preparation", () =>
+    Effect.gen(function* () {
+      const database = yield* Database.Service
+      const root = yield* seedSession(database)
+      yield* ManagedCommand.coverRoot(database, root)
+      const runtime = RuntimeLifecycle.make({ lineage: randomUUID() }, yield* Effect.scope, database)
+      const result = yield* runtime
+        .runManagedCommand(
+          root,
+          async () => ({
+            start: async () => {
+              throw new Error("Launch failed with unknown process state")
+            },
+            cancel: async () => ({ cleanup: "failed" as const }),
+          }),
+          undefined,
+          { preparation: "process-free" },
+        )
+        .pipe(Effect.exit)
+      expect(Exit.isFailure(result)).toBe(true)
+      yield* runtime.retireRoot(root)
+      expect(yield* runtime.commandStatus(root)).toBe("unknown")
+    }),
+  )
+
+  it.live("denies a paused command after its execution generation is revoked without retirement", () =>
+    Effect.gen(function* () {
+      const database = yield* Database.Service
+      const root = yield* seedSession(database)
+      const runtime = RuntimeLifecycle.make({ lineage: randomUUID() }, yield* Effect.scope, database)
+      const lease = yield* runtime.admit({ sessionID: root, directory: "/tmp" })
+      const ready = Promise.withResolvers<void>()
+      const proceed = Promise.withResolvers<void>()
+      const worker = yield* runtime
+        .runManagedCommand(
+          root,
+          async (authorize) => {
+            ready.resolve()
+            await proceed.promise
+            const allowed = await authorize(() => {
+              throw new Error("revoked execution opened its gate")
+            })
+            expect(allowed).toBe(false)
+            return {
+              start: async () => ({ cleanup: "confirmed" as const }),
+              cancel: async () => ({ cleanup: "confirmed" as const }),
+            }
+          },
+          lease.fence,
+        )
+        .pipe(Effect.forkScoped)
+      yield* Effect.promise(() => ready.promise)
+      yield* database.db.run(sql`UPDATE runtime_execution SET fence = fence + 1 WHERE session_id = ${root}`)
+      proceed.resolve()
+      yield* Fiber.join(worker)
+      yield* runtime.release(root, lease.fence)
+      expect(yield* runtime.commandStatus(root)).toBe("unknown")
+    }),
+  )
+
+  it.live("ordinary cancellation owns a descendant command until its cleanup finishes", () =>
+    Effect.gen(function* () {
+      const database = yield* Database.Service
+      const root = yield* seedSession(database)
+      const child = yield* seedSession(database, root)
+      const runtime = RuntimeLifecycle.make({ lineage: randomUUID() }, yield* Effect.scope, database)
+      const started = Promise.withResolvers<void>()
+      const cancelled = Promise.withResolvers<void>()
+      const cleanup = Promise.withResolvers<{ cleanup: "confirmed" }>()
+      const worker = yield* runtime
+        .runManagedCommand(child, async (authorize) => ({
+          start: async () => {
+            expect(await authorize(() => started.resolve())).toBe(true)
+            return cleanup.promise
+          },
+          cancel: () => {
+            cancelled.resolve()
+            return cleanup.promise
+          },
+        }))
+        .pipe(Effect.forkScoped)
+      yield* Effect.promise(() => started.promise)
+      expect(yield* runtime.cancel(root)).toBe(true)
+      yield* Effect.promise(() => cancelled.promise)
+      yield* runtime.finishCancel(root)
+      expect(yield* runtime.commandStatus(root)).toBe("draining")
+      expect((yield* runtime.status()).active).toBe(1)
+      cleanup.resolve({ cleanup: "confirmed" })
+      yield* Fiber.join(worker)
+      expect(yield* runtime.commandStatus(root)).toBe("unknown")
+    }),
+  )
+
+  it.live("rejects managed preparation under another runtime's execution ownership", () =>
+    Effect.gen(function* () {
+      const database = yield* Database.Service
+      const root = yield* seedSession(database)
+      const owner = RuntimeLifecycle.make({ lineage: randomUUID() }, yield* Effect.scope, database)
+      const other = RuntimeLifecycle.make({ lineage: randomUUID() }, yield* Effect.scope, database)
+      const lease = yield* owner.admit({ sessionID: root, directory: "/tmp" })
+      expect(
+        yield* owner
+          .runManagedCommand(root, async () => {
+            throw new Error("missing generation prepared a command")
+          })
+          .pipe(Effect.flip),
+      ).toBeInstanceOf(ManagedCommand.AdmissionError)
+      expect(
+        yield* owner
+          .runManagedCommand(
+            root,
+            async () => {
+              throw new Error("stale generation prepared a command")
+            },
+            lease.fence - 1,
+          )
+          .pipe(Effect.flip),
+      ).toBeInstanceOf(ManagedCommand.AdmissionError)
+      expect(
+        yield* other
+          .runManagedCommand(root, async () => {
+            throw new Error("foreign runtime prepared a command")
+          })
+          .pipe(Effect.flip),
+      ).toBeInstanceOf(ManagedCommand.AdmissionError)
+      yield* owner.release(root, lease.fence)
+    }),
+  )
+
+  it.live("observes retirement outside the local registry and joins the cancelled running handle", () =>
+    Effect.gen(function* () {
+      const database = yield* Database.Service
+      const root = yield* seedSession(database)
+      yield* ManagedCommand.coverRoot(database, root)
+      const owner = RuntimeLifecycle.make({ lineage: randomUUID() }, yield* Effect.scope, database)
+      const ready = Promise.withResolvers<void>()
+      const done = Promise.withResolvers<{ cleanup: "confirmed" }>()
+      const worker = yield* owner
+        .runManagedCommand(root, async (authorize) => ({
+          start: async () => {
+            expect(
+              await authorize(() => {
+                ready.resolve()
+              }),
+            ).toBe(true)
+            return done.promise
+          },
+          cancel: () => {
+            done.resolve({ cleanup: "confirmed" })
+            return done.promise
+          },
+        }))
+        .pipe(Effect.forkScoped)
+      yield* Effect.promise(() => ready.promise)
+      // Bypass the local registry, as another server process would.
+      yield* RuntimeRetirement.retireRoot(database, root)
+      expect(yield* awaitWithTimeout(Fiber.join(worker), "owner did not observe durable retirement")).toEqual({
+        cleanup: "confirmed",
+      })
+      expect(yield* owner.commandStatus(root)).toBe("drained")
+    }),
+  )
+
+  it.live("owns interrupted preparation until its handle is cancelled and cleanup is confirmed", () =>
+    Effect.gen(function* () {
+      const database = yield* Database.Service
+      const root = yield* seedSession(database)
+      yield* ManagedCommand.coverRoot(database, root)
+      const runtime = RuntimeLifecycle.make({ lineage: randomUUID() }, yield* Effect.scope, database)
+      const preparing = Promise.withResolvers<void>()
+      const prepared = Promise.withResolvers<void>()
+      const cancelled = Promise.withResolvers<void>()
+      const cleanup = Promise.withResolvers<{ cleanup: "confirmed" }>()
+      const starts: string[] = []
+      const worker = yield* runtime
+        .runManagedCommand(root, async () => {
+          preparing.resolve()
+          await prepared.promise
+          return {
+            start: () => {
+              starts.push("started")
+              return cleanup.promise
+            },
+            cancel: () => {
+              cancelled.resolve()
+              return cleanup.promise
+            },
+          }
+        })
+        .pipe(Effect.forkScoped)
+      yield* Effect.promise(() => preparing.promise)
+      yield* Fiber.interrupt(worker)
+      yield* runtime.retireRoot(root)
+      expect(yield* runtime.commandStatus(root)).toBe("draining")
+      expect(yield* runtime.request("shutdown")).toMatchObject({ state: "draining", active: 1 })
+      prepared.resolve()
+      yield* Effect.promise(() => cancelled.promise)
+      expect(starts).toEqual([])
+      expect(yield* runtime.commandStatus(root)).toBe("draining")
+      cleanup.resolve({ cleanup: "confirmed" })
+      yield* runtime.awaitDrain
+      expect(yield* runtime.commandStatus(root)).toBe("drained")
+    }),
+  )
+
+  it.live("denies a delayed gate after retirement by another runtime and preserves failed cleanup uncertainty", () =>
+    Effect.gen(function* () {
+      const database = yield* Database.Service
+      const root = yield* seedSession(database)
+      yield* ManagedCommand.coverRoot(database, root)
+      const owner = RuntimeLifecycle.make({ lineage: randomUUID() }, yield* Effect.scope, database)
+      const other = RuntimeLifecycle.make({ lineage: randomUUID() }, yield* Effect.scope, database)
+      const ready = Promise.withResolvers<void>()
+      const gate = Promise.withResolvers<void>()
+      const opens: string[] = []
+      const worker = yield* owner
+        .runManagedCommand(root, async (authorize) => {
+          const result = (async () => {
+            ready.resolve()
+            await gate.promise
+            expect(
+              await authorize(() => {
+                opens.push("opened")
+              }),
+            ).toBe(false)
+            return { cleanup: "failed" as const }
+          })()
+          return { start: () => result, cancel: () => result }
+        })
+        .pipe(Effect.forkScoped)
+      yield* Effect.promise(() => ready.promise)
+      yield* other.retireRoot(root)
+      gate.resolve()
+      yield* Fiber.join(worker)
+      expect(opens).toEqual([])
+      expect(yield* owner.commandStatus(root)).toBe("unknown")
+      expect(yield* other.commandStatus(root)).toBe("unknown")
+    }),
+  )
+
+  it.live("never treats local runner release as proof that every tool or plugin has stopped", () =>
+    Effect.gen(function* () {
+      const database = yield* Database.Service
+      const root = yield* seedSession(database)
+      yield* ManagedCommand.coverRoot(database, root)
+      const runtime = RuntimeLifecycle.make({ lineage: randomUUID() }, yield* Effect.scope, database)
+      const admission = yield* runtime.admit({ sessionID: root, directory: "/tmp" })
+      yield* runtime.retireRoot(root)
+      expect(yield* runtime.commandStatus(root)).toBe("draining")
+      yield* runtime.release(root, admission.fence)
+      expect(yield* runtime.commandStatus(root)).toBe("unknown")
+    }),
+  )
+
   for (const retired of [false, true]) {
     it.live(
       `keeps independent shell/prepare work tracked after ${retired ? "retirement" : "ordinary cancellation"} acknowledgement`,

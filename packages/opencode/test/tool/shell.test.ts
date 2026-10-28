@@ -1,7 +1,7 @@
 import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { describe, expect } from "bun:test"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
-import { Cause, Effect, Exit, Layer } from "effect"
+import { Cause, Effect, Exit, Fiber, Layer } from "effect"
 import type * as Scope from "effect/Scope"
 import os from "os"
 import path from "path"
@@ -21,6 +21,11 @@ import { testEffect } from "../lib/effect"
 import { Tool } from "@/tool/tool"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { InstanceStore } from "@/project/instance-store"
+import { Database } from "@opencode-ai/core/database/database"
+import { ManagedCommand } from "@opencode-ai/core/managed-command"
+import { RuntimeLifecycle } from "../../src/server/runtime-lifecycle"
+import { sql } from "drizzle-orm"
+import { randomUUID } from "node:crypto"
 
 const shellLayer = Layer.mergeAll(
   LayerNode.compile(
@@ -32,6 +37,7 @@ const shellLayer = Layer.mergeAll(
       Config.node,
       Agent.node,
       RuntimeFlags.node,
+      Database.node,
     ]),
   ),
   testInstanceStoreLayer,
@@ -182,6 +188,118 @@ const mustTruncate = (result: {
 }
 
 describe("tool.shell", () => {
+  wintest(
+    "managed shell runs through durable runtime admission",
+    () =>
+      Effect.gen(function* () {
+        const instance = yield* TestInstance
+        const database = yield* Database.Service
+        const sessionID = SessionID.make(`ses_${randomUUID()}`)
+        const projectID = randomUUID()
+        yield* database.db.run(
+          sql`INSERT INTO project (id, worktree, time_created, time_updated, sandboxes) VALUES (${projectID}, ${instance.directory}, 0, 0, '[]')`,
+        )
+        yield* database.db.run(
+          sql`INSERT INTO session (id, project_id, slug, directory, title, version, time_created, time_updated) VALUES (${sessionID}, ${projectID}, ${sessionID}, ${instance.directory}, 'test', '1', 0, 0)`,
+        )
+        yield* ManagedCommand.coverRoot(database, sessionID)
+        const runtime = RuntimeLifecycle.make({ lineage: randomUUID() }, yield* Effect.scope, database)
+        const admission = yield* runtime.admit({ sessionID, directory: instance.directory })
+        const previous = process.env.OPENCODE_MANAGED_PROFILE
+        const previousToolchain = process.env.OPENCODE_MANAGED_RUST_TOOLCHAIN
+        yield* Effect.acquireUseRelease(
+          Effect.sync(() => {
+            process.env.OPENCODE_MANAGED_PROFILE = "1"
+          }),
+          () =>
+            Effect.gen(function* () {
+              const context = { ...ctx, sessionID, managedRuntime: runtime, executionFence: admission.fence }
+              expect((yield* fail({ command: "true" }, { ...context, executionFence: undefined })).message).toContain(
+                "requires an execution fence",
+              )
+              yield* fail({ command: "touch stale" }, { ...context, executionFence: admission.fence + 1 })
+              expect(yield* Effect.promise(() => Bun.file(path.join(instance.directory, "stale")).exists())).toBe(false)
+              const result = yield* run({ command: "printf managed; printf error >&2; exit 7" }, context)
+              expect(result.output).toContain("managed")
+              expect(result.output).toContain("error")
+              expect(result.metadata.exit).toBe(7)
+              const absolute = yield* run(
+                { command: `printf mapped > '${instance.directory}/absolute'; cat '${instance.directory}/absolute'` },
+                context,
+              )
+              expect(absolute.output).toBe("mapped")
+              const environment = yield* run({ command: 'printf "%s" "${OPENCODE_MANAGED_PROFILE-unset}"' }, context)
+              expect(environment.output).toBe("unset")
+              if (Bun.which("rustc")) {
+                const rust = yield* Effect.promise(() => Bun.$`rustc --print sysroot`.text())
+                process.env.OPENCODE_MANAGED_RUST_TOOLCHAIN = rust.trim()
+                const compiled = yield* run(
+                  {
+                    command: `printf 'fn main() { println!("rust-ok"); }' > '${instance.directory}/main.rs'; rustc '${instance.directory}/main.rs' -o '${instance.directory}/app' && '${instance.directory}/app'`,
+                    timeout: 30000,
+                  },
+                  context,
+                )
+                expect(compiled.metadata.exit).toBe(0)
+                expect(compiled.output).toContain("rust-ok")
+              }
+              const outside = yield* fail({ command: "true", workdir: os.tmpdir() }, context)
+              expect(outside.message).toContain("workdir must be inside")
+              const timeout = yield* fail({ command: "true", timeout: Infinity }, context)
+              expect(timeout.message).toContain("timeout")
+              const controller = new AbortController()
+              const running = yield* run(
+                { command: "touch ready; sleep 30" },
+                { ...context, abort: controller.signal },
+              ).pipe(Effect.forkScoped)
+              yield* Effect.promise(async () => {
+                const deadline = Date.now() + 10000
+                while (!(await Bun.file(path.join(instance.directory, "ready")).exists())) {
+                  if (Date.now() > deadline) throw new Error("managed command did not start")
+                  await Bun.sleep(10)
+                }
+              })
+              controller.abort()
+              expect((yield* Fiber.join(running)).output).toContain("aborted")
+              yield* Effect.promise(async () => {
+                const deadline = Date.now() + 10000
+                while (true) {
+                  const pending = await Effect.runPromise(
+                    database.db.get(
+                      sql`SELECT 1 FROM managed_command WHERE session_id = ${sessionID} AND state IN ('pending', 'running')`,
+                    ),
+                  )
+                  if (!pending) break
+                  if (Date.now() > deadline) throw new Error("managed command did not clean up")
+                  await Bun.sleep(10)
+                }
+              })
+              const retiring = yield* run({ command: "touch retiring; sleep 30" }, context).pipe(Effect.forkScoped)
+              yield* Effect.promise(async () => {
+                const deadline = Date.now() + 10000
+                while (!(await Bun.file(path.join(instance.directory, "retiring")).exists())) {
+                  if (Date.now() > deadline) throw new Error("managed command did not start")
+                  await Bun.sleep(10)
+                }
+              })
+              yield* runtime.retireRoot(sessionID)
+              expect((yield* Fiber.join(retiring)).output).toContain("cancelled")
+              yield* fail({ command: "touch forbidden" }, context)
+              expect(yield* Effect.promise(() => Bun.file(path.join(instance.directory, "forbidden")).exists())).toBe(
+                false,
+              )
+            }),
+          () =>
+            Effect.sync(() => {
+              if (previous === undefined) delete process.env.OPENCODE_MANAGED_PROFILE
+              else process.env.OPENCODE_MANAGED_PROFILE = previous
+              if (previousToolchain === undefined) delete process.env.OPENCODE_MANAGED_RUST_TOOLCHAIN
+              else process.env.OPENCODE_MANAGED_RUST_TOOLCHAIN = previousToolchain
+            }),
+        )
+      }),
+    30000,
+  )
   wintest("managed profile rejects before running a shell command", () =>
     Effect.gen(function* () {
       const instance = yield* TestInstance
@@ -193,7 +311,7 @@ describe("tool.shell", () => {
         () =>
           Effect.gen(function* () {
             const error = yield* fail({ command: "touch managed-shell-marker" })
-            expect(error.message).toContain("foreground validation requires descendant containment")
+            expect(error.message).toContain("Managed shell requires a tracked runtime")
             expect(
               yield* Effect.promise(() => Bun.file(path.join(instance.directory, "managed-shell-marker")).exists()),
             ).toBe(false)

@@ -8,6 +8,7 @@ import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { Database } from "@opencode-ai/core/database/database"
+import { ManagedCommand } from "@opencode-ai/core/managed-command"
 import {
   createOpencodeClient,
   type EventSessionQueueChanged,
@@ -126,6 +127,35 @@ function idle(sdk: Sdk, sessionID: string) {
 }
 
 describe("native queue HttpApi SDK", () => {
+  for (const profile of ["managed", "plugins", "unmanaged"] as const) {
+    it.live(`enrolls only fresh managed roots without untracked plugin authority (${profile})`, () =>
+      Effect.gen(function* () {
+        const previous = {
+          profile: process.env.OPENCODE_MANAGED_PROFILE,
+          plugins: process.env.OPENCODE_MANAGED_PLUGIN_ALLOWLIST,
+        }
+        yield* Effect.addFinalizer(() =>
+          Effect.sync(() => {
+            if (previous.profile === undefined) delete process.env.OPENCODE_MANAGED_PROFILE
+            else process.env.OPENCODE_MANAGED_PROFILE = previous.profile
+            if (previous.plugins === undefined) delete process.env.OPENCODE_MANAGED_PLUGIN_ALLOWLIST
+            else process.env.OPENCODE_MANAGED_PLUGIN_ALLOWLIST = previous.plugins
+          }),
+        )
+        process.env.OPENCODE_MANAGED_PROFILE = profile === "unmanaged" ? "0" : "1"
+        process.env.OPENCODE_MANAGED_PLUGIN_ALLOWLIST = profile === "plugins" ? '["trusted-plugin"]' : "[]"
+        const { sessionID } = yield* fixture
+        expect(yield* runtime.commandStatus(sessionID)).toBe(profile === "managed" ? "drained" : "unknown")
+        // Neither another server profile nor a later configuration change can upgrade this root.
+        process.env.OPENCODE_MANAGED_PROFILE = "1"
+        process.env.OPENCODE_MANAGED_PLUGIN_ALLOWLIST = "[]"
+        const database = yield* Database.Service
+        yield* ManagedCommand.enrollCreatedRoot(database, sessionID)
+        expect(yield* runtime.commandStatus(sessionID)).toBe(profile === "managed" ? "drained" : "unknown")
+      }),
+    )
+  }
+
   it.live(
     "round-trips all payload contracts and deduplicates concurrent admissions without transcript or busy state",
     () =>
@@ -329,7 +359,7 @@ describe("native queue HttpApi SDK", () => {
     }),
   )
 
-  it.live("waits for an admitted local lease before completing retirement", () =>
+  it.live("returns bounded retirement status while an admitted local lease is held", () =>
     Effect.gen(function* () {
       const { sessionID, directory } = yield* fixture
       const admission = yield* runtime.admit({ sessionID, directory, manualRecovery: true })
@@ -356,13 +386,44 @@ describe("native queue HttpApi SDK", () => {
         ),
         "retirement barrier was not committed",
       )
-      expect(yield* Deferred.isDone(done)).toBe(false)
+      expect(yield* awaitWithTimeout(Deferred.await(done), "retirement waited for a held lease")).toBe(200)
       yield* runtime.release(sessionID, admission.fence)
-      expect(yield* awaitWithTimeout(Deferred.await(done), "retirement did not join the lease")).toBe(200)
     }),
   )
 
-  it.live("keeps retirement durable when the caller abandons the idle wait", () =>
+  it.live("interrupts descendants during retirement even when the root already has a cancellation owner", () =>
+    Effect.gen(function* () {
+      const { sdk, sessionID, directory, llm } = yield* fixture
+      const child = yield* ok(() => sdk.session.create({ parentID: sessionID }))
+      const release = Promise.withResolvers<void>()
+      yield* llm.hold("child", release.promise)
+      yield* Effect.addFinalizer(() => Effect.sync(() => release.resolve()))
+      yield* Effect.promise(() =>
+        sdk.session.promptAsync({
+          sessionID: child.id,
+          agent: "build",
+          model,
+          parts: [{ type: "text", text: "start child" }],
+        }),
+      )
+      yield* awaitWithTimeout(llm.wait(1), "child prompt did not start")
+      expect(yield* runtime.cancel(sessionID)).toBe(true)
+      yield* Effect.addFinalizer(() => runtime.finishCancel(sessionID))
+      const server = yield* HttpServer.HttpServer
+      const response = yield* Effect.promise(() =>
+        fetch(
+          `${HttpServer.formatAddress(server.address)}/session/${sessionID}/retire?directory=${encodeURIComponent(directory)}`,
+          { method: "POST", headers: { authorization } },
+        ),
+      )
+      expect(response.status).toBe(200)
+      yield* awaitWithTimeout(runtime.waitForIdle(child.id), "retirement skipped the descendant interruption")
+      // The retire handler must not acknowledge the owner's cancellation marker.
+      expect(yield* runtime.cancel(sessionID)).toBe(false)
+    }),
+  )
+
+  it.live("keeps retirement durable when the caller abandons the request", () =>
     Effect.gen(function* () {
       const { sessionID, directory, sdk } = yield* fixture
       const admission = yield* runtime.admit({ sessionID, directory, manualRecovery: true })
@@ -382,7 +443,8 @@ describe("native queue HttpApi SDK", () => {
         "retirement barrier was not committed",
       )
       controller.abort()
-      expect(yield* Effect.promise(() => pending)).toBeUndefined()
+      // A bounded retirement may already have returned before abort reaches the transport.
+      yield* Effect.promise(() => pending)
       expect(
         (yield* Effect.promise(() =>
           sdk.session.promptAsync({ sessionID, agent: "build", model, parts: [{ type: "text", text: "after" }] }),
@@ -428,7 +490,7 @@ describe("native queue HttpApi SDK", () => {
       )
       expect(abort.response.status).toBe(200)
       expect(retired.status).toBe(200)
-      expect((yield* Effect.promise(() => retired.json())).commandStatus).toBe("unknown")
+      expect(["draining", "unknown"]).toContain((yield* Effect.promise(() => retired.json())).commandStatus)
       expect(
         (yield* Effect.promise(() =>
           sdk.session.promptAsync({

@@ -24,6 +24,7 @@ import { ModelV2 } from "@opencode-ai/core/model"
 import { isRecord } from "@/util/record"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { McpActivation } from "./mcp-activation"
+import type { RuntimeLifecycle } from "@/server/runtime-lifecycle"
 
 const MCP_RESOURCE_TOOLS = {
   list: "list_mcp_resources",
@@ -47,6 +48,8 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
   bypassAgentCheck: boolean
   messages: SessionV1.WithParts[]
   promptOps: TaskPromptOps
+  executionFence?: number
+  managedRuntime?: Pick<RuntimeLifecycle.Interface, "runManagedCommand">
 }) {
   const tools: Record<string, AITool> = {}
   const run = yield* EffectBridge.make()
@@ -65,6 +68,8 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
     abort: options.abortSignal!,
     messageID: input.processor.message.id,
     callID: options.toolCallId,
+    managedRuntime: input.managedRuntime,
+    executionFence: input.executionFence,
     extra: {
       model: input.model,
       bypassAgentCheck: input.bypassAgentCheck,

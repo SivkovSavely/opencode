@@ -42,6 +42,12 @@ export class Retired extends Schema.TaggedErrorClass<Retired>()("SessionInput.Re
   sessionID: SessionSchema.ID,
 }) {}
 
+export class ManagedProfile extends Schema.TaggedErrorClass<ManagedProfile>()("SessionInput.ManagedProfile", {}) {}
+
+export const guardManagedProfile = Effect.suspend(() =>
+  process.env.OPENCODE_MANAGED_PROFILE === "1" ? Effect.fail(new ManagedProfile()) : Effect.void,
+)
+
 export const admit = Effect.fn("SessionInput.admit")(function* (
   db: DatabaseService,
   events: EventV2.Interface,
@@ -52,6 +58,7 @@ export const admit = Effect.fn("SessionInput.admit")(function* (
     readonly delivery: Delivery
   },
 ) {
+  yield* guardManagedProfile
   const checkRetirement = db
     .get(sql`SELECT session_id FROM runtime_retirement WHERE session_id = ${input.sessionID}`)
     .pipe(

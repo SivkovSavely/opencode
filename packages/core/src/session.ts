@@ -37,6 +37,7 @@ import { SessionRevert } from "./session/revert"
 import { Revert } from "@opencode-ai/schema/revert"
 import { FSUtil } from "./fs-util"
 import { SessionDurable } from "@opencode-ai/schema/durable-event-manifest"
+import { ManagedCommand } from "./managed-command"
 
 export const RevertState = Revert.State
 export type RevertState = Revert.State
@@ -155,7 +156,7 @@ export interface Interface {
     prompt: PromptInput.Prompt
     delivery?: SessionInput.Delivery
     resume?: boolean
-  }) => Effect.Effect<SessionInput.Admitted, NotFoundError | PromptConflictError | SessionInput.Retired>
+  }) => Effect.Effect<SessionInput.Admitted, NotFoundError | PromptConflictError | SessionInput.Retired | SessionInput.ManagedProfile>
   readonly shell: (input: {
     id?: EventV2.ID
     sessionID: SessionSchema.ID
@@ -245,7 +246,10 @@ const layer = Layer.effect(
           time: { created: now, updated: now },
         })
         const projected = yield* events
-          .publish(SessionV1.Event.Created, { sessionID, info }, { location: input.location })
+          .publish(SessionV1.Event.Created, { sessionID, info }, {
+            location: input.location,
+            commit: () => ManagedCommand.enrollCreatedRoot(database, sessionID),
+          })
           .pipe(
             Effect.as({ type: "created" } as const),
             Effect.catchDefect((defect) => {
@@ -366,6 +370,7 @@ const layer = Layer.effect(
       prompt: Effect.fn("V2Session.prompt")((input) =>
         Effect.uninterruptible(
           Effect.gen(function* () {
+            yield* SessionInput.guardManagedProfile
             yield* result.get(input.sessionID)
             const prompt = resolvePrompt(input.prompt)
             const messageID = input.id ?? SessionMessage.ID.create()
@@ -430,6 +435,7 @@ const layer = Layer.effect(
       }),
       active: execution.active,
       resume: Effect.fn("V2Session.resume")(function* (sessionID) {
+        yield* SessionInput.guardManagedProfile
         yield* result.get(sessionID)
         yield* execution.resume(sessionID)
       }),

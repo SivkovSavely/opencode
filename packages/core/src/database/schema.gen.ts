@@ -24,6 +24,25 @@ export default {
         );
       `)
       yield* tx.run(`
+        CREATE TABLE \`managed_command_coverage\` (
+          \`root_session_id\` text PRIMARY KEY,
+          \`state\` text NOT NULL,
+          \`time_created\` integer NOT NULL
+        );
+      `)
+      yield* tx.run(`
+        CREATE TABLE \`managed_command\` (
+          \`id\` text PRIMARY KEY,
+          \`session_id\` text NOT NULL,
+          \`root_session_id\` text NOT NULL,
+          \`owner_instance\` text NOT NULL,
+          \`execution_generation\` text NOT NULL,
+          \`state\` text NOT NULL,
+          \`time_created\` integer NOT NULL,
+          \`time_updated\` integer NOT NULL
+        );
+      `)
+      yield* tx.run(`
         CREATE TABLE \`runtime_execution\` (
           \`id\` text PRIMARY KEY,
           \`session_id\` text NOT NULL,
@@ -326,6 +345,7 @@ export default {
           CONSTRAINT \`fk_session_share_session_id_session_id_fk\` FOREIGN KEY (\`session_id\`) REFERENCES \`session\`(\`id\`) ON DELETE CASCADE
         );
       `)
+      yield* tx.run(`CREATE INDEX \`managed_command_root_idx\` ON \`managed_command\` (\`root_session_id\`);`)
       yield* tx.run(`CREATE UNIQUE INDEX \`runtime_execution_session_idx\` ON \`runtime_execution\` (\`session_id\`);`)
       yield* tx.run(
         `CREATE INDEX \`runtime_execution_owner_state_idx\` ON \`runtime_execution\` (\`owner_lineage\`,\`state\`);`,

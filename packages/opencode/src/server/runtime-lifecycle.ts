@@ -1,6 +1,7 @@
 import { Database } from "@opencode-ai/core/database/database"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { RuntimeRetirement } from "@opencode-ai/core/runtime-retirement"
+import { ManagedCommand } from "@opencode-ai/core/managed-command"
 import { sql } from "drizzle-orm"
 import {
   Cause,
@@ -65,6 +66,10 @@ export type ExecutionRecord = {
 
 export type AdmissionResult = { manualRecovery: boolean; fence: number }
 
+export type ManagedResult = { cleanup: "confirmed" | "failed" }
+export type ManagedHandle<T extends ManagedResult> = { start: () => Promise<T>; cancel: () => Promise<T> }
+export type ManagedAuthorization = (open: () => void) => Promise<boolean>
+
 export type Interface = {
   readonly identity: {
     readonly lineage: string
@@ -79,6 +84,14 @@ export type Interface = {
   readonly retireRoot: (
     sessionID: string,
   ) => Effect.Effect<RuntimeRetirement.Result, RuntimeRetirement.RootRetirementError>
+  readonly runManagedCommand: <T extends ManagedResult>(
+    sessionID: string,
+    prepare: (authorize: ManagedAuthorization) => Promise<ManagedHandle<T>>,
+    executionFence?: number,
+    /** Trusted assertion that the entire prepare callback cannot launch processes, including on rejection. */
+    options?: { preparation: "process-free" },
+  ) => Effect.Effect<T, ManagedCommand.AdmissionError>
+  readonly commandStatus: (rootSessionID: string) => Effect.Effect<ManagedCommand.Status>
   /** Acquire in a caller-side mask/acquireUseRelease so success installs finishCancel before interruption. */
   readonly cancel: (sessionID: string) => Effect.Effect<boolean>
   readonly waitCancel: (sessionID: string) => Effect.Effect<void>
@@ -368,6 +381,142 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
   const retryWakes = new Map<string, { attempt: number; retryAt: number; deferred: Deferred.Deferred<void> }>()
   const recoveryPreparedSessions = new Set<string>()
   const databaseRef: { current?: Database.Interface } = { current: database }
+  const managed = new Map<string, { sessionID: string; cancel: () => void }>()
+  // Preserve column order: this is compared with Core's persisted admission-generation snapshot.
+  const managedAncestors = (database: Database.Interface, sessionID: string) =>
+    database.db.all<{ id: string }>(sql`
+      WITH RECURSIVE ancestors(id) AS (
+        SELECT ${sessionID}
+        UNION SELECT s.parent_id FROM session s JOIN ancestors a ON s.id = a.id WHERE s.parent_id IS NOT NULL
+        UNION SELECT e.parent_session_id FROM runtime_execution e JOIN ancestors a ON e.session_id = a.id
+          WHERE e.parent_session_id IS NOT NULL
+      ) SELECT a.id, s.id AS projected, s.parent_id, e.parent_session_id AS execution_parent,
+        e.fence, e.owner_instance, e.state, e.desired_active, r.session_id AS retired
+        FROM ancestors a LEFT JOIN session s ON s.id = a.id
+        LEFT JOIN runtime_execution e ON e.session_id = a.id
+        LEFT JOIN runtime_retirement r ON r.session_id = a.id ORDER BY a.id
+    `)
+
+  const runManagedCommand = <T extends ManagedResult>(
+    sessionID: string,
+    prepare: (authorize: ManagedAuthorization) => Promise<ManagedHandle<T>>,
+    executionFence?: number,
+    options?: { preparation: "process-free" },
+  ) =>
+    Effect.uninterruptibleMask((restore) =>
+      Effect.gen(function* () {
+        const database = databaseRef.current ?? (yield* Database.Service)
+        const state: { cancelled: boolean; authorizationAttempted: boolean; handle?: ManagedHandle<T> } = {
+          cancelled: false,
+          authorizationAttempted: false,
+        }
+        const cancel = () => {
+          state.cancelled = true
+          // The owned job below joins this same idempotent cancellation result.
+          if (state.handle) void state.handle.cancel().catch(() => {})
+        }
+        const permit = yield* SynchronizedRef.modifyEffect(ref, (local) =>
+          Effect.gen(function* () {
+            if (local.phase !== "running" || local.cancelling.has(sessionID))
+              return yield* new ManagedCommand.AdmissionError({ sessionID })
+            const permit = yield* ManagedCommand.admit(database, sessionID, identity.instance, executionFence)
+            const ancestors = yield* managedAncestors(database, sessionID)
+            if (
+              JSON.stringify(ancestors) !== permit.generation ||
+              ancestors.some((row) => local.cancelling.has(row.id))
+            ) {
+              yield* ManagedCommand.settle(database, permit, true)
+              return yield* new ManagedCommand.AdmissionError({ sessionID })
+            }
+            managed.set(permit.id, { sessionID, cancel })
+            return [permit, local] as const
+          }),
+        )
+        // This promise owns preparation, process handles and durable settlement even if the caller is interrupted.
+        const polling = { done: false }
+        const monitor = (async () => {
+          while (!polling.done) {
+            const owned = await Effect.runPromise(
+              Effect.gen(function* () {
+                const row = yield* database.db.get(sql`
+                SELECT 1 FROM managed_command WHERE id = ${permit.id} AND owner_instance = ${identity.instance}
+                  AND execution_generation = ${permit.generation} AND state IN ('pending', 'running')
+              `)
+                return !!row && JSON.stringify(yield* managedAncestors(database, sessionID)) === permit.generation
+              }),
+            )
+            if (!owned) {
+              cancel()
+              return
+            }
+            await Bun.sleep(25)
+          }
+        })().catch(cancel)
+        const job = (async () => {
+          const handle = await prepare((open) => {
+            state.authorizationAttempted = true
+            return Effect.runPromise(
+              SynchronizedRef.modifyEffect(ref, (local) =>
+                Effect.gen(function* () {
+                  if (state.cancelled || local.phase !== "running") return [false, local] as const
+                  const ancestors = yield* managedAncestors(database, sessionID)
+                  if (ancestors.some((row) => local.cancelling.has(row.id))) return [false, local] as const
+                  const allowed = yield* ManagedCommand.authorize(database, permit, () => {
+                    if (state.cancelled) throw new Error("Managed command was cancelled before gate authorization")
+                    open()
+                  })
+                  return [allowed, local] as const
+                }),
+              ),
+            )
+          })
+          state.handle = handle
+          const result = await (state.cancelled ? handle.cancel() : handle.start())
+          await Effect.runPromise(ManagedCommand.settle(database, permit, result.cleanup === "confirmed"))
+          return result
+        })()
+          .catch(async (error: unknown) => {
+            if (state.handle) {
+              const result = await state.handle.cancel().catch(() => undefined)
+              await Effect.runPromise(ManagedCommand.settle(database, permit, result?.cleanup === "confirmed"))
+            }
+            // No handle alone is not proof: an arbitrary prepare callback may already have launched work.
+            if (!state.handle)
+              await Effect.runPromise(
+                ManagedCommand.settle(
+                  database,
+                  permit,
+                  options?.preparation === "process-free" && !state.authorizationAttempted,
+                ),
+              )
+            throw error
+          })
+          .finally(async () => {
+            polling.done = true
+            await monitor
+            managed.delete(permit.id)
+            await Effect.runPromise(checkQuiescent())
+          })
+        return yield* restore(Effect.promise(() => job)).pipe(Effect.onInterrupt(() => Effect.sync(cancel)))
+      }),
+    )
+
+  const commandStatus = Effect.fn("RuntimeLifecycle.commandStatus")(function* (rootSessionID: string) {
+    const database = databaseRef.current ?? (yield* Database.Service)
+    const local = SynchronizedRef.getUnsafe(ref)
+    const members = yield* database.db.all<{ session_id: string }>(sql`
+      WITH RECURSIVE tree(session_id) AS (
+        SELECT ${rootSessionID}
+        UNION SELECT session_id FROM runtime_retirement_member WHERE root_session_id = ${rootSessionID}
+        UNION SELECT s.id FROM session s JOIN tree t ON s.parent_id = t.session_id
+        UNION SELECT e.session_id FROM runtime_execution e JOIN tree t ON e.parent_session_id = t.session_id
+      ) SELECT session_id FROM tree
+    `)
+    if (members.some((row) => local.active.has(row.session_id) || local.leases.has(row.session_id)))
+      return "draining" as const
+    // Activity triggers persist uncertainty even after projected history is deleted.
+    return yield* ManagedCommand.status(database, rootSessionID, new Set(managed.keys()))
+  })
 
   const read = Effect.fnUntraced(function* (sessionID: string) {
     const database = databaseRef.current ?? (yield* Database.Service)
@@ -551,12 +700,14 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
   const checkQuiescent = Effect.fnUntraced(function* () {
     const local = SynchronizedRef.getUnsafe(ref)
     for (const [id, deferred] of idleWaiters) {
-      if (local.active.has(id) || local.leases.has(id)) continue
+      if (local.active.has(id) || local.leases.has(id) || [...managed.values()].some((entry) => entry.sessionID === id))
+        continue
       idleWaiters.delete(id)
       yield* Deferred.succeed(deferred, true)
     }
     const shouldStop = yield* SynchronizedRef.modify(ref, (state) => {
-      if (state.phase !== "draining" || state.active.size > 0 || state.leases.size > 0) return [false, state] as const
+      if (state.phase !== "draining" || state.active.size > 0 || state.leases.size > 0 || managed.size > 0)
+        return [false, state] as const
       return [true, { ...state, phase: "quiescent" }] as const
     })
     if (!shouldStop) return
@@ -570,6 +721,27 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
     yield* Deferred.succeed(stopped, { action: SynchronizedRef.getUnsafe(ref).action! }).pipe(Effect.ignore)
     yield* Effect.logInfo("runtime quiescent", { lineage: identity.lineage, instance: identity.instance })
   })
+
+  Effect.runSync(
+    Scope.addFinalizer(
+      scope,
+      Effect.gen(function* () {
+        yield* SynchronizedRef.update(ref, (local): LocalState =>
+          local.phase !== "running"
+            ? local
+            : {
+                ...local,
+                phase: "draining",
+                action: "shutdown",
+                drainStarted: true,
+              },
+        )
+        yield* Deferred.succeed(draining, undefined).pipe(Effect.ignore)
+        for (const entry of managed.values()) entry.cancel()
+        yield* checkQuiescent()
+      }),
+    ),
+  )
 
   const parkRetrying = Effect.fnUntraced(function* () {
     const ids = [...SynchronizedRef.getUnsafe(ref).active.entries()]
@@ -964,6 +1136,17 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
         const cancelling = new Map(state.cancelling)
         cancelling.set(sessionID, { deferred: Deferred.makeUnsafe<boolean>(), rootSessionID: sessionID })
         const database = databaseRef.current ?? (yield* Database.Service)
+        // Independent commands use their durable permit as the generation, even without an execution row.
+        yield* database.db.run(sql`
+          WITH RECURSIVE descendants(id) AS (
+            SELECT ${sessionID}
+            UNION SELECT session_id FROM managed_command WHERE root_session_id = ${sessionID}
+            UNION SELECT s.id FROM session s JOIN descendants d ON s.parent_id = d.id
+            UNION SELECT e.session_id FROM runtime_execution e JOIN descendants d ON e.parent_session_id = d.id
+          ) UPDATE managed_command SET state = 'unknown', time_updated = ${Date.now()}
+            WHERE session_id IN (SELECT id FROM descendants) AND owner_instance <> ${identity.instance}
+              AND state IN ('pending', 'running')
+        `)
         if (yield* RuntimeRetirement.lookup(database, sessionID)) {
           const members = yield* database.db.all<{ session_id: string }>(sql`
             SELECT session_id FROM runtime_retirement_member WHERE root_session_id = ${sessionID}
@@ -1054,6 +1237,19 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
       (decision) =>
         Effect.gen(function* () {
           for (const id of [sessionID, ...decision.cancelled]) retryWakes.delete(id)
+          if (managed.size > 0) {
+            const database = databaseRef.current ?? (yield* Database.Service)
+            const commands = yield* database.db.all<{ session_id: string }>(sql`
+              WITH RECURSIVE descendants(id) AS (
+                SELECT ${sessionID}
+                UNION SELECT session_id FROM managed_command WHERE root_session_id = ${sessionID}
+                UNION SELECT s.id FROM session s JOIN descendants d ON s.parent_id = d.id
+                UNION SELECT e.session_id FROM runtime_execution e JOIN descendants d ON e.parent_session_id = d.id
+              ) SELECT id AS session_id FROM descendants
+            `)
+            for (const entry of managed.values())
+              if (commands.some((command) => command.session_id === entry.sessionID)) entry.cancel()
+          }
           if (!decision.owner) return false
           yield* Effect.logInfo("runtime cancellation acquired", {
             sessionID,
@@ -1097,7 +1293,12 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
 
   const waitForIdle = Effect.fn("RuntimeLifecycle.waitForIdle")(function* (sessionID: string) {
     const deferred = yield* SynchronizedRef.modify(ref, (state) => {
-      if (!state.active.has(sessionID) && !state.leases.has(sessionID)) return [undefined, state] as const
+      if (
+        !state.active.has(sessionID) &&
+        !state.leases.has(sessionID) &&
+        ![...managed.values()].some((entry) => entry.sessionID === sessionID)
+      )
+        return [undefined, state] as const
       const deferred = idleWaiters.get(sessionID) ?? Deferred.makeUnsafe<boolean>()
       idleWaiters.set(sessionID, deferred)
       return [deferred, state] as const
@@ -1124,6 +1325,11 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
         return [result, { ...state, startupPending, parentModeOverrides }] as const
       }),
     ).pipe(
+      Effect.tap((result) =>
+        Effect.sync(() => {
+          for (const entry of managed.values()) if (result.sessionIDs.includes(entry.sessionID)) entry.cancel()
+        }),
+      ),
       Effect.tap((result) => Effect.forEach(result.sessionIDs, notifyParentIdle, { discard: true })),
       Effect.uninterruptible,
     )
@@ -2421,7 +2627,11 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
     return {
       state: local.phase,
       action: local.action,
-      active: new Set([...local.active.keys(), ...local.leases.keys()]).size,
+      active: new Set([
+        ...local.active.keys(),
+        ...local.leases.keys(),
+        ...[...managed.values()].map((entry) => entry.sessionID),
+      ]).size,
       parked: parked?.count ?? 0,
       restartSupported: identity.restartSupported,
       lineage: identity.lineage,
@@ -2444,6 +2654,8 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
     recoveryPrepared,
     admit,
     retireRoot,
+    runManagedCommand,
+    commandStatus,
     cancel,
     waitCancel,
     waitForIdle,
@@ -2488,6 +2700,8 @@ export function unavailable(): Interface {
     admit: () => Effect.succeed({ manualRecovery: false, fence: 0 }),
     retireRoot: (sessionID) =>
       Effect.fail(new RuntimeRetirement.RootRetirementError({ sessionID, reason: "unavailable" })),
+    runManagedCommand: (sessionID) => Effect.fail(new ManagedCommand.AdmissionError({ sessionID })),
+    commandStatus: () => Effect.succeed("unknown"),
     cancel: () => Effect.succeed(true),
     waitCancel: () => Effect.void,
     waitForIdle: () => Effect.void,

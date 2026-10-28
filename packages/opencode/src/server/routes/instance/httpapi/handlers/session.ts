@@ -255,7 +255,7 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
     })
 
     const retire = Effect.fn("SessionHttpApi.retire")(function* (ctx: { params: { sessionID: SessionID } }) {
-      const result = yield* Effect.uninterruptible(
+      const result = yield* Effect.uninterruptibleMask((restore) =>
         Effect.gen(function* () {
           const result = yield* runtime.retireRoot(ctx.params.sessionID).pipe(
             Effect.mapError((error) => {
@@ -266,28 +266,32 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
               return new HttpApiError.ServiceUnavailable({})
             }),
           )
-          while (!(yield* runtime.cancel(ctx.params.sessionID))) yield* runtime.waitCancel(ctx.params.sessionID)
-          yield* Effect.forEach(
-            result.sessionIDs,
-            (id) =>
-              Effect.all([runState.cancel(SessionID.make(id)), sessionV2.interrupt(SessionSchema.ID.make(id))], {
-                concurrency: "unbounded",
-                discard: true,
+          // The HTTP request never waits for uncooperative tools. The runtime scope owns cancellation.
+          yield* restore(
+            Effect.uninterruptibleMask((restore) =>
+              Effect.gen(function* () {
+                const ownsCancel = yield* runtime.cancel(ctx.params.sessionID)
+                yield* restore(
+                  Effect.forEach(
+                    result.sessionIDs,
+                    (id) =>
+                      Effect.all(
+                        [runState.cancel(SessionID.make(id)), sessionV2.interrupt(SessionSchema.ID.make(id))],
+                        {
+                          concurrency: "unbounded",
+                          discard: true,
+                        },
+                      ),
+                    { concurrency: "unbounded", discard: true },
+                  ),
+                ).pipe(Effect.ensuring(ownsCancel ? runtime.finishCancel(ctx.params.sessionID) : Effect.void))
               }),
-            { concurrency: "unbounded", discard: true },
-          ).pipe(Effect.ensuring(runtime.finishCancel(ctx.params.sessionID)))
+            ),
+          ).pipe(Effect.forkIn(scope, { startImmediately: true }))
           return result
         }),
       )
-      yield* Effect.forEach(result.sessionIDs, (id) => runtime.waitCancel(id), {
-        concurrency: "unbounded",
-        discard: true,
-      })
-      yield* Effect.forEach(result.sessionIDs, (id) => runtime.waitForIdle(id), {
-        concurrency: "unbounded",
-        discard: true,
-      })
-      return { ...result, commandStatus: "unknown" as const }
+      return { ...result, commandStatus: yield* runtime.commandStatus(ctx.params.sessionID) }
     })
 
     const retry = Effect.fn("SessionHttpApi.retry")(function* (ctx: {
@@ -348,7 +352,7 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
             manualRecovery: true,
           })
           .pipe(Effect.mapError((error) => new ConflictError({ resource: current.id, message: error.message }))),
-        () =>
+        (admission) =>
           Effect.gen(function* () {
             yield* revertSvc.cleanup(current)
             const messages = yield* SessionError.mapStorageNotFound(session.messages({ sessionID: current.id }))
@@ -366,7 +370,7 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
               model: { providerID: ctx.payload.providerID, modelID: ctx.payload.modelID },
               auto: ctx.payload.auto ?? false,
             })
-            yield* promptSvc.loop({ sessionID: current.id })
+            yield* promptSvc.loop({ sessionID: current.id, executionFence: admission.fence })
             return true
           }),
         (admission) => runtime.release(current.id, admission.fence),

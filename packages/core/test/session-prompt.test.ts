@@ -100,6 +100,36 @@ const eventCount = (type: string) =>
   )
 
 describe("SessionV2.prompt", () => {
+  it.effect("blocks managed admissions, retries and resumes without recording or scheduling work", () =>
+    Effect.gen(function* () {
+      yield* setup
+      const session = yield* SessionV2.Service
+      const id = SessionMessage.ID.create()
+      const prompt = Prompt.make({ text: "existing" })
+      yield* session.prompt({ sessionID, id, prompt, resume: false })
+      const previous = process.env.OPENCODE_MANAGED_PROFILE
+      yield* Effect.gen(function* () {
+        process.env.OPENCODE_MANAGED_PROFILE = "1"
+        wakeCalls.length = 0
+        executionCalls.length = 0
+        for (const input of [
+          { sessionID, id, prompt },
+          { sessionID, prompt, resume: false },
+          { sessionID, prompt },
+        ]) {
+          expect((yield* session.prompt(input).pipe(Effect.flip))._tag).toBe("SessionInput.ManagedProfile")
+        }
+        expect((yield* session.resume(sessionID).pipe(Effect.flip))._tag).toBe("SessionInput.ManagedProfile")
+        expect(yield* admittedCount).toBe(1)
+        expect(wakeCalls).toEqual([])
+        expect(executionCalls).toEqual([])
+      }).pipe(Effect.ensuring(Effect.sync(() => {
+        if (previous === undefined) delete process.env.OPENCODE_MANAGED_PROFILE
+        else process.env.OPENCODE_MANAGED_PROFILE = previous
+      })))
+    }),
+  )
+
   it.effect("rejects new admissions and exact retries after retirement without waking", () =>
     Effect.gen(function* () {
       yield* setup
