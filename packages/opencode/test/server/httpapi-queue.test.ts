@@ -1,5 +1,7 @@
 import { describe, expect } from "bun:test"
-import { ConfigProvider, Effect, Deferred, Layer } from "effect"
+import { ConfigProvider, Effect, Deferred, Layer, Scope } from "effect"
+import { sql } from "drizzle-orm"
+import { randomUUID } from "node:crypto"
 import { HttpServer } from "effect/unstable/http"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
@@ -21,7 +23,8 @@ import { disposeAllInstances, tmpdirScoped } from "../fixture/fixture"
 import { awaitWithTimeout, pollWithTimeout, testEffect } from "../lib/effect"
 import { TestLLMServer } from "../lib/llm-server"
 import { testProviderConfig } from "../lib/test-provider"
-import { httpApiLayer } from "./httpapi-layer"
+import { httpApiLayerWithRuntime } from "./httpapi-layer"
+import { RuntimeLifecycle } from "../../src/server/runtime-lifecycle"
 
 const appLayer = AppNodeBuilder.build(
   LayerNode.group([
@@ -43,7 +46,9 @@ const authorization = `Basic ${Buffer.from("queue-user:queue-secret").toString("
 const it = testEffect(
   Layer.mergeAll(
     appLayer,
-    httpApiLayer.pipe(
+    httpApiLayerWithRuntime(
+      RuntimeLifecycle.make({ lineage: randomUUID(), instance: randomUUID() }, Scope.makeUnsafe()),
+    ).pipe(
       Layer.provide(appLayer),
       Layer.provide(
         ConfigProvider.layer(
@@ -214,6 +219,95 @@ describe("native queue HttpApi SDK", () => {
         expect((yield* ok(() => sdk.session.status()))[sessionID]?.type ?? "idle").toBe("idle")
         expect(yield* llm.calls).toBe(0)
       }),
+  )
+
+  it.live("accepts PTY notifications for completed sessions but rejects them after cancellation", () =>
+    Effect.gen(function* () {
+      const { sdk, sessionID, llm } = yield* fixture
+      yield* llm.text("initial result")
+      yield* ok(() =>
+        sdk.session.prompt({
+          sessionID,
+          agent: "build",
+          model,
+          parts: [{ type: "text", text: "start session" }],
+        }),
+      )
+      yield* awaitWithTimeout(llm.wait(1), "initial session prompt did not run")
+      yield* idle(sdk, sessionID)
+
+      yield* llm.text("PTY completion result")
+      yield* Effect.promise(() =>
+        sdk.session.promptAsync({
+          sessionID,
+          agent: "build",
+          model,
+          parts: [{ type: "text", text: "<pty_exited>\nID: pty_test\n</pty_exited>" }],
+        }),
+      )
+      yield* awaitWithTimeout(llm.wait(2), "PTY notification did not resume the completed session")
+      yield* idle(sdk, sessionID)
+      expect(yield* llm.calls).toBe(2)
+
+      const cancelledSession = yield* ok(() => sdk.session.create({ title: "Cancelled PTY notification" }))
+      const release = Promise.withResolvers<void>()
+      yield* llm.hold("active result", release.promise)
+      yield* llm.text("must not run")
+      yield* Effect.promise(() =>
+        sdk.session.promptAsync({
+          sessionID: cancelledSession.id,
+          agent: "build",
+          model,
+          parts: [{ type: "text", text: "start cancellable session" }],
+        }),
+      )
+      yield* awaitWithTimeout(llm.wait(3), "cancellable session prompt did not start")
+      yield* ok(() => sdk.session.abort({ sessionID: cancelledSession.id }))
+      const cancelledRuntime = yield* Database.Service.use(({ db }) =>
+        db.get<{ state: string; fence: number }>(sql`
+          SELECT state, fence FROM runtime_execution WHERE session_id = ${cancelledSession.id}
+        `),
+      )
+      expect(cancelledRuntime?.state).toBe("cancelled")
+      release.resolve()
+      yield* idle(sdk, cancelledSession.id)
+
+      const controller = new AbortController()
+      yield* Effect.addFinalizer(() => Effect.sync(() => controller.abort()))
+      const events = yield* Effect.promise(() => sdk.event.subscribe(undefined, { signal: controller.signal }))
+      const ready = yield* Deferred.make<void>()
+      const rejected = yield* Deferred.make<void>()
+      yield* Effect.promise(async () => {
+        for await (const event of events.stream) {
+          if (event.type === "server.connected") Deferred.doneUnsafe(ready, Effect.void)
+          if (event.type !== "session.error" || event.properties.sessionID !== cancelledSession.id) continue
+          Deferred.doneUnsafe(rejected, Effect.void)
+          return
+        }
+      }).pipe(Effect.forkScoped)
+      yield* awaitWithTimeout(Deferred.await(ready), "SDK event stream did not connect")
+
+      yield* llm.text("must not run")
+      yield* Effect.promise(() =>
+        sdk.session.promptAsync({
+          sessionID: cancelledSession.id,
+          agent: "build",
+          model,
+          parts: [{ type: "text", text: "late PTY completion" }],
+        }),
+      )
+      const runtimeBeforeTimeout = yield* Database.Service.use(({ db }) =>
+        db.get<{ state: string; fence: number }>(sql`
+          SELECT state, fence FROM runtime_execution WHERE session_id = ${cancelledSession.id}
+        `),
+      )
+      yield* awaitWithTimeout(
+        Deferred.await(rejected),
+        `cancelled-session notification was not rejected: ${JSON.stringify({ runtime: runtimeBeforeTimeout, calls: yield* llm.calls })}`,
+      )
+      expect(yield* llm.calls).toBe(3)
+      yield* idle(sdk, cancelledSession.id)
+    }),
   )
 
   it.live("uses revisions and stable IDs for reorder, delete, conversion, and queue-only clear", () =>

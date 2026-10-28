@@ -3,20 +3,28 @@ import { Config, Layer } from "effect"
 import { HttpClient, HttpClientRequest, HttpRouter, HttpServer } from "effect/unstable/http"
 import { layerWebSocketConstructorGlobal } from "effect/unstable/socket/Socket"
 import { HttpApiApp } from "../../src/server/routes/instance/httpapi/server"
+import type { Interface as RuntimeLifecycle } from "../../src/server/runtime-lifecycle"
 
-const servedRoutes: Layer.Layer<never, Config.ConfigError, HttpServer.HttpServer> = HttpRouter.serve(
-  HttpApiApp.routes,
-  {
+function servedRoutes(routes: Layer.Layer<never, Config.ConfigError, HttpServer.HttpServer>) {
+  return HttpRouter.serve(routes, {
     disableListenLog: true,
     disableLogger: true,
-  },
-)
+  })
+}
 
-export const httpApiLayer = servedRoutes.pipe(
-  Layer.provide(layerWebSocketConstructorGlobal),
-  Layer.provideMerge(NodeHttpServer.layerTest),
-  Layer.provideMerge(NodeServices.layer),
-)
+function layer(routes: Layer.Layer<never, Config.ConfigError, HttpServer.HttpServer>) {
+  return servedRoutes(routes).pipe(
+    Layer.provide(layerWebSocketConstructorGlobal),
+    Layer.provideMerge(NodeHttpServer.layerTest),
+    Layer.provideMerge(NodeServices.layer),
+  )
+}
+
+export const httpApiLayer = layer(HttpApiApp.routes)
+
+export function httpApiLayerWithRuntime(runtime: RuntimeLifecycle) {
+  return layer(HttpApiApp.createRoutes(undefined, runtime))
+}
 
 export function request(path: string, init?: RequestInit) {
   const url = new URL(path, "http://localhost")
