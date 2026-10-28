@@ -1,6 +1,6 @@
 import yargs from "yargs"
 import { TuiThreadCommand } from "./cli/cmd/tui"
-import { InstallationVersion } from "@opencode-ai/core/installation/version"
+import { cliVersion } from "./cli/version"
 import { hideBin } from "yargs/helpers"
 const cli = yargs(hideBin(process.argv))
   .parserConfiguration({ "populate--": true })
@@ -8,7 +8,7 @@ const cli = yargs(hideBin(process.argv))
   .wrap(100)
   .help("help", "show help")
   .alias("help", "h")
-  .version("version", "show version number", InstallationVersion)
+  .version("version", "show version number", cliVersion)
   .alias("version", "v")
   .option("print-logs", {
     describe: "print logs to stderr",
