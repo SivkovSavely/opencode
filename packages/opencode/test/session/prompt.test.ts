@@ -287,8 +287,9 @@ const makeOwnedRuntime = (
   processor?: "blocking",
   snapshot?: Layer.Layer<Snapshot.Service>,
   failInterruptedReleaseOnce = false,
+  plugin?: Layer.Layer<Plugin.Service>,
 ) =>
-  makeHttp({ processor, snapshot }).pipe(
+  makeHttp({ processor, snapshot, plugin }).pipe(
     Layer.provideMerge(
       Layer.effect(
         RuntimeLifecycle.Service,
@@ -333,6 +334,27 @@ const makeOwnedRuntime = (
     ),
   )
 const ownedRuntime = testEffect(makeOwnedRuntime())
+const retryCommandRuntime = testEffect(
+  makeOwnedRuntime(
+    false,
+    undefined,
+    undefined,
+    false,
+    Layer.succeed(
+      Plugin.Service,
+      Plugin.Service.of({
+        trigger: (name, input, output) =>
+          name === "command.execute.before"
+            ? RuntimeLifecycle.current()!
+                .retry((input as { sessionID: string }).sessionID, Date.now() + 60_000)
+                .pipe(Effect.as(output))
+            : Effect.succeed(output),
+        list: () => Effect.succeed([]),
+        init: () => Effect.void,
+      }),
+    ),
+  ),
+)
 const ownedBlockingRuntime = testEffect(makeOwnedRuntime(false, "blocking"))
 const archivingRuntime = testEffect(makeOwnedRuntime(true))
 const interruptedReleaseRetryRuntime = testEffect(makeOwnedRuntime(false, undefined, interruptedSnapshot, true))
@@ -1038,6 +1060,23 @@ it.instance("native queue commands materialize inside the runner without recursi
   }),
 )
 
+retryCommandRuntime.instance("command hands off its lease before prompt admission when retry starts", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig((url) => ({
+      ...providerCfg(url),
+      command: { probe: { template: "hello" } },
+    }))
+    const { prompt, chat } = yield* boot()
+    yield* llm.text("result")
+    const result = yield* awaitWithTimeout(
+      prompt.command({ sessionID: chat.id, command: "probe", arguments: "" }),
+      "command deadlocked during retry",
+      "5 seconds",
+    )
+    expect(result.info.role).toBe("assistant")
+  }),
+)
+
 unix("pending command conversions defer interpolation until an irreversible claim", () =>
   Effect.gen(function* () {
     const { directory } = yield* TestInstance
@@ -1308,6 +1347,7 @@ ownedRuntime.instance("native queue automatic admission cannot revive a cancelle
     yield* runtime.admit({ sessionID: chat.id, directory: chat.directory })
     yield* runtime.cancel(chat.id)
     yield* runtime.finishCancel(chat.id)
+    yield* runtime.release(chat.id)
     yield* prompt.queueSubmit(chat.id, { id: "runtime-cancelled", payload: queuedPrompt("runtime-cancelled-input") })
     expect(yield* sessions.messages({ sessionID: chat.id })).toEqual([])
     expect((yield* queue.get(chat.id, "runtime-cancelled")).state).toBe("pending")
@@ -3827,6 +3867,57 @@ noLLMServer.instance("assertNotBusy succeeds when idle", () =>
 )
 
 // Shell semantics
+
+unixNoLLMServer(
+  "managed profile rejects session shell and command expansion before execution",
+  () =>
+    Effect.gen(function* () {
+      const instance = yield* TestInstance
+      const { prompt, chat, run } = yield* boot()
+      const previous = process.env.OPENCODE_MANAGED_PROFILE
+      const marker = process.env.OPENCODE_TEST_MANAGED_MARKER
+      yield* Effect.acquireUseRelease(
+        Effect.sync(() => {
+          process.env.OPENCODE_MANAGED_PROFILE = "1"
+          process.env.OPENCODE_TEST_MANAGED_MARKER = path.join(instance.directory, "managed-template-marker")
+        }),
+        () =>
+          Effect.gen(function* () {
+            const shell = yield* prompt
+              .shell({ sessionID: chat.id, agent: "build", command: "touch managed-session-marker" })
+              .pipe(Effect.exit)
+            expect(Exit.isFailure(shell)).toBe(true)
+            if (Exit.isFailure(shell))
+              expect(String(Cause.squash(shell.cause))).toContain(
+                "foreground validation requires descendant containment",
+              )
+            yield* run.assertNotBusy(chat.id)
+            const command = yield* prompt
+              .command({ sessionID: chat.id, command: "probe", arguments: "" })
+              .pipe(Effect.exit)
+            expect(Exit.isFailure(command)).toBe(true)
+            if (Exit.isFailure(command))
+              expect(String(Cause.squash(command.cause))).toContain(
+                "foreground validation requires descendant containment",
+              )
+            expect(
+              yield* Effect.promise(() => Bun.file(path.join(instance.directory, "managed-session-marker")).exists()),
+            ).toBe(false)
+            expect(
+              yield* Effect.promise(() => Bun.file(path.join(instance.directory, "managed-template-marker")).exists()),
+            ).toBe(false)
+          }),
+        () =>
+          Effect.sync(() => {
+            if (previous === undefined) delete process.env.OPENCODE_MANAGED_PROFILE
+            else process.env.OPENCODE_MANAGED_PROFILE = previous
+            if (marker === undefined) delete process.env.OPENCODE_TEST_MANAGED_MARKER
+            else process.env.OPENCODE_TEST_MANAGED_MARKER = marker
+          }),
+      )
+    }),
+  { config: { ...cfg, command: { probe: { template: '!`touch "$OPENCODE_TEST_MANAGED_MARKER"`' } } } },
+)
 
 it.instance("shell rejects with BusyError when loop running", () =>
   Effect.gen(function* () {

@@ -278,6 +278,12 @@ export const layer = Layer.effect(
       })
       return yield* transaction(sessionID, () =>
         Effect.gen(function* () {
+          const retired = yield* db
+            .get<{
+              root_session_id: string
+            }>(sql`SELECT root_session_id FROM runtime_retirement WHERE session_id = ${sessionID}`)
+            .pipe(Effect.orDie)
+          if (retired) return yield* new QueueError({ reason: "conflict", message: "Session root is retired" })
           const existing = yield* db
             .select()
             .from(SessionQueueTable)

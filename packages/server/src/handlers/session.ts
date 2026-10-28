@@ -165,6 +165,11 @@ export const SessionHandler = HttpApiBuilder.group(Api, "server.session", (handl
                     }),
                   ),
                 ),
+                Effect.catchTag("SessionInput.Retired", (error) =>
+                  Effect.fail(
+                    new ConflictError({ message: `Session is retired: ${error.sessionID}`, resource: error.sessionID }),
+                  ),
+                ),
               ),
           }
         }),

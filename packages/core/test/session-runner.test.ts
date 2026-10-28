@@ -32,6 +32,7 @@ import { Prompt } from "@opencode-ai/core/session/prompt"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { SessionExecution } from "@opencode-ai/core/session/execution"
 import { SessionRunCoordinator } from "@opencode-ai/core/session/run-coordinator"
+import { RuntimeRetirement } from "@opencode-ai/core/runtime-retirement"
 import { SessionRunner } from "@opencode-ai/core/session/runner"
 import * as SessionRunnerLLM from "@opencode-ai/core/session/runner/llm"
 import { SessionRunnerModel } from "@opencode-ai/core/session/runner/model"
@@ -336,6 +337,81 @@ const setup = Effect.gen(function* () {
     .run()
     .pipe(Effect.orDie)
   yield* insertSession(sessionID)
+})
+
+describe("retired V2 execution", () => {
+  it.effect("does not start a provider after retirement during request preparation", () =>
+    Effect.gen(function* () {
+      yield* setup
+      const session = yield* SessionV2.Service
+      const database = yield* Database.Service
+      yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "start" }), resume: false })
+      const entered = yield* Deferred.make<void>()
+      const release = yield* Deferred.make<void>()
+      modelResolveHook = Deferred.succeed(entered, undefined).pipe(Effect.andThen(Deferred.await(release)))
+      requests.length = 0
+      const run = yield* session.resume(sessionID).pipe(Effect.forkChild)
+      yield* Deferred.await(entered)
+      yield* RuntimeRetirement.retireRoot(database, sessionID)
+      yield* Deferred.succeed(release, undefined)
+      expect((yield* Fiber.await(run))._tag).toBe("Failure")
+      expect(requests).toHaveLength(0)
+    }),
+  )
+
+  it.effect("does not dispatch a tool or continue after retirement during a provider turn", () =>
+    Effect.gen(function* () {
+      yield* setup
+      const session = yield* SessionV2.Service
+      const database = yield* Database.Service
+      yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "start" }), resume: false })
+      requests.length = 0
+      executions.length = 0
+      response = [
+        LLMEvent.stepStart({ index: 0 }),
+        LLMEvent.toolCall({ id: "retired-call", name: "echo", input: { text: "forbidden" } }),
+        LLMEvent.stepFinish({ index: 0, reason: "tool-calls" }),
+        LLMEvent.finish({ reason: "tool-calls" }),
+      ]
+      streamGate = yield* Deferred.make<void>()
+      streamStarted = yield* Deferred.make<void>()
+      const run = yield* session.resume(sessionID).pipe(Effect.forkChild)
+      yield* Deferred.await(streamStarted)
+      yield* RuntimeRetirement.retireRoot(database, sessionID)
+      yield* Deferred.succeed(streamGate, undefined)
+      yield* Fiber.await(run)
+      expect(executions).toEqual([])
+      expect(requests).toHaveLength(1)
+      requests.length = 0
+    }),
+  )
+
+  it.effect("does not start a continuation after an in-flight tool settles", () =>
+    Effect.gen(function* () {
+      yield* setup
+      const session = yield* SessionV2.Service
+      const database = yield* Database.Service
+      yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "start" }), resume: false })
+      requests.length = 0
+      response = [
+        LLMEvent.stepStart({ index: 0 }),
+        LLMEvent.toolCall({ id: "inflight-call", name: "echo", input: { text: "started" } }),
+        LLMEvent.stepFinish({ index: 0, reason: "tool-calls" }),
+        LLMEvent.finish({ reason: "tool-calls" }),
+      ]
+      toolExecutionsReady = 1
+      toolExecutionsStarted = yield* Deferred.make<void>()
+      toolExecutionGate = yield* Deferred.make<void>()
+      const run = yield* session.resume(sessionID).pipe(Effect.forkChild)
+      yield* Deferred.await(toolExecutionsStarted)
+      yield* RuntimeRetirement.retireRoot(database, sessionID)
+      yield* Deferred.succeed(toolExecutionGate, undefined)
+      expect((yield* Fiber.await(run))._tag).toBe("Failure")
+      expect(requests).toHaveLength(1)
+      requests.length = 0
+      executions.length = 0
+    }),
+  )
 })
 
 const providerUnavailable = () =>

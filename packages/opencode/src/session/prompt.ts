@@ -42,7 +42,7 @@ import { FSUtil } from "@opencode-ai/core/fs-util"
 import { Truncate } from "@/tool/truncate"
 import { Image } from "@/image/image"
 import { decodeDataUrl } from "@/util/data-url"
-import { Cause, Effect, Exit, Latch, Layer, Option, Scope, Context, Schema, Types } from "effect"
+import { Cause, Deferred, Effect, Exit, Latch, Layer, Option, Scope, Context, Schema, Types } from "effect"
 import { InstanceState } from "@/effect/instance-state"
 import { TaskTool, type TaskPromptOps } from "@/tool/task"
 import { SessionRunState } from "./run-state"
@@ -61,6 +61,7 @@ import { RuntimeLifecycle } from "@/server/runtime-lifecycle"
 import { SessionQueue } from "./queue"
 import { SessionQueueV1 } from "@opencode-ai/schema/v1/session-queue"
 import { SessionQueueTable } from "@opencode-ai/core/session/queue.sql"
+import { requireUnmanagedShell } from "@/util/managed-shell"
 
 // @ts-ignore
 globalThis.AI_SDK_LOG_WARNINGS = false
@@ -113,11 +114,18 @@ function isOrphanedInterruptedTool(part: SessionV1.ToolPart) {
 
 export interface Interface {
   readonly cancel: (sessionID: SessionID) => Effect.Effect<void>
-  readonly prompt: (input: PromptInput, task?: TaskAdmission) => Effect.Effect<SessionV1.WithParts, Image.Error>
+  readonly prompt: (
+    input: PromptInput,
+    task?: TaskAdmission,
+  ) => Effect.Effect<SessionV1.WithParts, Image.Error | RuntimeLifecycle.RuntimeDrainingError>
   readonly loop: (input: LoopInput) => Effect.Effect<SessionV1.WithParts>
   readonly recover: (sessionID: SessionID) => Effect.Effect<SessionV1.WithParts>
-  readonly shell: (input: ShellInput) => Effect.Effect<SessionV1.WithParts, Session.BusyError>
-  readonly command: (input: CommandInput) => Effect.Effect<SessionV1.WithParts, Image.Error>
+  readonly shell: (
+    input: ShellInput,
+  ) => Effect.Effect<SessionV1.WithParts, Session.BusyError | RuntimeLifecycle.RuntimeDrainingError>
+  readonly command: (
+    input: CommandInput,
+  ) => Effect.Effect<SessionV1.WithParts, Image.Error | RuntimeLifecycle.RuntimeDrainingError>
   readonly resolvePromptParts: (template: string) => Effect.Effect<PromptInput["parts"]>
   readonly queueSubmit: (
     sessionID: SessionID,
@@ -136,6 +144,7 @@ type TaskAdmission = {
   parentCallID?: string
   parentMode?: "foreground" | "background"
   notification?: boolean
+  admission?: Deferred.Deferred<void, RuntimeLifecycle.RuntimeDrainingError>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/SessionPrompt") {}
@@ -788,6 +797,7 @@ const layer = Layer.effect(
       ready?: Latch.Latch,
       delivery?: SessionQueueV1.Entry,
     ) {
+      requireUnmanagedShell()
       return yield* Effect.uninterruptibleMask((restore) =>
         Effect.gen(function* () {
           const markReady = ready ? ready.open.pipe(Effect.asVoid) : Effect.void
@@ -795,6 +805,12 @@ const layer = Layer.effect(
             .transaction(
               () =>
                 Effect.gen(function* () {
+                  const retired = yield* db
+                    .get<{
+                      session_id: string
+                    }>(sql`SELECT session_id FROM runtime_retirement WHERE session_id = ${input.sessionID}`)
+                    .pipe(Effect.orDie)
+                  if (retired) return yield* Effect.interrupt
                   if (delivery && !(yield* ownsQueue(input.sessionID))) return yield* Effect.interrupt
                   const ctx = yield* InstanceState.context
                   const session = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
@@ -920,6 +936,7 @@ const layer = Layer.effect(
                 stdin: "ignore",
                 forceKillAfter: "3 seconds",
               })
+              if (!(yield* runtime.beforeTurn(input.sessionID))) return yield* Effect.interrupt
               const handle = yield* spawner.spawn(cmd)
               yield* Stream.runForEach(Stream.decodeText(handle.all), (chunk) =>
                 Effect.gen(function* () {
@@ -1402,6 +1419,12 @@ const layer = Layer.effect(
         .transaction(
           () =>
             Effect.gen(function* () {
+              const retired = yield* db
+                .get<{
+                  session_id: string
+                }>(sql`SELECT session_id FROM runtime_retirement WHERE session_id = ${input.sessionID}`)
+                .pipe(Effect.orDie)
+              if (retired) return yield* Effect.interrupt
               if (delivery && (delivery.delivery === "queue" || delivery.state === "claimed")) {
                 if (!(yield* ownsQueue(input.sessionID))) return yield* Effect.interrupt
               }
@@ -1492,12 +1515,9 @@ const layer = Layer.effect(
       task?: TaskAdmission,
       delivery?: SessionQueueV1.Entry,
       resolved?: boolean,
-    ) => Effect.Effect<SessionV1.WithParts, Image.Error> = Effect.fn("SessionPrompt.prompt")(function* (
-      input: PromptInput,
-      task?: TaskAdmission,
-      delivery?: SessionQueueV1.Entry,
-      resolved = false,
-    ) {
+    ) => Effect.Effect<SessionV1.WithParts, Image.Error | RuntimeLifecycle.RuntimeDrainingError> = Effect.fn(
+      "SessionPrompt.prompt",
+    )(function* (input: PromptInput, task?: TaskAdmission, delivery?: SessionQueueV1.Entry, resolved = false) {
       const session = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
       const work = Effect.gen(function* () {
         const existing =
@@ -1528,52 +1548,62 @@ const layer = Layer.effect(
         return message
       })
 
-      if (input.noReply === true) return yield* work
+      if (input.noReply === true && delivery) return yield* work
       yield* Effect.logInfo("restart diagnostic runtime admission requested", {
         sessionID: input.sessionID,
         parentSessionID: session.parentID,
       })
-      const admission = yield* runtime
-        .admit({
-          sessionID: input.sessionID,
-          directory: session.directory,
-          parentSessionID: session.parentID,
-          parentMessageID: task?.parentMessageID,
-          parentCallID: task?.parentCallID,
-          parentMode: task?.parentMode,
-          rejectCancelled: task?.notification,
-          rejectRecoveryNeeded: task?.notification,
-          manualRecovery: task === undefined,
-        })
-        .pipe(Effect.orDie)
-      yield* Effect.logInfo("restart diagnostic runtime admission accepted", {
-        sessionID: input.sessionID,
-        parentSessionID: session.parentID,
-      })
       let interrupted = false
-      const loop = runLoop(
-        input.sessionID,
-        admission.manualRecovery,
-        admission.manualRecovery,
-        admission.manualRecovery,
-        true,
-      ).pipe(
-        Effect.onExit((exit) =>
-          Effect.sync(() => (interrupted = Exit.isFailure(exit) && Cause.hasInterrupts(exit.cause))),
-        ),
-      )
       return yield* Effect.acquireUseRelease(
-        Effect.void,
-        () =>
-          work.pipe(
-            Effect.andThen(() => state.enqueue(input.sessionID, lastAssistant(input.sessionID), loop)),
+        runtime
+          .admit({
+            sessionID: input.sessionID,
+            directory: session.directory,
+            parentSessionID: session.parentID,
+            parentMessageID: task?.parentMessageID,
+            parentCallID: task?.parentCallID,
+            parentMode: task?.parentMode,
+            rejectCancelled: task?.notification,
+            rejectRecoveryNeeded: task?.notification,
+            manualRecovery: task === undefined || task.admission !== undefined,
+          })
+          .pipe(Effect.tapError((error) => (task?.admission ? Deferred.fail(task.admission, error) : Effect.void))),
+        (admission) =>
+          Effect.gen(function* () {
+            if (task?.admission) yield* Deferred.succeed(task.admission, undefined)
+            yield* Effect.logInfo("restart diagnostic runtime admission accepted", {
+              sessionID: input.sessionID,
+              parentSessionID: session.parentID,
+            })
+            const loop = runLoop(
+              input.sessionID,
+              admission.manualRecovery,
+              admission.manualRecovery,
+              admission.manualRecovery,
+              true,
+            ).pipe(
+              Effect.onExit((exit) =>
+                Effect.sync(() => (interrupted = Exit.isFailure(exit) && Cause.hasInterrupts(exit.cause))),
+              ),
+            )
+            if (!(yield* runtime.beforeTurn(input.sessionID)))
+              return yield* new RuntimeLifecycle.RuntimeDrainingError({
+                message: "Session execution is no longer active",
+              })
+            const message = yield* work
+            if (!(yield* runtime.beforeTurn(input.sessionID)))
+              return yield* new RuntimeLifecycle.RuntimeDrainingError({
+                message: "Session execution is no longer active",
+              })
+            return input.noReply ? message : yield* state.enqueue(input.sessionID, lastAssistant(input.sessionID), loop)
+          }).pipe(
             Effect.onExit((exit) =>
               Effect.sync(() => {
                 if (Exit.isFailure(exit) && Cause.squash(exit.cause) instanceof Runner.Interrupted) interrupted = true
               }),
             ),
           ),
-        () =>
+        (admission) =>
           interrupted
             ? Effect.gen(function* () {
                 yield* releaseInterrupted(input.sessionID, admission.fence)
@@ -1612,7 +1642,9 @@ const layer = Layer.effect(
           .where(eq(SessionQueueTable.id, entry.id))
           .get()
           .pipe(Effect.orDie)
-        return yield* prompt({ ...payload, ...input }, undefined, entry, original?.delivery === "steer")
+        return yield* prompt({ ...payload, ...input }, undefined, entry, original?.delivery === "steer").pipe(
+          Effect.catchTag("RuntimeDrainingError", Effect.die),
+        )
       }
       if (payload.kind === "command" && entry.delivery === "steer" && entry.state === "pending")
         return yield* createUserMessage(
@@ -1629,7 +1661,7 @@ const layer = Layer.effect(
         return yield* command(
           { ...payload, ...input, model: `${payload.model.providerID}/${payload.model.modelID}` },
           entry,
-        )
+        ).pipe(Effect.catchTag("RuntimeDrainingError", Effect.die))
       if (payload.kind === "shell") {
         if (entry.delivery === "queue")
           return yield* shellImpl({ ...input, command: payload.command }, undefined, entry)
@@ -2516,30 +2548,75 @@ const layer = Layer.effect(
       )
     })
 
-    const shell: (input: ShellInput) => Effect.Effect<SessionV1.WithParts, Session.BusyError> = Effect.fn(
-      "SessionPrompt.shell",
-    )(function* (input: ShellInput) {
-      const ready = yield* Latch.make()
-      return yield* state.startShell(
-        input.sessionID,
-        lastAssistant(input.sessionID),
-        shellImpl(input, ready).pipe(
-          Effect.onExit((exit) =>
-            Effect.gen(function* () {
-              if (Exit.isSuccess(exit)) return
-              const flush = yield* InstanceState.get(queueState)
-              flush.delete(input.sessionID)
-              yield* queue.block(input.sessionID).pipe(Effect.orDie)
-            }),
-          ),
-        ),
-        ready,
+    const shell = Effect.fn("SessionPrompt.shell")(function* (input: ShellInput) {
+      requireUnmanagedShell()
+      const session = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
+      return yield* Effect.acquireUseRelease(
+        runtime.admit({
+          sessionID: input.sessionID,
+          directory: session.directory,
+          parentSessionID: session.parentID,
+          manualRecovery: true,
+        }),
+        () =>
+          Effect.gen(function* () {
+            const ready = yield* Latch.make()
+            return yield* state.startShell(
+              input.sessionID,
+              lastAssistant(input.sessionID),
+              shellImpl(input, ready).pipe(
+                Effect.onExit((exit) =>
+                  Effect.gen(function* () {
+                    if (Exit.isSuccess(exit)) return
+                    const flush = yield* InstanceState.get(queueState)
+                    flush.delete(input.sessionID)
+                    yield* queue.block(input.sessionID).pipe(Effect.orDie)
+                  }),
+                ),
+              ),
+              ready,
+            )
+          }),
+        (admission) => runtime.release(input.sessionID, admission.fence),
       )
     })
 
     const command = Effect.fn("SessionPrompt.command")(function* (
       input: CommandInput,
       delivery?: SessionQueueV1.Entry,
+    ) {
+      if (delivery) return yield* commandImpl(input, delivery)
+      const session = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
+      let released = false
+      return yield* Effect.acquireUseRelease(
+        runtime.admit({
+          sessionID: input.sessionID,
+          directory: session.directory,
+          parentSessionID: session.parentID,
+          manualRecovery: true,
+        }),
+        (admission) =>
+          commandImpl(
+            input,
+            undefined,
+            Effect.uninterruptible(
+              runtime.release(input.sessionID, admission.fence).pipe(
+                Effect.tap(() =>
+                  Effect.sync(() => {
+                    released = true
+                  }),
+                ),
+              ),
+            ),
+          ),
+        (admission) => (released ? Effect.void : runtime.release(input.sessionID, admission.fence)),
+      )
+    })
+
+    const commandImpl = Effect.fn("SessionPrompt.commandImpl")(function* (
+      input: CommandInput,
+      delivery?: SessionQueueV1.Entry,
+      handoff?: Effect.Effect<void>,
     ) {
       yield* Effect.logInfo("command", {
         "session.id": input.sessionID,
@@ -2584,12 +2661,14 @@ const layer = Layer.effect(
 
       const shellMatches = ConfigMarkdown.shell(template)
       if (shellMatches.length > 0) {
+        requireUnmanagedShell()
         const cfg = yield* config.get()
         const sh = Shell.preferred(cfg.shell)
         const results = yield* Effect.forEach(
           shellMatches,
           ([, cmd]) =>
             Effect.gen(function* () {
+              if (!(yield* runtime.beforeTurn(input.sessionID))) return yield* Effect.interrupt
               const handle = yield* spawner.spawn(
                 ChildProcess.make(cmd, {
                   shell: sh,
@@ -2665,6 +2744,7 @@ const layer = Layer.effect(
         { parts },
       )
 
+      if (handoff) yield* handoff
       const result = yield* prompt(
         {
           sessionID: input.sessionID,

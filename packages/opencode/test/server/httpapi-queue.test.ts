@@ -43,11 +43,16 @@ const appLayer = AppNodeBuilder.build(
   ],
 )
 const authorization = `Basic ${Buffer.from("queue-user:queue-secret").toString("base64")}`
+const runtime = RuntimeLifecycle.make({ lineage: randomUUID(), instance: randomUUID() }, Scope.makeUnsafe())
 const it = testEffect(
   Layer.mergeAll(
     appLayer,
-    httpApiLayerWithRuntime(
-      RuntimeLifecycle.make({ lineage: randomUUID(), instance: randomUUID() }, Scope.makeUnsafe()),
+    Layer.unwrap(
+      Effect.gen(function* () {
+        const previous = RuntimeLifecycle.current() ?? RuntimeLifecycle.unavailable()
+        yield* Effect.addFinalizer(() => Effect.sync(() => RuntimeLifecycle.setCurrent(previous)))
+        return httpApiLayerWithRuntime(runtime)
+      }),
     ).pipe(
       Layer.provide(appLayer),
       Layer.provide(
@@ -221,7 +226,7 @@ describe("native queue HttpApi SDK", () => {
       }),
   )
 
-  it.live("accepts PTY notifications for completed sessions but rejects them after cancellation", () =>
+  it.live("treats async prompts as ordinary prompts after cancellation", () =>
     Effect.gen(function* () {
       const { sdk, sessionID, llm } = yield* fixture
       yield* llm.text("initial result")
@@ -272,21 +277,6 @@ describe("native queue HttpApi SDK", () => {
       release.resolve()
       yield* idle(sdk, cancelledSession.id)
 
-      const controller = new AbortController()
-      yield* Effect.addFinalizer(() => Effect.sync(() => controller.abort()))
-      const events = yield* Effect.promise(() => sdk.event.subscribe(undefined, { signal: controller.signal }))
-      const ready = yield* Deferred.make<void>()
-      const rejected = yield* Deferred.make<void>()
-      yield* Effect.promise(async () => {
-        for await (const event of events.stream) {
-          if (event.type === "server.connected") Deferred.doneUnsafe(ready, Effect.void)
-          if (event.type !== "session.error" || event.properties.sessionID !== cancelledSession.id) continue
-          Deferred.doneUnsafe(rejected, Effect.void)
-          return
-        }
-      }).pipe(Effect.forkScoped)
-      yield* awaitWithTimeout(Deferred.await(ready), "SDK event stream did not connect")
-
       yield* llm.text("must not run")
       yield* Effect.promise(() =>
         sdk.session.promptAsync({
@@ -296,17 +286,159 @@ describe("native queue HttpApi SDK", () => {
           parts: [{ type: "text", text: "late PTY completion" }],
         }),
       )
-      const runtimeBeforeTimeout = yield* Database.Service.use(({ db }) =>
-        db.get<{ state: string; fence: number }>(sql`
-          SELECT state, fence FROM runtime_execution WHERE session_id = ${cancelledSession.id}
-        `),
-      )
-      yield* awaitWithTimeout(
-        Deferred.await(rejected),
-        `cancelled-session notification was not rejected: ${JSON.stringify({ runtime: runtimeBeforeTimeout, calls: yield* llm.calls })}`,
-      )
-      expect(yield* llm.calls).toBe(3)
+      yield* awaitWithTimeout(llm.wait(4), "ordinary async prompt did not resume after cancellation")
+      expect(yield* llm.calls).toBe(4)
       yield* idle(sdk, cancelledSession.id)
+    }),
+  )
+
+  it.live("retires roots and rejects subsequent prompt and queue admissions", () =>
+    Effect.gen(function* () {
+      const { sdk, sessionID, directory, llm } = yield* fixture
+      const server = yield* HttpServer.HttpServer
+      const response = yield* Effect.promise(() =>
+        fetch(
+          `${HttpServer.formatAddress(server.address)}/session/${sessionID}/retire?directory=${encodeURIComponent(directory)}`,
+          { method: "POST", headers: { authorization } },
+        ),
+      )
+      expect(response.status).toBe(200)
+      expect(yield* Effect.promise(() => response.json())).toEqual({
+        rootSessionID: sessionID,
+        sessionIDs: [sessionID],
+        commandStatus: "unknown",
+      })
+      const payload = { sessionID, agent: "build", model, parts: [{ type: "text" as const, text: "after retirement" }] }
+      expect((yield* Effect.promise(() => sdk.session.prompt(payload))).response.status).toBe(409)
+      expect((yield* Effect.promise(() => sdk.session.promptAsync(payload))).response.status).toBe(409)
+      expect((yield* Effect.promise(() => sdk.session.summarize({ sessionID, ...model }))).response.status).toBe(409)
+      expect(
+        (yield* Effect.promise(() => sdk.session.shell({ sessionID, agent: "build", command: "echo forbidden" })))
+          .response.status,
+      ).toBe(409)
+      expect(
+        (yield* Effect.promise(() => sdk.session.command({ sessionID, command: "missing", arguments: "" }))).response
+          .status,
+      ).toBe(409)
+      expect(
+        (yield* Effect.promise(() =>
+          sdk.session.queueSubmit({ sessionID, id: randomUUID(), payload: prompt("queued") }),
+        )).response.status,
+      ).toBe(409)
+      expect(yield* llm.calls).toBe(0)
+    }),
+  )
+
+  it.live("waits for an admitted local lease before completing retirement", () =>
+    Effect.gen(function* () {
+      const { sessionID, directory } = yield* fixture
+      const admission = yield* runtime.admit({ sessionID, directory, manualRecovery: true })
+      yield* Effect.addFinalizer(() => runtime.release(sessionID, admission.fence))
+      const done = yield* Deferred.make<number>()
+      const server = yield* HttpServer.HttpServer
+      yield* Effect.promise(() =>
+        fetch(
+          `${HttpServer.formatAddress(server.address)}/session/${sessionID}/retire?directory=${encodeURIComponent(directory)}`,
+          {
+            method: "POST",
+            headers: { authorization },
+          },
+        ),
+      ).pipe(
+        Effect.flatMap((response) => Deferred.succeed(done, response.status)),
+        Effect.forkScoped,
+      )
+      yield* pollWithTimeout(
+        Database.Service.use(({ db }) =>
+          db.get<{ session_id: string }>(
+            sql`SELECT session_id FROM runtime_retirement WHERE session_id = ${sessionID}`,
+          ),
+        ),
+        "retirement barrier was not committed",
+      )
+      expect(yield* Deferred.isDone(done)).toBe(false)
+      yield* runtime.release(sessionID, admission.fence)
+      expect(yield* awaitWithTimeout(Deferred.await(done), "retirement did not join the lease")).toBe(200)
+    }),
+  )
+
+  it.live("keeps retirement durable when the caller abandons the idle wait", () =>
+    Effect.gen(function* () {
+      const { sessionID, directory, sdk } = yield* fixture
+      const admission = yield* runtime.admit({ sessionID, directory, manualRecovery: true })
+      yield* Effect.addFinalizer(() => runtime.release(sessionID, admission.fence))
+      const controller = new AbortController()
+      const server = yield* HttpServer.HttpServer
+      const url = `${HttpServer.formatAddress(server.address)}/session/${sessionID}/retire?directory=${encodeURIComponent(directory)}`
+      const pending = fetch(url, { method: "POST", headers: { authorization }, signal: controller.signal }).catch(
+        () => undefined,
+      )
+      yield* pollWithTimeout(
+        Database.Service.use(({ db }) =>
+          db.get<{ session_id: string }>(
+            sql`SELECT session_id FROM runtime_retirement WHERE session_id = ${sessionID}`,
+          ),
+        ),
+        "retirement barrier was not committed",
+      )
+      controller.abort()
+      expect(yield* Effect.promise(() => pending)).toBeUndefined()
+      expect(
+        (yield* Effect.promise(() =>
+          sdk.session.promptAsync({ sessionID, agent: "build", model, parts: [{ type: "text", text: "after" }] }),
+        )).response.status,
+      ).toBe(409)
+      yield* runtime.release(sessionID, admission.fence)
+      const retry = yield* Effect.promise(() => fetch(url, { method: "POST", headers: { authorization } }))
+      expect(retry.status).toBe(200)
+      expect((yield* Effect.promise(() => retry.json())).commandStatus).toBe("unknown")
+    }),
+  )
+
+  it.live("joins concurrent abort and retirement of an active session", () =>
+    Effect.gen(function* () {
+      const { sdk, sessionID, directory, llm } = yield* fixture
+      const release = Promise.withResolvers<void>()
+      yield* llm.hold("active", release.promise)
+      yield* Effect.addFinalizer(() => Effect.sync(() => release.resolve()))
+      yield* Effect.promise(() =>
+        sdk.session.promptAsync({
+          sessionID,
+          agent: "build",
+          model,
+          parts: [{ type: "text", text: "start" }],
+        }),
+      )
+      yield* awaitWithTimeout(llm.wait(1), "prompt did not start")
+      const server = yield* HttpServer.HttpServer
+      const [abort, retired] = yield* Effect.all(
+        [
+          Effect.promise(() => sdk.session.abort({ sessionID })),
+          Effect.promise(() =>
+            fetch(
+              `${HttpServer.formatAddress(server.address)}/session/${sessionID}/retire?directory=${encodeURIComponent(directory)}`,
+              {
+                method: "POST",
+                headers: { authorization },
+              },
+            ),
+          ),
+        ],
+        { concurrency: "unbounded" },
+      )
+      expect(abort.response.status).toBe(200)
+      expect(retired.status).toBe(200)
+      expect((yield* Effect.promise(() => retired.json())).commandStatus).toBe("unknown")
+      expect(
+        (yield* Effect.promise(() =>
+          sdk.session.promptAsync({
+            sessionID,
+            agent: "build",
+            model,
+            parts: [{ type: "text", text: "after" }],
+          }),
+        )).response.status,
+      ).toBe(409)
     }),
   )
 

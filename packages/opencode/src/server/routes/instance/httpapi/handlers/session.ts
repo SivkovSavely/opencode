@@ -2,6 +2,8 @@ import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import path from "node:path"
 import { Agent } from "@/agent/agent"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
+import { SessionV2 } from "@opencode-ai/core/session"
+import { SessionSchema } from "@opencode-ai/core/session/schema"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { Command } from "@/command"
 import { Permission } from "@/permission"
@@ -20,7 +22,7 @@ import { SessionSummary } from "@/session/summary"
 import { Todo } from "@/session/todo"
 import { MessageID, PartID, SessionID } from "@/session/schema"
 import { NamedError } from "@opencode-ai/core/util/error"
-import { Cause, Effect, Option, Schema, Scope } from "effect"
+import { Cause, Deferred, Effect, Option, Schema, Scope } from "effect"
 import * as Stream from "effect/Stream"
 import { InstanceState } from "@/effect/instance-state"
 import { HttpServerRequest, HttpServerResponse } from "effect/unstable/http"
@@ -45,6 +47,7 @@ import {
   ForbiddenError,
   InvalidRequestError,
   PermissionNotFoundError,
+  SessionBusyError,
   SessionNotFoundError,
 } from "../errors"
 import * as SessionError from "./session-errors"
@@ -58,6 +61,7 @@ const tryParseJson = (text: string) =>
 export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", (handlers) =>
   Effect.gen(function* () {
     const session = yield* Session.Service
+    const sessionV2 = yield* SessionV2.Service
     const shareSvc = yield* SessionShare.Service
     const promptSvc = yield* SessionPrompt.Service
     const queueSvc = yield* SessionQueue.Service
@@ -250,6 +254,42 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       return true
     })
 
+    const retire = Effect.fn("SessionHttpApi.retire")(function* (ctx: { params: { sessionID: SessionID } }) {
+      const result = yield* Effect.uninterruptible(
+        Effect.gen(function* () {
+          const result = yield* runtime.retireRoot(ctx.params.sessionID).pipe(
+            Effect.mapError((error) => {
+              if (error.reason === "not_found")
+                return new SessionNotFoundError({ sessionID: ctx.params.sessionID, message: "Session not found" })
+              if (error.reason === "not_root")
+                return new ConflictError({ resource: ctx.params.sessionID, message: "Session is not a root" })
+              return new HttpApiError.ServiceUnavailable({})
+            }),
+          )
+          while (!(yield* runtime.cancel(ctx.params.sessionID))) yield* runtime.waitCancel(ctx.params.sessionID)
+          yield* Effect.forEach(
+            result.sessionIDs,
+            (id) =>
+              Effect.all([runState.cancel(SessionID.make(id)), sessionV2.interrupt(SessionSchema.ID.make(id))], {
+                concurrency: "unbounded",
+                discard: true,
+              }),
+            { concurrency: "unbounded", discard: true },
+          ).pipe(Effect.ensuring(runtime.finishCancel(ctx.params.sessionID)))
+          return result
+        }),
+      )
+      yield* Effect.forEach(result.sessionIDs, (id) => runtime.waitCancel(id), {
+        concurrency: "unbounded",
+        discard: true,
+      })
+      yield* Effect.forEach(result.sessionIDs, (id) => runtime.waitForIdle(id), {
+        concurrency: "unbounded",
+        discard: true,
+      })
+      return { ...result, commandStatus: "unknown" as const }
+    })
+
     const retry = Effect.fn("SessionHttpApi.retry")(function* (ctx: {
       params: { sessionID: SessionID }
       payload: { attempt: number; next: number }
@@ -298,22 +338,39 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       params: { sessionID: SessionID }
       payload: typeof SummarizePayload.Type
     }) {
-      yield* revertSvc.cleanup(yield* requireSession(ctx.params.sessionID))
-      const messages = yield* SessionError.mapStorageNotFound(session.messages({ sessionID: ctx.params.sessionID }))
-      const defaultAgent = yield* agentSvc.defaultAgent()
-      const currentAgent = messages.findLast((message) => message.info.role === "user")?.info.agent ?? defaultAgent
-
-      yield* compactSvc.create({
-        sessionID: ctx.params.sessionID,
-        agent: currentAgent,
-        model: {
-          providerID: ctx.payload.providerID,
-          modelID: ctx.payload.modelID,
-        },
-        auto: ctx.payload.auto ?? false,
-      })
-      yield* promptSvc.loop({ sessionID: ctx.params.sessionID })
-      return true
+      const current = yield* requireSession(ctx.params.sessionID)
+      return yield* Effect.acquireUseRelease(
+        runtime
+          .admit({
+            sessionID: current.id,
+            directory: current.directory,
+            parentSessionID: current.parentID,
+            manualRecovery: true,
+          })
+          .pipe(Effect.mapError((error) => new ConflictError({ resource: current.id, message: error.message }))),
+        () =>
+          Effect.gen(function* () {
+            yield* revertSvc.cleanup(current)
+            const messages = yield* SessionError.mapStorageNotFound(session.messages({ sessionID: current.id }))
+            const defaultAgent = yield* agentSvc.defaultAgent()
+            const currentAgent =
+              messages.findLast((message) => message.info.role === "user")?.info.agent ?? defaultAgent
+            if (!(yield* runtime.beforeTurn(current.id)))
+              return yield* new ConflictError({
+                resource: current.id,
+                message: "Session execution is no longer active",
+              })
+            yield* compactSvc.create({
+              sessionID: current.id,
+              agent: currentAgent,
+              model: { providerID: ctx.payload.providerID, modelID: ctx.payload.modelID },
+              auto: ctx.payload.auto ?? false,
+            })
+            yield* promptSvc.loop({ sessionID: current.id })
+            return true
+          }),
+        (admission) => runtime.release(current.id, admission.fence),
+      )
     })
 
     const prompt = Effect.fn("SessionHttpApi.prompt")(function* (ctx: {
@@ -326,7 +383,13 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
           ...ctx.payload,
           sessionID: ctx.params.sessionID,
         })
-        .pipe(Effect.mapError(() => new HttpApiError.BadRequest({})))
+        .pipe(
+          Effect.mapError((error) =>
+            error._tag === "RuntimeDrainingError"
+              ? new ConflictError({ resource: ctx.params.sessionID, message: error.message })
+              : new HttpApiError.BadRequest({}),
+          ),
+        )
       return HttpServerResponse.stream(Stream.make(JSON.stringify(message)).pipe(Stream.encodeText), {
         contentType: "application/json",
       })
@@ -337,20 +400,26 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       payload: typeof PromptPayload.Type
     }) {
       yield* requireSession(ctx.params.sessionID)
-      yield* promptSvc
-        .prompt({ ...ctx.payload, sessionID: ctx.params.sessionID }, { notification: true })
-        .pipe(
-          Effect.catchCause((cause) =>
-            Effect.gen(function* () {
-              yield* Effect.logError("prompt_async failed", { sessionID: ctx.params.sessionID, cause })
-              yield* events.publish(Session.Event.Error, {
-                sessionID: ctx.params.sessionID,
-                error: new NamedError.Unknown({ message: Cause.pretty(cause) }).toObject(),
-              })
-            }),
-          ),
-          Effect.forkIn(scope, { startImmediately: true }),
-        )
+      const admission = yield* Deferred.make<void, RuntimeLifecycle.RuntimeDrainingError>()
+      yield* promptSvc.prompt({ ...ctx.payload, sessionID: ctx.params.sessionID }, { admission }).pipe(
+        Effect.catchCause((cause) =>
+          Effect.gen(function* () {
+            yield* Deferred.fail(
+              admission,
+              new RuntimeLifecycle.RuntimeDrainingError({ message: "Prompt admission failed" }),
+            )
+            yield* Effect.logError("prompt_async failed", { sessionID: ctx.params.sessionID, cause })
+            yield* events.publish(Session.Event.Error, {
+              sessionID: ctx.params.sessionID,
+              error: new NamedError.Unknown({ message: Cause.pretty(cause) }).toObject(),
+            })
+          }),
+        ),
+        Effect.forkIn(scope, { startImmediately: true }),
+      )
+      yield* Deferred.await(admission).pipe(
+        Effect.mapError((error) => new ConflictError({ resource: ctx.params.sessionID, message: error.message })),
+      )
       return HttpApiSchema.NoContent.make()
     })
 
@@ -423,7 +492,13 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       yield* requireSession(ctx.params.sessionID)
       return yield* promptSvc
         .command({ ...ctx.payload, sessionID: ctx.params.sessionID })
-        .pipe(Effect.mapError(() => new HttpApiError.BadRequest({})))
+        .pipe(
+          Effect.mapError((error) =>
+            error._tag === "RuntimeDrainingError"
+              ? new ConflictError({ resource: ctx.params.sessionID, message: error.message })
+              : new HttpApiError.BadRequest({}),
+          ),
+        )
     })
 
     const shell = Effect.fn("SessionHttpApi.shell")(function* (ctx: {
@@ -431,7 +506,15 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       payload: typeof ShellPayload.Type
     }) {
       yield* requireSession(ctx.params.sessionID)
-      return yield* SessionError.mapBusy(promptSvc.shell({ ...ctx.payload, sessionID: ctx.params.sessionID }))
+      return yield* promptSvc
+        .shell({ ...ctx.payload, sessionID: ctx.params.sessionID })
+        .pipe(
+          Effect.mapError((error) =>
+            error._tag === "RuntimeDrainingError"
+              ? new ConflictError({ resource: ctx.params.sessionID, message: error.message })
+              : new SessionBusyError({ sessionID: ctx.params.sessionID, message: error.message }),
+          ),
+        )
     })
 
     const revert = Effect.fn("SessionHttpApi.revert")(function* (ctx: {
@@ -512,6 +595,7 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       .handle("update", update)
       .handleRaw("fork", forkRaw)
       .handle("abort", abort)
+      .handle("retire", retire)
       .handle("retry", retry)
       .handle("init", init)
       .handle("share", share)

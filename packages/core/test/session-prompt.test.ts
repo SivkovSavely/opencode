@@ -18,6 +18,7 @@ import { SessionExecution } from "@opencode-ai/core/session/execution"
 import { SessionInput } from "@opencode-ai/core/session/input"
 import { SessionInputTable, SessionMessageTable, SessionTable } from "@opencode-ai/core/session/sql"
 import { SessionStore } from "@opencode-ai/core/session/store"
+import { RuntimeRetirement } from "@opencode-ai/core/runtime-retirement"
 import { testEffect } from "./lib/effect"
 
 const executionCalls: SessionV2.ID[] = []
@@ -99,6 +100,52 @@ const eventCount = (type: string) =>
   )
 
 describe("SessionV2.prompt", () => {
+  it.effect("rejects new admissions and exact retries after retirement without waking", () =>
+    Effect.gen(function* () {
+      yield* setup
+      const session = yield* SessionV2.Service
+      const database = yield* Database.Service
+      const id = SessionMessage.ID.create()
+      const prompt = Prompt.make({ text: "retired" })
+      yield* session.prompt({ sessionID, id, prompt, resume: false })
+      const count = yield* eventCount(EventV2.versionedType(SessionEvent.PromptAdmitted.type, 1))
+      yield* RuntimeRetirement.retireRoot(database, sessionID)
+      wakeCalls.length = 0
+      for (const messageID of [id, SessionMessage.ID.create()]) {
+        const error = yield* session.prompt({ sessionID, id: messageID, prompt }).pipe(Effect.flip)
+        expect(error).toMatchObject({ _tag: "SessionInput.Retired", sessionID })
+      }
+      expect(wakeCalls).toEqual([])
+      expect(yield* admittedCount).toBe(1)
+      expect(yield* eventCount(EventV2.versionedType(SessionEvent.PromptAdmitted.type, 1))).toBe(count)
+    }),
+  )
+
+  it.effect("rolls back admission when retirement wins after the initial check", () =>
+    Effect.gen(function* () {
+      yield* setup
+      const database = yield* Database.Service
+      const events = yield* EventV2.Service
+      const id = SessionMessage.ID.create()
+      const guardedEvents: EventV2.Interface = {
+        ...events,
+        publish: (definition, data, options) =>
+          RuntimeRetirement.retireRoot(database, sessionID).pipe(
+            Effect.orDie,
+            Effect.andThen(events.publish(definition, data, options)),
+          ),
+      }
+      const error = yield* SessionInput.admit(database.db, guardedEvents, {
+        id,
+        sessionID,
+        prompt: Prompt.make({ text: "race" }),
+        delivery: "steer",
+      }).pipe(Effect.flip)
+      expect(error).toMatchObject({ _tag: "SessionInput.Retired", sessionID })
+      expect(yield* admitted(id)).toBeUndefined()
+      expect(yield* eventCount(EventV2.versionedType(SessionEvent.PromptAdmitted.type, 1))).toBe(0)
+    }),
+  )
   it.effect("exposes the execution registry", () =>
     Effect.gen(function* () {
       activeSessions.add(sessionID)

@@ -12,6 +12,12 @@ import { ConfigPlugin } from "@/config/plugin"
 import { ConfigPluginV1 } from "@opencode-ai/core/v1/config/plugin"
 import { InstallationVersion } from "@opencode-ai/core/installation/version"
 import { isLegacyQueuePlugin, QUEUE_PLUGIN_CONFLICT } from "./queue-conflict"
+import {
+  isManagedPluginAllowed,
+  isManagedPtyPlugin,
+  MANAGED_PTY_CONFLICT,
+  MANAGED_UNTRUSTED_PLUGIN,
+} from "./managed-profile"
 
 export namespace PluginLoader {
   // A normalized plugin declaration derived from config before any filesystem or npm work happens.
@@ -92,6 +98,11 @@ export namespace PluginLoader {
     | { ok: false; stage: "missing"; value: Missing }
     | { ok: false; stage: "install" | "entry" | "compatibility"; error: unknown }
   > {
+    const managed = kind === "server" && process.env["OPENCODE_MANAGED_PROFILE"] === "1"
+    if (managed && isManagedPtyPlugin(plan.spec))
+      return { ok: false, stage: "compatibility", error: new Error(MANAGED_PTY_CONFLICT) }
+    if (managed && !isManagedPluginAllowed(plan.spec))
+      return { ok: false, stage: "compatibility", error: new Error(MANAGED_UNTRUSTED_PLUGIN) }
     if (isLegacyQueuePlugin(plan.spec))
       return { ok: false, stage: "compatibility", error: new Error(QUEUE_PLUGIN_CONFLICT) }
     // First make sure the plugin exists locally, installing npm plugins on demand.
@@ -112,6 +123,8 @@ export namespace PluginLoader {
     }
     if (isLegacyQueuePlugin(plan.spec, base.pkg?.json))
       return { ok: false, stage: "compatibility", error: new Error(QUEUE_PLUGIN_CONFLICT) }
+    if (managed && isManagedPtyPlugin(plan.spec, base.pkg?.json))
+      return { ok: false, stage: "compatibility", error: new Error(MANAGED_PTY_CONFLICT) }
     if (!base.entry)
       return {
         ok: false,

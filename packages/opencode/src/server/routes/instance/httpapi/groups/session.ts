@@ -99,6 +99,7 @@ export const SessionPaths = {
   update: `${root}/:sessionID`,
   fork: `${root}/:sessionID/fork`,
   abort: `${root}/:sessionID/abort`,
+  retire: `${root}/:sessionID/retire`,
   share: `${root}/:sessionID/share`,
   init: `${root}/:sessionID/init`,
   summarize: `${root}/:sessionID/summarize`,
@@ -275,6 +276,23 @@ export const SessionApi = HttpApi.make("session")
             description: "Abort an active session and stop any ongoing AI processing or command execution.",
           }),
         ),
+        HttpApiEndpoint.post("retire", SessionPaths.retire, {
+          params: { sessionID: SessionID },
+          query: WorkspaceRoutingQuery,
+          success: Schema.Struct({
+            rootSessionID: Schema.String,
+            sessionIDs: Schema.Array(Schema.String),
+            commandStatus: Schema.Literal("unknown"),
+          }),
+          error: [SessionNotFoundError, ConflictError, HttpApiError.ServiceUnavailable],
+        }).annotateMerge(
+          OpenApi.annotations({
+            identifier: "session.retire",
+            summary: "Retire session root",
+            description:
+              "Permanently prevent new work for a session root and its descendants. External command status is unknown.",
+          }),
+        ),
         HttpApiEndpoint.post("retry", SessionPaths.retry, {
           params: { sessionID: SessionID },
           query: WorkspaceRoutingQuery,
@@ -332,7 +350,7 @@ export const SessionApi = HttpApi.make("session")
           query: WorkspaceRoutingQuery,
           payload: SummarizePayload,
           success: described(Schema.Boolean, "Summarized session"),
-          error: [HttpApiError.BadRequest, ApiNotFoundError],
+          error: [HttpApiError.BadRequest, ApiNotFoundError, ConflictError],
         }).annotateMerge(
           OpenApi.annotations({
             identifier: "session.summarize",
@@ -345,7 +363,7 @@ export const SessionApi = HttpApi.make("session")
           query: WorkspaceRoutingQuery,
           payload: PromptPayload,
           success: described(SessionV1.WithParts, "Created message"),
-          error: [HttpApiError.BadRequest, ApiNotFoundError],
+          error: [HttpApiError.BadRequest, ApiNotFoundError, ConflictError],
         }).annotateMerge(
           OpenApi.annotations({
             identifier: "session.prompt",
@@ -358,7 +376,7 @@ export const SessionApi = HttpApi.make("session")
           query: WorkspaceRoutingQuery,
           payload: PromptPayload,
           success: described(HttpApiSchema.NoContent, "Prompt accepted"),
-          error: [HttpApiError.BadRequest, ApiNotFoundError],
+          error: [HttpApiError.BadRequest, ApiNotFoundError, ConflictError],
         }).annotateMerge(
           OpenApi.annotations({
             identifier: "session.prompt_async",
@@ -404,7 +422,7 @@ export const SessionApi = HttpApi.make("session")
           query: WorkspaceRoutingQuery,
           payload: CommandPayload,
           success: described(SessionV1.WithParts, "Created message"),
-          error: [HttpApiError.BadRequest, ApiNotFoundError],
+          error: [HttpApiError.BadRequest, ApiNotFoundError, ConflictError],
         }).annotateMerge(
           OpenApi.annotations({
             identifier: "session.command",
@@ -417,7 +435,7 @@ export const SessionApi = HttpApi.make("session")
           query: WorkspaceRoutingQuery,
           payload: ShellPayload,
           success: described(SessionV1.WithParts, "Created message"),
-          error: [HttpApiError.BadRequest, ApiNotFoundError, SessionBusyError],
+          error: [HttpApiError.BadRequest, ApiNotFoundError, SessionBusyError, ConflictError],
         }).annotateMerge(
           OpenApi.annotations({
             identifier: "session.shell",

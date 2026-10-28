@@ -53,6 +53,20 @@ export default {
         );
       `)
       yield* tx.run(`
+        CREATE TABLE \`runtime_retirement_member\` (
+          \`root_session_id\` text NOT NULL,
+          \`session_id\` text NOT NULL,
+          CONSTRAINT \`runtime_retirement_member_pk\` PRIMARY KEY(\`root_session_id\`, \`session_id\`)
+        );
+      `)
+      yield* tx.run(`
+        CREATE TABLE \`runtime_retirement\` (
+          \`session_id\` text PRIMARY KEY,
+          \`root_session_id\` text NOT NULL,
+          \`time_created\` integer NOT NULL
+        );
+      `)
+      yield* tx.run(`
         CREATE TABLE \`session_queue_import\` (
           \`session_id\` text PRIMARY KEY,
           \`hidden\` text NOT NULL,
@@ -317,6 +331,7 @@ export default {
         `CREATE INDEX \`runtime_execution_owner_state_idx\` ON \`runtime_execution\` (\`owner_lineage\`,\`state\`);`,
       )
       yield* tx.run(`CREATE INDEX \`runtime_execution_parent_idx\` ON \`runtime_execution\` (\`parent_session_id\`);`)
+      yield* tx.run(`CREATE INDEX \`runtime_retirement_root_idx\` ON \`runtime_retirement\` (\`root_session_id\`);`)
       yield* tx.run(
         `CREATE INDEX \`session_queue_session_state_delivery_position_idx\` ON \`session_queue\` (\`session_id\`,\`state\`,\`delivery\`,\`position\`);`,
       )

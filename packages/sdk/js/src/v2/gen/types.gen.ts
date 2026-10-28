@@ -2580,6 +2580,22 @@ export type NotFoundError = {
   }
 }
 
+export type SessionNotFoundError = {
+  _tag: "SessionNotFoundError"
+  sessionID: string
+  message: string
+}
+
+export type ConflictError = {
+  _tag: "ConflictError"
+  message: string
+  resource?: string
+}
+
+export type EffectHttpApiErrorServiceUnavailable = {
+  _tag: "ServiceUnavailable"
+}
+
 export type TextPartInput = {
   id?: string
   type: "text"
@@ -2628,21 +2644,9 @@ export type SubtaskPartInput = {
   command?: string
 }
 
-export type SessionNotFoundError = {
-  _tag: "SessionNotFoundError"
-  sessionID: string
-  message: string
-}
-
 export type ForbiddenError = {
   _tag: "ForbiddenError"
   message: string
-}
-
-export type ConflictError = {
-  _tag: "ConflictError"
-  message: string
-  resource?: string
 }
 
 export type SessionBusyError = {
@@ -10402,6 +10406,10 @@ export type SessionPromptErrors = {
    * NotFoundError
    */
   404: NotFoundError
+  /**
+   * ConflictError
+   */
+  409: ConflictError
 }
 
 export type SessionPromptError = SessionPromptErrors[keyof SessionPromptErrors]
@@ -10560,6 +10568,52 @@ export type SessionAbortResponses = {
 }
 
 export type SessionAbortResponse = SessionAbortResponses[keyof SessionAbortResponses]
+
+export type SessionRetireData = {
+  body?: never
+  path: {
+    sessionID: string
+  }
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/session/{sessionID}/retire"
+}
+
+export type SessionRetireErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+  /**
+   * SessionNotFoundError
+   */
+  404: SessionNotFoundError
+  /**
+   * ConflictError
+   */
+  409: ConflictError
+  /**
+   * ServiceUnavailable
+   */
+  503: EffectHttpApiErrorServiceUnavailable
+}
+
+export type SessionRetireError = SessionRetireErrors[keyof SessionRetireErrors]
+
+export type SessionRetireResponses = {
+  /**
+   * Success
+   */
+  200: {
+    rootSessionID: string
+    sessionIDs: Array<string>
+    commandStatus: "unknown"
+  }
+}
+
+export type SessionRetireResponse = SessionRetireResponses[keyof SessionRetireResponses]
 
 export type SessionRetryData = {
   body?: {
@@ -10739,6 +10793,10 @@ export type SessionSummarizeErrors = {
    * NotFoundError
    */
   404: NotFoundError
+  /**
+   * ConflictError
+   */
+  409: ConflictError
 }
 
 export type SessionSummarizeError = SessionSummarizeErrors[keyof SessionSummarizeErrors]
@@ -10789,6 +10847,10 @@ export type SessionPromptAsyncErrors = {
    * NotFoundError
    */
   404: NotFoundError
+  /**
+   * ConflictError
+   */
+  409: ConflictError
 }
 
 export type SessionPromptAsyncError = SessionPromptAsyncErrors[keyof SessionPromptAsyncErrors]
@@ -11013,6 +11075,10 @@ export type SessionCommandErrors = {
    * NotFoundError
    */
   404: NotFoundError
+  /**
+   * ConflictError
+   */
+  409: ConflictError
 }
 
 export type SessionCommandError = SessionCommandErrors[keyof SessionCommandErrors]
@@ -11059,9 +11125,9 @@ export type SessionShellErrors = {
    */
   404: NotFoundError
   /**
-   * SessionBusyError
+   * SessionBusyError | ConflictError
    */
-  409: SessionBusyError
+  409: SessionBusyError | ConflictError
 }
 
 export type SessionShellError = SessionShellErrors[keyof SessionShellErrors]

@@ -1,6 +1,6 @@
 export * as SessionInput from "./input"
 
-import { and, asc, eq, isNull, lte } from "drizzle-orm"
+import { and, asc, eq, isNull, lte, sql } from "drizzle-orm"
 import { DateTime, Effect, Schema } from "effect"
 import { Admitted, Delivery } from "@opencode-ai/schema/session-input"
 import type { Database } from "../database/database"
@@ -38,6 +38,10 @@ export class LifecycleConflict extends Schema.TaggedErrorClass<LifecycleConflict
   id: SessionMessage.ID,
 }) {}
 
+export class Retired extends Schema.TaggedErrorClass<Retired>()("SessionInput.Retired", {
+  sessionID: SessionSchema.ID,
+}) {}
+
 export const admit = Effect.fn("SessionInput.admit")(function* (
   db: DatabaseService,
   events: EventV2.Interface,
@@ -48,17 +52,22 @@ export const admit = Effect.fn("SessionInput.admit")(function* (
     readonly delivery: Delivery
   },
 ) {
+  const checkRetirement = db
+    .get(sql`SELECT session_id FROM runtime_retirement WHERE session_id = ${input.sessionID}`)
+    .pipe(
+      Effect.orDie,
+      Effect.flatMap((row) => (row ? Effect.fail(new Retired({ sessionID: input.sessionID })) : Effect.void)),
+    )
+  yield* checkRetirement
   const existing = yield* find(db, input.id)
   if (existing !== undefined) return existing
   const timestamp = yield* DateTime.now
   return yield* events
-    .publish(SessionEvent.PromptAdmitted, {
-      messageID: input.id,
-      sessionID: input.sessionID,
-      timestamp,
-      prompt: input.prompt,
-      delivery: input.delivery,
-    })
+    .publish(
+      SessionEvent.PromptAdmitted,
+      { messageID: input.id, sessionID: input.sessionID, timestamp, prompt: input.prompt, delivery: input.delivery },
+      { commit: () => checkRetirement.pipe(Effect.orDie) },
+    )
     .pipe(
       Effect.flatMap((event) =>
         event.durable === undefined
@@ -75,7 +84,9 @@ export const admit = Effect.fn("SessionInput.admit")(function* (
             ),
       ),
       Effect.catchDefect((defect) =>
-        find(db, input.id).pipe(Effect.flatMap((stored) => (stored ? Effect.succeed(stored) : Effect.die(defect)))),
+        defect instanceof Retired
+          ? Effect.fail(defect)
+          : find(db, input.id).pipe(Effect.flatMap((stored) => (stored ? Effect.succeed(stored) : Effect.die(defect)))),
       ),
     )
 })

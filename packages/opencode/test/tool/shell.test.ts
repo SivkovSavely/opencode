@@ -182,6 +182,37 @@ const mustTruncate = (result: {
 }
 
 describe("tool.shell", () => {
+  wintest("managed profile rejects before running a shell command", () =>
+    Effect.gen(function* () {
+      const instance = yield* TestInstance
+      const previous = process.env.OPENCODE_MANAGED_PROFILE
+      yield* Effect.acquireUseRelease(
+        Effect.sync(() => {
+          process.env.OPENCODE_MANAGED_PROFILE = "1"
+        }),
+        () =>
+          Effect.gen(function* () {
+            const error = yield* fail({ command: "touch managed-shell-marker" })
+            expect(error.message).toContain("foreground validation requires descendant containment")
+            expect(
+              yield* Effect.promise(() => Bun.file(path.join(instance.directory, "managed-shell-marker")).exists()),
+            ).toBe(false)
+            process.env.OPENCODE_MANAGED_PROFILE = "true"
+            const result = yield* run({ command: "touch managed-shell-marker" })
+            expect(result.metadata.exit).toBe(0)
+            expect(
+              yield* Effect.promise(() => Bun.file(path.join(instance.directory, "managed-shell-marker")).exists()),
+            ).toBe(true)
+          }),
+        () =>
+          Effect.sync(() => {
+            if (previous === undefined) delete process.env.OPENCODE_MANAGED_PROFILE
+            else process.env.OPENCODE_MANAGED_PROFILE = previous
+          }),
+      )
+    }),
+  )
+
   wintest(
     "defaults to the linked worktree for pwd and git commands",
     () =>

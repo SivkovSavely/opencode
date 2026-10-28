@@ -1,5 +1,6 @@
 import { Database } from "@opencode-ai/core/database/database"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
+import { RuntimeRetirement } from "@opencode-ai/core/runtime-retirement"
 import { sql } from "drizzle-orm"
 import {
   Cause,
@@ -32,6 +33,8 @@ export type ExecutionState =
 
 export class RuntimeDrainingError extends Schema.TaggedErrorClass<RuntimeDrainingError>()("RuntimeDrainingError", {
   message: Schema.String,
+  reason: Schema.optional(Schema.Literal("retired")),
+  rootSessionID: Schema.optional(Schema.String),
 }) {}
 
 export class RuntimeFencedTransitionError extends Schema.TaggedErrorClass<RuntimeFencedTransitionError>()(
@@ -71,9 +74,17 @@ export type Interface = {
   readonly bindDatabase: (database: Database.Interface) => void
   readonly finishStartupRecovery: () => Effect.Effect<void>
   readonly recoveryPrepared: (sessionID: string) => Effect.Effect<void>
+  /** Each successful admission requires exactly one owner release, even after cancellation. */
   readonly admit: (input: AdmissionInput) => Effect.Effect<AdmissionResult, RuntimeDrainingError>
+  readonly retireRoot: (
+    sessionID: string,
+  ) => Effect.Effect<RuntimeRetirement.Result, RuntimeRetirement.RootRetirementError>
+  /** Acquire in a caller-side mask/acquireUseRelease so success installs finishCancel before interruption. */
   readonly cancel: (sessionID: string) => Effect.Effect<boolean>
   readonly waitCancel: (sessionID: string) => Effect.Effect<void>
+  /** Wait for local execution slots and every admitted owner to release; does not interrupt work. */
+  readonly waitForIdle: (sessionID: string) => Effect.Effect<void>
+  /** Acknowledge this cancellation owner only; does not release leases or imply work has stopped. */
   readonly finishCancel: (sessionID: string) => Effect.Effect<void>
   readonly verifyOwner: (sessionID: string) => Effect.Effect<"live" | "dead" | "unknown">
   readonly reconstructChild: (input: ReconstructedChildInput) => Effect.Effect<boolean>
@@ -156,6 +167,7 @@ type LocalState = {
   action?: Action
   drainStarted: boolean
   active: Map<string, LocalExecution>
+  leases: Map<string, { fence: number; count: number; released: Deferred.Deferred<boolean> }>
   startupPending: Map<string, Deferred.Deferred<boolean>>
   cancelling: Map<string, { deferred: Deferred.Deferred<boolean>; rootSessionID: string }>
   parentModeOverrides: Map<string, "foreground" | "background">
@@ -194,6 +206,7 @@ type FencedTransitionInput = {
   expectedState: ExecutionState
   nextState: ExecutionState
   retryAt?: number
+  ignoreRevoked?: boolean
 }
 
 type ReleaseResult = {
@@ -340,6 +353,7 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
     phase: "running",
     drainStarted: false,
     active: new Map(),
+    leases: new Map(),
     startupPending: new Map(),
     cancelling: new Map(),
     parentModeOverrides: new Map(),
@@ -350,6 +364,7 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
   const stopped = Deferred.makeUnsafe<{ action: Action }>()
   const recoveryPermits = Semaphore.makeUnsafe(2)
   const notificationClaims = new Set<string>()
+  const idleWaiters = new Map<string, Deferred.Deferred<boolean>>()
   const retryWakes = new Map<string, { attempt: number; retryAt: number; deferred: Deferred.Deferred<void> }>()
   const recoveryPreparedSessions = new Set<string>()
   const databaseRef: { current?: Database.Interface } = { current: database }
@@ -357,6 +372,17 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
   const read = Effect.fnUntraced(function* (sessionID: string) {
     const database = databaseRef.current ?? (yield* Database.Service)
     return decodeRow(yield* database.db.get(sql`SELECT * FROM runtime_execution WHERE session_id = ${sessionID}`))
+  })
+
+  const rejectRetired = Effect.fnUntraced(function* (input: AdmissionInput) {
+    const database = databaseRef.current ?? (yield* Database.Service)
+    const retired = yield* RuntimeRetirement.lookup(database, input.sessionID, input.parentSessionID)
+    if (retired)
+      return yield* new RuntimeDrainingError({
+        message: "Session root is retired",
+        reason: "retired",
+        rootSessionID: retired.root_session_id,
+      })
   })
 
   const waitForParentIdle = Effect.fnUntraced(function* (sessionID: string) {
@@ -370,6 +396,11 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
         return [created, { ...state, notificationReady }] as const
       })
       const parent = yield* read(sessionID)
+      const database = databaseRef.current ?? (yield* Database.Service)
+      if (yield* RuntimeRetirement.lookup(database, sessionID)) {
+        yield* notifyParentIdle(sessionID)
+        return false
+      }
       if (parent?.state === "cancelled") {
         yield* notifyParentIdle(sessionID)
         return false
@@ -435,6 +466,15 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
     if (updated) return updated
 
     const current = yield* read(input.sessionID)
+    if (
+      input.ignoreRevoked &&
+      (current?.desired_active !== 1 ||
+        current.owner_lineage !== identity.lineage ||
+        current.owner_instance !== identity.instance ||
+        current.fence !== input.fence ||
+        current.state !== input.expectedState)
+    )
+      return
     yield* Effect.logWarning("restart diagnostic fenced transition failed", {
       sessionID: input.sessionID,
       operation: input.operation,
@@ -509,8 +549,14 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
   })
 
   const checkQuiescent = Effect.fnUntraced(function* () {
+    const local = SynchronizedRef.getUnsafe(ref)
+    for (const [id, deferred] of idleWaiters) {
+      if (local.active.has(id) || local.leases.has(id)) continue
+      idleWaiters.delete(id)
+      yield* Deferred.succeed(deferred, true)
+    }
     const shouldStop = yield* SynchronizedRef.modify(ref, (state) => {
-      if (state.phase !== "draining" || state.active.size > 0) return [false, state] as const
+      if (state.phase !== "draining" || state.active.size > 0 || state.leases.size > 0) return [false, state] as const
       return [true, { ...state, phase: "quiescent" }] as const
     })
     if (!shouldStop) return
@@ -590,6 +636,7 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
 
   const rejectAdmission = (input: AdmissionInput, reason: string, row?: Row) =>
     Effect.gen(function* () {
+      yield* rejectRetired(input)
       yield* Effect.logWarning("restart diagnostic admission durable claim failed", {
         sessionID: input.sessionID,
         reason,
@@ -602,6 +649,7 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
 
   const admitDurably = Effect.fnUntraced(function* (input: AdmissionInput, row: Row | undefined) {
     const database = databaseRef.current ?? (yield* Database.Service)
+    yield* rejectRetired(input)
     yield* Effect.logInfo("restart diagnostic admission durable claim beginning", {
       sessionID: input.sessionID,
       observed: row ? rowFields(row) : undefined,
@@ -634,6 +682,7 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
         `),
       )
       if (!inserted) {
+        yield* rejectRetired(input)
         const current = yield* read(input.sessionID)
         yield* Effect.logWarning("restart diagnostic admission durable claim failed", {
           sessionID: input.sessionID,
@@ -736,6 +785,7 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
       `),
     )
     if (!claimed) {
+      yield* rejectRetired(input)
       const current = yield* read(input.sessionID)
       yield* Effect.logWarning("restart diagnostic admission durable claim failed", {
         sessionID: input.sessionID,
@@ -802,11 +852,13 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
   })
 
   const admit = Effect.fn("RuntimeLifecycle.admit")(function* (input: AdmissionInput) {
+    yield* rejectRetired(input)
     if (startupReady) yield* Deferred.await(startupReady)
     while (true) {
       const wait = yield* SynchronizedRef.modifyEffect(
         ref,
         Effect.fnUntraced(function* (state) {
+          yield* rejectRetired(input)
           const cancelling = state.cancelling.get(input.sessionID)
           if (cancelling)
             return [{ _tag: "wait" as const, deferred: cancelling.deferred } as AdmissionDecision, state] as const
@@ -819,7 +871,17 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
           const parentMode = state.parentModeOverrides.get(input.sessionID)
           const admissionInput = parentMode ? { ...input, parentMode } : input
           const row = yield* read(input.sessionID)
+          if (input.rejectCancelled && row?.state === "cancelled")
+            return yield* rejectAdmission(input, "Session was cancelled", row)
           const local = state.active.get(input.sessionID)
+          const lease = state.leases.get(input.sessionID)
+          if (lease && (!local || row?.desired_active !== 1 || row.state !== "active" || row.fence !== lease.fence))
+            return [{ _tag: "wait" as const, deferred: lease.released } as AdmissionDecision, state] as const
+          if (local && (row?.desired_active !== 1 || row.state !== "active" || row.fence !== local.fence)) {
+            const deferred = idleWaiters.get(input.sessionID) ?? Deferred.makeUnsafe<boolean>()
+            idleWaiters.set(input.sessionID, deferred)
+            return [{ _tag: "wait" as const, deferred } as AdmissionDecision, state] as const
+          }
           if (local) {
             if (
               local.mode !== "active" ||
@@ -841,7 +903,7 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
                 _tag: "admitted" as const,
                 result: { manualRecovery: claimed.manualRecovery, fence: claimed.row.fence },
               } as AdmissionDecision,
-              { ...state, active, parentModeOverrides },
+              { ...state, active, leases: addLease(state, input.sessionID, claimed.row.fence), parentModeOverrides },
             ] as const
           }
 
@@ -855,7 +917,7 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
               _tag: "admitted" as const,
               result: { manualRecovery: claimed.manualRecovery, fence: claimed.row.fence },
             } as AdmissionDecision,
-            { ...state, active, parentModeOverrides },
+            { ...state, active, leases: addLease(state, input.sessionID, claimed.row.fence), parentModeOverrides },
           ] as const
         }),
       )
@@ -868,7 +930,31 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
     }
   })
 
-  const cancel = Effect.fn("RuntimeLifecycle.cancel")(function* (sessionID: string) {
+  // Execution slots can be cancelled/parked independently of the fibers holding admitted leases.
+  function addLease(state: LocalState, sessionID: string, fence: number) {
+    const leases = new Map(state.leases)
+    const current = leases.get(sessionID)
+    leases.set(sessionID, {
+      fence,
+      count: (current?.count ?? 0) + 1,
+      released: current?.released ?? Deferred.makeUnsafe<boolean>(),
+    })
+    return leases
+  }
+
+  const releaseLease = Effect.fnUntraced(function* (state: LocalState, sessionID: string, fence?: number) {
+    const current = state.leases.get(sessionID)
+    if (!current || (fence !== undefined && current.fence !== fence)) return state
+    const leases = new Map(state.leases)
+    if (current.count > 1) leases.set(sessionID, { ...current, count: current.count - 1 })
+    if (current.count === 1) {
+      leases.delete(sessionID)
+      yield* Deferred.succeed(current.released, true)
+    }
+    return { ...state, leases }
+  })
+
+  const acquireCancellation = Effect.fnUntraced(function* (sessionID: string) {
     retryWakes.delete(sessionID)
     const decision = yield* SynchronizedRef.modifyEffect(
       ref,
@@ -877,6 +963,22 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
           return [{ owner: false as boolean, cancelled: [] as string[] }, state] as const
         const cancelling = new Map(state.cancelling)
         cancelling.set(sessionID, { deferred: Deferred.makeUnsafe<boolean>(), rootSessionID: sessionID })
+        const database = databaseRef.current ?? (yield* Database.Service)
+        if (yield* RuntimeRetirement.lookup(database, sessionID)) {
+          const members = yield* database.db.all<{ session_id: string }>(sql`
+            SELECT session_id FROM runtime_retirement_member WHERE root_session_id = ${sessionID}
+            UNION SELECT ${sessionID} AS session_id
+          `)
+          for (const member of members) {
+            if (cancelling.has(member.session_id)) continue
+            cancelling.set(member.session_id, { deferred: Deferred.makeUnsafe<boolean>(), rootSessionID: sessionID })
+          }
+          // Fence revocation is not evidence that the caller has interrupted and joined the work.
+          return [
+            { owner: true as boolean, cancelled: members.map((member) => member.session_id) },
+            { ...state, cancelling },
+          ] as const
+        }
         const row = yield* read(sessionID)
         if (!row || row.owner_lineage !== identity.lineage)
           return [
@@ -893,7 +995,6 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
             { ...state, cancelling },
           ] as const
 
-        const database = databaseRef.current ?? (yield* Database.Service)
         const updated = yield* database.db.all<{ session_id: string }>(sql`
           WITH RECURSIVE descendants(session_id) AS (
             SELECT ${sessionID}
@@ -920,11 +1021,9 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
             )
           RETURNING session_id
         `)
-        const active = new Map(state.active)
         const startupPending = new Map(state.startupPending)
         const parentModeOverrides = new Map(state.parentModeOverrides)
         for (const item of updated) {
-          active.delete(item.session_id)
           parentModeOverrides.delete(item.session_id)
           if (!cancelling.has(item.session_id))
             cancelling.set(item.session_id, { deferred: Deferred.makeUnsafe<boolean>(), rootSessionID: sessionID })
@@ -942,19 +1041,35 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
           })
         return [
           { owner: true as boolean, cancelled: updated.map((item) => item.session_id) },
-          { ...state, active, cancelling, startupPending, parentModeOverrides },
+          { ...state, cancelling, startupPending, parentModeOverrides },
         ] as const
       }),
     )
-    for (const id of [sessionID, ...decision.cancelled]) retryWakes.delete(id)
-    if (!decision.owner) return false
-    yield* Effect.forEach([sessionID, ...decision.cancelled], notifyParentIdle, {
-      concurrency: "unbounded",
-      discard: true,
-    })
-    if (decision.cancelled.length > 0) yield* checkQuiescent()
-    return true
+    return decision
   })
+
+  const cancel = Effect.fn("RuntimeLifecycle.cancel")((sessionID: string) =>
+    Effect.acquireUseRelease(
+      acquireCancellation(sessionID),
+      (decision) =>
+        Effect.gen(function* () {
+          for (const id of [sessionID, ...decision.cancelled]) retryWakes.delete(id)
+          if (!decision.owner) return false
+          yield* Effect.logInfo("runtime cancellation acquired", {
+            sessionID,
+            cancelledExecutions: decision.cancelled.length,
+          })
+          yield* Effect.forEach([sessionID, ...decision.cancelled], notifyParentIdle, {
+            concurrency: "unbounded",
+            discard: true,
+          })
+          if (decision.cancelled.length > 0) yield* checkQuiescent()
+          return true
+        }),
+      // Failure before ownership reaches the caller must not strand cancellation joiners.
+      (decision, exit) => (decision.owner && Exit.isFailure(exit) ? finishCancel(sessionID) : Effect.void),
+    ),
+  )
 
   const waitCancel = Effect.fn("RuntimeLifecycle.waitCancel")(function* (sessionID: string) {
     const marker = SynchronizedRef.getUnsafe(ref).cancelling.get(sessionID)
@@ -963,10 +1078,11 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
 
   const finishCancel = Effect.fn("RuntimeLifecycle.finishCancel")(function* (sessionID: string) {
     const deferreds = yield* SynchronizedRef.modify(ref, (state) => {
-      const cancelling = new Map(state.cancelling)
       const deferreds = [] as Deferred.Deferred<boolean>[]
+      if (state.cancelling.get(sessionID)?.rootSessionID !== sessionID) return [deferreds, state] as const
+      const cancelling = new Map(state.cancelling)
       for (const [id, marker] of cancelling) {
-        if (id !== sessionID && marker.rootSessionID !== sessionID) continue
+        if (marker.rootSessionID !== sessionID) continue
         cancelling.delete(id)
         deferreds.push(marker.deferred)
       }
@@ -976,6 +1092,41 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
       concurrency: "unbounded",
       discard: true,
     })
+    yield* checkQuiescent()
+  }, Effect.uninterruptible)
+
+  const waitForIdle = Effect.fn("RuntimeLifecycle.waitForIdle")(function* (sessionID: string) {
+    const deferred = yield* SynchronizedRef.modify(ref, (state) => {
+      if (!state.active.has(sessionID) && !state.leases.has(sessionID)) return [undefined, state] as const
+      const deferred = idleWaiters.get(sessionID) ?? Deferred.makeUnsafe<boolean>()
+      idleWaiters.set(sessionID, deferred)
+      return [deferred, state] as const
+    })
+    if (deferred) yield* Deferred.await(deferred)
+  })
+
+  const retireRoot = Effect.fn("RuntimeLifecycle.retireRoot")(function* (sessionID: string) {
+    return yield* SynchronizedRef.modifyEffect(
+      ref,
+      Effect.fnUntraced(function* (state) {
+        const database = databaseRef.current ?? (yield* Database.Service)
+        const result = yield* RuntimeRetirement.retireRoot(database, sessionID)
+        const startupPending = new Map(state.startupPending)
+        const parentModeOverrides = new Map(state.parentModeOverrides)
+        for (const id of result.sessionIDs) {
+          parentModeOverrides.delete(id)
+          retryWakes.delete(id)
+          recoveryPreparedSessions.delete(id)
+          const pending = startupPending.get(id)
+          if (pending) yield* Deferred.succeed(pending, false).pipe(Effect.ignore)
+          startupPending.delete(id)
+        }
+        return [result, { ...state, startupPending, parentModeOverrides }] as const
+      }),
+    ).pipe(
+      Effect.tap((result) => Effect.forEach(result.sessionIDs, notifyParentIdle, { discard: true })),
+      Effect.uninterruptible,
+    )
   })
 
   const verifyOwner = Effect.fn("RuntimeLifecycle.verifyOwner")(function* (sessionID: string) {
@@ -1239,7 +1390,8 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
   const release = Effect.fn("RuntimeLifecycle.release")(function* (sessionID: string, fence?: number) {
     const result = yield* SynchronizedRef.modifyEffect(
       ref,
-      Effect.fnUntraced(function* (state) {
+      Effect.fnUntraced(function* (previous) {
+        const state = yield* releaseLease(previous, sessionID, fence)
         const current = state.active.get(sessionID)
         if (!current || (fence !== undefined && current.fence !== fence)) {
           const result: ReleaseResult = { released: false, reason: "absent", phase: state.phase }
@@ -1258,15 +1410,23 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
           }
           return [result, { ...state, active }] as const
         }
-        const nextState = state.phase === "draining" ? "parked" : "completed"
-        yield* update({
-          sessionID,
-          operation: "release",
-          fence: current.fence,
-          expectedState: current.mode === "retry_wait" ? "retry_wait" : "active",
-          nextState,
-          retryAt: nextState === "parked" && current.mode === "retry_wait" ? current.retryAt : undefined,
-        })
+        const row = yield* read(sessionID)
+        const revoked =
+          row?.desired_active !== 1 ||
+          row.fence !== current.fence ||
+          row.owner_instance !== identity.instance ||
+          row.owner_lineage !== identity.lineage
+        const nextState = revoked ? "cancelled" : state.phase === "draining" ? "parked" : "completed"
+        if (!revoked)
+          yield* update({
+            sessionID,
+            operation: "release",
+            fence: current.fence,
+            expectedState: current.mode === "retry_wait" ? "retry_wait" : "active",
+            nextState,
+            retryAt: nextState === "parked" && current.mode === "retry_wait" ? current.retryAt : undefined,
+            ignoreRevoked: true,
+          })
         const active = new Map(state.active)
         active.delete(sessionID)
         retryWakes.delete(sessionID)
@@ -1293,7 +1453,10 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
       lineage: identity.lineage,
       instance: identity.instance,
     })
-    if (!result.released) return
+    if (!result.released) {
+      yield* checkQuiescent()
+      return
+    }
     if (result.nextState === "completed") yield* notifyParentIdle(sessionID)
     yield* Effect.logInfo("execution released", {
       sessionID,
@@ -1310,7 +1473,8 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
   ) {
     const result = yield* SynchronizedRef.modifyEffect(
       ref,
-      Effect.fnUntraced(function* (state) {
+      Effect.fnUntraced(function* (previous) {
+        const state = yield* releaseLease(previous, sessionID, fence)
         const current = state.active.get(sessionID)
         if (!current || current.fence !== fence) return ["absent" as const, state] as const
         if (current.leases > 1) {
@@ -1319,14 +1483,16 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
           return ["active" as const, { ...state, active }] as const
         }
         const expectedState = current.mode === "retry_wait" ? "retry_wait" : "active"
-        const transition = yield* Effect.exit(update({
-          sessionID,
-          operation: "park",
-          fence: current.fence,
-          expectedState,
-          nextState: "parked",
-          retryAt: current.mode === "retry_wait" ? current.retryAt : undefined,
-        }))
+        const transition = yield* Effect.exit(
+          update({
+            sessionID,
+            operation: "park",
+            fence: current.fence,
+            expectedState,
+            nextState: "parked",
+            retryAt: current.mode === "retry_wait" ? current.retryAt : undefined,
+          }),
+        )
         if (Exit.isFailure(transition)) {
           const row = yield* read(sessionID)
           if (
@@ -1359,6 +1525,10 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
       Effect.fnUntraced(function* (state) {
         const current = state.active.get(sessionID)
         if (!current) return [false, state] as const
+        const row = yield* read(sessionID)
+        if (row?.desired_active === 0) return [false, state] as const
+        const database = databaseRef.current ?? (yield* Database.Service)
+        if (yield* RuntimeRetirement.lookup(database, sessionID)) return [false, state] as const
         yield* update({
           sessionID,
           operation: "park",
@@ -1403,6 +1573,7 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
           fence: current.fence,
           expectedState: current.mode === "retry_wait" ? "retry_wait" : "active",
           nextState: "completed",
+          ignoreRevoked: true,
         })
         const active = new Map(state.active)
         active.delete(sessionID)
@@ -1481,6 +1652,15 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
     const state = SynchronizedRef.getUnsafe(ref)
     const current = state.active.get(sessionID)
     if (state.phase !== "running" || (current?.mode !== "active" && current?.mode !== "retry_wait")) return
+    const row = yield* read(sessionID)
+    if (
+      row?.desired_active !== 1 ||
+      row.owner_lineage !== identity.lineage ||
+      row.owner_instance !== identity.instance ||
+      row.fence !== current.fence ||
+      row.state !== current.mode
+    )
+      return
     return current.fence
   })
 
@@ -1491,7 +1671,7 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
         lineage: identity.lineage,
         instance: identity.instance,
       })
-      return true
+      return yield* beforeTurn(sessionID)
     }
     yield* Effect.logInfo("restart diagnostic checkpoint rejected; parking execution", {
       sessionID,
@@ -1552,7 +1732,11 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
     if (result.parked) yield* checkQuiescent()
   })
 
-  const wakeRetry = Effect.fn("RuntimeLifecycle.wakeRetry")(function* (sessionID: string, attempt: number, retryAt: number) {
+  const wakeRetry = Effect.fn("RuntimeLifecycle.wakeRetry")(function* (
+    sessionID: string,
+    attempt: number,
+    retryAt: number,
+  ) {
     const state = SynchronizedRef.getUnsafe(ref)
     const current = state.active.get(sessionID)
     const wake = retryWakes.get(sessionID)
@@ -1563,11 +1747,16 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
       current.retryAt !== retryAt ||
       wake?.attempt !== attempt ||
       wake.retryAt !== retryAt
-    ) return false
+    )
+      return false
     return yield* Deferred.succeed(wake.deferred, undefined)
   })
 
-  const awaitRetryWake = Effect.fn("RuntimeLifecycle.awaitRetryWake")(function* (sessionID: string, attempt: number, retryAt: number) {
+  const awaitRetryWake = Effect.fn("RuntimeLifecycle.awaitRetryWake")(function* (
+    sessionID: string,
+    attempt: number,
+    retryAt: number,
+  ) {
     const wake = retryWakes.get(sessionID)
     if (wake?.attempt !== attempt || wake.retryAt !== retryAt) return yield* Effect.never
     return yield* Deferred.await(wake.deferred)
@@ -1578,7 +1767,8 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
       ref,
       Effect.fnUntraced(function* (state) {
         const current = state.active.get(sessionID)
-        if (state.phase !== "running" || !current || current.mode !== "retry_wait") {
+        const row = yield* read(sessionID)
+        if (state.phase !== "running" || !current || current.mode !== "retry_wait" || row?.desired_active !== 1) {
           const result: ResumeResult = {
             resumed: false,
             phase: state.phase,
@@ -1658,6 +1848,7 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
       ref,
       Effect.fnUntraced(function* (state) {
         if (state.phase !== "running") return [undefined, state] as const
+        if (state.leases.has(row.session_id)) return [undefined, state] as const
         const record = yield* claim(row)
         if (!record) return [undefined, state] as const
         const active = new Map(state.active)
@@ -1996,18 +2187,18 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
           recoveryRecord,
         })
         while (true) {
+          if (!(yield* beforeTurn(record.sessionID))) return false
           recoveryPreparedSessions.delete(record.sessionID)
-          const work = run(recoveryRecord).pipe(
-            Effect.tap(() =>
-              Effect.logInfo("runtime recovery continuation returned successfully", {
-                ...recordFields(recoveryRecord),
-              }),
-            ),
-            Effect.tap(() => complete(record.sessionID)),
-          )
-          const exit = yield* (permitHeld
-            ? Effect.exit(work)
-            : recoveryPermits.withPermit(Effect.exit(work)))
+          // Recheck after acquiring the permit, not just before waiting for it.
+          const work = Effect.gen(function* () {
+            if (!(yield* beforeTurn(record.sessionID))) return
+            yield* run(recoveryRecord)
+            yield* Effect.logInfo("runtime recovery continuation returned successfully", {
+              ...recordFields(recoveryRecord),
+            })
+            yield* complete(record.sessionID)
+          })
+          const exit = yield* permitHeld ? Effect.exit(work) : recoveryPermits.withPermit(Effect.exit(work))
           if (Exit.isSuccess(exit)) break
           if (recoveryPreparedSessions.has(record.sessionID) || Cause.hasInterrupts(exit.cause))
             return yield* Effect.failCause(exit.cause)
@@ -2088,7 +2279,14 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
             return false
           }),
         ),
-        Effect.ensuring(Effect.sync(() => recoveryPreparedSessions.delete(record.sessionID))),
+        Effect.ensuring(
+          Effect.gen(function* () {
+            recoveryPreparedSessions.delete(record.sessionID)
+            const row = yield* read(record.sessionID)
+            if (row?.desired_active !== 1 || (yield* RuntimeRetirement.lookup(database, record.sessionID)))
+              yield* complete(record.sessionID)
+          }).pipe(Effect.orDie),
+        ),
       )
     })
 
@@ -2223,7 +2421,7 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
     return {
       state: local.phase,
       action: local.action,
-      active: local.active.size,
+      active: new Set([...local.active.keys(), ...local.leases.keys()]).size,
       parked: parked?.count ?? 0,
       restartSupported: identity.restartSupported,
       lineage: identity.lineage,
@@ -2245,8 +2443,10 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
     finishStartupRecovery,
     recoveryPrepared,
     admit,
+    retireRoot,
     cancel,
     waitCancel,
+    waitForIdle,
     finishCancel,
     verifyOwner,
     reconstructChild,
@@ -2286,8 +2486,11 @@ export function unavailable(): Interface {
     finishStartupRecovery: () => Effect.void,
     recoveryPrepared: () => Effect.void,
     admit: () => Effect.succeed({ manualRecovery: false, fence: 0 }),
+    retireRoot: (sessionID) =>
+      Effect.fail(new RuntimeRetirement.RootRetirementError({ sessionID, reason: "unavailable" })),
     cancel: () => Effect.succeed(true),
     waitCancel: () => Effect.void,
+    waitForIdle: () => Effect.void,
     finishCancel: () => Effect.void,
     verifyOwner: () => Effect.succeed("unknown"),
     reconstructChild: () => Effect.succeed(false),

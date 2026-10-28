@@ -1,9 +1,9 @@
 {
   "version": "7",
   "dialect": "sqlite",
-  "id": "985ed164-ab3b-4b58-8888-389ecec55a7b",
+  "id": "5f95eafe-57bf-42c2-86a6-c444a117fc30",
   "prevIds": [
-    "421b02a8-945d-4b26-9597-4d6113121bd7"
+    "ecec0272-77af-4b44-b94c-3e698cc0ca7b"
   ],
   "ddl": [
     {
@@ -16,6 +16,14 @@
     },
     {
       "name": "runtime_execution",
+      "entityType": "tables"
+    },
+    {
+      "name": "runtime_retirement_member",
+      "entityType": "tables"
+    },
+    {
+      "name": "runtime_retirement",
       "entityType": "tables"
     },
     {
@@ -445,6 +453,56 @@
       "name": "time_updated",
       "entityType": "columns",
       "table": "runtime_execution"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "root_session_id",
+      "entityType": "columns",
+      "table": "runtime_retirement_member"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "session_id",
+      "entityType": "columns",
+      "table": "runtime_retirement_member"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "session_id",
+      "entityType": "columns",
+      "table": "runtime_retirement"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "root_session_id",
+      "entityType": "columns",
+      "table": "runtime_retirement"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "time_created",
+      "entityType": "columns",
+      "table": "runtime_retirement"
     },
     {
       "type": "text",
@@ -2248,6 +2306,16 @@
     },
     {
       "columns": [
+        "root_session_id",
+        "session_id"
+      ],
+      "nameExplicit": false,
+      "name": "runtime_retirement_member_pk",
+      "entityType": "pks",
+      "table": "runtime_retirement_member"
+    },
+    {
+      "columns": [
         "email",
         "url"
       ],
@@ -2301,6 +2369,15 @@
       "nameExplicit": false,
       "name": "runtime_execution_pk",
       "table": "runtime_execution",
+      "entityType": "pks"
+    },
+    {
+      "columns": [
+        "session_id"
+      ],
+      "nameExplicit": false,
+      "name": "runtime_retirement_pk",
+      "table": "runtime_retirement",
       "entityType": "pks"
     },
     {
@@ -2519,6 +2596,20 @@
       "name": "runtime_execution_parent_idx",
       "entityType": "indexes",
       "table": "runtime_execution"
+    },
+    {
+      "columns": [
+        {
+          "value": "root_session_id",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "origin": "manual",
+      "name": "runtime_retirement_root_idx",
+      "entityType": "indexes",
+      "table": "runtime_retirement"
     },
     {
       "columns": [

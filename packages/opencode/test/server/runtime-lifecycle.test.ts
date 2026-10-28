@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test"
 import { Database } from "@opencode-ai/core/database/database"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
-import { Clock, Deferred, Duration, Effect, Exit, Fiber, Ref, Scope } from "effect"
+import { Clock, Deferred, Duration, Effect, Exit, Fiber, Logger, Ref, Scope } from "effect"
 import * as TestClock from "effect/testing/TestClock"
 import { randomUUID } from "node:crypto"
 import { sql } from "drizzle-orm"
@@ -218,16 +218,15 @@ describe("runtime lifecycle", () => {
       yield* replaceOwner(database, sessionID, randomUUID(), 1)
 
       expect(Exit.isFailure(yield* runtime.park(sessionID).pipe(Effect.exit))).toBe(true)
-      expect(Exit.isFailure(yield* runtime.release(sessionID).pipe(Effect.exit))).toBe(true)
       expect(Exit.isFailure(yield* runtime.retry(sessionID, Date.now() + 10_000).pipe(Effect.exit))).toBe(true)
       expect((yield* executionDetails(database, sessionID))?.state).toBe("active")
       expect((yield* runtime.status()).active).toBe(1)
 
       expect((yield* runtime.request("shutdown")).state).toBe("draining")
       expect((yield* runtime.status()).active).toBe(1)
-      expect(Exit.isFailure(yield* runtime.release(sessionID).pipe(Effect.exit))).toBe(true)
+      yield* runtime.release(sessionID)
       expect((yield* executionDetails(database, sessionID))?.state).toBe("active")
-      expect((yield* runtime.status()).state).toBe("draining")
+      expect((yield* runtime.status()).state).toBe("stopping")
 
       const retryRuntime = RuntimeLifecycle.make({ lineage: randomUUID(), instance: randomUUID() }, scope, database)
       const retrySessionID = yield* seedSession(database)
@@ -283,7 +282,9 @@ describe("runtime lifecycle", () => {
         recovery_attempts: 1,
       })
       expect(yield* old.beforeTurn(sessionID)).toBe(false)
-      expect(Exit.isFailure(yield* old.release(sessionID).pipe(Effect.exit))).toBe(true)
+      yield* old.release(sessionID)
+      expect((yield* old.status()).active).toBe(0)
+      expect(yield* executionDetails(database, sessionID)).toMatchObject({ owner_instance: newInstance, fence: 1 })
       expect(yield* executionDetails(database, sessionID)).toMatchObject({
         state: "active",
         owner_instance: newInstance,
@@ -587,6 +588,130 @@ describe("runtime lifecycle", () => {
     }),
   )
 
+  it.effect("cancelled recovery retains its internal slot until the continuation returns", () =>
+    Effect.gen(function* () {
+      const database = yield* Database.Service
+      const scope = yield* Effect.scope
+      const lineage = randomUUID()
+      const sessionID = yield* seedSession(database)
+      const previous = RuntimeLifecycle.make({ lineage }, scope, database)
+      yield* previous.admit({ sessionID, directory: "/tmp" })
+      yield* previous.park(sessionID)
+      yield* previous.release(sessionID)
+      const replacement = RuntimeLifecycle.make({ lineage }, scope, database)
+      const started = yield* Deferred.make<void>()
+      const finish = yield* Deferred.make<void>()
+      yield* replacement.recover(() =>
+        Effect.gen(function* () {
+          yield* Deferred.succeed(started, undefined)
+          yield* Deferred.await(finish)
+        }),
+      )
+      yield* Deferred.await(started)
+      expect(yield* replacement.cancel(sessionID)).toBe(true)
+      yield* replacement.finishCancel(sessionID)
+      expect((yield* replacement.request("shutdown")).state).toBe("draining")
+      expect((yield* replacement.status()).active).toBe(1)
+      const idle = yield* replacement.waitForIdle(sessionID).pipe(Effect.forkChild)
+      yield* Deferred.succeed(finish, undefined)
+      yield* Fiber.join(idle)
+      yield* replacement.awaitDrain
+      expect((yield* replacement.status()).active).toBe(0)
+      expect((yield* executionDetails(database, sessionID))?.state).toBe("cancelled")
+    }),
+  )
+
+  it.effect("overlapping descendant aborts cannot acknowledge another cancellation owner or drop shared leases", () =>
+    Effect.gen(function* () {
+      const database = yield* Database.Service
+      const parent = yield* seedSession(database)
+      const child = yield* seedSession(database)
+      const runtime = RuntimeLifecycle.make({ lineage: randomUUID() }, yield* Effect.scope, database)
+      const parentLease = yield* runtime.admit({ sessionID: parent, directory: "/tmp" })
+      const childLease = yield* runtime.admit({ sessionID: child, directory: "/tmp", parentSessionID: parent })
+      yield* runtime.admit({ sessionID: child, directory: "/tmp", parentSessionID: parent })
+      expect(yield* runtime.cancel(parent)).toBe(true)
+      expect(yield* runtime.cancel(child)).toBe(false)
+      const acknowledged = yield* Deferred.make<void>()
+      const abort = yield* runtime
+        .waitCancel(child)
+        .pipe(Effect.andThen(Deferred.succeed(acknowledged, undefined)), Effect.forkChild)
+      yield* runtime.finishCancel(child)
+      yield* Effect.yieldNow
+      expect(yield* Deferred.isDone(acknowledged)).toBe(false)
+      yield* runtime.releaseInterrupted(parent, parentLease.fence)
+      yield* runtime.releaseInterrupted(child, childLease.fence)
+      yield* runtime.finishCancel(parent)
+      yield* Fiber.join(abort)
+      expect((yield* runtime.status()).active).toBe(1)
+      const admitted = yield* Deferred.make<void>()
+      const resume = yield* runtime.admit({ sessionID: child, directory: "/tmp" }).pipe(
+        Effect.tap(() => Deferred.succeed(admitted, undefined)),
+        Effect.forkChild,
+      )
+      yield* Effect.yieldNow
+      expect(yield* Deferred.isDone(admitted)).toBe(false)
+      yield* runtime.release(child, childLease.fence)
+      const next = yield* Fiber.join(resume)
+      expect(next.fence).toBeGreaterThan(childLease.fence)
+      // A late old-generation release must not consume the new admission.
+      yield* runtime.release(child, childLease.fence)
+      expect((yield* runtime.status()).active).toBe(1)
+      yield* runtime.request("shutdown")
+      yield* runtime.release(child, next.fence)
+      yield* runtime.awaitDrain
+    }),
+  )
+
+  it.effect("interruption after cancellation acquisition clears its markers without releasing owners", () =>
+    Effect.gen(function* () {
+      const database = yield* Database.Service
+      const runtime = RuntimeLifecycle.make({ lineage: randomUUID() }, yield* Effect.scope, database)
+      const parent = yield* seedSession(database)
+      const child = yield* seedSession(database)
+      const other = yield* seedSession(database)
+      yield* runtime.admit({ sessionID: parent, directory: "/tmp" })
+      yield* runtime.admit({ sessionID: child, directory: "/tmp", parentSessionID: parent })
+      yield* runtime.admit({ sessionID: other, directory: "/tmp" })
+      expect(yield* runtime.cancel(other)).toBe(true)
+      const returned = yield* Deferred.make<void>()
+      const interrupted = yield* runtime.cancel(parent).pipe(
+        Effect.tap(() => Deferred.succeed(returned, undefined)),
+        Effect.provide(
+          Logger.layer([
+            Logger.make((options) => {
+              if (!Array.isArray(options.message) || options.message[0] !== "runtime cancellation acquired") return
+              // The marker is published, but the caller has not received ownership or installed cleanup.
+              options.fiber.interruptUnsafe()
+            }),
+          ]),
+        ),
+        Effect.forkChild,
+      )
+      expect(Exit.isFailure(yield* Fiber.await(interrupted))).toBe(true)
+      expect(yield* Deferred.isDone(returned)).toBe(false)
+      yield* runtime.waitCancel(parent)
+      yield* runtime.waitCancel(child)
+      expect((yield* runtime.status()).active).toBe(3)
+      expect((yield* executionDetails(database, parent))?.state).toBe("cancelled")
+      const unrelated = yield* Deferred.make<void>()
+      const waiter = yield* runtime
+        .waitCancel(other)
+        .pipe(Effect.andThen(Deferred.succeed(unrelated, undefined)), Effect.forkChild)
+      yield* Effect.yieldNow
+      expect(yield* Deferred.isDone(unrelated)).toBe(false)
+      // A new cancellation can own the aborted acquisition's tree again.
+      expect(yield* runtime.cancel(parent)).toBe(true)
+      yield* runtime.finishCancel(parent)
+      yield* runtime.finishCancel(other)
+      yield* Fiber.join(waiter)
+      yield* runtime.release(parent)
+      yield* runtime.release(child)
+      yield* runtime.release(other)
+      expect((yield* runtime.request("shutdown")).state).toBe("stopping")
+    }),
+  )
+
   it.effect("persists cancellation before fencing the local execution", () =>
     Effect.gen(function* () {
       const database = yield* Database.Service
@@ -606,11 +731,13 @@ describe("runtime lifecycle", () => {
         desired_active: 0,
         fence: 1,
       })
-      expect((yield* runtime.status()).active).toBe(0)
+      expect((yield* runtime.status()).active).toBe(1)
       expect(yield* runtime.beforeTurn(sessionID)).toBe(false)
       yield* runtime.finishCancel(sessionID)
       yield* Fiber.join(waiter)
       expect(yield* Ref.get(waited)).toBe(true)
+      expect((yield* runtime.status()).active).toBe(1)
+      yield* runtime.release(sessionID)
 
       const resumed = RuntimeLifecycle.make({ lineage, instance: randomUUID() }, scope, database)
       yield* resumed.admit({ sessionID, directory: "/tmp" })
@@ -661,8 +788,10 @@ describe("runtime lifecycle", () => {
       }).pipe(Effect.forkChild)
       yield* Deferred.await(started)
       yield* Effect.yieldNow
-      expect((yield* runtime.status()).active).toBe(0)
+      expect((yield* runtime.status()).active).toBe(1)
       yield* runtime.finishCancel(sessionID)
+      expect(yield* Deferred.isDone(admitted)).toBe(false)
+      yield* runtime.release(sessionID)
       yield* Deferred.await(admitted)
       expect((yield* runtime.status()).active).toBe(1)
       yield* runtime.release(sessionID)
@@ -696,8 +825,9 @@ describe("runtime lifecycle", () => {
         expect(yield* executionDetails(database, sessionID)).toMatchObject({ state: "cancelled", desired_active: 0 })
         expect(yield* runtime.beforeTurn(sessionID)).toBe(false)
       }
-      expect((yield* runtime.status()).active).toBe(0)
+      expect((yield* runtime.status()).active).toBe(3)
       yield* runtime.finishCancel(parentID)
+      for (const sessionID of [parentID, childID, grandchildID]) yield* runtime.release(sessionID)
       expect(
         Exit.isFailure(
           yield* runtime
@@ -1115,10 +1245,8 @@ describe("runtime lifecycle", () => {
       )
 
       yield* Deferred.await(firstFailed)
-      while ((yield* executionDetails(database, sessionID))?.recovery_preparation_attempts !== 1)
-        yield* Effect.yieldNow
-      while ((yield* executionDetails(database, sessionID))?.recovery_preparation_attempts !== 2)
-        yield* Effect.yieldNow
+      while ((yield* executionDetails(database, sessionID))?.recovery_preparation_attempts !== 1) yield* Effect.yieldNow
+      while ((yield* executionDetails(database, sessionID))?.recovery_preparation_attempts !== 2) yield* Effect.yieldNow
       yield* Deferred.await(failedThreeTimes)
       while ((yield* execution(database, sessionID))?.state !== "recovery_needed") yield* Effect.yieldNow
       expect(yield* Ref.get(attempts)).toBe(3)
@@ -1316,6 +1444,7 @@ describe("runtime lifecycle", () => {
       yield* Fiber.join(timer)
       yield* TestClock.adjust(Duration.millis(20_000))
       expect(yield* Ref.get(attempts)).toBe(0)
+      yield* runtime.release(sessionID)
       expect(yield* runtime.awaitDrain).toBeUndefined()
       expect(yield* runtime.isParked(sessionID)).toBe(true)
       expect(yield* execution(database, sessionID)).toEqual({ state: "parked", retry_at: retryAt })

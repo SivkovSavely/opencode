@@ -73,6 +73,67 @@ const triggerSystemTransform = Effect.fn("PluginTriggerTest.triggerSystemTransfo
 })
 
 describe("plugin.trigger", () => {
+  it.instance("managed profile skips project pty plugin before evaluation while preserving other hooks", () =>
+    Effect.gen(function* () {
+      const previous = process.env.OPENCODE_MANAGED_PROFILE
+      const previousAllowlist = process.env.OPENCODE_MANAGED_PLUGIN_ALLOWLIST
+      process.env.OPENCODE_MANAGED_PROFILE = "1"
+      yield* Effect.gen(function* () {
+        const test = yield* TestInstance
+        const pty = path.join(test.directory, "renamed")
+        const mark = path.join(test.directory, "pty-executed")
+        const other = path.join(test.directory, "compression.ts")
+        const wrapper = path.join(test.directory, "wrapper.ts")
+        const wrapperMark = path.join(test.directory, "wrapper-executed")
+        process.env.OPENCODE_MANAGED_PLUGIN_ALLOWLIST = JSON.stringify([
+          pathToFileURL(other).href,
+          pathToFileURL(pty).href,
+        ])
+        yield* Effect.promise(() =>
+          Bun.write(path.join(pty, "package.json"), JSON.stringify({ name: "opencode-pty", main: "index.ts" })),
+        )
+        yield* Effect.promise(() =>
+          Bun.write(
+            path.join(pty, "index.ts"),
+            `await Bun.write(${JSON.stringify(mark)}, "executed"); export default async () => ({})`,
+          ),
+        )
+        yield* Effect.promise(() =>
+          Bun.write(
+            other,
+            `export default async () => ({ ${JSON.stringify(systemHook)}: (_input, output) => { output.system.push("compression") } })`,
+          ),
+        )
+        yield* Effect.promise(() =>
+          Bun.write(
+            wrapper,
+            `await Bun.write(${JSON.stringify(wrapperMark)}, "executed"); export { default } from ${JSON.stringify(pathToFileURL(path.join(pty, "index.ts")).href)}`,
+          ),
+        )
+        yield* Effect.promise(() =>
+          Bun.write(
+            path.join(test.directory, "opencode.json"),
+            JSON.stringify({
+              plugin: [pathToFileURL(pty).href, pathToFileURL(wrapper).href, pathToFileURL(other).href],
+            }),
+          ),
+        )
+        expect(yield* triggerSystemTransform()).toEqual(["compression"])
+        expect(yield* Effect.promise(() => Bun.file(mark).exists())).toBe(false)
+        expect(yield* Effect.promise(() => Bun.file(wrapperMark).exists())).toBe(false)
+      }).pipe(
+        Effect.ensuring(
+          Effect.sync(() => {
+            if (previous === undefined) delete process.env.OPENCODE_MANAGED_PROFILE
+            else process.env.OPENCODE_MANAGED_PROFILE = previous
+            if (previousAllowlist === undefined) delete process.env.OPENCODE_MANAGED_PLUGIN_ALLOWLIST
+            else process.env.OPENCODE_MANAGED_PLUGIN_ALLOWLIST = previousAllowlist
+          }),
+        ),
+      )
+    }),
+  )
+
   it.instance("runs synchronous hooks without crashing", () =>
     withProject(
       [
