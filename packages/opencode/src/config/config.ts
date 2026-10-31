@@ -449,26 +449,28 @@ const layer = Layer.effect(
 
           yield* ensureGitignore(dir).pipe(Effect.orDie)
 
-          const dep = yield* npmSvc
-            .install(dir, {
-              add: [
-                {
-                  name: "@opencode-ai/plugin",
-                  version: InstallationLocal ? undefined : InstallationVersion,
-                },
-              ],
-            })
-            .pipe(
-              Effect.exit,
-              Effect.tap((exit) =>
-                Exit.isFailure(exit)
-                  ? Effect.logWarning("background dependency install failed", { dir, error: String(exit.cause) })
-                  : Effect.void,
-              ),
-              Effect.asVoid,
-              Effect.forkDetach,
-            )
-          deps.push(dep)
+          if (process.env.OPENCODE_MANAGED_PROFILE !== "1") {
+            const dep = yield* npmSvc
+              .install(dir, {
+                add: [
+                  {
+                    name: "@opencode-ai/plugin",
+                    version: InstallationLocal ? undefined : InstallationVersion,
+                  },
+                ],
+              })
+              .pipe(
+                Effect.exit,
+                Effect.tap((exit) =>
+                  Exit.isFailure(exit)
+                    ? Effect.logWarning("background dependency install failed", { dir, error: String(exit.cause) })
+                    : Effect.void,
+                ),
+                Effect.asVoid,
+                Effect.forkDetach,
+              )
+            deps.push(dep)
+          }
 
           result.command = mergeDeep(result.command ?? {}, yield* Effect.promise(() => ConfigCommand.load(dir)))
           result.agent = mergeDeep(result.agent ?? {}, yield* Effect.promise(() => ConfigAgent.load(dir)))
@@ -618,7 +620,13 @@ const layer = Layer.effect(
     )
 
     const get = Effect.fn("Config.get")(function* () {
-      return yield* InstanceState.use(state, (s) => s.config)
+      const config = yield* InstanceState.use(state, (s) => s.config)
+      if (process.env.OPENCODE_MANAGED_PROFILE === "1" && Object.keys(config.mcp ?? {}).length > 0)
+        throw new Error("MCP configuration is unavailable in the managed profile: execution is not accounted")
+      // These services can launch instance-owned processes outside managed command accounting.
+      if (process.env.OPENCODE_MANAGED_PROFILE === "1")
+        return { ...config, lsp: false as const, formatter: false as const, snapshot: false }
+      return config
     })
 
     const directories = Effect.fn("Config.directories")(function* () {

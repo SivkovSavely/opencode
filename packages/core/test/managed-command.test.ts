@@ -18,6 +18,38 @@ const seed = (database: Database.Interface, id = "root") =>
   })
 
 describe("managed command durable ownership", () => {
+  test("unresolved model leases survive retirement and reopen without upgrading unknown coverage", async () => {
+    await using tmp = await tmpdir()
+    const filename = path.join(tmp.path, "execution.sqlite")
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const database = yield* Database.Service
+        yield* seed(database)
+        yield* ManagedCommand.coverRoot(database, "root")
+        yield* ManagedCommand.beginExecution(database, "root", "crashed")
+        yield* RuntimeRetirement.retireRoot(database, "root")
+        expect(yield* ManagedCommand.status(database, "root")).toBe("unknown")
+      }).pipe(Effect.provide(Database.layerFromPath(filename)), Effect.scoped),
+    )
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const database = yield* Database.Service
+        expect(yield* ManagedCommand.status(database, "root")).toBe("unknown")
+        expect(yield* ManagedCommand.beginExecution(database, "root", "replacement").pipe(Effect.flip)).toBeInstanceOf(
+          ManagedCommand.AdmissionError,
+        )
+        yield* seed(database, "untracked")
+        yield* ManagedCommand.coverRoot(database, "untracked")
+        yield* database.db.run(sql`INSERT INTO runtime_execution
+        (id, session_id, directory, owner_lineage, owner_instance, fence, state, desired_active, time_created, time_updated)
+        VALUES ('untracked', 'untracked', '/tmp', 'owner', 'owner', 0, 'active', 1, 0, 0)`)
+        const permit = yield* ManagedCommand.beginExecution(database, "untracked", "replacement")
+        yield* ManagedCommand.settle(database, permit, true)
+        expect(yield* ManagedCommand.status(database, "untracked")).toBe("unknown")
+      }).pipe(Effect.provide(Database.layerFromPath(filename)), Effect.scoped),
+    )
+  })
+
   test("denies changed ancestry even when neither the command nor its original root was retired", async () => {
     await using tmp = await tmpdir()
     await Effect.runPromise(
@@ -55,7 +87,8 @@ describe("managed command durable ownership", () => {
           '20261028171804_managed_command_ownership',
           '20261028171900_managed_command_eligibility',
           '20261028173819_managed_command_generation',
-          '20261028174200_managed_command_ancestry'
+          '20261028174200_managed_command_ancestry',
+          '20261031090000_managed_execution_accounting'
         )`)
         yield* seed(database, "historical")
         yield* DatabaseMigration.apply(database.db)

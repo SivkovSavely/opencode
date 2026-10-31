@@ -253,6 +253,8 @@ const layer = Layer.effect(
      * on failure the transport is closed; on success the caller owns it.
      */
     const connectTransport = Effect.fn("MCP.connectTransport")(function* (transport: Transport, timeout: number) {
+      if (process.env.OPENCODE_MANAGED_PROFILE === "1")
+        throw new Error("MCP connections are unavailable in the managed profile")
       const directory = yield* InstanceState.directory
       return yield* Effect.acquireUseRelease(
         Effect.succeed(transport),
@@ -410,6 +412,8 @@ const layer = Layer.effect(
 
     const create = Effect.fn("MCP.create")(
       function* (s: State, key: string, mcp: ConfigMCPV1.Info, revision = 0) {
+        if (process.env.OPENCODE_MANAGED_PROFILE === "1")
+          throw new Error("MCP connections are unavailable in the managed profile")
         if (mcp.enabled === false) {
           return DISABLED_RESULT
         }
@@ -531,7 +535,6 @@ const layer = Layer.effect(
     const state = yield* InstanceState.make<State>(
       Effect.fn("MCP.state")(function* () {
         const cfg = yield* cfgSvc.get()
-        const bridge = yield* EffectBridge.make()
         const config = cfg.mcp ?? {}
         const s: State = {
           config: {},
@@ -544,6 +547,8 @@ const layer = Layer.effect(
           activeOAuth: new Map(),
           pendingOAuthTransports: new Map(),
         }
+        if (process.env.OPENCODE_MANAGED_PROFILE === "1") return s
+        const bridge = yield* EffectBridge.make()
 
         yield* Effect.forEach(
           Object.entries(config),
@@ -763,6 +768,8 @@ const layer = Layer.effect(
     })
 
     const add = Effect.fn("MCP.add")(function* (name: string, mcp: ConfigMCPV1.Info) {
+      if (process.env.OPENCODE_MANAGED_PROFILE === "1")
+        throw new Error("MCP connections are unavailable in the managed profile")
       const s = yield* InstanceState.get(state)
       return yield* connectLock(s, name).withPermits(1)(
         Effect.gen(function* () {

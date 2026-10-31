@@ -1,4 +1,5 @@
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
+import { env } from "node:process"
 import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { Image } from "@/image/image"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
@@ -502,12 +503,13 @@ const layer = Layer.effect(
               }
               ctx.snapshot = undefined
             }
-            yield* summary
-              .summarize({
-                sessionID: ctx.sessionID,
-                messageID: ctx.assistantMessage.parentID,
-              })
-              .pipe(Effect.ignore, Effect.forkIn(scope))
+            if (env.OPENCODE_MANAGED_PROFILE !== "1")
+              yield* summary
+                .summarize({
+                  sessionID: ctx.sessionID,
+                  messageID: ctx.assistantMessage.parentID,
+                })
+                .pipe(Effect.ignore, Effect.forkIn(scope))
             if (
               !ctx.assistantMessage.summary &&
               isOverflow({ cfg: yield* config.get(), tokens: usage.tokens, model: ctx.model })

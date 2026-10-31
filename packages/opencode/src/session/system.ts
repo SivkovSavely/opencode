@@ -125,6 +125,7 @@ const layer = Layer.effect(
         permission?: PermissionV1.Ruleset,
         activated?: readonly string[],
       ) {
+        if (process.env.OPENCODE_MANAGED_PROFILE === "1") return
         const ruleset = Permission.merge(agent.permission, permission ?? [])
         const lazyServers = (yield* mcp.lazyServers()).filter(
           (item) => Permission.evaluate("mcp_enable", item.name, ruleset).action !== "deny",

@@ -334,6 +334,49 @@ const makeOwnedRuntime = (
     ),
   )
 const ownedRuntime = testEffect(makeOwnedRuntime())
+
+ownedRuntime.instance("managed runner retains its execution lease after the prompt caller is interrupted", () =>
+  Effect.gen(function* () {
+    const previous = process.env.OPENCODE_MANAGED_PROFILE
+    const allowlist = process.env.OPENCODE_MANAGED_PLUGIN_ALLOWLIST
+    yield* Effect.acquireRelease(
+      Effect.sync(() => {
+        process.env.OPENCODE_MANAGED_PROFILE = "1"
+        process.env.OPENCODE_MANAGED_PLUGIN_ALLOWLIST = "[]"
+      }),
+      () =>
+        Effect.sync(() => {
+          if (previous === undefined) delete process.env.OPENCODE_MANAGED_PROFILE
+          else process.env.OPENCODE_MANAGED_PROFILE = previous
+          if (allowlist === undefined) delete process.env.OPENCODE_MANAGED_PLUGIN_ALLOWLIST
+          else process.env.OPENCODE_MANAGED_PLUGIN_ALLOWLIST = allowlist
+        }),
+    )
+    const { llm } = yield* useServerConfig(providerCfg)
+    const { prompt, chat, run } = yield* boot()
+    const runtime = yield* RuntimeLifecycle.Service
+    const database = yield* Database.Service
+    const release = yield* Deferred.make<void>()
+    yield* Effect.addFinalizer(() => Deferred.succeed(release, undefined))
+    yield* llm.hold("provider is still streaming", deferredAsPromise(release))
+    const caller = yield* prompt
+      .prompt({ sessionID: chat.id, model: ref, parts: [{ type: "text", text: "hello" }] })
+      .pipe(Effect.forkScoped)
+    yield* llm.wait(1)
+    yield* Fiber.interrupt(caller)
+    expect(yield* runtime.commandStatus(chat.id)).toBe("draining")
+    expect(
+      yield* database.db.get(sql`SELECT state FROM managed_command
+      WHERE session_id = ${chat.id} AND execution_generation = 'managed-execution'`),
+    ).toEqual({ state: "running" })
+    yield* runtime.retireRoot(chat.id)
+    expect(yield* runtime.commandStatus(chat.id)).toBe("draining")
+    yield* awaitWithTimeout(prompt.cancel(chat.id), "retirement did not join the detached managed provider runner")
+    yield* run.assertNotBusy(chat.id)
+    expect(yield* runtime.commandStatus(chat.id)).toBe("drained")
+    expect(yield* llm.calls).toBe(1)
+  }),
+)
 const retryCommandRuntime = testEffect(
   makeOwnedRuntime(
     false,
@@ -3897,9 +3940,7 @@ unixNoLLMServer(
               .pipe(Effect.exit)
             expect(Exit.isFailure(command)).toBe(true)
             if (Exit.isFailure(command))
-              expect(String(Cause.squash(command.cause))).toContain(
-                "foreground validation requires descendant containment",
-              )
+              expect(String(Cause.squash(command.cause))).toContain("Managed execution requires a tracked runtime")
             expect(
               yield* Effect.promise(() => Bun.file(path.join(instance.directory, "managed-session-marker")).exists()),
             ).toBe(false)

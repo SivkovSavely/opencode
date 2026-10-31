@@ -56,7 +56,6 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
   const plugin = yield* Plugin.Service
   const permission = yield* Permission.Service
   const registry = yield* ToolRegistry.Service
-  const mcp = yield* MCP.Service
   const sessions = yield* Session.Service
   const current = yield* sessions.get(input.session.id).pipe(Effect.orDie)
   const activated = McpActivation.names(current.metadata)
@@ -111,6 +110,7 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
     sessionID: input.session.id,
     mcpActivated: activated,
   })) {
+    if (process.env.OPENCODE_MANAGED_PROFILE === "1" && item.id !== "bash") continue
     const schema = ProviderTransform.schema(input.model, ToolJsonSchema.fromTool(item))
     tools[item.id] = tool({
       description: item.description,
@@ -149,6 +149,10 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
     })
   }
 
+  // MCP, task delegation and arbitrary tools do not have joined managed retirement contracts.
+  if (process.env.OPENCODE_MANAGED_PROFILE === "1") return tools
+
+  const mcp = yield* MCP.Service
   const hasMcpResourceServer = Object.values(yield* mcp.clients(activated)).some(
     (client) => !!client.getServerCapabilities()?.resources,
   )

@@ -382,6 +382,7 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
   const recoveryPreparedSessions = new Set<string>()
   const databaseRef: { current?: Database.Interface } = { current: database }
   const managed = new Map<string, { sessionID: string; cancel: () => void }>()
+  const executionPermits = new Map<string, ManagedCommand.Permit>()
   // Preserve column order: this is compared with Core's persisted admission-generation snapshot.
   const managedAncestors = (database: Database.Interface, sessionID: string) =>
     database.db.all<{ id: string }>(sql`
@@ -1025,6 +1026,14 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
 
   const admit = Effect.fn("RuntimeLifecycle.admit")(function* (input: AdmissionInput) {
     yield* rejectRetired(input)
+    if (process.env.OPENCODE_MANAGED_PROFILE === "1" && input.parentSessionID)
+      return yield* new RuntimeDrainingError({ message: "Child execution is unavailable in the managed profile" })
+    if (
+      process.env.OPENCODE_MANAGED_PROFILE === "1" &&
+      process.env.OPENCODE_MANAGED_PLUGIN_ALLOWLIST &&
+      process.env.OPENCODE_MANAGED_PLUGIN_ALLOWLIST.trim() !== "[]"
+    )
+      return yield* new RuntimeDrainingError({ message: "Managed model execution requires an empty plugin allowlist" })
     if (startupReady) yield* Deferred.await(startupReady)
     while (true) {
       const wait = yield* SynchronizedRef.modifyEffect(
@@ -1079,7 +1088,23 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
             ] as const
           }
 
-          const claimed = yield* admitDurably(admissionInput, row)
+          const database = databaseRef.current ?? (yield* Database.Service)
+          const permit =
+            process.env.OPENCODE_MANAGED_PROFILE === "1"
+              ? yield* ManagedCommand.beginExecution(database, input.sessionID, identity.instance).pipe(
+                  Effect.catchTag("ManagedCommandAdmissionError", () =>
+                    Effect.fail(
+                      new RuntimeDrainingError({ message: "Managed execution requires a live root session" }),
+                    ),
+                  ),
+                )
+              : undefined
+          const claimed = yield* admitDurably(admissionInput, row).pipe(
+            Effect.onError(() =>
+              permit ? ManagedCommand.settle(database, permit, true).pipe(Effect.asVoid, Effect.orDie) : Effect.void,
+            ),
+          )
+          if (permit) executionPermits.set(input.sessionID, permit)
           const active = new Map(state.active)
           active.set(input.sessionID, { fence: claimed.row.fence, leases: 1, mode: "active" })
           const parentModeOverrides = new Map(state.parentModeOverrides)
@@ -1120,6 +1145,12 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
     const leases = new Map(state.leases)
     if (current.count > 1) leases.set(sessionID, { ...current, count: current.count - 1 })
     if (current.count === 1) {
+      const permit = executionPermits.get(sessionID)
+      if (permit) {
+        const database = databaseRef.current ?? (yield* Database.Service)
+        yield* ManagedCommand.settle(database, permit, true)
+        executionPermits.delete(sessionID)
+      }
       leases.delete(sessionID)
       yield* Deferred.succeed(current.released, true)
     }
@@ -1342,6 +1373,7 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
   })
 
   const reconstructChild = Effect.fn("RuntimeLifecycle.reconstructChild")(function* (input: ReconstructedChildInput) {
+    if (process.env.OPENCODE_MANAGED_PROFILE === "1") return false
     const parent = yield* read(input.parentSessionID)
     if (
       !parent ||
@@ -1585,6 +1617,7 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
     parentSessionID: string,
     effect: Effect.Effect<void>,
   ) {
+    if (process.env.OPENCODE_MANAGED_PROFILE === "1") return
     yield* Effect.gen(function* () {
       const pending = SynchronizedRef.getUnsafe(ref).startupPending.get(parentSessionID)
       if (pending) yield* Deferred.await(pending)
@@ -2697,7 +2730,12 @@ export function unavailable(): Interface {
     bindDatabase() {},
     finishStartupRecovery: () => Effect.void,
     recoveryPrepared: () => Effect.void,
-    admit: () => Effect.succeed({ manualRecovery: false, fence: 0 }),
+    admit: () =>
+      Effect.suspend(() =>
+        process.env.OPENCODE_MANAGED_PROFILE === "1"
+          ? Effect.fail(new RuntimeDrainingError({ message: "Managed execution requires a tracked runtime" }))
+          : Effect.succeed({ manualRecovery: false, fence: 0 }),
+      ),
     retireRoot: (sessionID) =>
       Effect.fail(new RuntimeRetirement.RootRetirementError({ sessionID, reason: "unavailable" })),
     runManagedCommand: (sessionID) => Effect.fail(new ManagedCommand.AdmissionError({ sessionID })),

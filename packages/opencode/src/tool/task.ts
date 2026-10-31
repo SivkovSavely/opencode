@@ -506,7 +506,13 @@ export const TaskTool = Tool.define(
       parameters: Parameters,
       jsonSchema: flags.experimentalBackgroundSubagents ? undefined : ToolJsonSchema.fromSchema(BaseParameters),
       execute: (params: Schema.Schema.Type<typeof Parameters>, ctx: Tool.Context) =>
-        run(params, ctx).pipe(Effect.orDie),
+        Effect.suspend(() =>
+          process.env.OPENCODE_MANAGED_PROFILE === "1"
+            ? Effect.die(
+                new Error("Task delegation is unavailable in the managed profile: child execution is not accounted"),
+              )
+            : run(params, ctx).pipe(Effect.orDie),
+        ),
     }
   }),
 )

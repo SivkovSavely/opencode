@@ -1603,6 +1603,7 @@ const layer = Layer.effect(
 
         // plugin auth loader - database now has entries for config providers
         for (const plugin of plugins) {
+          if (process.env.OPENCODE_MANAGED_PROFILE === "1") continue
           if (!plugin.auth) continue
           const providerID = ProviderV2.ID.make(plugin.auth.provider)
           if (disabled.has(providerID)) continue
@@ -1623,6 +1624,8 @@ const layer = Layer.effect(
         }
 
         for (const [id, fn] of Object.entries(custom(dep))) {
+          // Zen only filters the catalog and supplies public credentials; other loaders may start credential chains.
+          if (process.env.OPENCODE_MANAGED_PROFILE === "1" && id !== "opencode") continue
           const providerID = ProviderV2.ID.make(id)
           if (disabled.has(providerID)) continue
           const data = database[providerID]
@@ -1729,6 +1732,13 @@ const layer = Layer.effect(
 
     async function resolveSDK(model: Model, s: State, envs: Record<string, string | undefined>) {
       try {
+        if (
+          process.env.OPENCODE_MANAGED_PROFILE === "1" &&
+          !["@ai-sdk/openai", "@ai-sdk/openai-compatible", "@ai-sdk/anthropic"].includes(model.api.npm)
+        )
+          throw new Error(
+            `Provider SDK ${model.api.npm} is unavailable in the managed profile: execution is not accounted`,
+          )
         const provider = s.providers[model.providerID]
         const options = { ...provider.options }
 

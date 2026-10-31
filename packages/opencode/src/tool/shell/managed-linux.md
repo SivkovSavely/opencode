@@ -88,7 +88,9 @@ registry-managed handle without supplying its fence. `startPaused()/authorize()`
 remain available to callers that implement the fence directly; they intentionally
 do not call `Options.authorize` on the caller's behalf.
 `cancel(): Promise<Result>` is idempotent, synchronously revokes future
-authorization and closes the gate, then kills and joins cleanup. Cancellation
+authorization, then closes the gate, kills and joins cleanup. During launch it
+retains the unopened gate until namespace identity capture, so gate EOF cannot
+race away the evidence needed to confirm descendant cleanup. Cancellation
 before any successful authorization guarantees no user code, including while
 launch is in flight. After publication it cannot promise code has not run.
 `Symbol.asyncDispose` cancels and joins, throwing on failed cleanup. Callers must
@@ -99,7 +101,7 @@ positive token from the supervisor after it records the namespace-init identity.
 EOF denies execution. This covers early supervisor death even before Bubblewrap
 installs its parent-death signal. The command receives neither the gate nor the
 Bubblewrap or native wait-report descriptors. Arguments are passed verbatim, not interpolated.
-The FIFO is provisioned at launch by trusted `/usr/bin/mkfifo` in a private 0700
+The FIFO is provisioned at launch through libc `mkfifo` in a private 0700
 temporary directory and unlinked before spawning Bubblewrap. Only its blocking
 read descriptor is inherited as stdin; the host alone owns the nonblocking write
 descriptor. Fixed ready/authorized frames are stripped before output accounting.
@@ -116,6 +118,25 @@ helper is bound read-only at `/managed-wait`. Bubblewrap's PID-1 reaper remains 
 place; the helper forks the actual argv process and uses `waitpid` on that child.
 It exits after reporting, so ordinary completion still triggers namespace-wide
 descendant destruction.
+
+Compilation uses fixed arguments, a private 0700 directory outside the workspace
+bound as `/build`, and only fixed `PATH`, `HOME`, `TMPDIR` and `LC_ALL` values.
+A separate Bubblewrap PID namespace owns the compiler driver and every worker
+(cc1, assembler and linker). This trusted setup mounts only read-only `/usr`,
+private proc/devices and its writable private build directory, never the workspace.
+A fixed shell gate blocks compiler execution until the supervisor pins the
+monitor and namespace init using the same authenticated status pipe, live-parent
+and distinct-PID-namespace checks as command launch. EOF denies compilation.
+Cancellation or expiry kills init via pidfd, then the monitor, joins monitor exit,
+observes namespace teardown and joins diagnostic-pipe EOF before deleting build
+artifacts. A missing identity or unconfirmed teardown returns `cleanup: "failed"`;
+there is no numeric-PID kill fallback. Setup cancellation never launches the user
+command namespace. A successful compiler exit is insufficient: the
+output must be an owned regular, single-link executable with an ELF header before
+its partial filename is renamed to `wait`. Source, partial output, binary and
+control files are removed on setup failure or joined completion. The read-only
+bind-mounted binary is not unlinked inside the sandbox (that would fail with
+`EBUSY`); its host path is removed after namespace teardown.
 
 The helper opens a private FIFO in a narrowly bound disposable control directory
 at `/run/managed`, unlinks it **before** acknowledging the closed gate, and sets
@@ -166,28 +187,33 @@ such a valid report is retained without changing the cancellation/timeout reason
   merged `/usr` (`/bin`, `/lib`, `/lib64` mapped to `/usr/bin`, `/usr/lib`). Other
   distributions/toolchains can fail; this is not a portable Linux runtime image.
 - Requires Bun FFI, glibc `libc.so.6` exporting `pidfd_open`/`pidfd_send_signal`,
-  `/usr/bin/cc`, `/usr/bin/mkfifo`, and Linux `close_range`. Missing support fails
+  `/usr/bin/cc`, `/usr/bin/sh`, libc `mkfifo`, and Linux `close_range`. Missing support fails
   closed; there is no numeric-PID kill or lossy-status fallback. Validated with
   glibc 2.44 and GCC 16.2.1. Each launch compiles its helper; compilation/setup is
-  trusted, joined work, not a sandboxed project build. Cancellation/expiry during
-  setup prevents namespace launch but waits for this trusted work to finish.
-  An abrupt host-process crash can leave these trusted setup helpers running
-  until they finish; they have no project inputs or authorization to run user code.
+  trusted work, not a project build. Cancellation/expiry terminates and joins its
+  PID namespace, including stopped workers; an abrupt host-process death uses
+  `--die-with-parent` to kill the compiler namespace. No project inputs or user-code
+  authorization are available during compilation.
 - Mandatory user, PID, network, IPC, UTS, and cgroup namespaces; private proc and
   minimal devices; all capabilities dropped; further user namespaces disabled.
   Bubblewrap's PID-1 reaper is retained. `--die-with-parent` kills the namespace
   chain on supervisor death. New network namespaces include working loopback but
   no host interfaces or routes; host abstract Unix sockets are also isolated.
-- Read-only binds: `/usr/bin`, `/usr/lib`, and optionally one Rust toolchain at
+- Read-only binds: `/usr/bin`, `/usr/lib`, `/usr/include`, and optionally one Rust toolchain at
   `/toolchain`. User-data writable bind: the explicit workspace at `/work`. No host
   root/home bind, `/run`, host `/tmp`, `/etc`, sysfs/cgroupfs, manager socket,
   session bus, agent socket, resolver, host proc, or inherited extra descriptor.
   `/tmp`, HOME, Cargo home, and `/run` are private. No environment is inherited;
   only fixed HOME, PATH, TMPDIR, CARGO_HOME, and CARGO_NET_OFFLINE are supplied.
+  System C headers support native Cargo dependencies such as generated parsers;
+  GCC's private headers, startup objects, linker and libraries remain supplied by
+  `/usr/lib`, including through the existing `/lib` and `/lib64` symlinks. No host
+  `/etc` or additional library root is exposed.
 - The generated helper adds one read-only file bind and its private writable
   FIFO directory bind described above. No broad temporary-directory mount or
-  host control socket is added. Its host temporary directory must not lie under
-  the workspace; a conflicting `TMPDIR` is rejected before compilation.
+  host control socket is added. Both helper and gate temporary directories must
+  lie outside the workspace. Each independently canonicalizes and rejects a
+  conflicting `TMPDIR` before creating any directory, and rechecks the result.
 - The workspace must be a **trusted, exclusively delegated staging directory**,
   not an arbitrary live repository or home. Existing special files and writable
   hard links are rejected recursively. Symlinks resolve within the sandbox's
@@ -209,8 +235,12 @@ Both output pipes are continuously drained with one combined retention budget
 (default 1 MiB, maximum 16 MiB). Excess bytes are discarded and `truncated` is
 reported. Byte buffers avoid claiming UTF-8 completeness across truncation.
 
-Finite positive timeout is mandatory. Readiness requires a retained pidfd for
-namespace init, captured against a pinned proc-directory start-time identity.
+Finite positive timeout is mandatory. The host hierarchy is Bun supervisor,
+launched Bubblewrap monitor, then Bubblewrap's namespace init. The status pipe
+belongs only to Bubblewrap; its `child-pid` is not a direct child of Bun. Readiness
+requires retained pidfds and pinned proc-directory identities for both monitor
+and init, with live parent relationships checked during capture. Init must have
+namespace-local PID 1 and a PID namespace distinct from its monitor.
 Timeout/cancellation kills init through that pidfd **before** killing the
 Bubblewrap monitor; it does not depend solely on the monitor-death signal or use
 a reused numeric PID. Cancellation during startup waits for identity capture;
@@ -218,8 +248,9 @@ an unobserved init falls back to monitor termination after the cleanup interval
 and can never produce confirmed cleanup. `--die-with-parent` remains enabled for
 host-process crashes, and gate EOF denies execution before authorization. On
 ordinary main-process exit, Bubblewrap's reaper also exits and the kernel kills detached descendants.
-Cleanup waits for the recorded host PID/start-time identity of namespace init to
-disappear or become a zombie, and joins both pipe EOFs. Linux namespace-init exit
+Cleanup observes init through its retained proc directory, never by re-opening
+a potentially reused numeric PID, and waits for it to disappear or become a
+zombie, then joins both pipe EOFs. Linux namespace-init exit
 joins the remaining namespace tasks before zombie state. A missing identity,
 observer error, I/O error, or cleanup observation deadline produces
 `cleanup: "failed"`, never a successful teardown claim. A failed result is not
@@ -235,7 +266,13 @@ if the monitor has an exit status. `supervisorSignal` records the actual
 signal observed for the Bubblewrap monitor, separately from `reason` (exit,
 timeout, cancellation, or setup failure). A missing command produces shell exit 127. Do not interpret nonzero status, timeout, or pipe EOF alone as cleanup.
 
-There is no cgroup resource budget, seccomp syscall filter, disk quota, memory,
+The helper's seccomp filter denies new Unix sockets, reconnectable datagram
+socketpairs and io_uring. Connected Unix stream/seqpacket socketpairs remain
+available for Cargo IPC; they cannot reconnect to host pathname sockets, even
+after peer closure, shutdown or an `AF_UNSPEC` disconnect attempt. IPv4/IPv6
+sockets remain available inside the isolated network namespace.
+
+There is no cgroup resource budget, general-purpose syscall allowlist, disk quota, memory,
 CPU, PID, or output-rate limit. Fork/memory/disk exhaustion and kernel exploits
 remain risks; this is not a hostile multi-tenant service boundary. Uninterruptible
 kernel tasks can prevent exit, so command timeout is not a hard wall-clock return
@@ -249,12 +286,23 @@ the kernel teardown behavior independently instead.
 From `packages/opencode`:
 
 ```sh
-bun test test/tool/managed-linux.test.ts --timeout 45000
+bun test test/tool/managed-linux.test.ts test/tool/managed-linux-native.test.ts --timeout 45000
 bun typecheck
 ```
 
-Tests use only disposable directories. They compile a real Rust adversarial
-probe and a separate offline Cargo project; exercise a positive registration
+Tests use only disposable directories. Native setup tests poison inherited
+compiler settings and use `/usr/bin/prlimit` to force a real compiler output
+failure, checking that interrupted and failed setup leave no private artifacts.
+Separate fixtures pin and SIGSTOP an actual GCC cc1 worker, then cancel or expire
+the real launcher and verify timely namespace-wide death and artifact removal.
+Another resumes that worker after moving `TMPDIR` into the workspace and checks
+that gate provisioning independently rejects it without executing user code.
+Tests also reject a real Bubblewrap child without a distinct PID namespace.
+The integration tests compile a real Rust adversarial
+probe, a separate offline Cargo project, and a Cargo build script that invokes
+real `cc` and `ar`, links a native C library, and tests it from Rust. The native
+dependency includes system headers, calls libc, checks the header mount is
+read-only, and checks `/etc/passwd` remains unavailable. Tests exercise a positive registration
 barrier, paused readiness, synchronous authorization, peer acknowledgement,
 paused cancellation/death/timeout, blocked-timer deadline enforcement, bounded
 stdout/stderr, distinct raw exit/signal reports despite ambiguous Bubblewrap JSON,

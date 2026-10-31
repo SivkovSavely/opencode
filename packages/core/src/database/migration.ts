@@ -8,6 +8,7 @@ import schema from "./schema.gen"
 import retirementGuards from "./migration/20261028141816_runtime_retirement_guards"
 import managedEligibility from "./migration/20261028171900_managed_command_eligibility"
 import managedAncestry from "./migration/20261028174200_managed_command_ancestry"
+import managedExecution from "./migration/20261031090000_managed_execution_accounting"
 
 type Database = EffectDrizzleSqlite.EffectSQLiteDatabase
 type Transaction = Parameters<Parameters<Database["transaction"]>[0]>[0]
@@ -33,6 +34,7 @@ export function apply(db: Database) {
           yield* retirementGuards.up(tx)
           yield* managedEligibility.up(tx)
           yield* managedAncestry.up(tx)
+          yield* managedExecution.up(tx)
           yield* tx.run(
             sql`CREATE TABLE ${sql.identifier("migration")} (id TEXT PRIMARY KEY, time_completed INTEGER NOT NULL)`,
           )

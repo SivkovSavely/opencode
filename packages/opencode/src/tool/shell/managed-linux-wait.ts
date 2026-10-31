@@ -1,21 +1,45 @@
+import { spawn } from "node:child_process"
 import { closeSync, constants, openSync, readSync } from "node:fs"
-import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises"
+import { lstat, mkdir, mkdtemp, readFile, realpath, rename, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import path from "node:path"
+import { createInterface } from "node:readline"
+import type { Readable } from "node:stream"
 import type { ManagedPidfd } from "./managed-linux-pidfd"
 
 /** Trusted source only: neither the compiler nor its inputs come from the workspace. */
-export async function create(workspace: string, native: Awaited<ReturnType<typeof ManagedPidfd.load>>, check: () => void) {
+export async function create(
+  workspace: string,
+  native: Awaited<ReturnType<typeof ManagedPidfd.load>>,
+  check: () => void,
+  cleanupMs = 10_000,
+) {
   check()
-  const dir = await mkdtemp(path.join(tmpdir(), "opencode-managed-wait-"))
+  const temporary = await realpath(tmpdir())
+  if (temporary === workspace || temporary.startsWith(`${workspace}/`))
+    throw new Error("Managed helper directory must be outside the workspace")
+  const dir = await mkdtemp(path.join(temporary, "opencode-managed-wait-"))
   const descriptors: number[] = []
   try {
     const canonical = await realpath(dir)
     if (canonical === workspace || canonical.startsWith(`${workspace}/`))
       throw new Error("Managed helper directory must be outside the workspace")
     check()
-    const file = path.join(dir, "wait.c")
-    await writeFile(file, source, { mode: 0o600 })
+    await writeFile(path.join(dir, "wait.c"), source, { mode: 0o600, flag: "wx" })
+    check()
+    await compile(dir, native, check, cleanupMs)
+    const partial = path.join(dir, "wait.partial")
+    const info = await lstat(partial)
+    if (
+      !info.isFile() ||
+      info.nlink !== 1 ||
+      info.uid !== process.getuid!() ||
+      !(info.mode & 0o100) ||
+      !(await readFile(partial)).subarray(0, 4).equals(Buffer.from([0x7f, 0x45, 0x4c, 0x46]))
+    )
+      throw new Error("Compiler did not produce a managed ELF executable")
+    const file = path.join(dir, "wait")
+    await rename(partial, file)
     check()
     const control = path.join(dir, "control")
     await mkdir(control, { mode: 0o700 })
@@ -74,6 +98,210 @@ export async function create(workspace: string, native: Awaited<ReturnType<typeo
   }
 }
 
+export class CleanupError extends Error {}
+
+/** A PID namespace, not a process group or a racy tree scan, owns all compiler workers. */
+async function compile(
+  dir: string,
+  native: Awaited<ReturnType<typeof ManagedPidfd.load>>,
+  check: () => void,
+  cleanupMs: number,
+) {
+  const child = spawn(
+    "/usr/bin/bwrap",
+    [
+      "--unshare-user",
+      "--unshare-pid",
+      "--unshare-net",
+      "--die-with-parent",
+      "--new-session",
+      "--cap-drop",
+      "ALL",
+      "--ro-bind",
+      "/usr",
+      "/usr",
+      "--symlink",
+      "usr/bin",
+      "/bin",
+      "--symlink",
+      "usr/lib",
+      "/lib",
+      "--symlink",
+      "usr/lib",
+      "/lib64",
+      "--proc",
+      "/proc",
+      "--dev",
+      "/dev",
+      "--bind",
+      dir,
+      "/build",
+      "--chdir",
+      "/build",
+      "--clearenv",
+      "--setenv",
+      "PATH",
+      "/usr/bin",
+      "--setenv",
+      "HOME",
+      "/build",
+      "--setenv",
+      "TMPDIR",
+      "/build",
+      "--setenv",
+      "LC_ALL",
+      "C",
+      "--json-status-fd",
+      "3",
+      "--",
+      "/usr/bin/sh",
+      "-c",
+      'IFS= read -r token && [ "$token" = compile ] || exit 125; exec /usr/bin/cc "$@" </dev/null',
+      "managed-compile",
+      "-D_GNU_SOURCE",
+      "-std=c11",
+      "-O2",
+      "-Wall",
+      "-Wextra",
+      "-Werror",
+      "wait.c",
+      "-o",
+      "wait.partial",
+    ],
+    { cwd: dir, env: {}, stdio: ["pipe", "ignore", "pipe", "pipe"] },
+  )
+  const state: {
+    monitor?: ReturnType<typeof native.monitor>
+    target?: ReturnType<typeof native.monitor>
+    error?: unknown
+    stopped: boolean
+    fallback?: ReturnType<typeof setTimeout>
+  } = { stopped: false }
+  const exited = new Promise<number | null>((resolve) => {
+    child.once("exit", resolve)
+    child.once("error", (error) => {
+      state.error = error
+      resolve(null)
+    })
+  })
+  const diagnostics: Buffer[] = []
+  const drained = new Promise<void>((resolve) => {
+    child.stderr!.on("data", (chunk: Buffer) => diagnostics.push(chunk))
+    child.stderr!.once("end", resolve)
+    child.stderr!.once("close", resolve)
+    child.stderr!.once("error", (error) => {
+      state.error = error
+      resolve()
+    })
+  })
+  // EOF denies compilation. Never grant a permit until init's pidfd is retained.
+  child.stdin!.on("error", (error) => {
+    state.error ??= error
+  })
+  const stop = (error: unknown) => {
+    state.error ??= error
+    state.stopped = true
+    if (!state.target) {
+      state.fallback ??= setTimeout(() => {
+        child.stdin!.destroy()
+        try {
+          state.monitor?.kill()
+        } catch (error) {
+          state.error = error
+        }
+      }, cleanupMs)
+      return
+    }
+    clearTimeout(state.fallback)
+    child.stdin!.destroy()
+    try {
+      state.target.kill()
+      state.monitor!.kill()
+    } catch (error) {
+      state.error = error
+    }
+  }
+  try {
+    if (child.pid) state.monitor = native.monitor(child.pid)
+  } catch (error) {
+    stop(error)
+    child.stdin!.destroy()
+  }
+  const statuses = (async () => {
+    for await (const line of createInterface({ input: child.stdio[3] as Readable })) {
+      const info: unknown = JSON.parse(line)
+      if (typeof info !== "object" || !info) throw new Error("Invalid compiler namespace status")
+      if ("exit-code" in info) continue
+      if (!("child-pid" in info) || !Number.isSafeInteger(info["child-pid"]) || state.target || !state.monitor)
+        throw new Error("Invalid compiler namespace identity")
+      state.target = state.monitor.captureNamespace(Number(info["child-pid"]))
+      if (state.stopped) {
+        stop(state.error)
+        continue
+      }
+      check()
+      child.stdin!.end("compile\n")
+    }
+  })().catch((error) => {
+    stop(error)
+    // No compiler permit was published without a retained namespace identity.
+    if (!state.target) {
+      child.stdin!.destroy()
+      try {
+        state.monitor?.kill()
+      } catch (error) {
+        state.error = error
+      }
+    }
+  })
+  const timer = setInterval(() => {
+    if (state.stopped) return
+    try {
+      check()
+    } catch (error) {
+      stop(error)
+    }
+  }, 5)
+  try {
+    const code = await exited
+    clearInterval(timer)
+    clearTimeout(state.fallback)
+    await statuses
+    child.stdin!.destroy()
+    const deadline = performance.now() + cleanupMs
+    // Monitor exit and pipe EOF alone do not prove the compiler workers have exited.
+    const clean = await (async () => {
+      try {
+        if (!state.target) return !child.pid
+        if (!state.target.exited()) state.target.kill()
+        while (!state.target.exited() && performance.now() < deadline) await Bun.sleep(5)
+        return state.target.exited()
+      } catch (error) {
+        state.error = error
+        return false
+      }
+    })()
+    const pipes = await new Promise<boolean>((resolve) => {
+      const timer = setTimeout(() => resolve(false), Math.max(1, deadline - performance.now()))
+      drained.then(() => {
+        clearTimeout(timer)
+        resolve(true)
+      })
+    })
+    if (!pipes) child.stderr!.destroy()
+    await drained
+    if (!clean || !pipes) throw new CleanupError("Compiler namespace teardown or pipe EOF not confirmed")
+    if (state.error) throw state.error
+    check()
+    if (code !== 0) throw new Error(`Cannot compile managed helper (${code}): ${Buffer.concat(diagnostics)}`)
+  } finally {
+    clearInterval(timer)
+    clearTimeout(state.fallback)
+    state.target?.close()
+    state.monitor?.close()
+  }
+}
+
 const source = String.raw`
 #include <errno.h>
 #include <fcntl.h>
@@ -114,9 +342,17 @@ static int restrict_sockets(void) {
     BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPERM),
     BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_io_uring_register, 0, 1),
     BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPERM),
-    // Unix datagram socketpairs can reconnect to host pathname sockets.
-    BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_socketpair, 0, 1),
+    // Connected stream/seqpacket pairs support Cargo IPC but cannot reconnect.
+    // Datagram pairs can reconnect to host pathname sockets and remain forbidden.
+    BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_socketpair, 0, 8),
+    BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, args[0])),
+    BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, AF_UNIX, 0, 4),
+    BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, args[1])),
+    BPF_STMT(BPF_ALU | BPF_AND | BPF_K, ~(SOCK_CLOEXEC | SOCK_NONBLOCK)),
+    BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SOCK_STREAM, 2, 0),
+    BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SOCK_SEQPACKET, 1, 0),
     BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPERM),
+    BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
     BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_socket, 0, 4),
     BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, args[0])),
     BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, AF_INET, 2, 0),
@@ -143,7 +379,7 @@ static int send_bytes(int fd, const void *data, size_t length) {
 
 int main(int argc, char **argv) {
   if (argc < 2) return 126;
-  if (unlink("/tmp/managed-wait") < 0 || restrict_sockets() < 0) return 126;
+  if (restrict_sockets() < 0) return 126;
   // Children must not reopen the reporting channel through /proc or pidfd_getfd.
   if (prctl(PR_SET_DUMPABLE, 0, 0, 0, 0) < 0) return 126;
   int report = open("/run/managed/result", O_WRONLY | O_CLOEXEC | O_NONBLOCK);

@@ -3,7 +3,8 @@ import { mkdir, unlink } from "fs/promises"
 import path from "path"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
-import { Effect, Layer } from "effect"
+import { Cause, Effect, Exit, Layer } from "effect"
+import { pathToFileURL } from "node:url"
 import { ModelsDev } from "@opencode-ai/core/models-dev"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
@@ -86,6 +87,73 @@ const languageBaseURL = (language: unknown) => (language as { config: { baseURL:
 
 const it = testEffect(LayerNode.compile(LayerNode.group([Provider.node, Env.node, Plugin.node])))
 const experimentalModels = testEffect(providerLayer({ enableExperimentalModels: true }))
+
+it.instance("managed Zen autoloads free models without credentials or provider config", () =>
+  Effect.gen(function* () {
+    yield* setProcessEnv("OPENCODE_MANAGED_PROFILE", "1")
+    yield* setProcessEnv("OPENCODE_MANAGED_PLUGIN_ALLOWLIST", "[]")
+    yield* remove("OPENCODE_API_KEY")
+    const provider = yield* Provider.Service
+    const zen = yield* provider.getProvider(ProviderV2.ID.opencode)
+    expect(zen).toBeDefined()
+    expect(zen.options.apiKey).toBe("public")
+    expect(Object.values(zen.models).every((model) => model.cost.input === 0)).toBe(true)
+    const model = yield* provider.getModel(ProviderV2.ID.opencode, ModelV2.ID.make("big-pickle"))
+    expect(model.api.npm).toBe("@ai-sdk/openai-compatible")
+    expect((yield* provider.getLanguage(model)).modelId).toBe("big-pickle")
+  }),
+)
+
+it.instance(
+  "managed provider rejects custom SDK imports and factories while bundled compatible SDKs still work",
+  () =>
+    Effect.gen(function* () {
+      const instance = yield* TestInstance
+      const marker = path.join(instance.directory, "unsafe-sdk")
+      yield* setProcessEnv("OPENCODE_MANAGED_PROFILE", "1")
+      yield* setProcessEnv("OPENCODE_MANAGED_PLUGIN_ALLOWLIST", "[]")
+      yield* setProcessEnv("OPENCODE_TEST_PROVIDER_MARKER", marker)
+      const provider = yield* Provider.Service
+      const unsafe = yield* provider.getModel(ProviderV2.ID.make("unsafe"), ModelV2.ID.make("model"))
+      const rejected = yield* Effect.exit(provider.getLanguage(unsafe))
+      expect(Exit.isFailure(rejected)).toBe(true)
+      if (Exit.isFailure(rejected)) {
+        const error = Cause.squash(rejected.cause)
+        expect(error).toBeInstanceOf(Provider.InitError)
+        if (error instanceof Provider.InitError)
+          expect(String(error.cause)).toContain("is unavailable in the managed profile")
+      }
+      expect(yield* Effect.promise(() => Bun.file(`${marker}-import`).exists())).toBe(false)
+      expect(yield* Effect.promise(() => Bun.file(`${marker}-factory`).exists())).toBe(false)
+      const supported = yield* provider.getModel(ProviderV2.ID.make("supported"), ModelV2.ID.make("model"))
+      expect((yield* provider.getLanguage(supported)).modelId).toBe("model")
+      const cloud = yield* provider.getModel(ProviderV2.ID.make("google-vertex"), ModelV2.ID.make("managed-compatible"))
+      const cloudProvider = yield* provider.getProvider(ProviderV2.ID.make("google-vertex"))
+      expect(cloudProvider.options.fetch).toBeUndefined()
+      expect((yield* provider.getLanguage(cloud)).modelId).toBe("managed-compatible")
+    }),
+  {
+    config: {
+      provider: {
+        unsafe: {
+          npm: pathToFileURL(path.join(import.meta.dir, "../fixture/managed-provider-unsafe.ts")).href,
+          models: { model: { name: "Unsafe" } },
+          options: { apiKey: "test" },
+        },
+        supported: {
+          npm: "@ai-sdk/openai-compatible",
+          models: { model: { name: "Supported" } },
+          options: { apiKey: "test", baseURL: "http://127.0.0.1:1/v1" },
+        },
+        "google-vertex": {
+          npm: "@ai-sdk/openai-compatible",
+          models: { "managed-compatible": { name: "Direct compatible" } },
+          options: { apiKey: "test", baseURL: "http://127.0.0.1:1/v1", project: "test" },
+        },
+      },
+    },
+  },
+)
 
 const alphaProviderConfig = {
   provider: {

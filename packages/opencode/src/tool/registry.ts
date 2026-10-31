@@ -190,6 +190,8 @@ const layer = Layer.effect(
         const matches = dirs.flatMap((dir) =>
           Glob.scanSync("{tool,tools}/*.{js,ts}", { cwd: dir, absolute: true, dot: true, symlink: true }),
         )
+        if (process.env.OPENCODE_MANAGED_PROFILE === "1" && matches.length)
+          throw new Error("Custom tools are unavailable in the managed profile: their execution is not accounted")
         if (matches.length) yield* config.waitForDependencies()
         for (const match of matches) {
           const namespace = path.basename(match, path.extname(match))
@@ -306,6 +308,7 @@ const layer = Layer.effect(
 
     const tools: Interface["tools"] = Effect.fn("ToolRegistry.tools")(function* (input) {
       const filtered = (yield* all()).filter((tool) => {
+        if (process.env.OPENCODE_MANAGED_PROFILE === "1") return tool.id === "bash"
         if (tool.id === WebSearchTool.id) {
           return webSearchEnabled(input.providerID, { exa: flags.enableExa, parallel: flags.enableParallel })
         }

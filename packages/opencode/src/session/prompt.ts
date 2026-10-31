@@ -62,6 +62,7 @@ import { SessionQueue } from "./queue"
 import { SessionQueueV1 } from "@opencode-ai/schema/v1/session-queue"
 import { SessionQueueTable } from "@opencode-ai/core/session/queue.sql"
 import { requireUnmanagedShell } from "@/util/managed-shell"
+import { ManagedCommand } from "@opencode-ai/core/managed-command"
 
 // @ts-ignore
 globalThis.AI_SDK_LOG_WARNINGS = false
@@ -1065,6 +1066,8 @@ const layer = Layer.effect(
       )(function* (part) {
         if (part.type === "file") {
           if (part.source?.type === "resource") {
+            if (process.env.OPENCODE_MANAGED_PROFILE === "1")
+              throw new Error("MCP resources are unavailable in the managed profile")
             const { clientName, uri } = part.source
             yield* Effect.logInfo("mcp resource", { clientName, uri, mime: part.mime })
             const pieces: Draft<SessionV1.Part>[] = [
@@ -2164,6 +2167,10 @@ const layer = Layer.effect(
         deferInterruptedPark = false,
         executionFence?: number,
       ) {
+        if (process.env.OPENCODE_MANAGED_PROFILE !== "1")
+          yield* ManagedCommand.invalidateCoverage(database, sessionID).pipe(Effect.orDie)
+        if (process.env.OPENCODE_MANAGED_PROFILE === "1" && (yield* runtime.ownershipFence(sessionID)) === undefined)
+          throw new Error("Managed execution requires an admitted runtime owner")
         const ctx = yield* InstanceState.context
         let structured: unknown
         let step = 0
@@ -2260,7 +2267,7 @@ const layer = Layer.effect(
           }
 
           step++
-          if (step === 1)
+          if (step === 1 && process.env.OPENCODE_MANAGED_PROFILE !== "1")
             yield* title({
               session,
               modelID: lastUser.model.modelID,
@@ -2272,6 +2279,8 @@ const layer = Layer.effect(
           const task = tasks.pop()
 
           if (task?.type === "subtask") {
+            if (process.env.OPENCODE_MANAGED_PROFILE === "1")
+              throw new Error("Task delegation is unavailable in the managed profile: child execution is not accounted")
             yield* handleSubtask({ task, model, lastUser, sessionID, session, msgs })
             continue
           }
@@ -2397,7 +2406,7 @@ const layer = Layer.effect(
               })
             }
 
-            if (step === 1)
+            if (step === 1 && process.env.OPENCODE_MANAGED_PROFILE !== "1")
               yield* summary.summarize({ sessionID, messageID: lastUser.id }).pipe(Effect.ignore, Effect.forkIn(scope))
 
             yield* plugin.trigger("experimental.chat.messages.transform", {}, { messages: msgs })
@@ -2407,7 +2416,9 @@ const layer = Layer.effect(
               sys.skills(agent),
               sys.environment(model),
               instruction.system().pipe(Effect.orDie),
-              sys.mcp(agent, session.permission, McpActivation.names(currentSession.metadata)),
+              process.env.OPENCODE_MANAGED_PROFILE === "1"
+                ? Effect.succeed(undefined)
+                : sys.mcp(agent, session.permission, McpActivation.names(currentSession.metadata)),
               MessageV2.toModelMessagesEffect(msgs, model),
             ])
             const system = [
@@ -2502,7 +2513,8 @@ const layer = Layer.effect(
           continue
         }
 
-        yield* compaction.prune({ sessionID }).pipe(Effect.ignore, Effect.forkIn(scope))
+        if (process.env.OPENCODE_MANAGED_PROFILE !== "1")
+          yield* compaction.prune({ sessionID }).pipe(Effect.ignore, Effect.forkIn(scope))
         return yield* lastAssistant(sessionID)
       },
       (effect, sessionID, recovery, reconcile, manualRecovery, deferInterruptedPark) =>
@@ -2532,6 +2544,21 @@ const layer = Layer.effect(
             }),
           ),
         ),
+      // Runner owns this lease, independently of the interruptible caller waiting on enqueue.
+      (effect, sessionID) =>
+        process.env.OPENCODE_MANAGED_PROFILE !== "1"
+          ? effect
+          : Effect.acquireUseRelease(
+              Effect.gen(function* () {
+                const session = yield* sessions.get(sessionID).pipe(Effect.orDie)
+                return yield* runtime.admit({ sessionID, directory: session.directory })
+              }).pipe(Effect.orDie),
+              () => effect,
+              (admission, exit) =>
+                Exit.isFailure(exit) && Cause.hasInterrupts(exit.cause)
+                  ? releaseInterrupted(sessionID, admission.fence)
+                  : runtime.release(sessionID, admission.fence),
+            ),
     )
 
     const loop: (input: LoopInput) => Effect.Effect<SessionV1.WithParts> = Effect.fn("SessionPrompt.loop")(function* (

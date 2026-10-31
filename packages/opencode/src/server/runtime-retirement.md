@@ -56,12 +56,15 @@ It does not wait for leases or uncooperative tools. Repeating the operation poll
 the current status without reopening admission. A failed or
 interrupted request can leave the root retired; retry rather than resuming it.
 
-Historical roots, unacknowledged permits after a crash, failed cleanup, and roots
-with runtime execution or legacy/V2 history/input records remain `unknown`. Runner lease release is not proof
-of every tool or plugin's cleanup. `draining` means this process still owns a
-pending/running managed command or a live local execution lease. `drained` is only
-available for explicitly enrolled, execution-free roots whose commands all have
-confirmed cleanup. Never infer completion from owner death or fence revocation.
+Historical roots, unacknowledged permits after a crash, failed cleanup, and
+unaccounted execution remain `unknown`. V2 history/input also invalidates managed
+coverage because V2 execution is not supported by this profile. Legitimate legacy
+model messages and tool results do not invalidate an already enrolled root.
+`draining` means this process still owns a pending/running managed command or a
+live local execution lease. `drained` requires explicit enrollment, confirmed
+settlement of every durable permit, and no live local lease. A runner's release
+does not confirm an independent shell permit or an arbitrary plugin's cleanup.
+Never infer completion from owner death or fence revocation.
 
 V2 checks
 retirement at execution boundaries and interrupts active local drains, but a
@@ -102,10 +105,83 @@ coverage unknown. Trust is not a plugin cleanup guarantee. Call
 `ManagedCommand.invalidateCoverage(database, rootSessionID)` before any untracked
 nonmanaged execution. Existing roots cannot be upgraded, and unknown coverage
 cannot be restored. Normal nonmanaged execution is not routed through this API.
-History, inbox, and runtime execution inserts also permanently invalidate coverage
-in SQLite, including when their projections are subsequently deleted. Child
-creation and ancestry changes also invalidate coverage, so reparenting cannot
-import untracked work into a covered tree. Ordinary model sessions deliberately
-remain unknown even after all tracked commands and local leases finish. This
-implementation does not claim containment of arbitrary in-process plugin code,
-external tools, or activity that bypasses every application admission boundary.
+Managed model execution requires a tracked runtime. Before admitting its first
+local owner, the runtime persists a `managed_command` execution lease with generation
+`managed-execution`; it confirms that lease only when the last admitted owner has
+released. Cancellation acknowledgement, completion state, owner death, and server
+restart do not confirm a lease. Unresolved crash-era leases remain unknown even
+after a later owner completes new work. Managed bash has its own independent
+durable permit and joined namespace cleanup, including after caller interruption.
+The instance-owned model runner holds its own admission lease independently of
+the prompt caller. Disconnecting that caller cannot settle a still-running model
+turn; retirement must cancel and join the runner before its lease is released.
+
+Legacy history alone is not execution and no longer invalidates an enrolled root.
+Unaccounted runtime execution, V2 inbox/history activity, child creation, and ancestry
+changes still permanently invalidate coverage in SQLite, including when projections
+are subsequently deleted. Unmanaged model loops explicitly invalidate coverage.
+Retirement fences later model admission, retries, and managed command authorization;
+ordinary cancellation remains resumable. A newly enrolled managed root can therefore
+execute model turns and managed bash and reach `drained` after joined cancellation.
+
+The initial managed model profile exposes only bash (plus in-process structured
+output). Task delegation, background children/notifications, MCP tools/resources,
+custom tools, nonempty plugin allowlists, and execution without a tracked runtime
+are unsupported. Custom tools and direct task invocation fail closed; unsupported
+tools are not advertised to the model. Detached title generation, summaries, and
+pruning are disabled. V2 wake/resume remains explicitly unsupported. This contract
+does not claim containment of arbitrary in-process plugin code, external tools, or
+activity that bypasses every application admission boundary.
+
+Managed configuration rejects every MCP entry, local or remote, including disabled
+and lazy entries, before bootstrap or MCP instance initialization. Dynamic MCP add
+and transport creation are also rejected. Managed prompts skip MCP system context,
+tool/resource discovery and resource attachments, so an MCP server cannot be
+launched as a side effect of preparing an otherwise supported model turn.
+The managed effective configuration also forces LSP, formatting and snapshots off:
+prompt file attachments must not start detached language servers, and snapshot or
+formatting helpers must not launch processes outside managed bash accounting.
+Configuration loading does not schedule dependency installation in this profile.
+Provider SDKs are restricted to bundled `@ai-sdk/openai`,
+`@ai-sdk/openai-compatible`, and `@ai-sdk/anthropic`; arbitrary SDK installation,
+imports, plugin auth hooks, and provider-specific credential loaders are excluded.
+The built-in Zen loader may filter the local model catalog and supply public
+credentials. These restrictions are part of the supported execution contract,
+not proof that arbitrary in-process extensions have a joined lifecycle.
+
+## Historical Recovery Consumer Requirements
+
+The retirement operation is not a historical cleanup attestation API. Consumers
+must retain uncertainty rather than manufacture coverage or Session projections.
+In particular, the reported BAILA-160 inventory of 36 historical roots, including
+17 absent from both inspected projections, cannot be reconciled by enrolling them
+as new managed roots. This implementation does not alter that inventory or its
+persisted recovery state.
+
+- Use `POST /session/:sessionID/retire` against the verified owning Serve/database
+  with the correct workspace context and normal authentication. Retain the exact
+  root ID, returned membership, database identity, runtime version, and responses
+  as evidence. HTTP 200 establishes a permanent admission barrier, not cleanup.
+- Poll the same operation until `commandStatus` is `drained`. `draining` requires
+  waiting; `unknown` requires separate audited recovery, not a timeout-based
+  promotion. A lost HTTP response is retried idempotently, never by resuming the
+  old root. Retired prompt admission returns HTTP 409.
+- HTTP 404 means neither a Session nor a persisted root retirement tombstone was
+  found in that database. It is not evidence that execution ended. HTTP 409 on
+  retirement means the ID is not a root; HTTP 503 means retirement is unavailable.
+  None permits replacement. Do not invent records to turn a missing ID into 200.
+- For historical or crash-era `unknown`, separately establish and audit the
+  execution process boundary and descendant termination, covering every possible
+  owning Serve/runtime and database, and fence all old admission/notification
+  paths. A missing PID, process exit, owner death, fence increment, or a clean
+  workspace alone cannot supply this evidence. This API deliberately has no
+  endpoint to overwrite `unknown` or acknowledge historical cleanup.
+- Any future historical-attestation API needs explicit authorization, durable
+  immutable provenance binding the exact roots, database/runtime identities and
+  terminated process boundaries, idempotency, and admission fencing before
+  publishing cleanup. It must not reuse normal creation-time managed enrollment.
+  That separate procedure and API are not implemented here.
+- Start replacement work only after all relevant roots have both a durable
+  admission barrier and authoritative cleanup evidence. New roots do not acquire
+  a workspace-wide exclusion lock against unrelated sessions; the consumer must
+  enforce this ordering for every historical owner of the workspace.

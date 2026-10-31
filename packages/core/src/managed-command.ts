@@ -35,6 +35,30 @@ export const enrollCreatedRoot = (database: Database.Interface, sessionID: strin
     ? coverRoot(database, sessionID).pipe(Effect.asVoid, Effect.orDie)
     : invalidateCoverage(database, sessionID).pipe(Effect.asVoid, Effect.orDie)
 
+/** A durable lease for local model execution, settled only after all admitted owners join. */
+export const beginExecution = Effect.fn("ManagedCommand.beginExecution")(function* (
+  database: Database.Interface,
+  sessionID: string,
+  ownerInstance: string,
+) {
+  const permit = {
+    id: randomUUID(),
+    sessionID,
+    rootSessionID: sessionID,
+    ownerInstance,
+    generation: "managed-execution",
+  }
+  const row = yield* database.db.get(sql`
+    INSERT INTO managed_command (id, session_id, root_session_id, owner_instance, execution_generation, state, time_created, time_updated)
+    SELECT ${permit.id}, ${sessionID}, ${sessionID}, ${ownerInstance}, ${permit.generation}, 'running', ${Date.now()}, ${Date.now()}
+    WHERE EXISTS (SELECT 1 FROM session WHERE id = ${sessionID} AND parent_id IS NULL)
+      AND NOT EXISTS (SELECT 1 FROM runtime_retirement WHERE session_id = ${sessionID})
+    RETURNING id
+  `)
+  if (!row) return yield* new AdmissionError({ sessionID })
+  return permit
+})
+
 // Snapshot both ancestry graphs, including missing projections and ancestor execution generations.
 const boundary = (db: Pick<Database.Interface["db"], "all">, sessionID: string) =>
   db.all<{

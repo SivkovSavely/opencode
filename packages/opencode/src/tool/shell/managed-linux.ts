@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process"
 import { closeSync, constants, openSync, writeSync } from "node:fs"
-import { lstat, mkdtemp, readdir, realpath, readFile, rm } from "node:fs/promises"
+import { lstat, mkdtemp, readdir, realpath, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import path from "node:path"
 import { createInterface } from "node:readline"
@@ -104,6 +104,9 @@ export async function prepare(options: Options) {
     "--ro-bind",
     "/usr/lib",
     "/usr/lib",
+    "--ro-bind",
+    "/usr/include",
+    "/usr/include",
     "--symlink",
     "usr/bin",
     "/bin",
@@ -224,12 +227,17 @@ export async function prepare(options: Options) {
     const provision = await ManagedPidfd.load()
       .then(async (native) => {
         try {
-          const waiter = await ManagedWait.create(workspace, native, () => {
-            if (state.reason !== "exit" || performance.now() >= expires)
-              throw new Error("Managed command preparation was cancelled")
-          })
+          const waiter = await ManagedWait.create(
+            workspace,
+            native,
+            () => {
+              if (state.reason !== "exit" || performance.now() >= expires)
+                throw new Error("Managed command preparation was cancelled")
+            },
+            cleanupMs,
+          )
           try {
-            return { gate: await createGate(), native, waiter, error: undefined }
+            return { gate: await createGate(workspace, native), native, waiter, error: undefined, cleanupFailed: false }
           } catch (error) {
             await waiter.close()
             throw error
@@ -239,7 +247,13 @@ export async function prepare(options: Options) {
           throw error
         }
       })
-      .catch((error: unknown) => ({ gate: undefined, native: undefined, waiter: undefined, error: String(error) }))
+      .catch((error: unknown) => ({
+        gate: undefined,
+        native: undefined,
+        waiter: undefined,
+        error: String(error),
+        cleanupFailed: error instanceof ManagedWait.CleanupError,
+      }))
     if (state.reason === "exit" && performance.now() >= expires) state.reason = "timeout"
     if (!provision.gate || state.reason !== "exit") {
       if (provision.gate) {
@@ -261,7 +275,8 @@ export async function prepare(options: Options) {
         stdout: Buffer.alloc(0),
         stderr: Buffer.from(provision.error ?? "").subarray(0, budget),
         truncated: Buffer.byteLength(provision.error ?? "") > budget,
-        cleanup: "confirmed",
+        cleanup: provision.cleanupFailed ? "failed" : "confirmed",
+        ...(provision.cleanupFailed ? { cleanupError: provision.error } : {}),
       }
     }
     const gate = provision.gate
@@ -296,10 +311,16 @@ export async function prepare(options: Options) {
       pid?: number
       stat?: string
       target?: ReturnType<typeof native.monitor>
+      monitor?: ReturnType<typeof native.monitor>
       error?: string
       shellStatus?: number
       termination?: Exclude<Result["termination"], { kind: "unreported" }>
     } = {}
+    try {
+      if (child.pid) identity.monitor = native.monitor(child.pid)
+    } catch (error) {
+      identity.error = String(error)
+    }
     const stopped: { value: boolean; timer?: ReturnType<typeof setTimeout> } = { value: false }
     const closeGate = () => {
       try {
@@ -311,21 +332,32 @@ export async function prepare(options: Options) {
     const kill = () => {
       stopped.value = true
       state.phase = "stopping"
-      closeGate()
       // Let bwrap publish init's identity before killing its monitor. Otherwise init
       // can survive a monitor death before installing PR_SET_PDEATHSIG.
       if (!identity.target) {
         if (!child.pid || child.exitCode !== null || child.signalCode !== null) return
-        stopped.timer ??= setTimeout(() => child.kill("SIGKILL"), cleanupMs)
+        stopped.timer ??= setTimeout(() => {
+          closeGate()
+          try {
+            identity.monitor?.kill()
+          } catch (error) {
+            identity.error = String(error)
+          }
+        }, cleanupMs)
         return
       }
+      closeGate()
       clearTimeout(stopped.timer)
       try {
         identity.target?.kill()
       } catch (error) {
         identity.error = String(error)
       }
-      child.kill("SIGKILL")
+      try {
+        identity.monitor?.kill()
+      } catch (error) {
+        identity.error = String(error)
+      }
     }
     state.stop = kill
     state.permit = () => {
@@ -460,7 +492,8 @@ export async function prepare(options: Options) {
           throw new Error("Invalid bwrap namespace identity")
         if (!identity.pid) {
           identity.pid = Number(info["child-pid"])
-          identity.target = native.monitor(identity.pid)
+          if (!identity.monitor) throw new Error("Unpinned bwrap monitor")
+          identity.target = identity.monitor.captureNamespace(identity.pid)
           identity.stat = identity.target.stat
           if (stopped.value || !identity.stat) kill()
           else markReady()
@@ -484,16 +517,15 @@ export async function prepare(options: Options) {
     await statuses
     // Also join unexpected monitor death through the retained init pidfd.
     kill()
+    closeGate()
     waiter.release()
     const deadline = Date.now() + cleanupMs
     const cleanup = await (async () => {
       if (!identity.pid || !identity.stat) return false
       while (Date.now() < deadline) {
-        const current = await processIdentity(identity.pid!)
-        // A namespace init becomes a zombie only after zap_pid_ns_processes joins its tasks.
-        if (!current || current !== identity.stat) return true
-        const stat = await readFile(`/proc/${identity.pid}/stat`, "utf8").catch(() => "")
-        if (stat.slice(stat.lastIndexOf(")") + 2).startsWith("Z ")) return true
+        // The retained proc directory cannot observe a numerically reused PID.
+        // Init becomes a zombie only after zap_pid_ns_processes joins its tasks.
+        if (identity.target!.exited()) return true
         await Bun.sleep(10)
       }
       return false
@@ -522,6 +554,7 @@ export async function prepare(options: Options) {
     state.phase = "completed"
     acknowledged.resolve(false)
     identity.target?.close()
+    identity.monitor?.close()
     native.close()
     return {
       reason:
@@ -564,19 +597,18 @@ export async function prepare(options: Options) {
   }
 }
 
-async function createGate() {
-  const dir = await mkdtemp(path.join(tmpdir(), "opencode-managed-gate-"))
+async function createGate(workspace: string, native: Awaited<ReturnType<typeof ManagedPidfd.load>>) {
+  const temporary = await realpath(tmpdir())
+  if (temporary === workspace || temporary.startsWith(`${workspace}/`))
+    throw new Error("Managed gate directory must be outside the workspace")
+  const dir = await mkdtemp(path.join(temporary, "opencode-managed-gate-"))
   const descriptors: number[] = []
   try {
+    const canonical = await realpath(dir)
+    if (canonical === workspace || canonical.startsWith(`${workspace}/`))
+      throw new Error("Managed gate directory must be outside the workspace")
     const fifo = path.join(dir, "permit")
-    const child = Bun.spawn(["/usr/bin/mkfifo", "-m", "600", fifo], {
-      env: {},
-      stdin: "ignore",
-      stdout: "ignore",
-      stderr: "pipe",
-    })
-    const stderr = await new Response(child.stderr).text()
-    if ((await child.exited) !== 0) throw new Error(`Cannot create managed gate: ${stderr}`)
+    native.mkfifo(fifo)
     // Bootstrap a blocking reader without deadlocking open(). Only the host keeps a writer.
     // node:fs opens descriptors close-on-exec; only read is explicitly passed to bwrap.
     descriptors.push(openSync(fifo, constants.O_RDWR | constants.O_NONBLOCK))
@@ -601,15 +633,6 @@ async function createGate() {
     descriptors.forEach((fd) => closeSync(fd))
     await rm(dir, { recursive: true, force: true })
   }
-}
-
-async function processIdentity(pid: number) {
-  return readFile(`/proc/${pid}/stat`, "utf8")
-    .then((stat) => stat.slice(stat.lastIndexOf(")") + 2).split(" ")[19])
-    .catch((error: NodeJS.ErrnoException) => {
-      if (error.code === "ENOENT" || error.code === "ESRCH") return undefined
-      throw error
-    })
 }
 
 async function requireTree(dir: string, writable = false): Promise<void> {

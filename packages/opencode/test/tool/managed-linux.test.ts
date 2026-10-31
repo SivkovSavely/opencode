@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, expect, test } from "bun:test"
 import { spawn } from "node:child_process"
-import { mkdtemp, mkdir, readFile, readdir, rm } from "node:fs/promises"
+import { mkdtemp, mkdir, readFile, readdir, readlink, rm } from "node:fs/promises"
 import { createServer } from "node:net"
 import { tmpdir } from "node:os"
 import path from "node:path"
@@ -27,10 +27,40 @@ unsafe extern "C" {
   fn pidfd_open(pid: i32, flags: u32) -> i32;
   fn pidfd_getfd(pidfd: i32, fd: i32, flags: u32) -> i32;
   fn close(fd: i32) -> i32;
+  fn socketpair(domain: i32, kind: i32, protocol: i32, fds: *mut i32) -> i32;
+  fn connect(fd: i32, address: *const u8, length: u32) -> i32;
+  fn shutdown(fd: i32, how: i32) -> i32;
 }
 fn main() {
   let args: Vec<String> = env::args().collect();
   match args[1].as_str() {
+    "socketpairs" => {
+      unsafe {
+        let mut address = [0u8; 110];
+        address[0..2].copy_from_slice(&1u16.to_ne_bytes());
+        let name = b"/work/control.sock";
+        address[2..2 + name.len()].copy_from_slice(name);
+        for kind in [1, 5, 1 | 0x80000 | 0x800, 5 | 0x80000] {
+          let mut fds = [-1; 2];
+          assert_eq!(socketpair(1, kind, 0, fds.as_mut_ptr()), 0);
+          for fd in fds {
+            assert_eq!(connect(fd, address.as_ptr(), (3 + name.len()) as u32), -1);
+            let unspecified = [0u8; 2];
+            assert_eq!(connect(fd, unspecified.as_ptr(), 2), -1);
+            assert_eq!(connect(fd, address.as_ptr(), (3 + name.len()) as u32), -1);
+            assert_eq!(shutdown(fd, 2), 0);
+            assert_eq!(connect(fd, unspecified.as_ptr(), 2), -1);
+            assert_eq!(connect(fd, address.as_ptr(), (3 + name.len()) as u32), -1);
+            close(fd);
+          }
+        }
+        let mut fds = [-1; 2];
+        for kind in [2, 2 | 0x80000, 2 | 0x800] {
+          assert_eq!(socketpair(1, kind, 0, fds.as_mut_ptr()), -1);
+        }
+      }
+      println!("connected-pairs-only");
+    }
     "tree" | "orphan" => {
       unsafe {
         if fork() == 0 {
@@ -413,10 +443,43 @@ test("cancellation during startup never executes code and cannot hide unobserved
   const result = await handle.cancel()
   expect(await started).toBe(result)
   expect(result.reason).toBe("cancelled")
+  expect(result.cleanup).toBe("confirmed")
   expect(await Bun.file(path.join(dir, "unexpected")).exists()).toBe(false)
-  if (result.cleanup === "failed") {
-    expect(result.cleanupError).toBeDefined()
-    await expect(handle[Symbol.asyncDispose]()).rejects.toThrow()
+  expect(result.cleanupError).toBeUndefined()
+  await handle[Symbol.asyncDispose]()
+})
+
+test("expiry during trusted preparation never launches user code and joins cleanup", async () => {
+  const dir = await workspace()
+  await using handle = await ManagedLinux.prepare({ workspace: dir, argv: ["touch", "unexpected"], timeoutMs: 1 })
+  const result = await handle.start()
+  expect(result.reason).toBe("timeout")
+  expect(result.cleanup).toBe("confirmed")
+  expect(await handle.startPaused()).toBe(false)
+  expect(await Bun.file(path.join(dir, "unexpected")).exists()).toBe(false)
+})
+
+test("connected Cargo socketpairs cannot reconnect to a host pathname socket; datagram pairs are denied", async () => {
+  const dir = await workspace()
+  await using handle = await ManagedLinux.prepare({
+    workspace: dir,
+    argv: ["/work/probe", "socketpairs"],
+    timeoutMs: 1000,
+  })
+  expect(await handle.startPaused()).toBe(true)
+  const server = createServer((socket) => socket.destroy())
+  const connections: number[] = []
+  server.on("connection", () => connections.push(1))
+  // Deliberately add a real host IPC endpoint after mount validation to test reconnect denial.
+  await new Promise<void>((resolve) => server.listen(path.join(dir, "control.sock"), resolve))
+  try {
+    const result = await handle.start()
+    expect(result.termination).toEqual({ kind: "exit", exitCode: 0 })
+    expect(result.stdout.toString()).toContain("connected-pairs-only")
+    expect(result.cleanup).toBe("confirmed")
+    expect(connections).toEqual([])
+  } finally {
+    await new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())))
   }
 })
 
@@ -627,11 +690,21 @@ test("pidfd destroys an orphan namespace even when init has no parent-death sign
   child.stderr!.on("data", (chunk: Buffer) => errors.push(chunk))
   child.stdout!.resume()
   const observed: { target?: ReturnType<typeof native.monitor>; closed?: boolean } = {}
+  const monitor = native.monitor(child.pid!)
   try {
     for await (const line of createInterface({ input: child.stdio[3] as Readable })) {
       const info: unknown = JSON.parse(line)
       if (typeof info !== "object" || !info || !("child-pid" in info) || typeof info["child-pid"] !== "number") continue
-      observed.target = native.monitor(info["child-pid"])
+      observed.target = monitor.captureNamespace(info["child-pid"])
+      const status = await readFile(`/proc/${info["child-pid"]}/status`, "utf8")
+      expect(
+        status
+          .match(/^NSpid:\s+(.+)$/m)?.[1]
+          ?.trim()
+          .split(/\s+/)
+          .at(-1),
+      ).toBe("1")
+      expect(await readlink(`/proc/${info["child-pid"]}/ns/pid`)).not.toBe(await readlink(`/proc/${child.pid}/ns/pid`))
       break
     }
     if (!observed.target) {
@@ -657,6 +730,7 @@ test("pidfd destroys an orphan namespace even when init has no parent-death sign
   } finally {
     if (!observed.closed) observed.target?.kill()
     observed.target?.close()
+    monitor.close()
     native.close()
     child.kill("SIGKILL")
     await exited
@@ -829,6 +903,73 @@ test("compiles and runs a disposable offline Rust Cargo project", async () => {
   const result = await handle.start()
   expect(result.stderr.toString()).toContain("Finished")
   expect(result.stdout.toString()).toContain("rust-sandbox-ok")
+  expect(result.shellStatus).toBe(0)
+  expect(result.cleanup).toBe("confirmed")
+}, 40_000)
+
+test("builds and tests an offline Cargo project with a native C dependency and read-only system headers", async () => {
+  const dir = await workspace()
+  await mkdir(path.join(dir, "src"))
+  await Bun.write(
+    path.join(dir, "Cargo.toml"),
+    '[package]\nname = "managed_native_probe"\nversion = "0.1.0"\nedition = "2021"\n',
+  )
+  await Bun.write(
+    path.join(dir, "build.rs"),
+    `
+use std::{env, path::PathBuf, process::Command};
+fn main() {
+    let out = PathBuf::from(env::var_os("OUT_DIR").unwrap());
+    assert!(Command::new("cc").args(["-std=c11", "-Wall", "-Wextra", "-Werror", "-c", "native.c", "-o"])
+        .arg(out.join("native.o")).status().unwrap().success());
+    assert!(Command::new("ar").arg("rcs").arg(out.join("libmanaged_native.a"))
+        .arg(out.join("native.o")).status().unwrap().success());
+    println!("cargo:rustc-link-search=native={}", out.display());
+    println!("cargo:rustc-link-lib=static=managed_native");
+}
+`,
+  )
+  await Bun.write(
+    path.join(dir, "native.c"),
+    `
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <sys/statvfs.h>
+#include <unistd.h>
+
+int32_t native_value(void) {
+    struct statvfs mount;
+    if (statvfs("/usr/include", &mount) != 0 || !(mount.f_flag & ST_RDONLY)) return -1;
+    if (access("/etc/passwd", F_OK) == 0) return -2;
+    char *text = malloc(16);
+    if (!text) return -3;
+    snprintf(text, 16, "%d", (int)INT32_C(42));
+    int32_t value = (int32_t)strtol(text, NULL, 10);
+    free(text);
+    return value;
+}
+`,
+  )
+  await Bun.write(
+    path.join(dir, "src/lib.rs"),
+    `
+unsafe extern "C" { fn native_value() -> i32; }
+#[test]
+fn native_headers_and_linking_work() { assert_eq!(unsafe { native_value() }, 42); }
+`,
+  )
+  await using handle = await ManagedLinux.prepare({
+    workspace: dir,
+    rustToolchain: toolchain,
+    argv: ["cargo", "test", "--offline"],
+    timeoutMs: 30_000,
+  })
+  const result = await handle.start()
+  expect(result.stderr.toString()).toContain("Finished")
+  expect(result.stdout.toString()).toContain("test native_headers_and_linking_work ... ok")
+  expect(result.reason).toBe("exit")
+  expect(result.termination).toEqual({ kind: "exit", exitCode: 0 })
   expect(result.shellStatus).toBe(0)
   expect(result.cleanup).toBe("confirmed")
 }, 40_000)
