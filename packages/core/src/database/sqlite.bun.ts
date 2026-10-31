@@ -1,4 +1,6 @@
 import { Database } from "bun:sqlite"
+import { existsSync } from "node:fs"
+import { DatabaseCompatibility } from "./compatibility"
 import { drizzle } from "drizzle-orm/bun-sqlite"
 import * as Context from "effect/Context"
 import * as Effect from "effect/Effect"
@@ -155,6 +157,14 @@ const nativeLayer = (config: Config) =>
   Layer.effect(
     Sqlite.Native,
     Effect.gen(function* () {
+      if (config.filename !== ":memory:" && existsSync(config.filename)) {
+        const probe = new Database(config.filename, { readonly: true })
+        try {
+          DatabaseCompatibility.check(config.filename, (sql) => probe.query(sql).all())
+        } finally {
+          probe.close()
+        }
+      }
       const native = new Database(config.filename, {
         readonly: config.readonly,
         readwrite: config.readwrite ?? true,

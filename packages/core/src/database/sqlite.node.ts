@@ -1,4 +1,6 @@
 import { DatabaseSync, type SQLInputValue } from "node:sqlite"
+import { existsSync } from "node:fs"
+import { DatabaseCompatibility } from "./compatibility"
 import { drizzle } from "drizzle-orm/node-sqlite"
 import * as Context from "effect/Context"
 import * as Effect from "effect/Effect"
@@ -148,6 +150,14 @@ const nativeLayer = (config: Config) =>
   Layer.effect(
     Sqlite.Native,
     Effect.gen(function* () {
+      if (config.filename !== ":memory:" && existsSync(config.filename)) {
+        const probe = new DatabaseSync(config.filename, { readOnly: true })
+        try {
+          DatabaseCompatibility.check(config.filename, (sql) => probe.prepare(sql).all())
+        } finally {
+          probe.close()
+        }
+      }
       const native = new DatabaseSync(config.filename, {
         readOnly: config.readonly,
         timeout: config.timeout,
