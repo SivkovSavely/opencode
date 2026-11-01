@@ -20,6 +20,7 @@ import { SessionRevert } from "@/session/revert"
 import { SessionRunState } from "@/session/run-state"
 import { SessionStatus } from "@/session/status"
 import { RuntimeLifecycle } from "@/server/runtime-lifecycle"
+import { ManagedWorkspace } from "@/server/managed-workspace"
 import { SessionSummary } from "@/session/summary"
 import { Todo } from "@/session/todo"
 import { MessageID, PartID, SessionID } from "@/session/schema"
@@ -81,16 +82,19 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
     const scope = yield* Scope.Scope
 
     const list = Effect.fn("SessionHttpApi.list")(function* (ctx: { query: typeof ListQuery.Type }) {
-      const directory = ctx.query.directory ? yield* InstanceState.directory : undefined
-      return yield* session.list({
-        directory: ctx.query.scope === "project" ? undefined : directory,
-        scope: ctx.query.scope,
-        path: ctx.query.path,
+      const directory = ManagedWorkspace.directory ?? (ctx.query.directory ? yield* InstanceState.directory : undefined)
+      const items = yield* session.list({
+        directory: !ManagedWorkspace.directory && ctx.query.scope === "project" ? undefined : directory,
+        scope: ManagedWorkspace.directory ? undefined : ctx.query.scope,
+        path: ManagedWorkspace.directory ? undefined : ctx.query.path,
         roots: ctx.query.roots,
         start: ctx.query.start,
         search: ctx.query.search,
         limit: ctx.query.limit,
       })
+      return ManagedWorkspace.directory
+        ? items.filter((item) => !item.workspaceID && ManagedWorkspace.allows(item.directory))
+        : items
     })
 
     const status = Effect.fn("SessionHttpApi.status")(function* () {
@@ -107,7 +111,10 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
 
     const children = Effect.fn("SessionHttpApi.children")(function* (ctx: { params: { sessionID: SessionID } }) {
       yield* requireSession(ctx.params.sessionID)
-      return yield* session.children(ctx.params.sessionID)
+      const items = yield* session.children(ctx.params.sessionID)
+      return ManagedWorkspace.directory
+        ? items.filter((item) => !item.workspaceID && ManagedWorkspace.allows(item.directory))
+        : items
     })
 
     const todo = Effect.fn("SessionHttpApi.todo")(function* (ctx: { params: { sessionID: SessionID } }) {

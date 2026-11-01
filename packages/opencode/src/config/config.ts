@@ -417,7 +417,7 @@ const layer = Layer.effect(
           yield* Effect.logDebug("loaded custom config", { path: Flag.OPENCODE_CONFIG })
         }
 
-        if (!Flag.OPENCODE_DISABLE_PROJECT_CONFIG) {
+        if (!Flag.OPENCODE_DISABLE_PROJECT_CONFIG && process.env.OPENCODE_MANAGED_PROFILE !== "1") {
           for (const file of yield* ConfigPaths.files("opencode", ctx.directory, ctx.worktree).pipe(Effect.orDie)) {
             yield* merge(file, yield* loadFile(file, authEnv), "local")
           }

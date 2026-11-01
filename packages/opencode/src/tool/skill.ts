@@ -4,6 +4,7 @@ import { Ripgrep } from "@opencode-ai/core/ripgrep"
 import { Skill } from "../skill"
 import * as Tool from "./tool"
 import DESCRIPTION from "./skill.txt"
+import { ManagedSkill } from "../skill/managed"
 
 export const Parameters = Schema.Struct({
   name: Schema.String.annotate({ description: "The name of the skill from available_skills" }),
@@ -30,6 +31,14 @@ export const SkillTool = Tool.define(
             always: [params.name],
             metadata: {},
           })
+
+          if (ManagedSkill.enabled) {
+            return {
+              title: `Loaded skill: ${info.name}`,
+              output: info.content.trim(),
+              metadata: { name: info.name, truncated: false } as { name: string; dir?: string; truncated?: boolean },
+            }
+          }
 
           const dir = path.dirname(info.location)
           const base = dir

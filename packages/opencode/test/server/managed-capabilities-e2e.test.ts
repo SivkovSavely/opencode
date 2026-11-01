@@ -202,11 +202,15 @@ test("isolated managed WorkQueue, children, compression and joined retirement", 
         : key === "workflow"
           ? workflow[index]
           : key === "review-child" && index === 0
-            ? bash("printf 'reviewer-real-output\\n'; printf reviewed > reviewed.txt")
+            ? bash(
+                "cat root.txt; printf 'reviewer-scratch\\n' > /tmp/reviewer.txt && test \"$(cat /tmp/reviewer.txt)\" = reviewer-scratch && printf 'reviewer-scratch-verified\\n'; if printf malicious > reviewed.txt 2>/dev/null; then printf 'source-write-unexpectedly-succeeded\\n'; else printf 'reviewer-readonly-denied\\n'; fi",
+              )
             : key === "verify-child" && index === 0
-              ? bash("test -f reviewed.txt && printf 'verifier-real-output\\n'; printf verified > verified.txt")
+              ? bash(
+                  "cat root.txt; printf 'verifier-scratch\\n' > /tmp/verifier.txt && test \"$(cat /tmp/verifier.txt)\" = verifier-scratch && printf 'verifier-scratch-verified\\n'; if printf malicious > verified.txt 2>/dev/null; then printf 'source-write-unexpectedly-succeeded\\n'; else printf 'verifier-readonly-denied\\n'; fi",
+                )
               : key === "retire-child-root" && index === 0
-                ? task("reviewer", "CAP:slow-child")
+                ? task("specialist", "CAP:slow-child")
                 : key === "slow-child" && index === 0
                   ? bash(
                       "setsid /bin/sh -c 'sleep 8; printf escaped > child-late.txt' </dev/null >/dev/null 2>&1 & printf ready > child-ready.txt; sleep 120",
@@ -221,9 +225,10 @@ test("isolated managed WorkQueue, children, compression and joined retirement", 
         expect(tools.toSorted()).toEqual([
           "bash",
           "compress",
+          "skill",
           ...(["review-child", "verify-child", "slow-child"].includes(key) ? [] : ["task"]),
           "wq_get_work",
-          "wq_update_progress",
+          ...(["review-child", "verify-child"].includes(key) ? [] : ["wq_update_progress"]),
         ])
       const chunk = (delta: unknown, finish: string | null = null) => ({
         id: `chatcmpl-${seen.length}`,
@@ -274,6 +279,7 @@ test("isolated managed WorkQueue, children, compression and joined retirement", 
       agent: {
         reviewer: { mode: "subagent", model: "staging/staging", permission: "allow" },
         verifier: { mode: "subagent", model: "staging/staging", permission: "allow" },
+        specialist: { mode: "subagent", model: "staging/staging", permission: "allow" },
       },
       provider: {
         staging: {
@@ -403,11 +409,15 @@ test("isolated managed WorkQueue, children, compression and joined retirement", 
         .filter((part) => part.tool === "bash")
         .map((part) => part.state?.output)
         .join("\n")
-      expect(output).toMatch(/reviewer-real-output|verifier-real-output/)
+      expect(output).toMatch(/reviewer-readonly-denied|verifier-readonly-denied/)
+      expect(output).toContain("root")
+      expect(output).toMatch(/reviewer-scratch-verified|verifier-scratch-verified/)
     }
-    expect(await Bun.file(path.join(workspace, "reviewed.txt")).text()).toBe("reviewed")
-    expect(await Bun.file(path.join(workspace, "verified.txt")).text()).toBe("verified")
-    expect(calls.slice(0, 2)).toEqual([
+    expect(await Bun.file(path.join(workspace, "reviewed.txt")).exists()).toBe(false)
+    expect(await Bun.file(path.join(workspace, "verified.txt")).exists()).toBe(false)
+    expect(await Bun.file(path.join(evidence, "tmp", "reviewer.txt")).exists()).toBe(false)
+    expect(await Bun.file(path.join(evidence, "tmp", "verifier.txt")).exists()).toBe(false)
+    expect(calls).toEqual([
       { name: "wq_get_work", arguments: { issueId: "STAGING-1" } },
       { name: "wq_update_progress", arguments: { issueId: "STAGING-1", expectedGeneration: 7, progress: "reviewing" } },
     ])

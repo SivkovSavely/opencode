@@ -24,18 +24,20 @@ export const directories = Effect.fn("ConfigPaths.directories")(function* (direc
   const afs = yield* FSUtil.Service
   return unique([
     Global.Path.config,
-    ...(!Flag.OPENCODE_DISABLE_PROJECT_CONFIG
+    ...(!Flag.OPENCODE_DISABLE_PROJECT_CONFIG && process.env.OPENCODE_MANAGED_PROFILE !== "1"
       ? yield* afs.up({
           targets: [".opencode"],
           start: directory,
           stop: worktree,
         })
       : []),
-    ...(yield* afs.up({
-      targets: [".opencode"],
-      start: Global.Path.home,
-      stop: Global.Path.home,
-    })),
+    ...(process.env.OPENCODE_MANAGED_PROFILE !== "1"
+      ? yield* afs.up({
+          targets: [".opencode"],
+          start: Global.Path.home,
+          stop: Global.Path.home,
+        })
+      : []),
     ...(Flag.OPENCODE_CONFIG_DIR ? [Flag.OPENCODE_CONFIG_DIR] : []),
   ])
 })

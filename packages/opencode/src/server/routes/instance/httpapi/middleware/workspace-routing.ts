@@ -13,6 +13,7 @@ import { HttpClient, HttpServerRequest, HttpServerResponse } from "effect/unstab
 import { HttpApiMiddleware } from "effect/unstable/httpapi"
 import * as Socket from "effect/unstable/socket/Socket"
 import { InvalidRequestError } from "../errors"
+import { ManagedWorkspace } from "@/server/managed-workspace"
 
 // Query fields this middleware reads from the URL. Spread into every
 // endpoint query schema in groups that apply WorkspaceRoutingMiddleware,
@@ -84,7 +85,12 @@ function selectedV2WorkspaceID(
 }
 
 function defaultDirectory(request: HttpServerRequest.HttpServerRequest, url: URL): string {
-  return url.searchParams.get("directory") || request.headers["x-opencode-directory"] || process.cwd()
+  return (
+    url.searchParams.get("directory") ||
+    request.headers["x-opencode-directory"] ||
+    ManagedWorkspace.directory ||
+    process.cwd()
+  )
 }
 
 function shouldStayOnControlPlane(request: HttpServerRequest.HttpServerRequest, url: URL): boolean {
@@ -219,16 +225,37 @@ function routeHttpApiWorkspace<E>(
 > {
   return Effect.gen(function* () {
     const request = yield* HttpServerRequest.HttpServerRequest
-    const sessionID = getWorkspaceRouteSessionID(requestURL(request))
+    const url = requestURL(request)
+    if (ManagedWorkspace.directory) {
+      const hints = [...url.searchParams.getAll("directory"), request.headers["x-opencode-directory"]].filter(
+        (value): value is string => value !== undefined,
+      )
+      if (
+        url.searchParams.has("workspace") ||
+        configuredWorkspaceID() ||
+        hints.some((hint) => {
+          try {
+            return !ManagedWorkspace.allows(decodeURIComponent(hint))
+          } catch {
+            return !ManagedWorkspace.allows(hint)
+          }
+        })
+      )
+        return HttpServerResponse.text("Forbidden", { status: 403 })
+    }
+    const sessionID = getWorkspaceRouteSessionID(url)
     const session = sessionID
       ? yield* Session.Service.use((svc) => svc.get(sessionID)).pipe(
           Effect.catchIf(
             (error): error is NotFoundError => NotFoundError.isInstance(error),
             () => Effect.succeed(undefined),
           ),
-          Effect.catchDefect(() => Effect.succeed(undefined)),
+          Effect.catchDefect((error) => (ManagedWorkspace.directory ? Effect.die(error) : Effect.succeed(undefined))),
         )
       : undefined
+    if (ManagedWorkspace.directory && session && (session.workspaceID || !ManagedWorkspace.allows(session.directory))) {
+      return HttpServerResponse.text("Forbidden", { status: 403 })
+    }
     const plan = yield* planRequest(request, session)
     return yield* routeWorkspace(client, effect, plan)
   })

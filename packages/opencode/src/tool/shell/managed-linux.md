@@ -200,7 +200,9 @@ such a valid report is retained without changing the cancellation/timeout reason
   chain on supervisor death. New network namespaces include working loopback but
   no host interfaces or routes; host abstract Unix sockets are also isolated.
 - Read-only binds: `/usr/bin`, `/usr/lib`, `/usr/include`, and optionally one Rust toolchain at
-  `/toolchain`. User-data writable bind: the explicit workspace at `/work`. No host
+  `/toolchain`. The explicit workspace at `/work` is writable for ordinary work
+  and read-only when the managed read-only ceiling applies. An optional validated
+  independent Git snapshot is mounted read-only at `/work/.git`. No host
   root/home bind, `/run`, host `/tmp`, `/etc`, sysfs/cgroupfs, manager socket,
   session bus, agent socket, resolver, host proc, or inherited extra descriptor.
   `/tmp`, HOME, Cargo home, and `/run` are private. No environment is inherited;
@@ -223,11 +225,18 @@ such a valid report is retained without changing the cancellation/timeout reason
   must be trusted, static, socket-free installation trees. This is not safe for
   arbitrary concurrent host mutation or for exposing a directory already used
   by host services. Read-only binding a socket does not prevent connecting to it.
-- All workspace changes persist and may be malicious. Host automation must not
+- Writable workspace changes persist and may be malicious; `/tmp` is discarded
+  per command. Read-only compiler runs need `CARGO_TARGET_DIR` under `/tmp`.
+  Host automation must not
   blindly execute generated scripts, load project config, follow new symlinks,
   or run build artifacts outside the sandbox. Offline Rust dependency resolution
   requires vendored dependencies already present in the workspace; no host Cargo
   credentials/cache, rustup home, or network download is exposed.
+
+The snapshot must be standalone, outside the workspace, without shared Git
+metadata, hooks, alternates or symlinks, with the exact sanitized config and index
+described in `../../server/managed-baila-workflow.md`. Refresh only after drain and
+restart. It enables inspection, not host Git mutation or a host bridge.
 
 ## Completion And Limits
 

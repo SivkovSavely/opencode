@@ -122,6 +122,7 @@ import { GlobalProjectList } from "@/server/global-project-list"
 import { RuntimeLifecycle } from "@/server/runtime-lifecycle"
 import { ServerRecovery } from "@/server/recovery"
 import { historicalFenceHandlers } from "./handlers/historical-fence"
+import { managedWorkspaceMiddleware } from "./middleware/managed-workspace"
 
 export const context = Context.makeUnsafe<unknown>(new Map())
 
@@ -301,6 +302,7 @@ export function createRoutes(
       compressionLayer,
       corsVaryFix,
       fenceLayer,
+      managedWorkspaceMiddleware,
       cors(corsOptions),
       AppNodeBuilderV1.build(MoveSession.node, [[LocationServiceMap.node, locationServiceMapV2]]),
       HttpServer.layerServices,

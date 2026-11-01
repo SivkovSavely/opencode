@@ -63,6 +63,7 @@ import { SessionQueueV1 } from "@opencode-ai/schema/v1/session-queue"
 import { SessionQueueTable } from "@opencode-ai/core/session/queue.sql"
 import { requireUnmanagedShell } from "@/util/managed-shell"
 import { ManagedCommand } from "@opencode-ai/core/managed-command"
+import { ManagedWorkspace } from "@/server/managed-workspace"
 
 // @ts-ignore
 globalThis.AI_SDK_LOG_WARNINGS = false
@@ -73,6 +74,25 @@ const decodeQueueOrder = Schema.decodeUnknownOption(
   Schema.Struct({ after: Schema.optional(MessageID), ids: Schema.Array(MessageID) }),
 )
 const MAX_MCP_RESOURCE_BLOB_BYTES = 10 * 1024 * 1024
+function hasManagedFileAttachment(parts: readonly { type: string; url?: string }[]) {
+  return (
+    ManagedWorkspace.profile &&
+    parts.some(
+      (part) =>
+        part.type === "file" &&
+        part.url !== undefined &&
+        URL.canParse(part.url) &&
+        new URL(part.url).protocol === "file:",
+    )
+  )
+}
+
+function rejectManagedInputParts(parts: readonly { type: string; url?: string }[]) {
+  if (hasManagedFileAttachment(parts)) throw new Error("File URL attachments are unavailable in the managed profile")
+  if (ManagedWorkspace.profile && parts.some((part) => part.type === "subtask"))
+    throw new Error("Structured subtasks are unavailable in the managed profile")
+}
+
 const SUPPORTED_MCP_RESOURCE_ATTACHMENT_MIMES = new Set([
   "application/pdf",
   "image/gif",
@@ -1028,6 +1048,7 @@ const layer = Layer.effect(
       delivery?: SessionQueueV1.Entry,
       resolved = false,
     ) {
+      rejectManagedInputParts(input.parts)
       const agentName = input.agent
       const ag = agentName ? yield* agents.get(agentName) : yield* agents.defaultInfo()
       if (!ag) {
@@ -1393,6 +1414,8 @@ const layer = Layer.effect(
           { message: info, parts: resolvedParts },
         )
 
+      rejectManagedInputParts(resolvedParts)
+
       const parts = resolved
         ? resolvedParts
         : yield* Effect.forEach(resolvedParts, (part) =>
@@ -1537,6 +1560,7 @@ const layer = Layer.effect(
     ) => Effect.Effect<SessionV1.WithParts, Image.Error | RuntimeLifecycle.RuntimeDrainingError> = Effect.fn(
       "SessionPrompt.prompt",
     )(function* (input: PromptInput, task?: TaskAdmission, delivery?: SessionQueueV1.Entry, resolved = false) {
+      rejectManagedInputParts(input.parts)
       const session = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
       const work = Effect.gen(function* () {
         const existing =
@@ -1901,6 +1925,23 @@ const layer = Layer.effect(
       sessionID: SessionID,
       input: SessionQueueV1.Submit,
     ) {
+      if (
+        (input.payload.kind === "prompt" || input.payload.kind === "command") &&
+        hasManagedFileAttachment(input.payload.parts ?? [])
+      )
+        return yield* new SessionQueue.QueueError({
+          reason: "invalid",
+          message: "File URL attachments are unavailable in the managed profile",
+        })
+      if (
+        ManagedWorkspace.profile &&
+        input.payload.kind === "prompt" &&
+        input.payload.parts.some((part) => part.type === "subtask")
+      )
+        return yield* new SessionQueue.QueueError({
+          reason: "invalid",
+          message: "Structured subtasks are unavailable in the managed profile",
+        })
       yield* requireManagedRootQueue(sessionID)
       yield* queue.enqueue(sessionID, input)
       yield* wakeQueue(sessionID)

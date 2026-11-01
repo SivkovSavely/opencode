@@ -22,59 +22,58 @@ const command = [
   "Bun.write(process.env.OPENCODE_TEST_MCP_MARKER, 'started'); setInterval(() => {}, 1000)",
 ]
 
-const managed = Effect.gen(function* () {
-  const previous = process.env.OPENCODE_MANAGED_PROFILE
-  const marker = process.env.OPENCODE_TEST_MCP_MARKER
-  const instance = yield* TestInstance
-  yield* Effect.acquireRelease(
-    Effect.sync(() => {
-      process.env.OPENCODE_MANAGED_PROFILE = "1"
-      process.env.OPENCODE_TEST_MCP_MARKER = path.join(instance.directory, "mcp-started")
-    }),
-    () =>
+const managed = (config?: unknown) =>
+  Effect.gen(function* () {
+    const previous = process.env.OPENCODE_MANAGED_PROFILE
+    const marker = process.env.OPENCODE_TEST_MCP_MARKER
+    const configContent = process.env.OPENCODE_CONFIG_CONTENT
+    const instance = yield* TestInstance
+    yield* Effect.acquireRelease(
       Effect.sync(() => {
-        if (previous === undefined) delete process.env.OPENCODE_MANAGED_PROFILE
-        else process.env.OPENCODE_MANAGED_PROFILE = previous
-        if (marker === undefined) delete process.env.OPENCODE_TEST_MCP_MARKER
-        else process.env.OPENCODE_TEST_MCP_MARKER = marker
+        process.env.OPENCODE_MANAGED_PROFILE = "1"
+        process.env.OPENCODE_TEST_MCP_MARKER = path.join(instance.directory, "mcp-started")
+        if (config !== undefined) process.env.OPENCODE_CONFIG_CONTENT = JSON.stringify(config)
       }),
-  )
-  return path.join(instance.directory, "mcp-started")
-})
+      () =>
+        Effect.sync(() => {
+          if (previous === undefined) delete process.env.OPENCODE_MANAGED_PROFILE
+          else process.env.OPENCODE_MANAGED_PROFILE = previous
+          if (marker === undefined) delete process.env.OPENCODE_TEST_MCP_MARKER
+          else process.env.OPENCODE_TEST_MCP_MARKER = marker
+          if (configContent === undefined) delete process.env.OPENCODE_CONFIG_CONTENT
+          else process.env.OPENCODE_CONFIG_CONTENT = configContent
+        }),
+    )
+    return path.join(instance.directory, "mcp-started")
+  })
 
-it.instance(
-  "managed config rejects local MCP before bootstrap or MCP initialization can launch it",
-  () =>
-    Effect.gen(function* () {
-      const marker = yield* managed
-      const mcp = yield* MCP.Service
-      const bootstrap = yield* InstanceBootstrap.Service
-      for (const effect of [mcp.status(), bootstrap.run]) {
-        const exit = yield* Effect.exit(effect)
-        expect(Exit.isFailure(exit)).toBe(true)
-        if (Exit.isFailure(exit)) expect(String(Cause.squash(exit.cause))).toContain("MCP configuration is unavailable")
-      }
-      expect(yield* Effect.promise(() => Bun.file(marker).exists())).toBe(false)
-    }),
-  { config: { mcp: { marker: { type: "local", command, timeout: 500 } } } },
-)
-
-it.instance(
-  "managed config rejects remote MCP before initialization",
-  () =>
-    Effect.gen(function* () {
-      yield* managed
-      const config = yield* Config.Service
-      const exit = yield* Effect.exit(config.get())
+it.instance("managed config rejects local MCP before bootstrap or MCP initialization can launch it", () =>
+  Effect.gen(function* () {
+    const marker = yield* managed({ mcp: { marker: { type: "local", command, timeout: 500 } } })
+    const mcp = yield* MCP.Service
+    const bootstrap = yield* InstanceBootstrap.Service
+    for (const effect of [mcp.status(), bootstrap.run]) {
+      const exit = yield* Effect.exit(effect)
       expect(Exit.isFailure(exit)).toBe(true)
       if (Exit.isFailure(exit)) expect(String(Cause.squash(exit.cause))).toContain("MCP configuration is unavailable")
-    }),
-  { config: { mcp: { remote: { type: "remote", url: "https://127.0.0.1:1/mcp" } } } },
+    }
+    expect(yield* Effect.promise(() => Bun.file(marker).exists())).toBe(false)
+  }),
+)
+
+it.instance("managed config rejects remote MCP before initialization", () =>
+  Effect.gen(function* () {
+    yield* managed({ mcp: { remote: { type: "remote", url: "https://127.0.0.1:1/mcp" } } })
+    const config = yield* Config.Service
+    const exit = yield* Effect.exit(config.get())
+    expect(Exit.isFailure(exit)).toBe(true)
+    if (Exit.isFailure(exit)) expect(String(Cause.squash(exit.cause))).toContain("MCP configuration is unavailable")
+  }),
 )
 
 it.instance("managed MCP rejects dynamic local servers without launching them", () =>
   Effect.gen(function* () {
-    const marker = yield* managed
+    const marker = yield* managed()
     const mcp = yield* MCP.Service
     expect(yield* mcp.status()).toEqual({})
     const exit = yield* Effect.exit(mcp.add("marker", { type: "local", command, timeout: 500 }))
@@ -88,7 +87,7 @@ it.instance(
   "managed file services cannot launch LSP, formatter or snapshot processes",
   () =>
     Effect.gen(function* () {
-      const marker = yield* managed
+      const marker = yield* managed()
       const instance = yield* TestInstance
       const config = yield* Config.Service
       const lsp = yield* LSP.Service

@@ -12,7 +12,7 @@ Run from `packages/opencode` in `/home/savochek/ExternalProjects/opencode`, bran
 
 ```sh
 bun test test/server/managed-ai-e2e.test.ts
-OPENCODE_MANAGED_BAILA_FIXTURE=/tmp/opencode/baila-recovery/workspace bun test test/server/managed-ai-e2e.test.ts
+OPENCODE_MANAGED_BAILA_FIXTURE=/absolute/verified/disposable-source bun test test/server/managed-ai-e2e.test.ts
 bun typecheck
 ```
 
@@ -28,8 +28,10 @@ HOME/test HOME, all four XDG homes, TMPDIR, absolute DB/config paths, managed
 profile enabled, and an empty plugin allowlist. State is outside the workspace
 and source checkout. Before **any HTTP request**, the harness checks the exact
 DB path in startup diagnostics, `/proc/PID/environ`, and actual open DB file
-descriptors. The credential-free loopback SSE model asserts that bash is the
-only advertised tool; no plugins or MCP servers are configured.
+descriptors. The historical credential-free loopback SSE model asserted bash as
+the only advertised tool; no plugins or MCP servers were configured. The current
+managed catalog also includes Task, Compress and Skill subject to configuration
+and permissions.
 
 The optional offline fixture is read-only input under `/tmp/opencode`. Every
 top-level entry, including `.cargo`, is recursively copied without hardlinks

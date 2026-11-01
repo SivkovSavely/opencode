@@ -11,6 +11,10 @@ import { ManagedWait } from "./managed-linux-wait"
 export interface Options {
   /** Exclusively delegated, socket-free directory; mounted writable at /work. */
   workspace: string
+  /** Candidate writes are denied by the mount, not shell command parsing. */
+  readOnly?: boolean
+  /** Independent, operator-provisioned Git inspection snapshot, never shared metadata. */
+  gitDirectory?: string
   /** A single installed Rust toolchain, not ~/.rustup or the home directory. */
   rustToolchain?: string
   argv: readonly [string, ...string[]]
@@ -70,6 +74,19 @@ export async function prepare(options: Options) {
   )
     throw new Error("Refusing to mount root or home")
   await requireTree(workspace, true)
+  const gitDirectory = options.gitDirectory ? await realpath(options.gitDirectory) : undefined
+  if (gitDirectory) {
+    if (
+      gitDirectory === workspace ||
+      gitDirectory.startsWith(`${workspace}/`) ||
+      workspace.startsWith(`${gitDirectory}/`)
+    )
+      throw new Error("Workspace and Git snapshot must not overlap")
+    await requireTree(gitDirectory, true)
+    await requireGitSnapshot(gitDirectory)
+  }
+  const gitEntry = gitDirectory ? await lstat(path.join(workspace, ".git")) : undefined
+  if (gitEntry && !gitEntry.isFile() && !gitEntry.isDirectory()) throw new Error("Unsafe workspace Git entry")
   const toolchain = options.rustToolchain ? await realpath(options.rustToolchain) : undefined
   if (toolchain) {
     if (toolchain === workspace || toolchain.startsWith(`${workspace}/`) || workspace.startsWith(`${toolchain}/`))
@@ -126,9 +143,37 @@ export async function prepare(options: Options) {
     "/home/sandbox",
     "--dir",
     "/run",
-    "--bind",
+    options.readOnly ? "--ro-bind" : "--bind",
     workspace,
     "/work",
+    ...(gitDirectory
+      ? [
+          "--ro-bind",
+          gitDirectory,
+          "/git",
+          "--setenv",
+          "GIT_DIR",
+          "/git",
+          "--setenv",
+          "GIT_WORK_TREE",
+          "/work",
+          "--setenv",
+          "GIT_OPTIONAL_LOCKS",
+          "0",
+          "--setenv",
+          "GIT_CONFIG_NOSYSTEM",
+          "1",
+          "--setenv",
+          "GIT_CONFIG_GLOBAL",
+          "/dev/null",
+          "--setenv",
+          "GIT_TERMINAL_PROMPT",
+          "0",
+          ...(gitEntry?.isFile()
+            ? ["--ro-bind", path.join(workspace, ".git"), "/work/.git"]
+            : ["--tmpfs", "/work/.git", "--remount-ro", "/work/.git"]),
+        ]
+      : []),
     "--chdir",
     "/work",
     "--setenv",
@@ -642,6 +687,29 @@ async function requireTree(dir: string, writable = false): Promise<void> {
     else if (!entry.isFile() && !entry.isSymbolicLink()) throw new Error(`Special file in mount: ${entry.name}`)
     else if (writable && entry.isFile() && (await lstat(path.join(dir, entry.name))).nlink > 1)
       throw new Error(`Hard-linked file in writable mount: ${entry.name}`)
+  }
+}
+
+async function requireGitSnapshot(dir: string, root = dir): Promise<void> {
+  if (dir === root) {
+    if ((await Bun.file(path.join(dir, "config")).text()) !== "[core]\n\trepositoryformatversion = 0\n\tbare = false\n")
+      throw new Error("Git snapshot requires sanitized configuration")
+    if (!(await lstat(path.join(dir, "objects"))).isDirectory() || !(await lstat(path.join(dir, "refs"))).isDirectory())
+      throw new Error("Git snapshot requires independent objects and refs")
+    if (!(await lstat(path.join(dir, "index"))).isFile()) throw new Error("Git snapshot requires an index")
+    if (
+      !/^(ref: refs\/heads\/[A-Za-z0-9._/-]+|[a-f0-9]{40,64})\n?$/.test(await Bun.file(path.join(dir, "HEAD")).text())
+    )
+      throw new Error("Invalid Git snapshot HEAD")
+  }
+  for (const entry of await readdir(dir, { withFileTypes: true })) {
+    const file = path.join(dir, entry.name)
+    if (
+      entry.isSymbolicLink() ||
+      ["commondir", "gitdir", "worktrees", "hooks", "alternates", "http-alternates"].includes(entry.name)
+    )
+      throw new Error("Git snapshot must not contain shared metadata, hooks, alternates or symlinks")
+    if (entry.isDirectory()) await requireGitSnapshot(file, root)
   }
 }
 

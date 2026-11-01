@@ -173,7 +173,10 @@ const loadState = Effect.fn("TuiConfig.loadState")(function* (ctx: { directory: 
   const directories = yield* ConfigPaths.directories(ctx.directory)
   yield* Effect.promise(() => migrateTuiConfig({ directories, cwd: ctx.directory }))
 
-  const projectFiles = Flag.OPENCODE_DISABLE_PROJECT_CONFIG ? [] : yield* ConfigPaths.files("tui", ctx.directory)
+  const projectFiles =
+    Flag.OPENCODE_DISABLE_PROJECT_CONFIG || process.env.OPENCODE_MANAGED_PROFILE === "1"
+      ? []
+      : yield* ConfigPaths.files("tui", ctx.directory)
 
   const acc: Acc = {
     result: {},

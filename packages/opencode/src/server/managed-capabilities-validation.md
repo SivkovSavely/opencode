@@ -49,7 +49,7 @@ The model authors actual tool calls admitted through HTTP `prompt_async`:
 
 The pre-existing Bash E2E retains its original success, failure, duration, bounded
 output, abort/resume, descendant cleanup, retirement races and restart assertions.
-Its catalog check now expects exactly `bash`, `task` and `compress`, independent
+Its historical catalog check expected `bash`, `task` and `compress`, independent
 of catalog ordering. Do not set `OPENCODE_MANAGED_BAILA_FIXTURE` for the toy
 capabilities validation; the expensive optional compiler fixture is unnecessary.
 
@@ -73,7 +73,7 @@ validation, not a production recovery or external-provider validation result.
 
 ## Validation Summary
 
-Final validation after the recovery fixes, from package directories:
+Historical validation after the recovery fixes, from package directories:
 
 | Scope                                                                           | Result                                  |
 | ------------------------------------------------------------------------------- | --------------------------------------- |
@@ -94,11 +94,80 @@ Client passed all 16 tests and SDK passed its test, with both package typechecks
 passing. Public clients and the CLI catalog were regenerated; the catalog covers
 205 operations, including both maintenance routes.
 
-An additional, unchanged `test/event-manifest.test.ts` assertion remains failing:
-it expects 89 public event types, but the manifest contains 90. The manifest test
-and Schema event definitions are unchanged from `9d3731afa90a`. This baseline
-assertion drift was not hidden or changed as part of this task; these results do
-not claim a completely green repository-wide OpenCode suite.
+The old 89-event assertion drift is fixed: the actual 90th event is
+`session.queue.changed`, added in `d1902bf076` after the older 89-event expectation
+from `3fe8474afe`. The test checks the manifest's unique definition inventory and
+explicit queue-event presence, not an arbitrary new count. The schema manifest
+now imports that V1 event through a compatibility entrypoint, preserving canonical
+identity and the V1-isolation check.
+
+Final validation on 2026-11-01 at HEAD `e89cc42867c3` plus uncommitted changes:
+
+| Scope                                  | Result                                                |
+| -------------------------------------- | ----------------------------------------------------- |
+| Full Core suite, 154 files             | 1,338 passed                                          |
+| Full Schema suite, 8 files             | 117 passed                                            |
+| Full Protocol suite                    | 2 passed                                              |
+| Full Client suite                      | 16 passed                                             |
+| Full sdk-next suite                    | 5 passed                                              |
+| Seven package `bun typecheck` commands | Passed                                                |
+| Client generated check                 | Passed, no drift                                      |
+| Core migration `--check`               | Passed, no migration needed                           |
+| CLI API catalog `--check`              | Passed, 205 operations                                |
+| Focused managed regression groups      | Passed; see `/tmp/opencode/final-managed-*.log`       |
+| Full OpenCode suite, 285 files         | 3,930 passed, 109 failed, 23 skipped, 1 todo, 1 error |
+
+The full OpenCode run is **not green**. Its completed serial run took 30m 58s and
+exited 1; `/tmp/opencode/final-opencode-full.log` retains the failure evidence.
+Failures include prompt/queue timeouts, workspace session-warp scope errors, HTTP
+Session and processor tests, and managed plugin/shell checks. Several affected
+files pass in fresh focused processes; that does not prove the aggregate failures
+pre-exist these changes or excuse them. Do not report release readiness. An earlier
+aggregate run had 250 failures; counts from different runs are not cumulative.
+The sdk-next database failure was traced to its first test deleting the
+module-captured database directory. A suite-lifetime test database fixes that
+fixture without changing production database behavior.
+
+After the final boundary changes and formatting, a fresh seven-file boundary set
+passed 34 tests, and sdk-next again passed all 5 tests. Evidence is
+`/tmp/opencode/final-boundary-validation.{log,exit}` and
+`/tmp/opencode/final-sdk-next-suite.{log,exit}`. The final managed source E2E pair
+passed 2 tests with 1,192 assertions in 108.97 seconds, with evidence at
+`/tmp/opencode/managed-ai-Krioxp` and `/tmp/opencode/managed-capabilities-hhlRp4`.
+The final full prompt file passed 123 tests with 1 skipped in a fresh process
+(`/tmp/opencode-prompt-followup.log`); its import-time managed guard wrapper passed
+both attachment and structured-subtask rejection cases. The managed plugin
+fixture now supplies allowlisted hooks through trusted configuration; its isolated
+trigger and profile files pass. These focused results do not erase aggregate
+failures or imply that the full suite was rerun after each fixture-only change.
+
+Reproduce from package directories, never the repository root:
+
+```sh
+# Each of packages/core, packages/schema, packages/protocol, packages/client, packages/sdk-next
+bun test
+bun typecheck
+# packages/server has no package-local tests
+# packages/opencode, packages/server, and each package above
+bun typecheck
+# packages/client
+bun run check:generated
+# packages/core
+bun run script/migration.ts --check
+# packages/opencode, without inherited managed configuration or output-token overrides
+env -u OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX -u OPENCODE_MANAGED_BAILA_FIXTURE bun test --max-concurrency 1
+bun run api:check
+```
+
+The retained `/tmp/opencode/final-<package>-{test,typecheck}.*` files and separate
+generated, catalog and migration logs record package checks. Bun was
+`1.4.3 (c6da4a4d3)`. The runtime/sandbox changes are Linux-only; compiler input,
+offline dependencies and the approved skill are local prerequisites, not downloads
+performed by this suite.
+
+The opt-in real-worktree staging evidence and source provenance are in
+`managed-baila-workflow.md`; it does not validate production adoption or model
+review quality.
 
 ## Orchestrator Consumer Requirements
 
@@ -107,8 +176,8 @@ Configure the trusted launch environment as described in
 and explicitly listing the required `wq_*` tools. Do not install the generic MCP
 entry or a DCP plugin in managed configuration. Keep the plugin allowlist empty.
 Grant tool permissions separately from the operator allowlist. In particular,
-reviewer/verifier agents need explicit WorkQueue write restrictions; an `edit`
-deny does not deny a `wq_*` mutation.
+reviewer/verifier agents should have explicit WorkQueue write restrictions in
+addition to the managed named-identity/effective-edit-deny mutation ceiling.
 
 Use configured `mode: "subagent"` agents with foreground `task` calls, and native
 `compress({})` for context reduction. Background promotion, asynchronous child

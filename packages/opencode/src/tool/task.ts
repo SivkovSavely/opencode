@@ -164,13 +164,19 @@ export const TaskTool = Tool.define(
       ) {
         return yield* Effect.fail(new Error("Cannot resume a task session from another parent or workspace"))
       }
+      if (managed && session && session.agent !== next.name)
+        return yield* Effect.fail(new Error("Cannot resume a managed task session with a different agent"))
       const parentAgent = managed ? yield* agent.get(ctx.agent) : undefined
       const childPermission = deriveSubagentSessionPermission({
         parentSessionPermission: managed ? [] : (parent.permission ?? []),
         subagent: next,
       })
       const managedParentPolicy = managed
-        ? [...(parentAgent?.permission ?? []), ...(parent.permission ?? [])]
+        ? [
+            ...(parentAgent?.permission ?? []),
+            ...(parent.permission ?? []),
+            ...(ctx.managedReadOnly ? [{ permission: "edit", pattern: "*", action: "deny" as const }] : []),
+          ]
         : undefined
       const childToolDenies = [
         ...(next.permission.some((rule) => rule.permission === "todowrite")

@@ -77,6 +77,7 @@ describe("plugin.trigger", () => {
     Effect.gen(function* () {
       const previous = process.env.OPENCODE_MANAGED_PROFILE
       const previousAllowlist = process.env.OPENCODE_MANAGED_PLUGIN_ALLOWLIST
+      const previousConfigContent = process.env.OPENCODE_CONFIG_CONTENT
       process.env.OPENCODE_MANAGED_PROFILE = "1"
       yield* Effect.gen(function* () {
         const test = yield* TestInstance
@@ -89,6 +90,7 @@ describe("plugin.trigger", () => {
           pathToFileURL(other).href,
           pathToFileURL(pty).href,
         ])
+        process.env.OPENCODE_CONFIG_CONTENT = JSON.stringify({ plugin: [pathToFileURL(other).href] })
         yield* Effect.promise(() =>
           Bun.write(path.join(pty, "package.json"), JSON.stringify({ name: "opencode-pty", main: "index.ts" })),
         )
@@ -128,6 +130,8 @@ describe("plugin.trigger", () => {
             else process.env.OPENCODE_MANAGED_PROFILE = previous
             if (previousAllowlist === undefined) delete process.env.OPENCODE_MANAGED_PLUGIN_ALLOWLIST
             else process.env.OPENCODE_MANAGED_PLUGIN_ALLOWLIST = previousAllowlist
+            if (previousConfigContent === undefined) delete process.env.OPENCODE_CONFIG_CONTENT
+            else process.env.OPENCODE_CONFIG_CONTENT = previousConfigContent
           }),
         ),
       )

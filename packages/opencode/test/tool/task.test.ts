@@ -21,6 +21,7 @@ import { SessionRunState } from "@/session/run-state"
 import { SessionStatus } from "@/session/status"
 
 import { TaskTool, type TaskPromptOps } from "../../src/tool/task"
+import { CompressTool } from "../../src/tool/compress"
 import { ApplyPatchTool } from "../../src/tool/apply_patch"
 import { Truncate } from "@/tool/truncate"
 import { ToolRegistry } from "@/tool/registry"
@@ -32,6 +33,7 @@ import { ModelV2 } from "@opencode-ai/core/model"
 import { ManagedCommand } from "@opencode-ai/core/managed-command"
 import { RuntimeLifecycle } from "@/server/runtime-lifecycle"
 import { Permission } from "@/permission"
+import { ManagedAccess } from "@/tool/managed-access"
 
 afterEach(async () => {
   await disposeAllInstances()
@@ -181,10 +183,176 @@ function reply(
 }
 
 describe("tool.task", () => {
+  it.instance("read-only managed children preserve their ceiling through nested task creation and resume", () =>
+    Effect.gen(function* () {
+      const previous = process.env.OPENCODE_MANAGED_PROFILE
+      yield* Effect.acquireRelease(
+        Effect.sync(() => {
+          process.env.OPENCODE_MANAGED_PROFILE = "1"
+        }),
+        () =>
+          Effect.sync(() => {
+            if (previous === undefined) delete process.env.OPENCODE_MANAGED_PROFILE
+            else process.env.OPENCODE_MANAGED_PROFILE = previous
+          }),
+      )
+      const database = yield* Database.Service
+      const sessions = yield* Session.Service
+      const agents = yield* Agent.Service
+      const config = yield* Config.Service
+      const cfg = yield* config.get()
+      const { chat, assistant } = yield* seed()
+      const runtime = RuntimeLifecycle.make({ lineage: "managed-read-only-task-test" }, yield* Effect.scope, database)
+      const root = yield* runtime.admit({ sessionID: chat.id, directory: chat.directory })
+      const task = yield* TaskTool.pipe(
+        Effect.flatMap((tool) => tool.init()),
+        Effect.provideService(Config.Service, { ...config, get: () => Effect.succeed({ ...cfg, subagent_depth: 3 }) }),
+      )
+      const compress = yield* CompressTool.pipe(Effect.flatMap((tool) => tool.init()))
+      let compactions = 0
+      const seen: { agent: string; id: SessionID; readOnly: boolean }[] = []
+      let nestedID: string | undefined
+      const ops: TaskPromptOps = {
+        ...stubOps(),
+        prompt: (input, parent) =>
+          Effect.acquireUseRelease(
+            runtime.admit({
+              sessionID: input.sessionID,
+              directory: chat.directory,
+              parentSessionID: parent?.parentMessageID === assistant.id ? chat.id : seen[0]!.id,
+              parentMode: "foreground",
+              managedChildAuthorization: parent?.managedChildAuthorization?.prompt,
+            }),
+            (admitted) =>
+              Effect.gen(function* () {
+                const current = yield* sessions.get(input.sessionID)
+                const selected = yield* agents.get(input.agent!)
+                if (!selected) throw new Error("Missing selected agent")
+                const policies = yield* sessions.managedPolicies(current.id)
+                const readOnly = ManagedAccess.readOnly(selected.name, [
+                  selected.permission,
+                  current.permission ?? [],
+                  ...policies,
+                ])
+                seen.push({ agent: selected.name, id: current.id, readOnly })
+                expect(readOnly).toBe(true)
+                if (current.parentID === chat.id) {
+                  const user = yield* sessions.updateMessage({
+                    id: MessageID.ascending(),
+                    role: "user",
+                    sessionID: current.id,
+                    agent: selected.name,
+                    model: ref,
+                    time: { created: Date.now() },
+                  })
+                  const nestedAssistant = {
+                    ...assistant,
+                    id: MessageID.ascending(),
+                    parentID: user.id,
+                    sessionID: current.id,
+                    agent: selected.name,
+                  }
+                  yield* sessions.updateMessage(nestedAssistant)
+                  const compressed = yield* compress.execute(
+                    {},
+                    {
+                      sessionID: current.id,
+                      messageID: nestedAssistant.id,
+                      agent: selected.name,
+                      abort: new AbortController().signal,
+                      managedRuntime: runtime,
+                      managedReadOnly: readOnly,
+                      executionFence: admitted.fence,
+                      extra: {
+                        requestCompaction: () =>
+                          Effect.sync(() => {
+                            compactions++
+                          }),
+                      },
+                      messages: [],
+                      metadata: () => Effect.void,
+                      ask: () => Effect.void,
+                    },
+                  )
+                  expect(compressed.metadata.queued).toBe(true)
+                  const result = yield* task.execute(
+                    { description: "nested", prompt: "verify", subagent_type: "general", task_id: nestedID },
+                    {
+                      sessionID: current.id,
+                      messageID: nestedAssistant.id,
+                      agent: selected.name,
+                      abort: new AbortController().signal,
+                      callID: "nested",
+                      managedRuntime: runtime,
+                      managedReadOnly: readOnly,
+                      executionFence: admitted.fence,
+                      extra: { promptOps: ops },
+                      messages: [],
+                      metadata: () => Effect.void,
+                      ask: () => Effect.void,
+                    },
+                  )
+                  nestedID = result.metadata.sessionId
+                } else {
+                  expect(
+                    policies.some((policy) => Permission.evaluate("edit", "anything", policy).action === "deny"),
+                  ).toBe(true)
+                }
+                yield* runtime.complete(input.sessionID)
+                return reply(input, "complete")
+              }),
+            (admitted) => runtime.release(input.sessionID, admitted.fence),
+          ).pipe(Effect.orDie),
+      }
+      const run = (task_id?: string) =>
+        task.execute(
+          { description: "review", prompt: "review", subagent_type: "general", task_id },
+          {
+            sessionID: chat.id,
+            messageID: assistant.id,
+            agent: "build",
+            abort: new AbortController().signal,
+            callID: "review",
+            managedRuntime: runtime,
+            managedReadOnly: true,
+            executionFence: root.fence,
+            extra: { promptOps: ops },
+            messages: [],
+            metadata: () => Effect.void,
+            ask: () => Effect.void,
+          },
+        )
+      const first = yield* run()
+      expect(nestedID).toBeDefined()
+      const firstNested = nestedID
+      yield* run(first.metadata.sessionId)
+      expect(nestedID).toBe(firstNested)
+      expect(seen.map((entry) => [entry.agent, entry.readOnly])).toEqual([
+        ["general", true],
+        ["general", true],
+        ["general", true],
+        ["general", true],
+      ])
+      expect(seen[0]?.id).toBe(seen[2]?.id)
+      expect(seen[1]?.id).toBe(seen[3]?.id)
+      expect(compactions).toBe(2)
+      yield* runtime.complete(chat.id)
+      yield* runtime.release(chat.id, root.fence)
+      expect(yield* runtime.commandStatus(chat.id)).toBe("drained")
+      yield* runtime.retireRoot(chat.id).pipe(Effect.orDie)
+      expect(yield* runtime.admit({ sessionID: chat.id, directory: chat.directory }).pipe(Effect.exit)).toMatchObject({
+        _tag: "Failure",
+      })
+    }),
+  )
+
   it.instance(
     "managed reviewers and verifiers are independent joined foreground children",
     () =>
       Effect.gen(function* () {
+        // Load the test's trusted agent configuration before enabling managed project-config isolation.
+        const agents = yield* Agent.Service
+        expect(yield* agents.get("reviewer")).toBeDefined()
         const previous = process.env.OPENCODE_MANAGED_PROFILE
         yield* Effect.acquireRelease(
           Effect.sync(() => {
@@ -199,7 +367,6 @@ describe("tool.task", () => {
         const database = yield* Database.Service
         const sessions = yield* Session.Service
         const jobs = yield* BackgroundJob.Service
-        const agents = yield* Agent.Service
         const { chat, assistant } = yield* seed()
         const runtime = RuntimeLifecycle.make({ lineage: "managed-task-test" }, yield* Effect.scope, database)
         const parent = yield* runtime.admit({ sessionID: chat.id, directory: chat.directory })
@@ -280,13 +447,45 @@ describe("tool.task", () => {
         ])
         expect(children).toHaveLength(2)
         expect(new Set(children).size).toBe(2)
+        const firstChild = SessionID.make(results[0]!.metadata.sessionId)
+        const reviewer = yield* agents.get("reviewer")
+        if (!reviewer) throw new Error("Missing reviewer")
+        const general = yield* agents.get("general")
+        if (!general) throw new Error("Missing general agent")
+        yield* sessions.setPermission({
+          sessionID: firstChild,
+          permission: [{ permission: "edit", pattern: "*", action: "allow" }],
+        })
+        const before = yield* sessions.get(firstChild)
+        const ancestry = yield* sessions.managedPolicies(firstChild)
+        expect(before.agent).toBe("reviewer")
+        expect(Permission.evaluate("edit", "file", reviewer.permission).action).toBe("allow")
+        expect(ManagedAccess.readOnly(general.name, [general.permission, before.permission ?? [], ...ancestry])).toBe(
+          false,
+        )
+        expect(ManagedAccess.readOnly(reviewer.name, [reviewer.permission, before.permission ?? [], ...ancestry])).toBe(
+          true,
+        )
+        expect(
+          ManagedAccess.readOnly("general", [
+            Permission.fromConfig({ edit: "deny" }),
+            Permission.fromConfig({ edit: "allow" }),
+          ]),
+        ).toBe(true)
+        const switched = yield* execute("general", false, firstChild).pipe(Effect.exit)
+        expect(Exit.isFailure(switched)).toBe(true)
+        if (Exit.isFailure(switched)) expect(Cause.pretty(switched.cause)).toContain("different agent")
+        expect(children).toHaveLength(2)
+        expect(yield* sessions.get(firstChild)).toEqual(before)
+        expect(yield* sessions.managedPolicies(firstChild)).toEqual(ancestry)
         yield* sessions.setPermission({
           sessionID: chat.id,
           permission: [{ permission: "bash", pattern: "echo *", action: "deny" }],
         })
-        const firstChild = children[0]
-        if (!firstChild) throw new Error("Missing first managed child")
         yield* execute("reviewer", false, firstChild)
+        const resumed = yield* sessions.get(firstChild)
+        expect(resumed.agent).toBe("reviewer")
+        expect(ManagedAccess.readOnly(reviewer.name, [reviewer.permission, resumed.permission ?? []])).toBe(true)
         const policies = yield* sessions.managedPolicies(firstChild)
         expect(policies.some((policy) => Permission.evaluate("bash", "echo unsafe", policy).action === "deny")).toBe(
           true,

@@ -17,6 +17,7 @@ import { Glob } from "@opencode-ai/core/util/glob"
 import { Discovery } from "./discovery"
 import { isRecord } from "@/util/record"
 import { escapeHtml } from "@/util/html"
+import { ManagedSkill } from "./managed"
 
 const CLAUDE_EXTERNAL_DIR = ".claude"
 const AGENTS_EXTERNAL_DIR = ".agents"
@@ -258,6 +259,7 @@ const layer = Layer.effect(
     const flags = yield* RuntimeFlags.Service
     const discovered = yield* InstanceState.make(
       Effect.fn("Skill.discovery")(function* (ctx) {
+        if (ManagedSkill.enabled) return { matches: [], dirs: [] }
         return yield* discoverSkills(
           config,
           discovery,
@@ -271,8 +273,13 @@ const layer = Layer.effect(
       }),
     )
     const state = yield* InstanceState.make(
-      Effect.fn("Skill.state")(function* () {
+      Effect.fn("Skill.state")(function* (ctx) {
         const s: State = { skills: {}, dirs: new Set() }
+        if (ManagedSkill.enabled) {
+          const skills = yield* Effect.promise(() => ManagedSkill.skills(ctx.directory, ctx.worktree))
+          for (const skill of skills) s.skills[skill.name] = skill
+          return s
+        }
         // Register the built-in skill BEFORE disk discovery so a user-disk
         // skill with the same name can override it.
         s.skills[CUSTOMIZE_OPENCODE_SKILL_NAME] = {

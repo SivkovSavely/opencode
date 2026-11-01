@@ -4,6 +4,7 @@ import { Effect, Layer } from "effect"
 import { HttpServerResponse } from "effect/unstable/http"
 import { HttpApiMiddleware } from "effect/unstable/httpapi"
 import { WorkspaceRouteContext } from "./workspace-routing"
+import { ManagedWorkspace } from "@/server/managed-workspace"
 
 export class InstanceContextMiddleware extends HttpApiMiddleware.Service<
   InstanceContextMiddleware,
@@ -26,7 +27,10 @@ function provideInstanceContext<E>(
 ): Effect.Effect<HttpServerResponse.HttpServerResponse, E, WorkspaceRouteContext> {
   return Effect.gen(function* () {
     const route = yield* WorkspaceRouteContext
-    const ctx = yield* store.load({ directory: decode(route.directory) })
+    if (route.workspaceID || !ManagedWorkspace.allows(decode(route.directory))) {
+      if (ManagedWorkspace.directory) return HttpServerResponse.text("Forbidden", { status: 403 })
+    }
+    const ctx = yield* store.load({ directory: ManagedWorkspace.directory ?? decode(route.directory) })
     return yield* effect.pipe(
       Effect.provideService(InstanceRef, ctx),
       Effect.provideService(WorkspaceRef, route.workspaceID),

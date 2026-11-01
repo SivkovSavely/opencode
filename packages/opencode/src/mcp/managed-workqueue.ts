@@ -5,6 +5,7 @@ import { AjvJsonSchemaValidator } from "@modelcontextprotocol/sdk/validation/ajv
 import { realpath, stat } from "node:fs/promises"
 import path from "node:path"
 import type { ManagedAuthorization, ManagedHandle } from "@/server/runtime-lifecycle"
+import { ManagedWorkspace } from "@/server/managed-workspace"
 
 export const TOOL_NAMES = Object.freeze([
   "wq_ping",
@@ -46,14 +47,23 @@ const environment = process.env.OPENCODE_MANAGED_WORK_QUEUE
 const MAX_BYTES = 1024 * 1024
 const TIMEOUT = 40_000
 
-export type Policy = Readonly<{ url: string; project: string; directory: string; tools: readonly string[] }>
+export type Policy = Readonly<{
+  url: string
+  project: string
+  directory: string
+  tools: readonly string[]
+  issueId?: string
+}>
 export type Result = { cleanup: "confirmed" | "failed"; result?: CallToolResult; error?: string }
 
 /** Only the server operator may supply this value, never workspace config or tool arguments. */
 export async function loadPolicy(raw = environment): Promise<Policy | undefined> {
   if (raw === undefined) return
   const value: unknown = JSON.parse(raw)
-  if (!object(value) || Object.keys(value).sort().join() !== "directory,project,tools,url")
+  if (
+    !object(value) ||
+    !["directory,project,tools,url", "directory,issueId,project,tools,url"].includes(Object.keys(value).sort().join())
+  )
     throw new Error("Invalid managed WorkQueue operator policy")
   if (typeof value.project !== "string" || !/^[A-Z][A-Z0-9_]{0,63}$/.test(value.project))
     throw new Error("Invalid managed WorkQueue project")
@@ -74,6 +84,13 @@ export async function loadPolicy(raw = environment): Promise<Policy | undefined>
     throw new Error("Managed WorkQueue requires an absolute workspace directory")
   if (!(await stat(value.directory)).isDirectory()) throw new Error("Managed WorkQueue workspace must be a directory")
   if (
+    value.issueId !== undefined &&
+    (typeof value.issueId !== "string" || !new RegExp(`^${value.project}-[1-9][0-9]*$`).test(value.issueId))
+  )
+    throw new Error("Invalid managed WorkQueue issue binding")
+  if (ManagedWorkspace.directory && (!ManagedWorkspace.allows(value.directory) || !value.issueId))
+    throw new Error("Dedicated managed WorkQueue requires the exact workspace and issue binding")
+  if (
     !Array.isArray(value.tools) ||
     value.tools.length === 0 ||
     value.tools.some((name) => typeof name !== "string" || !TOOL_NAMES.includes(name)) ||
@@ -85,6 +102,7 @@ export async function loadPolicy(raw = environment): Promise<Policy | undefined>
     project: value.project,
     directory: await realpath(value.directory),
     tools: Object.freeze(value.tools as string[]),
+    ...(typeof value.issueId === "string" ? { issueId: value.issueId } : {}),
   })
 }
 
@@ -135,7 +153,7 @@ export async function prepare(
   })
   try {
     await boundDirectory(policy, directory)
-    await scopeArguments(policy, input)
+    await scopeArguments(policy, name, input)
     await connection.client.connect(connection.transport)
     const tools = await catalog(connection.client, policy)
     const tool = tools.find((tool) => tool.name === name)!
@@ -300,8 +318,10 @@ async function boundDirectory(policy: Policy, directory: string) {
     throw new Error("WorkQueue is bound to a different canonical workspace")
 }
 
-async function scopeArguments(policy: Policy, args: Record<string, unknown>) {
+async function scopeArguments(policy: Policy, name: string, args: Record<string, unknown>) {
   if (Object.hasOwn(args, "projectKey")) throw new Error("WorkQueue projectKey is connection-bound")
+  if (policy.issueId && !isReadOnly(name) && args.issueId !== policy.issueId)
+    throw new Error("WorkQueue mutation requires the operator-bound issue ID")
   if (Object.hasOwn(args, "checkoutPath")) {
     if (typeof args.checkoutPath !== "string") throw new Error("Invalid WorkQueue checkoutPath")
     await boundDirectory(policy, args.checkoutPath)
@@ -312,6 +332,8 @@ async function scopeArguments(policy: Policy, args: Record<string, unknown>) {
       const ids = key === "dependencies" && Array.isArray(value) ? value : [value]
       if (ids.some((id) => typeof id !== "string" || !new RegExp(`^${policy.project}-[1-9][0-9]*$`).test(id)))
         throw new Error("WorkQueue issue IDs must belong to the bound project")
+      if (policy.issueId && ids.some((id) => id !== policy.issueId))
+        throw new Error("WorkQueue issue belongs to another slot assignment")
     }
   }
 }

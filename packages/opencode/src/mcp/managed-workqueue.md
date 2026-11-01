@@ -16,6 +16,7 @@ per-request HTTP headers. Import this module before project-controlled bootstrap
   "url": "http://127.0.0.1:8765/mcp?project=BAILA",
   "project": "BAILA",
   "directory": "/absolute/canonical/workspace",
+  "issueId": "BAILA-123",
   "tools": [
     "wq_ping",
     "wq_get_work",
@@ -32,8 +33,14 @@ and lifecycle write must be explicitly listed; the list is restricted to the 24
 known WorkQueue gateway tools. The canonical directory binds the actual workspace,
 not all repositories with a matching project name. Symlink aliases resolve to the
 same directory; unrelated directories, including other worktrees, are rejected.
-Shared workers inherit the same operator environment and must pass the same bound
-workspace directory. Runtime ancestor authorization remains mandatory.
+In dedicated `OPENCODE_MANAGED_WORKSPACE` mode, `issueId` is mandatory and the
+directory must match that workspace. Issue-bearing arguments must match the bound
+issue, and mutations require its exact `issueId`; read-only calls without an issue
+argument can still return project data. Runtime ancestor authorization remains
+mandatory. Use separate Serve processes and private endpoints per slot as described
+in `../server/managed-baila-workflow.md`; do not share a policy across assignments.
+Phase-specific grants require draining and restarting the process, since policy is
+captured at import time. Preparation must not grant Ready or Done.
 
 Only exact HTTP URLs on numeric `127.0.0.1`, path `/mcp`, and one matching project
 parameter are accepted. No credentials, extra parameters, fragments, redirects,
@@ -58,12 +65,13 @@ Import `ManagedWorkQueue` from `@/mcp/managed-workqueue`.
    transforms, inherited agent/session visibility filtering, normal permission asks,
    and output truncation. The permission key is the **exact tool name**, not `read`,
    `edit`, or a generic MCP key. Operator allowlisting is a ceiling, not a grant.
-   A read-only reviewer must have inherited write denies (for example, deny `wq_*`
-   and explicitly allow `wq_ping`, `wq_get_work`, and other approved read names).
-   An `edit` deny alone does not deny WorkQueue writes. Parent session denies are
-   inherited by shared workers; the selected child agent must also carry its own
-   reviewer restrictions. `isReadOnly(name)` is fixed locally, is exposed only as
-   permission metadata, and never automatically grants approval.
+   Named managed read-only identities and effective edit-deny policies impose an
+   unconditional mutation ceiling, even against broad WorkQueue permissions.
+   Mutations are hidden and rejected before dispatch. Also configure explicit
+   inherited write denies (for example, deny `wq_*` and explicitly allow
+   `wq_ping`, `wq_get_work`, and other approved read names). Parent session denies
+   are inherited by shared workers. `isReadOnly(name)` is fixed locally, supplies
+   both the ceiling and permission metadata, and never grants approval.
 4. After normal permission approval, invoke the existing runtime API:
 
 ```ts

@@ -14,6 +14,7 @@ import { Config } from "@/config/config"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { Shell } from "@opencode-ai/core/shell"
 import { ShellID } from "./shell/id"
+import { ManagedGit } from "./shell/managed-git"
 
 import * as Truncate from "./truncate"
 import { Plugin } from "@/plugin"
@@ -653,6 +654,7 @@ export const ShellTool = Tool.define(
                 if (workspace === "/work" || workspace.startsWith("/work/"))
                   throw new Error("Managed shell workspace conflicts with the sandbox mount")
                 const { ManagedLinux } = yield* Effect.promise(() => import("./shell/managed-linux"))
+                const gitDirectory = yield* Effect.promise(() => ManagedGit.directory(workspace))
                 const limits = yield* trunc.limits()
                 const abort = Effect.callback<null>((resume) => {
                   if (ctx.abort.aborted) return resume(Effect.succeed(null))
@@ -667,11 +669,13 @@ export const ShellTool = Tool.define(
                       async (authorize) => {
                         const handle = await ManagedLinux.prepare({
                           workspace,
+                          readOnly: ctx.managedReadOnly,
+                          gitDirectory,
                           rustToolchain: process.env.OPENCODE_MANAGED_RUST_TOOLCHAIN || undefined,
                           argv: [
                             "/bin/sh",
                             "-c",
-                              'mkdir -p -- "$1" && ln -sT -- /work "$2" && cd "$3" || exit 125; exec /bin/sh -c "$4"',
+                            'mkdir -p -- "$1" && ln -sT -- /work "$2" && cd "$3" || exit 125; exec /bin/sh -c "$4"',
                             "managed-shell",
                             path.dirname(workspace),
                             workspace,

@@ -6,6 +6,7 @@ import { ProviderTransform } from "@/provider/transform"
 import { MCP } from "@/mcp"
 import { McpCatalog } from "@/mcp/catalog"
 import { ManagedWorkQueue } from "@/mcp/managed-workqueue"
+import { ManagedAccess } from "@/tool/managed-access"
 import { Permission } from "@/permission"
 import { Tool } from "@/tool/tool"
 import { ToolJsonSchema } from "@/tool/json-schema"
@@ -65,6 +66,9 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
     process.env.OPENCODE_MANAGED_PROFILE === "1" && current.parentID
       ? yield* sessions.managedPolicies(input.session.id)
       : []
+  const managedReadOnly =
+    process.env.OPENCODE_MANAGED_PROFILE === "1" &&
+    ManagedAccess.readOnly(input.agent.name, [input.agent.permission, current.permission ?? [], ...inheritedPolicies])
   const activated = McpActivation.names(current.metadata)
   const truncate = yield* Truncate.Service
   const flags = yield* RuntimeFlags.Service
@@ -75,6 +79,7 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
     messageID: input.processor.message.id,
     callID: options.toolCallId,
     managedRuntime: input.managedRuntime,
+    managedReadOnly,
     executionFence: input.executionFence,
     extra: {
       model: input.model,
@@ -138,7 +143,8 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
     sessionID: input.session.id,
     mcpActivated: activated,
   })) {
-    if (process.env.OPENCODE_MANAGED_PROFILE === "1" && !["bash", "task", "compress"].includes(item.id)) continue
+    if (process.env.OPENCODE_MANAGED_PROFILE === "1" && !["bash", "task", "compress", "skill"].includes(item.id))
+      continue
     if (item.id !== "task" && inheritedPolicies.some((policy) => Permission.disabled([item.id], policy).has(item.id)))
       continue
     const schema = ProviderTransform.schema(input.model, ToolJsonSchema.fromTool(item))
@@ -198,6 +204,7 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
       ),
     )
     for (const item of Object.values(visible)) {
+      if (managedReadOnly && !ManagedWorkQueue.isReadOnly(item.name)) continue
       tools[item.name] = tool({
         description: item.description,
         inputSchema: jsonSchema(ProviderTransform.schema(input.model, item.inputSchema)),
@@ -205,6 +212,8 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
           return run.promise(
             Effect.gen(function* () {
               const ctx = context(args, options)
+              if (ctx.managedReadOnly && !ManagedWorkQueue.isReadOnly(item.name))
+                throw new Error("Managed read-only sessions cannot invoke mutating WorkQueue tools")
               yield* ctx.ask({
                 permission: item.name,
                 patterns: ["*"],

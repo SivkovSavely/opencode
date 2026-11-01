@@ -1,10 +1,17 @@
 # Managed Native Capabilities
 
-`OPENCODE_MANAGED_PROFILE=1` exposes the built-in `bash`, `task`, and `compress`
+`OPENCODE_MANAGED_PROFILE=1` exposes the built-in `bash`, `task`, `compress`, and `skill`
 tools through both the tool registry and the Session tool resolver. The trusted
 WorkQueue adapter is integrated separately. This is not permission to load local
 plugins, arbitrary MCP servers, or custom workspace tools. V2 Session execution
 remains unsupported in the managed profile.
+
+Managed Skill discovery is restricted to trusted import-time
+`OPENCODE_MANAGED_SKILLS` entries, not workspace discovery. Read-only agent names
+and effective ancestor edit-deny policies impose a read-only shell ceiling even
+against broad allows. Default names, the exhaustive custom-list requirement,
+dedicated slot boundaries, and consumer responsibilities are documented in
+`../server/managed-baila-workflow.md`.
 
 ## Foreground Child Tasks
 
@@ -24,13 +31,16 @@ child's deny or ask. This also applies to trusted WorkQueue calls. The parent's
 `task` policy gates its delegation call, not each descendant's delegation policy.
 Resuming a `task_id` refreshes the inherited policies in a transaction that
 revalidates the parent's fence, ownership, membership and retirement status.
-Existing child restrictions are retained.
+Existing child restrictions are retained. A managed `task_id` must resume with
+the same configured agent identity; changing `subagent_type` cannot shed a
+reviewer's read-only ceiling.
 
 Model-authored Task prompts are always a single literal text part. File paths,
 including workspace paths, and `@agent` mentions do not become attachments or
 agent parts and cannot confer read or delegation authority. Managed Task
-reconstruction applies the same rule. Trusted user input and unmanaged Tasks
-retain their existing mention semantics.
+reconstruction applies the same rule. Structured `subtask` prompt parts and
+host `file:` attachments are rejected in managed input preparation; use native
+Task calls instead. Unmanaged Tasks retain their existing mention semantics.
 
 `background: true` is rejected before child creation or scheduling. Managed tasks
 never register a BackgroundJob, cannot promote to background, and do not send

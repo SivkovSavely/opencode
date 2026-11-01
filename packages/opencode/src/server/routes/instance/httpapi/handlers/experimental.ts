@@ -11,6 +11,7 @@ import type { SessionID } from "@/session/schema"
 import { ToolJsonSchema } from "@/tool/json-schema"
 import { ToolRegistry } from "@/tool/registry"
 import { Worktree } from "@/worktree"
+import { ManagedWorkspace } from "@/server/managed-workspace"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import { Effect, Option } from "effect"
 import * as HttpServerResponse from "effect/unstable/http/HttpServerResponse"
@@ -168,7 +169,7 @@ export const experimentalHandlers = HttpApiBuilder.group(InstanceHttpApi, "exper
 
     const session = Effect.fn("ExperimentalHttpApi.session")(function* (ctx: { query: typeof SessionListQuery.Type }) {
       const limit = ctx.query.limit ?? 100
-      const directory = ctx.query.directory ? yield* InstanceState.directory : undefined
+      const directory = ManagedWorkspace.directory ?? (ctx.query.directory ? yield* InstanceState.directory : undefined)
       const all = yield* sessions.listGlobal({
         directory,
         roots: ctx.query.roots,

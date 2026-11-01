@@ -17,6 +17,7 @@ import { RootHttpApi } from "../api"
 import { GlobalUpgradeInput } from "../groups/global"
 import { RuntimeLifecycle } from "@/server/runtime-lifecycle"
 import { HttpApiError } from "effect/unstable/httpapi"
+import { ManagedWorkspace } from "@/server/managed-workspace"
 
 function globalEventType(data: unknown) {
   if (!data || typeof data !== "object" || !("payload" in data)) return "unknown"
@@ -48,6 +49,8 @@ function eventResponse() {
         Effect.sync(() => {
           subscriberID = EventDiagnostics.connectSubscriber({ transport: "global-event" })
           const handler = (event: GlobalBusEvent) => {
+            if (ManagedWorkspace.directory && (event.directory !== ManagedWorkspace.directory || event.workspace))
+              return
             EventDiagnostics.queueOffer(subscriberID, globalEventType(event))
             Queue.offerUnsafe(queue, event)
           }
@@ -116,9 +119,7 @@ export const globalHandlers = HttpApiBuilder.group(RootHttpApi, "global", (handl
     })
 
     const projectsList = Effect.fn("GlobalHttpApi.projectsList")(function* () {
-      const projects = yield* projectList
-        .list()
-        .pipe(Effect.mapError(() => new HttpApiError.InternalServerError({})))
+      const projects = yield* projectList.list().pipe(Effect.mapError(() => new HttpApiError.InternalServerError({})))
       return { projects }
     })
 

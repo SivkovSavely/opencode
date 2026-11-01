@@ -28,6 +28,7 @@ import { Question } from "../../src/question"
 import { Todo } from "../../src/session/todo"
 import { Session } from "@/session/session"
 import { SessionMessageTable } from "@opencode-ai/core/session/sql"
+import { SessionQueueTable } from "@opencode-ai/core/session/queue.sql"
 import { LLM } from "../../src/session/llm"
 import { MessageV2 } from "../../src/session/message-v2"
 import { FSUtil } from "@opencode-ai/core/fs-util"
@@ -381,68 +382,8 @@ ownedRuntime.instance("managed active children reject public prompt, loop and qu
   }),
 )
 
-ownedRuntime.instance("managed input subtasks inherit the actual parent agent's bash deny", () =>
-  Effect.gen(function* () {
-    const previous = process.env.OPENCODE_MANAGED_PROFILE
-    yield* Effect.acquireRelease(
-      Effect.sync(() => {
-        process.env.OPENCODE_MANAGED_PROFILE = "1"
-      }),
-      () =>
-        Effect.sync(() => {
-          if (previous === undefined) delete process.env.OPENCODE_MANAGED_PROFILE
-          else process.env.OPENCODE_MANAGED_PROFILE = previous
-        }),
-    )
-    const { dir, llm } = yield* useServerConfig((url) => ({
-      ...providerCfg(url),
-      agent: {
-        build: { permission: { bash: "deny" } },
-        reviewer: { mode: "subagent", permission: { bash: "allow" } },
-      },
-    }))
-    const sessions = yield* Session.Service
-    const prompt = yield* SessionPrompt.Service
-    const runtime = yield* RuntimeLifecycle.Service
-    const root = yield* sessions.create({ title: "Managed input delegation" })
-    const marker = path.join(dir, "must-not-exist")
-    yield* llm.push(reply().tool("bash", { command: `touch ${marker}`, description: "Attempt forbidden bash" }))
-    yield* llm.push(reply().text("Review finished without bash").stop())
-    yield* llm.push(reply().text("Parent complete").stop())
-    yield* prompt.prompt({
-      sessionID: root.id,
-      agent: "build",
-      model: ref,
-      parts: [{ type: "subtask", agent: "reviewer", description: "Review", prompt: "Review the change", model: ref }],
-    })
-    const child = (yield* sessions.children(root.id))[0]
-    if (!child) throw new Error("Missing subtask child")
-    const policies = yield* sessions.managedPolicies(child.id)
-    expect(policies.some((policy) => Permission.evaluate("bash", `touch ${marker}`, policy).action === "deny")).toBe(
-      true,
-    )
-    expect(yield* Effect.promise(() => Bun.file(marker).exists())).toBe(false)
-    const history = yield* sessions.messages({ sessionID: child.id })
-    expect(
-      history.flatMap((message) => message.parts).some((part) => part.type === "tool" && part.state.status === "error"),
-    ).toBe(true)
-    expect(yield* runtime.commandStatus(root.id)).toBe("drained")
-  }),
-)
-
 ownedRuntime.instance("managed model Task prompts never expand absolute or workspace file mentions", () =>
   Effect.gen(function* () {
-    const previous = process.env.OPENCODE_MANAGED_PROFILE
-    yield* Effect.acquireRelease(
-      Effect.sync(() => {
-        process.env.OPENCODE_MANAGED_PROFILE = "1"
-      }),
-      () =>
-        Effect.sync(() => {
-          if (previous === undefined) delete process.env.OPENCODE_MANAGED_PROFILE
-          else process.env.OPENCODE_MANAGED_PROFILE = previous
-        }),
-    )
     const { dir, llm } = yield* useServerConfig((url) => ({
       ...providerCfg(url),
       agent: {
@@ -450,6 +391,19 @@ ownedRuntime.instance("managed model Task prompts never expand absolute or works
         reviewer: { mode: "subagent", permission: { read: "allow" } },
       },
     }))
+    const config = yield* Config.Service
+    yield* config.get()
+    const previous = process.env.OPENCODE_MANAGED_PROFILE
+    yield* Effect.acquireRelease(
+      Effect.sync(() => {
+        process.env.OPENCODE_MANAGED_PROFILE = "1"
+      }),
+      () =>
+        Effect.sync(() => {
+          if (previous === undefined) delete process.env.OPENCODE_MANAGED_PROFILE
+          else process.env.OPENCODE_MANAGED_PROFILE = previous
+        }),
+    )
     const outside = yield* tmpdirScoped()
     expect(outside.startsWith(dir + path.sep)).toBe(false)
     const fs = yield* FSUtil.Service
@@ -490,6 +444,17 @@ ownedRuntime.instance("managed model Task prompts never expand absolute or works
 
 ownedRuntime.instance("managed model Task agent mentions cannot bypass denied delegation", () =>
   Effect.gen(function* () {
+    const { llm } = yield* useServerConfig((url) => ({
+      ...providerCfg(url),
+      subagent_depth: 2,
+      agent: {
+        build: { permission: { task: { "*": "deny", reviewer: "allow" } } },
+        reviewer: { mode: "subagent", permission: { task: { "*": "allow", forbidden: "deny" } } },
+        forbidden: { mode: "subagent", description: "Must not receive delegated work" },
+      },
+    }))
+    const config = yield* Config.Service
+    yield* config.get()
     const previous = process.env.OPENCODE_MANAGED_PROFILE
     yield* Effect.acquireRelease(
       Effect.sync(() => {
@@ -501,15 +466,6 @@ ownedRuntime.instance("managed model Task agent mentions cannot bypass denied de
           else process.env.OPENCODE_MANAGED_PROFILE = previous
         }),
     )
-    const { llm } = yield* useServerConfig((url) => ({
-      ...providerCfg(url),
-      subagent_depth: 2,
-      agent: {
-        build: { permission: { task: { "*": "deny", reviewer: "allow" } } },
-        reviewer: { mode: "subagent", permission: { task: { "*": "allow", forbidden: "deny" } } },
-        forbidden: { mode: "subagent", description: "Must not receive delegated work" },
-      },
-    }))
     const sessions = yield* Session.Service
     const prompt = yield* SessionPrompt.Service
     const runtime = yield* RuntimeLifecycle.Service
@@ -553,6 +509,9 @@ ownedRuntime.instance("managed model Task agent mentions cannot bypass denied de
 
 ownedRuntime.instance("managed overflow replays retain the turn budget until genuinely new input", () =>
   Effect.gen(function* () {
+    const { llm } = yield* useServerConfig((url) => ({ ...providerCfg(url), agent: { build: { steps: 3 } } }))
+    const config = yield* Config.Service
+    yield* config.get()
     const previous = process.env.OPENCODE_MANAGED_PROFILE
     yield* Effect.acquireRelease(
       Effect.sync(() => {
@@ -564,7 +523,6 @@ ownedRuntime.instance("managed overflow replays retain the turn budget until gen
           else process.env.OPENCODE_MANAGED_PROFILE = previous
         }),
     )
-    const { llm } = yield* useServerConfig((url) => ({ ...providerCfg(url), agent: { build: { steps: 3 } } }))
     const sessions = yield* Session.Service
     const prompt = yield* SessionPrompt.Service
     const root = yield* sessions.create({ title: "Managed overflow budget" })
@@ -614,6 +572,9 @@ ownedRuntime.instance("managed overflow replays retain the turn budget until gen
 
 ownedRuntime.instance("managed compression preserves structured-output enforcement on the next provider turn", () =>
   Effect.gen(function* () {
+    const { llm } = yield* useServerConfig((url) => providerCfg(url))
+    const config = yield* Config.Service
+    yield* config.get()
     const previous = process.env.OPENCODE_MANAGED_PROFILE
     yield* Effect.acquireRelease(
       Effect.sync(() => {
@@ -625,7 +586,6 @@ ownedRuntime.instance("managed compression preserves structured-output enforceme
           else process.env.OPENCODE_MANAGED_PROFILE = previous
         }),
     )
-    const { llm } = yield* useServerConfig((url) => providerCfg(url))
     const sessions = yield* Session.Service
     const prompt = yield* SessionPrompt.Service
     const runtime = yield* RuntimeLifecycle.Service
@@ -653,6 +613,9 @@ ownedRuntime.instance("managed compression preserves structured-output enforceme
 
 ownedRuntime.instance("managed runner retains its execution lease after the prompt caller is interrupted", () =>
   Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const config = yield* Config.Service
+    yield* config.get()
     const previous = process.env.OPENCODE_MANAGED_PROFILE
     const allowlist = process.env.OPENCODE_MANAGED_PLUGIN_ALLOWLIST
     yield* Effect.acquireRelease(
@@ -668,7 +631,6 @@ ownedRuntime.instance("managed runner retains its execution lease after the prom
           else process.env.OPENCODE_MANAGED_PLUGIN_ALLOWLIST = allowlist
         }),
     )
-    const { llm } = yield* useServerConfig(providerCfg)
     const { prompt, chat, run } = yield* boot()
     const runtime = yield* RuntimeLifecycle.Service
     const database = yield* Database.Service
@@ -746,6 +708,34 @@ const mutatingTaskPlugin = Layer.succeed(
   }),
 )
 const withMutatingTaskPlugin = testEffect(makeHttp({ plugin: mutatingTaskPlugin }))
+const withSubtaskMessagePlugin = testEffect(
+  makeOwnedRuntime(
+    false,
+    undefined,
+    undefined,
+    false,
+    Layer.succeed(
+      Plugin.Service,
+      Plugin.Service.of({
+        trigger: ((name: string, _input: unknown, output: { parts: SessionV1.Part[] }) => {
+          if (name === "chat.message")
+            output.parts.push({
+              type: "subtask",
+              agent: "general",
+              description: "Write files",
+              prompt: "Write a file",
+              id: PartID.ascending(),
+              messageID: MessageID.ascending(),
+              sessionID: SessionID.create(),
+            })
+          return Effect.succeed(output)
+        }) as Plugin.Interface["trigger"],
+        list: () => Effect.succeed([]),
+        init: () => Effect.void,
+      }),
+    ),
+  ),
+)
 const shellEnvStarted = Deferred.makeUnsafe<void>()
 const shellEnvFailed = Deferred.makeUnsafe<void>()
 const withFailingShellPlugin = testEffect(
@@ -5012,6 +5002,192 @@ noLLMServer.instance(
 )
 
 // Missing file handling
+
+withSubtaskMessagePlugin.instance(
+  "managed structured subtasks are rejected before admission after plugin injection",
+  () =>
+    Effect.gen(function* () {
+      if (process.env.OPENCODE_MANAGED_PROFILE !== "1") return
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const session = yield* sessions.create({})
+      const result = yield* prompt
+        .prompt({
+          sessionID: session.id,
+          agent: "build",
+          model: ref,
+          noReply: true,
+          parts: [{ type: "text", text: "Review" }],
+        })
+        .pipe(Effect.exit)
+      expect(Exit.isFailure(result)).toBe(true)
+      if (Exit.isFailure(result)) expect(Cause.pretty(result.cause)).toContain("Structured subtasks are unavailable")
+      expect(yield* sessions.messages({ sessionID: session.id })).toEqual([])
+      expect(yield* sessions.children(session.id)).toEqual([])
+    }),
+  { config: { ...cfg, agent: { reviewer: { mode: "primary", permission: { "*": "allow" } } } } },
+)
+
+noLLMServer.instance(
+  "managed structured subtasks are rejected before admission",
+  () =>
+    Effect.gen(function* () {
+      if (process.env.OPENCODE_MANAGED_PROFILE !== "1") return
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const queue = yield* SessionQueue.Service
+      const session = yield* sessions.create({ permission: [{ permission: "*", pattern: "*", action: "allow" }] })
+      const part = {
+        type: "subtask" as const,
+        agent: "general",
+        description: "Write files",
+        prompt: "Write a file",
+        model: ref,
+      }
+      for (const noReply of [true, false]) {
+        const result = yield* prompt
+          .prompt({ sessionID: session.id, agent: "reviewer", model: ref, noReply, parts: [part] })
+          .pipe(Effect.exit)
+        expect(Exit.isFailure(result)).toBe(true)
+        if (Exit.isFailure(result)) expect(Cause.pretty(result.cause)).toContain("Structured subtasks are unavailable")
+      }
+      const payload = { kind: "prompt" as const, agent: "reviewer", model: ref, parts: [part] }
+      const submitted = yield* prompt.queueSubmit(session.id, { id: "unsafe-subtask", payload }).pipe(Effect.exit)
+      expect(Exit.isFailure(submitted)).toBe(true)
+      if (Exit.isFailure(submitted))
+        expect(Cause.pretty(submitted.cause)).toContain("Structured subtasks are unavailable")
+      expect((yield* queue.list(session.id)).items).toEqual([])
+      yield* queue.enqueue(session.id, { id: "persisted-subtask", payload })
+      const database = yield* Database.Service
+      yield* database.db
+        .update(SessionQueueTable)
+        .set({ submission: JSON.stringify({ delivery: "steer" }) })
+        .where(eq(SessionQueueTable.id, "persisted-subtask"))
+        .run()
+        .pipe(Effect.orDie)
+      const converted = yield* prompt
+        .queueUpdate(session.id, {
+          revision: (yield* queue.list(session.id)).revision,
+          mutation: { action: "convert", id: "persisted-subtask", delivery: "steer" },
+        })
+        .pipe(Effect.exit)
+      expect(Exit.isFailure(converted)).toBe(true)
+      if (Exit.isFailure(converted))
+        expect(Cause.pretty(converted.cause)).toContain("Structured subtasks are unavailable")
+      expect(yield* sessions.messages({ sessionID: session.id })).toEqual([])
+      expect(yield* sessions.children(session.id)).toEqual([])
+    }),
+  { config: { ...cfg, agent: { reviewer: { mode: "primary", permission: { "*": "allow" } } } } },
+)
+
+noLLMServer.instance(
+  "managed file attachments are rejected before resolution",
+  () =>
+    Effect.gen(function* () {
+      if (process.env.OPENCODE_MANAGED_PROFILE !== "1") return
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const queue = yield* SessionQueue.Service
+      const session = yield* sessions.create({})
+      const secret = path.join((yield* TestInstance).directory, "secret.txt")
+      yield* writeText(secret, "HOST_SECRET_ATTACHMENT")
+      for (const mime of ["text/plain", "application/octet-stream"]) {
+        const part = { type: "file" as const, mime, filename: "secret", url: `file://${secret}?start=1&end=1` }
+        for (const noReply of [true, false]) {
+          const result = yield* prompt
+            .prompt({ sessionID: session.id, model: ref, noReply, parts: [part] })
+            .pipe(Effect.exit)
+          expect(Exit.isFailure(result)).toBe(true)
+          if (Exit.isFailure(result))
+            expect(Cause.pretty(result.cause)).toContain("File URL attachments are unavailable")
+        }
+        const result = yield* prompt
+          .queueSubmit(session.id, {
+            id: `unsafe-${mime}`,
+            payload: { ...queuedPrompt("queued"), kind: "prompt", parts: [part] },
+          })
+          .pipe(Effect.exit)
+        expect(Exit.isFailure(result)).toBe(true)
+      }
+      expect((yield* sessions.messages({ sessionID: session.id })).length).toBe(0)
+      expect((yield* queue.list(session.id)).items).toEqual([])
+      yield* queue.enqueue(session.id, {
+        id: "persisted-unsafe",
+        payload: {
+          ...queuedPrompt("queued"),
+          kind: "prompt",
+          parts: [{ type: "file", mime: "text/plain", url: `file://${secret}` }],
+        },
+      })
+      const converted = yield* prompt
+        .queueUpdate(session.id, {
+          revision: (yield* queue.list(session.id)).revision,
+          mutation: { action: "convert", id: "persisted-unsafe", delivery: "steer" },
+        })
+        .pipe(Effect.exit)
+      expect(Exit.isFailure(converted)).toBe(true)
+      if (Exit.isFailure(converted))
+        expect(Cause.pretty(converted.cause)).toContain("File URL attachments are unavailable")
+      yield* queue.enqueue(session.id, {
+        id: "resolved-unsafe",
+        payload: {
+          ...queuedPrompt("queued"),
+          kind: "prompt",
+          parts: [{ type: "file", mime: "application/octet-stream", url: `file://${secret}` }],
+        },
+      })
+      const database = yield* Database.Service
+      yield* database.db
+        .update(SessionQueueTable)
+        .set({ submission: JSON.stringify({ delivery: "steer" }) })
+        .where(eq(SessionQueueTable.id, "resolved-unsafe"))
+        .run()
+        .pipe(Effect.orDie)
+      const resolved = yield* prompt
+        .queueUpdate(session.id, {
+          revision: (yield* queue.list(session.id)).revision,
+          mutation: { action: "convert", id: "resolved-unsafe", delivery: "steer" },
+        })
+        .pipe(Effect.exit)
+      expect(Exit.isFailure(resolved)).toBe(true)
+      if (Exit.isFailure(resolved))
+        expect(Cause.pretty(resolved.cause)).toContain("File URL attachments are unavailable")
+      // The runtime fixture is intentionally untracked; the captured attachment
+      // policy remains managed even if later code mutates the environment.
+      const inline = yield* Effect.acquireUseRelease(
+        Effect.sync(() => {
+          process.env.OPENCODE_MANAGED_PROFILE = "0"
+        }),
+        () =>
+          Effect.gen(function* () {
+            const rejected = yield* prompt
+              .prompt({
+                sessionID: session.id,
+                model: ref,
+                noReply: true,
+                parts: [{ type: "file", mime: "text/plain", url: `file://${secret}` }],
+              })
+              .pipe(Effect.exit)
+            expect(Exit.isFailure(rejected)).toBe(true)
+            if (Exit.isFailure(rejected))
+              expect(Cause.pretty(rejected.cause)).toContain("File URL attachments are unavailable")
+            return yield* prompt.prompt({
+              sessionID: session.id,
+              model: ref,
+              noReply: true,
+              parts: [{ type: "file", mime: "text/plain", filename: "inline", url: "data:text/plain;base64,c2FmZQ==" }],
+            })
+          }),
+        () =>
+          Effect.sync(() => {
+            process.env.OPENCODE_MANAGED_PROFILE = "1"
+          }),
+      )
+      expect(JSON.stringify(inline.parts)).toContain("safe")
+      expect(JSON.stringify(inline.parts)).not.toContain("HOST_SECRET_ATTACHMENT")
+    }),
+  { config: cfg },
+)
 
 noLLMServer.instance(
   "does not fail the prompt when a file part is missing",

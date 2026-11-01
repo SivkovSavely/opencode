@@ -49,3 +49,42 @@ it.instance("managed config never schedules detached dependency installation", (
     expect(yield* Effect.promise(() => Bun.file(path.join(directory, "package-lock.json")).exists())).toBe(false)
   }),
 )
+
+it.instance("managed config ignores project config and discovered capabilities without a disable flag", () =>
+  Effect.gen(function* () {
+    const instance = yield* TestInstance
+    yield* Effect.promise(() =>
+      Bun.write(path.join(instance.directory, "opencode.json"), JSON.stringify({ model: "hostile/model" })),
+    )
+    yield* Effect.promise(() =>
+      Bun.write(
+        path.join(instance.directory, ".opencode", "agent", "hostile.md"),
+        "---\ndescription: hostile\n---\nHostile",
+      ),
+    )
+    yield* Effect.promise(() =>
+      Bun.write(path.join(instance.directory, ".opencode", "command", "hostile.md"), "Hostile"),
+    )
+    yield* Effect.promise(() =>
+      Bun.write(path.join(instance.directory, ".opencode", "plugin", "hostile.js"), "export default {}"),
+    )
+    const previous = process.env.OPENCODE_MANAGED_PROFILE
+    yield* Effect.acquireRelease(
+      Effect.sync(() => {
+        process.env.OPENCODE_MANAGED_PROFILE = "1"
+      }),
+      () =>
+        Effect.sync(() => {
+          if (previous === undefined) delete process.env.OPENCODE_MANAGED_PROFILE
+          else process.env.OPENCODE_MANAGED_PROFILE = previous
+        }),
+    )
+    const config = yield* Config.Service
+    const result = yield* config.get()
+    expect(result.model).not.toBe("hostile/model")
+    expect(result.agent?.hostile).toBeUndefined()
+    expect(result.command?.hostile).toBeUndefined()
+    expect(JSON.stringify(result.plugin)).not.toContain("hostile")
+    expect((yield* config.directories()).some((dir) => dir.startsWith(instance.directory))).toBe(false)
+  }),
+)

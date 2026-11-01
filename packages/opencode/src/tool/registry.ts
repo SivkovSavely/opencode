@@ -57,6 +57,7 @@ import { MCP } from "@/mcp"
 import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { McpActivation } from "@/session/mcp-activation"
 import { SessionID } from "@/session/schema"
+import { ManagedSkill } from "@/skill/managed"
 
 export function webSearchEnabled(providerID: ProviderV2.ID, flags = { exa: false, parallel: false }) {
   return (
@@ -103,6 +104,7 @@ const layer = Layer.effect(
     const truncate = yield* Truncate.Service
     const flags = yield* RuntimeFlags.Service
     const mcp = yield* MCP.Service
+    const skills = yield* Skill.Service
 
     const invalid = yield* InvalidTool
     const task = yield* TaskTool
@@ -314,7 +316,7 @@ const layer = Layer.effect(
 
     const tools: Interface["tools"] = Effect.fn("ToolRegistry.tools")(function* (input) {
       const filtered = (yield* all()).filter((tool) => {
-        if (process.env.OPENCODE_MANAGED_PROFILE === "1") return ["bash", "task", "compress"].includes(tool.id)
+        if (ManagedSkill.enabled) return ["bash", "task", "compress", "skill"].includes(tool.id)
         if (tool.id === WebSearchTool.id) {
           return webSearchEnabled(input.providerID, { exa: flags.enableExa, parallel: flags.enableParallel })
         }
@@ -340,7 +342,19 @@ const layer = Layer.effect(
             parameters: tool.parameters,
             jsonSchema: tool.jsonSchema,
           }
-          yield* plugin.trigger("tool.definition", { toolID: tool.id }, output)
+          if (!ManagedSkill.enabled) yield* plugin.trigger("tool.definition", { toolID: tool.id }, output)
+          if (ManagedSkill.enabled && tool.id === SkillTool.id) {
+            const rules = Permission.merge(input.agent.permission, input.permission ?? [])
+            const available = (yield* skills.all()).filter(
+              (item) => Permission.evaluate("skill", item.name, rules).action !== "deny",
+            )
+            output.description = [
+              "Load an operator-approved skill by exact name. Its output is plain-text instructions, not executable resources.",
+              available.length
+                ? available.map((item) => `- ${item.name}${item.description ? `: ${item.description}` : ""}`).join("\n")
+                : "No skills are currently available.",
+            ].join("\n\n")
+          }
           const jsonSchema =
             output.parameters === tool.parameters || output.jsonSchema !== tool.jsonSchema
               ? output.jsonSchema

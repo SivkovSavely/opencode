@@ -42,6 +42,7 @@ export type Context<M extends Metadata = Metadata> = {
   callID?: string
   managedRuntime?: Pick<RuntimeLifecycle.Interface, "runManagedCommand"> &
     Partial<Pick<RuntimeLifecycle.Interface, "authorizeChild">>
+  managedReadOnly?: boolean
   executionFence?: number
   extra?: { [key: string]: unknown }
   messages: SessionV1.WithParts[]

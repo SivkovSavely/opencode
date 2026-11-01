@@ -14,9 +14,11 @@ const tools: Tool[] = [
       properties: {
         issueId: { type: "string" },
         checkoutPath: { type: "string" },
+        prerequisiteIssueId: { type: "string" },
+        dependencies: { type: "array", items: { type: "string" } },
         expectedGeneration: { type: "integer" },
       },
-      required: ["issueId", "checkoutPath", "expectedGeneration"],
+      required: ["issueId", "expectedGeneration"],
       additionalProperties: false,
     },
   },
@@ -142,6 +144,54 @@ describe("managed WorkQueue operator policy", () => {
       { dependencies: ["OTHER-1"] },
     ])
       await expect(ManagedWorkQueue.prepare(policy, alias, "wq_claim_work", args, authorize)).rejects.toThrow()
+    expect(server.methods).toEqual([])
+  })
+
+  test("issue-bound slots reject other issues before gateway metadata or dispatch", async () => {
+    await using tmp = await tmpdir()
+    await using server = gateway({
+      catalog: [...tools, ...["wq_update_progress", "wq_release_checkout"].map((name) => ({ ...tools[1], name }))],
+    })
+    const names = ["wq_claim_work", "wq_update_progress", "wq_release_checkout"]
+    const policy = await server.policy(tmp.path, { issueId: "BAILA-1", tools: names })
+    for (const name of names)
+      await expect(
+        ManagedWorkQueue.prepare(policy, tmp.path, name, { issueId: "BAILA-2", expectedGeneration: 0 }, authorize),
+      ).rejects.toThrow()
+    for (const args of [
+      { issueId: "BAILA-1", prerequisiteIssueId: "BAILA-2", expectedGeneration: 0 },
+      { issueId: "BAILA-1", dependencies: ["BAILA-2"], expectedGeneration: 0 },
+      { prerequisiteIssueId: "BAILA-1", expectedGeneration: 0 },
+    ])
+      await expect(ManagedWorkQueue.prepare(policy, tmp.path, "wq_claim_work", args, authorize)).rejects.toThrow()
+    expect(server.methods).toEqual([])
+    expect(server.calls).toEqual([])
+  })
+
+  test("bound issue reads and mutations work, including canonical workspace aliases", async () => {
+    await using tmp = await tmpdir()
+    await using other = await tmpdir()
+    await using server = gateway()
+    const alias = path.join(other.path, "alias")
+    await symlink(tmp.path, alias)
+    const policy = await server.policy(tmp.path, { issueId: "BAILA-1", tools: ["wq_ping", "wq_claim_work"] })
+    const read = await ManagedWorkQueue.prepare(policy, alias, "wq_ping", {}, authorize)
+    expect((await read.start()).cleanup).toBe("confirmed")
+    const mutation = await ManagedWorkQueue.prepare(
+      policy,
+      alias,
+      "wq_claim_work",
+      { issueId: "BAILA-1", expectedGeneration: 0 },
+      authorize,
+    )
+    expect((await mutation.start()).cleanup).toBe("confirmed")
+    expect(server.calls.map((call) => call.arguments)).toEqual([{}, { issueId: "BAILA-1", expectedGeneration: 0 }])
+  })
+
+  test("operator policy rejects unknown keys", async () => {
+    await using tmp = await tmpdir()
+    await using server = gateway()
+    await expect(server.policy(tmp.path, { extra: true })).rejects.toThrow("Invalid managed WorkQueue operator policy")
     expect(server.methods).toEqual([])
   })
 })
