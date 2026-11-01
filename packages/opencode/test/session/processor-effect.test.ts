@@ -29,6 +29,7 @@ import { ModelV2 } from "@opencode-ai/core/model"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { LLMEvent } from "@opencode-ai/llm"
 import { RuntimeLifecycle } from "@/server/runtime-lifecycle"
+import { EffectBridge } from "@/effect/bridge"
 
 const summary = Layer.succeed(
   SessionSummary.Service,
@@ -672,6 +673,201 @@ it.live("session.processor effect tests retry OpenAI-compatible midstream server
   ),
 )
 
+it.live("session.processor records reused tool call IDs on provider retry", () =>
+  provideTmpdirServer(
+    ({ dir, llm }) =>
+      Effect.gen(function* () {
+        const { processors, session, provider } = yield* boot()
+        const events = yield* EventV2Bridge.Service
+        const bridge = yield* EffectBridge.make()
+        const completed = Promise.withResolvers<void>()
+        yield* Effect.addFinalizer(() => Effect.sync(() => completed.resolve()))
+        const first = reply().tool("lookup", { query: "first" }).item()
+        if (first.type !== "sse") throw new Error("expected stream")
+        yield* llm.push(
+          raw({
+            head: [...first.head, ...first.tail],
+            wait: completed.promise,
+            tail: [{ error: { type: "server_error", code: "server_error", message: "connection lost" } }],
+          }),
+          reply().tool("lookup", { query: "second" }),
+        )
+        const chat = yield* session.create({})
+        const parent = yield* user(chat.id, "retry tool")
+        const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+        const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+        const handle = yield* processors.create({ assistantMessage: msg, sessionID: chat.id, model: mdl })
+        const executed: string[] = []
+        const off = yield* events.listen((event) => {
+          if (event.type !== SessionV1.Event.PartUpdated.type) return Effect.void
+          const data = event.data as typeof SessionV1.Event.PartUpdated.data.Type
+          if (
+            data.part.messageID === msg.id &&
+            data.part.type === "tool" &&
+            data.part.state.status === "completed" &&
+            data.part.state.output === "first"
+          )
+            completed.resolve()
+          return Effect.void
+        })
+        yield* Effect.addFinalizer(() => off)
+        const result = yield* handle.process({
+          user: parent,
+          sessionID: chat.id,
+          model: mdl,
+          agent: agent(),
+          system: [],
+          messages: [{ role: "user", content: "retry tool" }],
+          tools: {
+            lookup: tool({
+              inputSchema: z.object({ query: z.string() }),
+              execute: (input, options) => {
+                const call = handle.toolCall(options.toolCallId)
+                return bridge.promise(
+                  Effect.gen(function* () {
+                    executed.push(input.query)
+                    const metadata = { sessionId: `ses_${input.query}` }
+                    yield* call.update((part) => ({
+                      ...part,
+                      state: { status: "running", input, metadata, time: { start: Date.now() } },
+                    }))
+                    return { title: input.query, output: input.query, metadata }
+                  }),
+                )
+              },
+            }),
+          },
+        })
+        const calls = (yield* MessageV2.parts(msg.id)).filter((part) => part.type === "tool")
+        expect(result).toBe("continue")
+        expect(yield* llm.calls).toBe(2)
+        expect(executed).toEqual(["first", "second"])
+        expect(calls).toHaveLength(2)
+        expect(calls.map((part) => part.callID)).toEqual(["call_1", "call_1"])
+        expect(calls.map((part) => part.state)).toMatchObject([
+          { status: "completed", input: { query: "first" }, output: "first", metadata: { sessionId: "ses_first" } },
+          { status: "completed", input: { query: "second" }, output: "second", metadata: { sessionId: "ses_second" } },
+        ])
+      }),
+    { config: (url) => providerCfg(url) },
+  ),
+)
+
+for (const phase of ["before retry registration", "while retry is running"] as const) {
+  it.live(`session.processor isolates aborted tool callbacks ${phase}`, () =>
+    provideTmpdirServer(
+      ({ dir, llm }) =>
+        Effect.gen(function* () {
+          const { processors, session, provider } = yield* boot()
+          const events = yield* EventV2Bridge.Service
+          const bridge = yield* EffectBridge.make()
+          const started = Promise.withResolvers<void>()
+          const entered = yield* Deferred.make<void>()
+          const resume = yield* Deferred.make<void>()
+          const release = yield* Deferred.make<void>()
+          const completing = yield* Deferred.make<void>()
+          const finished = yield* Deferred.make<void>()
+          yield* Effect.addFinalizer(() => Effect.sync(() => started.resolve()))
+          const first = reply().tool("lookup", { query: "first" }).item()
+          if (first.type !== "sse") throw new Error("expected stream")
+          yield* llm.push(
+            raw({
+              head: [...first.head, ...first.tail],
+              wait: started.promise,
+              tail: [{ error: { type: "server_error", code: "server_error", message: "connection lost" } }],
+            }),
+            reply().tool("lookup", { query: "second" }),
+          )
+          const chat = yield* session.create({})
+          const parent = yield* user(chat.id, "retry tool")
+          const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+          const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+          const handle = yield* processors.create({ assistantMessage: msg, sessionID: chat.id, model: mdl })
+          const executed: string[] = []
+          let steps = 0
+          let gated = false
+          const off = yield* events.listen((event) => {
+            if (event.type !== SessionV1.Event.PartUpdated.type) return Effect.void
+            const data = event.data as typeof SessionV1.Event.PartUpdated.data.Type
+            if (data.part.messageID !== msg.id) return Effect.void
+            if (data.part.type === "step-start") steps++
+            if (
+              data.part.type === "tool" &&
+              data.part.state.status === "running" &&
+              data.part.state.metadata?.sessionId === "ses_first"
+            )
+              started.resolve()
+            const blocked =
+              phase === "before retry registration"
+                ? steps === 2 && data.part.type === "step-start"
+                : data.part.type === "tool" &&
+                  data.part.state.status === "running" &&
+                  data.part.state.input.query === "second"
+            if (!blocked || gated) return Effect.void
+            gated = true
+            return Deferred.succeed(entered, undefined).pipe(Effect.andThen(Deferred.await(resume)))
+          })
+          yield* Effect.addFinalizer(() => off)
+          const processing = yield* handle
+            .process({
+              user: parent,
+              sessionID: chat.id,
+              model: mdl,
+              agent: agent(),
+              system: [],
+              messages: [{ role: "user", content: "retry tool" }],
+              tools: {
+                lookup: tool({
+                  inputSchema: z.object({ query: z.string() }),
+                  execute: (input, options) => {
+                    const call = handle.toolCall(options.toolCallId)
+                    return bridge.promise(
+                      Effect.gen(function* () {
+                        executed.push(input.query)
+                        const metadata = { sessionId: `ses_${input.query}` }
+                        yield* call.update((part) => ({
+                          ...part,
+                          state: { status: "running", input, metadata, time: { start: Date.now() } },
+                        }))
+                        const output = { title: input.query, output: input.query, metadata }
+                        if (input.query === "second") {
+                          yield* Deferred.await(finished)
+                          return output
+                        }
+                        yield* Deferred.await(release)
+                        expect(options.abortSignal?.aborted).toBe(true)
+                        yield* Deferred.succeed(completing, undefined)
+                        yield* call.complete(output)
+                        yield* Deferred.succeed(finished, undefined)
+                        return output
+                      }),
+                    )
+                  },
+                }),
+              },
+            })
+            .pipe(Effect.forkScoped)
+          yield* Deferred.await(entered)
+          yield* Deferred.succeed(release, undefined)
+          yield* Deferred.await(completing)
+          if (phase === "before retry registration") yield* Deferred.await(finished)
+          yield* Deferred.succeed(resume, undefined)
+          expect(yield* Fiber.join(processing)).toBe("continue")
+          const calls = (yield* MessageV2.parts(msg.id)).filter((part) => part.type === "tool")
+          expect(yield* llm.calls).toBe(2)
+          expect(executed).toEqual(["first", "second"])
+          expect(calls).toHaveLength(2)
+          expect(calls.map((part) => part.callID)).toEqual(["call_1", "call_1"])
+          expect(calls.map((part) => part.state)).toMatchObject([
+            { status: "completed", input: { query: "first" }, output: "first", metadata: { sessionId: "ses_first" } },
+            { status: "completed", input: { query: "second" }, output: "second", metadata: { sessionId: "ses_second" } },
+          ])
+        }),
+      { config: (url) => providerCfg(url) },
+    ),
+  )
+}
+
 it.live("session.processor effect tests retry network_error finish reasons", () =>
   provideTmpdirServer(
     ({ dir, llm }) =>
@@ -970,6 +1166,153 @@ it.live("session.processor effect tests complete AI SDK tool calls when native f
     { config: (url) => providerCfg(url) },
   ),
 )
+
+for (const phase of ["before registration", "during registration", "during tool call"] as const) {
+  it.live(`session.processor retains AI SDK metadata emitted ${phase}`, () =>
+    provideTmpdirServer(
+      ({ dir, llm }) =>
+        Effect.gen(function* () {
+          const { processors, session, provider } = yield* boot()
+          const events = yield* EventV2Bridge.Service
+          const bridge = yield* EffectBridge.make()
+          const early = yield* Deferred.make<void>()
+          const entered = yield* Deferred.make<void>()
+          const reporting = yield* Deferred.make<void>()
+          yield* llm.tool("lookup", { query: "weather" })
+          const chat = yield* session.create({})
+          const parent = yield* user(chat.id, "tool")
+          const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+          const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+          const handle = yield* processors.create({ assistantMessage: msg, sessionID: chat.id, model: mdl })
+          const order: string[] = []
+          // Gate the stream consumer while the real AI SDK dispatches and reports progress.
+          const off = yield* events.listen((event) => {
+            if (event.type !== SessionV1.Event.PartUpdated.type) return Effect.void
+            const data = event.data as typeof SessionV1.Event.PartUpdated.data.Type
+            if (data.part.messageID !== msg.id) return Effect.void
+            const blocked =
+              phase === "before registration"
+                ? data.part.type === "step-start"
+                : data.part.type === "tool" &&
+                  data.part.state.status === (phase === "during registration" ? "pending" : "running")
+            if (!blocked) return Effect.void
+            return Deferred.succeed(entered, undefined).pipe(Effect.andThen(Deferred.await(early)))
+          })
+          yield* Effect.addFinalizer(() => off)
+          const processing = yield* handle
+            .process({
+              user: parent,
+              sessionID: chat.id,
+              model: mdl,
+              agent: agent(),
+              system: [],
+              messages: [{ role: "user", content: "tool" }],
+              tools: {
+                lookup: tool({
+                  description: "Look up information",
+                  inputSchema: z.object({ query: z.string() }),
+                  execute: (input, options): Promise<string> => {
+                    const call = handle.toolCall(options.toolCallId)
+                    return bridge.promise(
+                      Effect.gen(function* () {
+                        yield* Deferred.await(entered)
+                        if (phase === "before registration")
+                          expect((yield* MessageV2.parts(msg.id)).some((part) => part.type === "tool")).toBe(false)
+                        order.push(`metadata ${phase}`)
+                        yield* Deferred.succeed(reporting, undefined)
+                        yield* call.update((part) => ({
+                          ...part,
+                          state: {
+                            status: "running",
+                            input,
+                            title: "Weather lookup",
+                            metadata: { sessionId: "ses_existing_child" },
+                            time: { start: 123 },
+                          },
+                        }))
+                        if (phase === "before registration") yield* Deferred.succeed(early, undefined)
+                        return yield* Effect.fail(new Error("lookup failed"))
+                      }),
+                    )
+                  },
+                }),
+              },
+            })
+            .pipe(Effect.forkScoped)
+          yield* Deferred.await(reporting)
+          if (phase !== "before registration") yield* Deferred.succeed(early, undefined)
+          yield* Fiber.join(processing)
+          const calls = (yield* MessageV2.parts(msg.id)).filter((part) => part.type === "tool")
+          expect(order).toEqual([`metadata ${phase}`])
+          expect(calls).toHaveLength(1)
+          expect(calls[0]?.state).toMatchObject({
+            status: "error",
+            input: { query: "weather" },
+            metadata: { sessionId: "ses_existing_child" },
+            time: { start: 123 },
+          })
+        }),
+      { config: (url) => providerCfg(url) },
+    ),
+  )
+}
+
+for (const metadata of [false, true]) {
+  itProviderError.live(
+    `session.processor orders early completion and ignores late updates (metadata: ${metadata})`,
+    () =>
+      provideTmpdirInstance(
+        (dir) =>
+          Effect.gen(function* () {
+            const { processors, session, provider } = yield* boot()
+            const chat = yield* session.create({})
+            const parent = yield* user(chat.id, "tool")
+            const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+            const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+            const handle = yield* processors.create({ assistantMessage: msg, sessionID: chat.id, model: mdl })
+            const call = handle.toolCall("call-1")
+            if (metadata) {
+              yield* call.update((part) => ({
+                ...part,
+                state: { status: "running", input: { stale: true }, metadata: { order: [1] }, time: { start: 123 } },
+              }))
+              yield* call.update((part) => {
+                expect(part.state).toMatchObject({ status: "running", metadata: { order: [1] } })
+                return { ...part, state: { ...part.state, metadata: { order: [1, 2] } } }
+              })
+            }
+            const output = { title: "done", output: "completed early", metadata: { order: [1, 2] } }
+            yield* call.complete(output)
+            yield* call.complete({ ...output, output: "duplicate" })
+            yield* handle.process({
+              user: parent,
+              sessionID: chat.id,
+              model: mdl,
+              agent: agent(),
+              system: [],
+              messages: [{ role: "user", content: "tool" }],
+              tools: {},
+            })
+            const parts = yield* MessageV2.parts(msg.id)
+            const calls = parts.filter((part) => part.type === "tool")
+            expect(calls).toHaveLength(1)
+            expect(calls[0]?.state).toMatchObject({
+              status: "completed",
+              input: {},
+              output: "completed early",
+              metadata: { order: [1, 2] },
+              ...(metadata ? { time: { start: 123 } } : {}),
+            })
+            yield* call.update(() => {
+              throw new Error("late update must not run")
+            })
+            yield* call.complete({ ...output, output: "late completion" })
+            expect(yield* MessageV2.parts(msg.id)).toEqual(parts)
+          }),
+        { config: cfg },
+      ),
+  )
+}
 
 it.live("session.processor effect tests mark pending tools as aborted on cleanup", () =>
   provideTmpdirServer(

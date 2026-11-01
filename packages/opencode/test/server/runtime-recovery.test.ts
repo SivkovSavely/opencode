@@ -5,6 +5,7 @@ import { Database } from "@opencode-ai/core/database/database"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { ProviderV2 } from "@opencode-ai/core/provider"
+import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { createOpencodeClient } from "@opencode-ai/sdk/v2"
 import { sql } from "drizzle-orm"
 import { Context, Deferred, Effect, Layer } from "effect"
@@ -32,15 +33,228 @@ import { testProviderConfig } from "../lib/test-provider"
 const it = testEffect(Layer.mergeAll(TestLLMServer.layer, LayerNode.compile(CrossSpawnSpawner.node)))
 const model = { providerID: ProviderV2.ID.make("test"), modelID: ModelV2.ID.make("test-model") }
 
+describe("foreground Task settlement linkage", () => {
+  for (const scenario of [
+    "repair",
+    "success",
+    "historical-result",
+    "ambiguous-result",
+    "terminal",
+    "missing",
+    "tuple",
+    "parent-tuple",
+    "message-tuple",
+    "child-parent",
+    "background",
+    "input-background",
+    "no-task-id",
+    "task-id",
+    "metadata",
+    "metadata-id",
+    "metadata-message",
+    "empty-id",
+    "null-id",
+    "placement",
+    "result",
+    "cancelled",
+  ] as const) {
+    it.live(scenario, () =>
+      Effect.gen(function* () {
+        const directory = yield* tmpdirScoped({ git: true })
+        const runtime = RuntimeLifecycle.make({ lineage: randomUUID() }, yield* Effect.scope)
+        const context = yield* Layer.build(
+          AppNodeBuilderV1.build(
+            LayerNode.group([Session.node, Database.node, InstanceStore.node, SessionProjector.node]),
+          ).pipe(Layer.provide(Layer.succeed(RuntimeLifecycle.Service)(runtime))),
+        )
+        const database = Context.get(context, Database.Service)
+        const sessions = Context.get(context, Session.Service)
+        const store = Context.get(context, InstanceStore.Service)
+        yield* store.provide(
+          { directory },
+          Effect.gen(function* () {
+            const parent = yield* sessions.create({ title: "parent" })
+            const child = yield* sessions.create({
+              title: "child",
+              parentID: parent.id,
+              metadata: { task: { parentCallID: "historical" } },
+            })
+            const user = yield* sessions.updateMessage({
+              id: MessageID.ascending(),
+              sessionID: parent.id,
+              role: "user",
+              agent: "general",
+              model,
+              time: { created: Date.now() },
+            })
+            const assistant = yield* sessions.updateMessage({
+              id: MessageID.ascending(),
+              sessionID: parent.id,
+              role: "assistant",
+              parentID: user.id,
+              mode: "general",
+              agent: "general",
+              path: { cwd: directory, root: directory },
+              cost: 0,
+              tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+              modelID: model.modelID,
+              providerID: model.providerID,
+              time: { created: Date.now() },
+            })
+            const callID = "current-call"
+            const partID = PartID.ascending()
+            const taskInput = {
+              task_id: scenario === "task-id" ? "other" : scenario === "no-task-id" ? undefined : child.id,
+              prompt: "current task",
+              command: "review",
+              ...(scenario === "input-background" ? { background: true } : {}),
+            }
+            const metadata =
+              scenario === "metadata"
+                ? { parentCallID: "wrong" }
+                : scenario === "metadata-id"
+                  ? { sessionId: parent.id }
+                  : scenario === "metadata-message"
+                    ? { parentMessageID: user.id }
+                    : scenario === "empty-id"
+                      ? { sessionId: "" }
+                      : scenario === "null-id"
+                        ? { sessionId: null }
+                        : undefined
+            yield* sessions.updatePart({
+              id: partID,
+              messageID: assistant.id,
+              sessionID: parent.id,
+              type: "tool",
+              tool: "task",
+              callID,
+              state:
+                scenario === "terminal"
+                  ? {
+                      status: "completed",
+                      input: taskInput,
+                      output: "existing",
+                      title: "task",
+                      metadata: metadata ?? {},
+                      time: { start: 1, end: 2 },
+                    }
+                  : { status: "running", input: taskInput, metadata, time: { start: 1 } },
+            })
+            const now = Date.now()
+            const childPrompt = yield* sessions.updateMessage({
+              id: MessageID.ascending(),
+              sessionID: child.id,
+              role: "user",
+              agent: "general",
+              model,
+              time: { created: scenario === "historical-result" ? 0 : scenario === "ambiguous-result" ? 1 : now },
+            })
+            yield* sessions.updatePart({
+              id: PartID.ascending(),
+              sessionID: child.id,
+              messageID: childPrompt.id,
+              type: "text",
+              text: "current task",
+            })
+            if (scenario !== "missing")
+              yield* database.db.run(sql`
+            INSERT INTO runtime_execution (id, session_id, directory, owner_lineage, owner_instance, fence, state,
+              desired_active, parent_session_id, parent_message_id, parent_call_id, parent_mode, time_created, time_updated)
+            VALUES (${child.id}, ${child.id}, ${scenario === "placement" ? "/wrong" : directory}, ${"test"}, ${"test"}, 1,
+              ${"completed"}, 1, ${scenario === "parent-tuple" ? child.id : parent.id},
+              ${scenario === "message-tuple" ? user.id : assistant.id}, ${scenario === "tuple" ? "wrong" : callID},
+              ${scenario === "background" ? "background" : "foreground"}, ${now}, ${now})
+           `)
+            if (scenario === "child-parent")
+              yield* database.db.run(sql`UPDATE session SET parent_id = NULL WHERE id = ${child.id}`)
+            if (scenario === "cancelled")
+              yield* database.db.run(sql`
+            INSERT INTO runtime_execution (id, session_id, directory, owner_lineage, owner_instance, fence, state,
+              desired_active, time_created, time_updated)
+            VALUES (${parent.id}, ${parent.id}, ${directory}, ${"test"}, ${"test"}, 1, ${"cancelled"}, 0, ${now}, ${now})
+          `)
+            const record = {
+              sessionID: child.id,
+              parentSessionID: parent.id,
+              parentMessageID: assistant.id,
+              parentCallID: callID,
+            }
+            const result =
+              scenario === "result"
+                ? { info: assistant, parts: [] }
+                : scenario === "success" || scenario === "historical-result" || scenario === "ambiguous-result"
+                  ? {
+                      info: {
+                        ...assistant,
+                        sessionID: child.id,
+                        parentID: childPrompt.id,
+                        finish: "stop",
+                        time: { created: now, completed: now },
+                      },
+                      parts: [],
+                    }
+                  : undefined
+            expect(yield* ServerRecovery.foregroundSettlementComplete({ database, record })).toBe(false)
+            yield* ServerRecovery.settleForeground({ database, sessions, record, result })
+            const once = yield* sessions.messages({ sessionID: parent.id })
+            yield* ServerRecovery.settleForeground({ database, sessions, record, result })
+            const messages = yield* sessions.messages({ sessionID: parent.id })
+            expect(messages).toEqual(once)
+            expect((yield* sessions.get(child.id)).metadata?.task?.parentCallID).toBe("historical")
+            const part = messages
+              .find((message) => message.info.id === assistant.id)
+              ?.parts.find((item) => item.id === partID)
+            if (!part || part.type !== "tool") throw new Error("missing task")
+            if (
+              scenario === "repair" ||
+              scenario === "terminal" ||
+              scenario === "success" ||
+              scenario === "historical-result" ||
+              scenario === "ambiguous-result"
+            ) {
+              expect(part.state.status).toBe(scenario === "terminal" || scenario === "success" ? "completed" : "error")
+              if (part.state.status !== "error" && part.state.status !== "completed")
+                throw new Error("task not settled")
+              expect(part.state.metadata).toMatchObject({
+                sessionId: child.id,
+                parentSessionId: parent.id,
+                parentMessageID: assistant.id,
+                parentCallID: callID,
+              })
+              expect(yield* ServerRecovery.foregroundSettlementComplete({ database, record })).toBe(true)
+              expect(messages.filter((message) => message.info.id === `msg_task_summary_${callID}`)).toHaveLength(1)
+            } else {
+              expect(part.state.status).toBe("running")
+              expect(yield* ServerRecovery.foregroundSettlementComplete({ database, record })).toBe(false)
+            }
+          }),
+        )
+      }),
+    )
+  }
+})
+
 describe("HTTP startup recovery", () => {
-  for (const scenario of ["recovered", "foreground", "cancel", "task", "task-cancel", "task-reuse-cancel"] as const) {
+  for (const scenario of [
+    "recovered",
+    "foreground",
+    "cancel",
+    "task",
+    "task-resume",
+    "task-resume-unsaved",
+    "task-cancel",
+    "task-reuse-cancel",
+  ] as const) {
     const cancelledTask = scenario === "task-cancel" || scenario === "task-reuse-cancel"
+    const resumedTask = scenario === "task-resume" || scenario === "task-resume-unsaved"
     it.live(
       scenario === "task-cancel"
         ? "settles a reconstructed foreground Task when its empty child is stopped during prompt preparation"
         : scenario === "task-reuse-cancel"
           ? "does not deliver a reused child's previous answer when reconstructed prompt preparation is stopped"
-          : `${scenario} nested no-reply notification`,
+          : scenario === "task-resume-unsaved"
+            ? "does not deliver a reused child's previous answer when its newly admitted prompt was never saved"
+            : `${scenario} nested no-reply notification`,
       () =>
         Effect.gen(function* () {
           const previous = RuntimeLifecycle.current() ?? RuntimeLifecycle.unavailable()
@@ -150,13 +364,18 @@ export default async ({ directory }) => {
             }),
           )
           const child =
-            scenario === "task" || cancelledTask
+            scenario === "task" || resumedTask || cancelledTask
               ? yield* store.provide(
                   { directory },
-                  sessions.create({ title: "Task child", parentID: session.id, agent: "general" }),
+                  sessions.create({
+                    title: "Task child",
+                    parentID: session.id,
+                    agent: "general",
+                    ...(resumedTask ? { metadata: { task: { parentCallID: "historical-call" } } } : {}),
+                  }),
                 )
               : undefined
-          if (child && scenario === "task-reuse-cancel")
+          if (child && (scenario === "task-reuse-cancel" || scenario === "task-resume-unsaved"))
             yield* store.provide(
               { directory },
               Effect.gen(function* () {
@@ -244,16 +463,19 @@ export default async ({ directory }) => {
                         description: "review",
                         subagent_type: "general",
                         command: "review",
+                        ...(resumedTask ? { task_id: child.id } : {}),
                       },
-                      metadata: {
-                        sessionId: child.id,
-                        parentSessionId: session.id,
-                        parentMessageID,
-                        parentCallID: callID,
-                        messageID: childMessageID,
-                        model,
-                        inheritVariant: true,
-                      },
+                      metadata: resumedTask
+                        ? undefined
+                        : {
+                            sessionId: child.id,
+                            parentSessionId: session.id,
+                            parentMessageID,
+                            parentCallID: callID,
+                            messageID: childMessageID,
+                            model,
+                            inheritVariant: true,
+                          },
                       time: { start: Date.now() },
                     },
                   })
@@ -262,15 +484,52 @@ export default async ({ directory }) => {
             )
             const abandoned = RuntimeLifecycle.make({ lineage, instance: randomUUID() }, yield* Effect.scope, database)
             yield* abandoned.admit({ sessionID: session.id, directory })
+            if (child && resumedTask) {
+              // The resumed child was already admitted before the crash, but its parent lost SDK metadata.
+              if (scenario === "task-resume")
+                yield* store.provide(
+                  { directory },
+                  Effect.gen(function* () {
+                    yield* sessions.updateMessage({
+                      id: childMessageID,
+                      sessionID: child.id,
+                      role: "user",
+                      agent: "general",
+                      model,
+                      time: { created: Date.now() },
+                    })
+                    yield* sessions.updatePart({
+                      id: PartID.ascending(`prt_task_recovery_${childMessageID}_0`),
+                      messageID: childMessageID,
+                      sessionID: child.id,
+                      type: "text",
+                      text: "perform child task",
+                    })
+                  }),
+                )
+              yield* abandoned.admit({
+                sessionID: child.id,
+                directory,
+                parentSessionID: session.id,
+                parentMessageID,
+                parentCallID: callID,
+                parentMode: "foreground",
+              })
+              yield* database.db.run(
+                sql`UPDATE runtime_execution SET owner_start_time = ${"0"} WHERE session_id = ${child.id}`,
+              )
+            }
             yield* database.db.run(
               sql`UPDATE runtime_execution SET owner_start_time = ${"0"} WHERE session_id = ${session.id}`,
             )
           }
           if (child) {
-            expect(
-              yield* database.db.get(sql`SELECT session_id FROM runtime_execution WHERE session_id = ${child.id}`),
-            ).toBeUndefined()
-            if (cancelledTask) yield* llm.push(reply().text("parent continued").wait(releaseTurn.promise).stop())
+            if (!resumedTask)
+              expect(
+                yield* database.db.get(sql`SELECT session_id FROM runtime_execution WHERE session_id = ${child.id}`),
+              ).toBeUndefined()
+            if (cancelledTask || scenario === "task-resume-unsaved")
+              yield* llm.push(reply().text("parent continued").wait(releaseTurn.promise).stop())
             else
               yield* llm.push(
                 reply().text("child completed").wait(releaseChild.promise).stop(),
@@ -283,31 +542,36 @@ export default async ({ directory }) => {
           yield* runtime.finishStartupRecovery()
           const visible = yield* Effect.promise(() => sdk.session.get({ sessionID: session.id }))
           expect(visible.response.status).toBe(200)
-          if (child && cancelledTask) {
-            yield* awaitWithTimeout(
-              Deferred.await(entered),
-              "child prompt preparation did not reach the plugin gate",
-              "10 seconds",
-            )
+          if (child && (cancelledTask || scenario === "task-resume-unsaved")) {
+            if (cancelledTask)
+              yield* awaitWithTimeout(
+                Deferred.await(entered),
+                "child prompt preparation did not reach the plugin gate",
+                "10 seconds",
+              )
             const history = yield* Effect.promise(() => sdk.session.messages({ sessionID: child.id }))
             expect(history.response.status).toBe(200)
-            expect(history.data).toHaveLength(scenario === "task-reuse-cancel" ? 2 : 0)
+            expect(history.data).toHaveLength(scenario === "task-cancel" ? 0 : 2)
             expect(history.data?.some((message) => message.info.id === childMessageID)).toBe(false)
-            expect(yield* llm.calls).toBe(0)
-            const beforeStop = yield* Effect.promise(() => sdk.session.messages({ sessionID: session.id }))
-            const running = beforeStop.data?.flatMap((message) => message.parts).find((part) => part.id === taskPartID)
-            expect(running?.type === "tool" && running.state.status).toBe("running")
-            const stopped = yield* awaitWithTimeout(
-              Effect.promise(() => sdk.session.abort({ sessionID: child.id })),
-              "child abort blocked on prompt preparation",
-              "10 seconds",
-            )
-            expect(stopped.response.status).toBe(200)
-            expect(
-              yield* database.db.get(
-                sql`SELECT state, desired_active FROM runtime_execution WHERE session_id = ${child.id}`,
-              ),
-            ).toEqual({ state: "cancelled", desired_active: 0 })
+            if (cancelledTask) {
+              expect(yield* llm.calls).toBe(0)
+              const beforeStop = yield* Effect.promise(() => sdk.session.messages({ sessionID: session.id }))
+              const running = beforeStop.data
+                ?.flatMap((message) => message.parts)
+                .find((part) => part.id === taskPartID)
+              expect(running?.type === "tool" && running.state.status).toBe("running")
+              const stopped = yield* awaitWithTimeout(
+                Effect.promise(() => sdk.session.abort({ sessionID: child.id })),
+                "child abort blocked on prompt preparation",
+                "10 seconds",
+              )
+              expect(stopped.response.status).toBe(200)
+              expect(
+                yield* database.db.get(
+                  sql`SELECT state, desired_active FROM runtime_execution WHERE session_id = ${child.id}`,
+                ),
+              ).toEqual({ state: "cancelled", desired_active: 0 })
+            }
             const childMessages = yield* Effect.promise(() => sdk.session.messages({ sessionID: child.id }))
             expect(childMessages.data).toEqual(history.data)
             yield* awaitWithTimeout(llm.wait(1), "parent did not continue after child cancellation", "10 seconds")
@@ -325,7 +589,7 @@ export default async ({ directory }) => {
             })
             if (task?.[0]?.type !== "tool" || task[0].state.status !== "error")
               return yield* Effect.die("Cancelled Task did not settle")
-            expect(task[0].state.error.toLowerCase()).toContain("cancel")
+            expect(task[0].state.error.toLowerCase()).toContain(cancelledTask ? "cancel" : "current task prompt")
             expect(task[0].state.error).not.toContain("previous task answer")
             expect(
               parentMessages.data?.filter(
@@ -403,6 +667,16 @@ export default async ({ directory }) => {
             expect(JSON.stringify((yield* llm.inputs)[0])).toContain("perform child task")
             expect(JSON.stringify((yield* llm.inputs)[1])).toContain("child completed")
             expect(yield* llm.calls).toBe(2)
+            if (scenario === "task-resume") {
+              expect(settled[0].state.metadata).toMatchObject({
+                sessionId: child.id,
+                parentSessionId: session.id,
+                parentMessageID,
+                parentCallID: callID,
+              })
+              const unchanged = yield* Effect.promise(() => sdk.session.get({ sessionID: child.id }))
+              expect(unchanged.data?.metadata?.task).toMatchObject({ parentCallID: "historical-call" })
+            }
             releaseTurn.resolve()
             yield* pollWithTimeout(
               Effect.promise(() => sdk.session.status()).pipe(

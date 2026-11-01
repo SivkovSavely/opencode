@@ -13,6 +13,19 @@ type ForegroundTaskRecord = {
   parentCallID?: string
 }
 
+function matchingMetadata(metadata: Record<string, unknown> | undefined, record: ForegroundTaskRecord) {
+  if (metadata === undefined) return true
+  if (!metadata || typeof metadata !== "object" || Array.isArray(metadata)) return false
+  return (
+    [
+      ["sessionId", record.sessionID],
+      ["parentSessionId", record.parentSessionID],
+      ["parentMessageID", record.parentMessageID],
+      ["parentCallID", record.parentCallID],
+    ] as const
+  ).every(([key, value]) => !(key in metadata) || metadata[key] === value)
+}
+
 function taskOutcome(sessionID: string, result?: SessionV1.WithParts) {
   if (!result)
     return {
@@ -61,7 +74,8 @@ export const foregroundSettlementComplete = Effect.fn("ServerRecovery.foreground
   if (
     part?.type !== "tool" ||
     (part.state.status !== "completed" && part.state.status !== "error") ||
-    part.state.metadata?.sessionId !== record.sessionID
+    part.state.metadata?.sessionId !== record.sessionID ||
+    !matchingMetadata(part.state.metadata, record)
   )
     return false
   const command = part.state.input.command
@@ -81,6 +95,12 @@ export const settleForeground = Effect.fn("ServerRecovery.settleForeground")(fun
   const parentMessageID = record.parentMessageID
   const parentCallID = record.parentCallID
   if (!parentID || !parentMessageID || !parentCallID) return
+  if (
+    result &&
+    (result.info.sessionID !== record.sessionID ||
+      result.parts.some((part) => part.sessionID !== record.sessionID || part.messageID !== result.info.id))
+  )
+    return
   const { SessionID, MessageID, PartID } = yield* Effect.promise(() => import("../session/schema"))
   const { MessageV2 } = yield* Effect.promise(() => import("../session/message-v2"))
   const databaseService = yield* Effect.promise(() => import("@opencode-ai/core/database/database"))
@@ -131,7 +151,7 @@ export const settleForeground = Effect.fn("ServerRecovery.settleForeground")(fun
           })
           return
         }
-        if (part.state.metadata?.sessionId !== record.sessionID) {
+        if (!matchingMetadata(part.state.metadata, record)) {
           yield* Effect.logWarning("foreground Task recovery link does not match parent metadata", {
             childSessionID: record.sessionID,
             parentSessionID: record.parentSessionID,
@@ -139,12 +159,65 @@ export const settleForeground = Effect.fn("ServerRecovery.settleForeground")(fun
           })
           return
         }
+        const repair =
+          part.state.metadata?.sessionId === undefined && !(part.state.metadata && "sessionId" in part.state.metadata)
+        if (repair) {
+          if (
+            part.state.input.task_id !== record.sessionID ||
+            part.state.input.background === true ||
+            part.state.metadata?.background === true
+          )
+            return
+          const link = yield* database.db.get<{ valid: number }>(sql`
+            SELECT 1 AS valid FROM runtime_execution e
+            JOIN session child ON child.id = e.session_id
+            JOIN session parent ON parent.id = e.parent_session_id
+            WHERE e.session_id = ${record.sessionID} AND e.parent_session_id = ${parentID}
+              AND e.parent_message_id = ${parentMessageID} AND e.parent_call_id = ${parentCallID}
+              AND e.parent_mode = 'foreground' AND child.parent_id = parent.id
+              AND child.project_id = parent.project_id AND child.directory = parent.directory
+              AND child.workspace_id IS parent.workspace_id AND e.directory = child.directory
+          `)
+          if (!link) return
+        }
+        const childPrompt =
+          repair && result?.info.role === "assistant"
+            ? yield* getMessage(SessionID.make(record.sessionID), result.info.parentID)
+            : undefined
+        // Admission precedes saving the prompt. A reused child's historical answer is not a result for this call.
+        // Legacy calls without a prompt ID need an unambiguously newer, matching saved prompt; ties fail closed.
+        const currentResult =
+          !repair ||
+          !result ||
+          (childPrompt?.info.role === "user" &&
+            (part.state.metadata && "messageID" in part.state.metadata
+              ? part.state.metadata.messageID === childPrompt.info.id
+              : childPrompt.info.time.created > part.state.time.start &&
+                typeof part.state.input.prompt === "string" &&
+                childPrompt.parts.some((item) => item.type === "text" && item.text === part.state.input.prompt)))
+        const metadata = repair
+          ? {
+              ...part.state.metadata,
+              sessionId: record.sessionID,
+              parentSessionId: parentID,
+              parentMessageID,
+              parentCallID,
+              ...(currentResult && childPrompt ? { messageID: childPrompt.info.id } : {}),
+            }
+          : part.state.metadata
+        const outcome = currentResult
+          ? taskOutcome(record.sessionID, result)
+          : {
+              state: "error" as const,
+              text: `Subagent failed (task_id: ${record.sessionID}): could not verify a result for the current Task prompt`,
+            }
         const command = part.state.input.command
         const messageID = MessageID.ascending(`msg_task_summary_${parentCallID}`)
         const partID = PartID.ascending(`prt_task_summary_${parentCallID}`)
         const existing =
           typeof command === "string" && command.length > 0 ? yield* getMessage(parentSessionID, messageID) : undefined
         if (
+          !repair &&
           part.state.status !== "running" &&
           message.info.finish &&
           message.info.time.completed &&
@@ -152,7 +225,6 @@ export const settleForeground = Effect.fn("ServerRecovery.settleForeground")(fun
         )
           return
         if (part.state.status === "running") {
-          const outcome = taskOutcome(record.sessionID, result)
           const time = { start: part.state.time.start, end: Date.now() }
           yield* sessions.updatePart(
             outcome.state === "completed"
@@ -167,7 +239,7 @@ export const settleForeground = Effect.fn("ServerRecovery.settleForeground")(fun
                       text: outcome.text,
                     }),
                     title: part.state.title ?? "Subagent task",
-                    metadata: part.state.metadata ?? {},
+                    metadata: metadata ?? {},
                     time,
                   },
                 }
@@ -177,12 +249,14 @@ export const settleForeground = Effect.fn("ServerRecovery.settleForeground")(fun
                     status: "error",
                     input: part.state.input,
                     error: outcome.text,
-                    metadata: part.state.metadata,
+                    metadata,
                     time,
                   },
                 },
           )
         }
+        if (repair && part.state.status !== "running")
+          yield* sessions.updatePart({ ...part, state: { ...part.state, metadata: metadata ?? {} } })
         if (typeof command === "string" && command.length > 0) {
           const assistantParentID = message.info.role === "assistant" ? message.info.parentID : undefined
           if (!existing) {
@@ -225,7 +299,7 @@ export const settleForeground = Effect.fn("ServerRecovery.settleForeground")(fun
           childSessionID: record.sessionID,
           parentSessionID: record.parentSessionID,
           parentCallID: record.parentCallID,
-          outcome: part.state.status === "running" ? taskOutcome(record.sessionID, result).state : part.state.status,
+          outcome: part.state.status === "running" ? outcome.state : part.state.status,
         })
       }),
     { behavior: "immediate" },

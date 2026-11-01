@@ -47,7 +47,7 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
   agent: Agent.Info
   model: Provider.Model
   session: Session.Info
-  processor: Pick<SessionProcessor.Handle, "message" | "updateToolCall" | "completeToolCall">
+  processor: Pick<SessionProcessor.Handle, "message" | "toolCall">
   bypassAgentCheck: boolean
   messages: SessionV1.WithParts[]
   promptOps: TaskPromptOps
@@ -73,7 +73,11 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
   const truncate = yield* Truncate.Service
   const flags = yield* RuntimeFlags.Service
 
-  const context = (args: Record<string, unknown>, options: ToolExecutionOptions): Tool.Context => ({
+  const context = (
+    args: Record<string, unknown>,
+    options: ToolExecutionOptions,
+    call: ReturnType<SessionProcessor.Handle["toolCall"]>,
+  ): Tool.Context => ({
     sessionID: input.session.id,
     abort: options.abortSignal!,
     messageID: input.processor.message.id,
@@ -91,7 +95,7 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
     agent: input.agent.name,
     messages: input.messages,
     metadata: (val) =>
-      input.processor.updateToolCall(options.toolCallId, (match) => {
+      call.update((match) => {
         if (!["running", "pending"].includes(match.state.status)) return match
         return {
           ...match,
@@ -152,9 +156,10 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
       description: item.description,
       inputSchema: jsonSchema(schema),
       execute(args, options) {
+        const call = input.processor.toolCall(options.toolCallId)
         return run.promise(
           Effect.gen(function* () {
-            const ctx = context(args, options)
+            const ctx = context(args, options, call)
             yield* plugin.trigger(
               "tool.execute.before",
               { tool: item.id, sessionID: ctx.sessionID, callID: ctx.callID },
@@ -176,7 +181,7 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
               output,
             )
             if (options.abortSignal?.aborted) {
-              yield* input.processor.completeToolCall(options.toolCallId, output)
+              yield* call.complete(output)
             }
             return output
           }),
@@ -209,9 +214,10 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
         description: item.description,
         inputSchema: jsonSchema(ProviderTransform.schema(input.model, item.inputSchema)),
         execute(args, options) {
+          const call = input.processor.toolCall(options.toolCallId)
           return run.promise(
             Effect.gen(function* () {
-              const ctx = context(args, options)
+              const ctx = context(args, options, call)
               if (ctx.managedReadOnly && !ManagedWorkQueue.isReadOnly(item.name))
                 throw new Error("Managed read-only sessions cannot invoke mutating WorkQueue tools")
               yield* ctx.ask({
@@ -256,7 +262,7 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
                 },
               }
               if (options.abortSignal?.aborted) {
-                yield* input.processor.completeToolCall(options.toolCallId, output)
+                yield* call.complete(output)
               }
               return output
             }),
@@ -288,10 +294,11 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
         }),
       ),
       execute(args, opts) {
+        const call = input.processor.toolCall(opts.toolCallId)
         return run.promise(
           Effect.gen(function* () {
             const parsed = parseListMcpResourcesArgs(args)
-            const ctx = context(toRecord(args), opts)
+            const ctx = context(toRecord(args), opts, call)
             const clients = yield* mcp.clients(activated)
             const resourceServers = Object.entries(clients)
               .filter((entry) => !!entry[1].getServerCapabilities()?.resources)
@@ -346,7 +353,7 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
               output,
             )
             if (opts.abortSignal?.aborted) {
-              yield* input.processor.completeToolCall(opts.toolCallId, output)
+              yield* call.complete(output)
             }
             return output
           }),
@@ -371,10 +378,11 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
         }),
       ),
       execute(args, opts) {
+        const call = input.processor.toolCall(opts.toolCallId)
         return run.promise(
           Effect.gen(function* () {
             const parsed = parseListMcpResourcesArgs(args)
-            const ctx = context(toRecord(args), opts)
+            const ctx = context(toRecord(args), opts, call)
             const clients = yield* mcp.clients(activated)
             const resourceServers = Object.entries(clients)
               .filter((entry) => !!entry[1].getServerCapabilities()?.resources)
@@ -429,7 +437,7 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
               output,
             )
             if (opts.abortSignal?.aborted) {
-              yield* input.processor.completeToolCall(opts.toolCallId, output)
+              yield* call.complete(output)
             }
             return output
           }),
@@ -458,10 +466,11 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
         }),
       ),
       execute(args, opts) {
+        const call = input.processor.toolCall(opts.toolCallId)
         return run.promise(
           Effect.gen(function* () {
             const parsed = parseReadMcpResourceArgs(args)
-            const ctx = context(toRecord(args), opts)
+            const ctx = context(toRecord(args), opts, call)
             const clients = yield* mcp.clients(activated)
             const client = clients[parsed.server]
             if (!client) {
@@ -511,7 +520,7 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
               output,
             )
             if (opts.abortSignal?.aborted) {
-              yield* input.processor.completeToolCall(opts.toolCallId, output)
+              yield* call.complete(output)
             }
             return output
           }),
@@ -530,10 +539,11 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
     const schema = yield* Effect.promise(() => Promise.resolve(asSchema(item.inputSchema).jsonSchema))
     const transformed = ProviderTransform.schema(input.model, { ...schema, properties: schema.properties ?? {} })
     item.inputSchema = jsonSchema(transformed)
-    item.execute = (args, opts) =>
-      run.promise(
+    item.execute = (args, opts) => {
+      const call = input.processor.toolCall(opts.toolCallId)
+      return run.promise(
         Effect.gen(function* () {
-          const ctx = context(args, opts)
+          const ctx = context(args, opts, call)
           yield* plugin.trigger(
             "tool.execute.before",
             { tool: key, sessionID: ctx.sessionID, callID: opts.toolCallId },
@@ -616,11 +626,12 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
             content: result.content,
           }
           if (opts.abortSignal?.aborted) {
-            yield* input.processor.completeToolCall(opts.toolCallId, output)
+            yield* call.complete(output)
           }
           return output
         }),
       )
+    }
     tools[key] = item
   }
 

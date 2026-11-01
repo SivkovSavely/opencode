@@ -207,8 +207,7 @@ function fake(
     get message() {
       return msg
     },
-    updateToolCall: Effect.fn("TestSessionProcessor.updateToolCall")(() => Effect.succeed(undefined)),
-    completeToolCall: Effect.fn("TestSessionProcessor.completeToolCall")(() => Effect.void),
+    toolCall: () => ({ update: () => Effect.succeed(undefined), complete: () => Effect.void }),
     process: Effect.fn("TestSessionProcessor.process")(() => Effect.succeed(result)),
   } satisfies SessionProcessorModule.SessionProcessor.Handle
 }

@@ -23,7 +23,6 @@ import {
   Message as MessageType,
   Part as PartType,
   ReasoningPart,
-  Session,
   TextPart,
   ToolPart,
   UserMessage,
@@ -65,6 +64,7 @@ import { partDefaultOpen } from "./part-default-open"
 import { animate } from "motion"
 import { attached, inline, kind, typeLabel } from "./message-file"
 import { readPartText } from "./message-part-text"
+import { taskSession } from "./task-session"
 import { formatTimestamp, formatToolTimestamp } from "./timestamp"
 import { SessionProgressIndicatorV2 } from "../v2/components/session-progress-indicator-v2"
 import { RawToolDetails, rawToolRequest, rawToolResponse } from "./raw-tool-details"
@@ -588,22 +588,6 @@ function urls(text: string | undefined) {
 function sessionLink(id: string | undefined, href?: (id: string) => string | undefined) {
   if (!id) return undefined
   return href?.(id)
-}
-
-function taskSession(
-  input: Record<string, any>,
-  parentID: string | undefined,
-  sessions: Session[] | undefined,
-  agents?: readonly { name: string; color?: string }[],
-) {
-  if (!parentID) return undefined
-  const description = typeof input.description === "string" ? input.description : ""
-  const agent = taskAgent(input.subagent_type, agents).name
-  return (sessions ?? [])
-    .filter((session) => session.parentID === parentID && !session.time?.archived)
-    .filter((session) => (description ? session.title.startsWith(description) : true))
-    .filter((session) => (agent ? session.title.includes(`@${agent}`) : true))
-    .sort((a, b) => (b.time.created ?? 0) - (a.time.created ?? 0))[0]?.id
 }
 
 const CONTEXT_GROUP_TOOLS = new Set(["read", "glob", "grep", "list"])
@@ -1586,8 +1570,13 @@ PART_MAPPING["tool"] = function ToolPartDisplay(props) {
   const partMetadata = () => part().state?.metadata ?? emptyMetadata
   const taskId = createMemo(() => {
     if (part().tool !== "task") return
-    const value = partMetadata().sessionId
-    if (typeof value === "string" && value) return value
+    return taskSession({
+      task: input(),
+      metadata: partMetadata(),
+      parentID: part().sessionID,
+      currentID: data.sessionID,
+      sessions: data.store.session,
+    })
   })
   const taskHref = createMemo(() => {
     if (part().tool !== "task") return
@@ -1597,7 +1586,8 @@ PART_MAPPING["tool"] = function ToolPartDisplay(props) {
     if (part().tool !== "task") return undefined
     const value = input().description
     if (typeof value === "string" && value) return value
-    return taskId()
+    const metadataID = partMetadata().sessionId
+    return taskId() ?? (typeof metadataID === "string" && metadataID ? metadataID : undefined)
   })
 
   const render = createMemo(() => ToolRegistry.render(part().tool) ?? GenericTool)
@@ -2008,9 +1998,15 @@ ToolRegistry.register({
     const data = useData()
     const i18n = useI18n()
     const childSessionId = createMemo(() => {
-      const value = props.metadata.sessionId
-      if (typeof value === "string" && value) return value
-      return taskSession(props.input, data.sessionID, data.store.session, data.store.agent)
+      return taskSession({
+        task: props.input,
+        metadata: props.metadata,
+        parentID: props.sessionID,
+        currentID: data.sessionID,
+        sessions: data.store.session,
+        agent: taskAgent(props.input.subagent_type, data.store.agent).name,
+        titleFallback: true,
+      })
     })
     const agent = createMemo(() => taskAgent(props.input.subagent_type, data.store.agent))
     const title = createMemo(() => agent().name ?? i18n.t("ui.tool.agent.default"))
@@ -2020,7 +2016,7 @@ ToolRegistry.register({
       const value =
         typeof props.input.description === "string" && props.input.description
           ? props.input.description
-          : childSessionId()
+          : (childSessionId() ?? (typeof props.metadata.sessionId === "string" ? props.metadata.sessionId : undefined))
       if (!value) return value
       if (props.metadata.background === true) return `${value} (background)`
       return value

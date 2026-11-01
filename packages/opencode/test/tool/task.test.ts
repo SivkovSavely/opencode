@@ -852,15 +852,36 @@ describe("tool.task", () => {
     },
   )
 
-  it.instance("execute resumes an existing task session from task_id", () =>
+  it.instance("execute resumes task_id with current linkage and preserves its historical call", () =>
     Effect.gen(function* () {
       const sessions = yield* Session.Service
       const { chat, assistant } = yield* seed()
-      const child = yield* sessions.create({ parentID: chat.id, title: "Existing child" })
+      const historical = {
+        parentSessionId: chat.id,
+        parentMessageID: MessageID.ascending(),
+        parentCallID: "original-call",
+        messageID: MessageID.ascending(),
+      }
+      const child = yield* sessions.create({
+        parentID: chat.id,
+        title: "Existing child",
+        metadata: { task: historical },
+      })
       const tool = yield* TaskTool
       const def = yield* tool.init()
       let seen: SessionPrompt.PromptInput | undefined
-      const promptOps = stubOps({ text: "resumed", onPrompt: (input) => (seen = input) })
+      let parent: Parameters<TaskPromptOps["prompt"]>[1]
+      let promptCalls = 0
+      const metadata: Record<string, unknown>[] = []
+      const promptOps: TaskPromptOps = {
+        ...stubOps(),
+        prompt: (input, link) => {
+          seen = input
+          parent = link
+          promptCalls++
+          return Effect.succeed(reply(input, "resumed"))
+        },
+      }
 
       const result = yield* def.execute(
         {
@@ -872,11 +893,12 @@ describe("tool.task", () => {
         {
           sessionID: chat.id,
           messageID: assistant.id,
+          callID: "resumed-call",
           agent: "build",
           abort: new AbortController().signal,
           extra: { promptOps },
           messages: [],
-          metadata: () => Effect.void,
+          metadata: (update) => Effect.sync(() => void metadata.push(update.metadata ?? {})),
           ask: () => Effect.void,
         },
       )
@@ -888,6 +910,20 @@ describe("tool.task", () => {
       expect(result.output).toContain(`<task id="${child.id}" state="completed">`)
       expect(seen?.sessionID).toBe(child.id)
       expect(seen?.variant).toBe("xhigh")
+      expect(seen?.messageID).not.toBe(historical.messageID)
+      expect(promptCalls).toBe(1)
+      expect(parent).toMatchObject({
+        parentMessageID: assistant.id,
+        parentCallID: "resumed-call",
+        parentMode: "foreground",
+      })
+      expect(metadata[0]).toMatchObject({
+        sessionId: child.id,
+        parentSessionId: chat.id,
+        parentMessageID: assistant.id,
+        parentCallID: "resumed-call",
+      })
+      expect((yield* sessions.get(child.id)).metadata?.task).toEqual(historical)
     }),
   )
 

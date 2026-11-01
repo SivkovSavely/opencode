@@ -34,9 +34,8 @@ const input = {
   session: { id: sessionID, directory: policy.directory, permission: [] } as unknown as Session.Info,
   processor: {
     message: { id: MessageID.ascending(), modelID: ModelV2.ID.make("test-model") },
-    updateToolCall: () => Effect.void,
-    completeToolCall: () => Effect.void,
-  } as unknown as Pick<SessionProcessor.Handle, "message" | "updateToolCall" | "completeToolCall">,
+    toolCall: () => ({ update: () => Effect.void, complete: () => Effect.void }),
+  } as unknown as Pick<SessionProcessor.Handle, "message" | "toolCall">,
   bypassAgentCheck: false,
   messages: [],
   promptOps: {} as never,

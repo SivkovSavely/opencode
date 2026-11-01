@@ -150,9 +150,8 @@ it.live("managed parent allow exceptions intersect child and ancestor restrictio
       session: current,
       processor: {
         message: { id: messageID },
-        updateToolCall: () => Effect.void,
-        completeToolCall: () => Effect.void,
-      } as unknown as Pick<SessionProcessor.Handle, "message" | "updateToolCall" | "completeToolCall">,
+        toolCall: () => ({ update: () => Effect.void, complete: () => Effect.void }),
+      } as unknown as Pick<SessionProcessor.Handle, "message" | "toolCall">,
       bypassAgentCheck: false,
       messages: [],
       promptOps: {} as never,
@@ -231,7 +230,7 @@ const sessionWithActivation = (activated: string[]) =>
       } as unknown as Session.Info),
   } as Partial<Session.Interface> as Session.Interface)
 
-it.effect("preserves running tool start time across metadata updates", () =>
+it.effect("preserves tool start time and binds progress and abort completion to one execution", () =>
   Effect.gen(function* () {
     const state: SessionV1.ToolPart = {
       id: partID,
@@ -247,6 +246,9 @@ it.effect("preserves running tool start time across metadata updates", () =>
       },
     }
     const updates: number[] = []
+    const bindings: string[] = []
+    const completed: string[] = []
+    const controller = new AbortController()
     const processor = {
       message: {
         id: messageID,
@@ -262,15 +264,26 @@ it.effect("preserves running tool start time across metadata updates", () =>
         providerID: ProviderV2.ID.make("test"),
         time: { created: 1 },
       } satisfies SessionV1.Assistant,
-      updateToolCall: (_toolCallID, update) =>
-        Effect.sync(() => {
-          const next = update(state)
-          state.state = next.state
-          if (state.state.status === "running") updates.push(state.state.time.start)
-          return state
-        }),
-      completeToolCall: () => Effect.void,
-    } satisfies Pick<SessionProcessor.Handle, "message" | "updateToolCall" | "completeToolCall">
+      toolCall: (id) => {
+        expect(bindings).toHaveLength(0)
+        bindings.push(id)
+        return {
+          update: (update) =>
+            Effect.sync(() => {
+              const next = update(state)
+              state.state = next.state
+              if (state.state.status === "running") updates.push(state.state.time.start)
+              controller.abort()
+              return state
+            }),
+          complete: (output) =>
+            Effect.sync(() => {
+              expect(output.output).toBe("done")
+              completed.push(id)
+            }),
+        }
+      },
+    } satisfies Pick<SessionProcessor.Handle, "message" | "toolCall">
 
     const tools = yield* SessionTools.resolve({
       agent,
@@ -290,13 +303,15 @@ it.effect("preserves running tool start time across metadata updates", () =>
         {},
         {
           toolCallId: callID,
-          abortSignal: new AbortController().signal,
+          abortSignal: controller.signal,
           messages: [],
         },
       ),
     )
 
     expect(updates).toEqual([100, 100])
+    expect(bindings).toEqual([callID])
+    expect(completed).toEqual([callID])
     expect(observed.fence).toBe(42)
     expect(state.state.status).toBe("running")
     if (state.state.status === "running") {
@@ -313,9 +328,8 @@ it.effect("refreshes MCP tools from current session metadata without leaking the
       session: { id: sessionID, metadata: {}, permission: [] } as unknown as Session.Info,
       processor: {
         message: { id: messageID },
-        updateToolCall: () => Effect.void,
-        completeToolCall: () => Effect.void,
-      } as unknown as Pick<SessionProcessor.Handle, "message" | "updateToolCall" | "completeToolCall">,
+        toolCall: () => ({ update: () => Effect.void, complete: () => Effect.void }),
+      } as unknown as Pick<SessionProcessor.Handle, "message" | "toolCall">,
       bypassAgentCheck: false,
       messages: [],
       promptOps: {} as never,
@@ -495,7 +509,7 @@ it.live("managed WorkQueue wrapper applies inherited permissions, tracked dispat
         const input = {
           agent: { name: "general", mode: "subagent", options: {}, permission: allow },
           model: { providerID: ProviderV2.ID.make("test"), api: { id: "test-model" } },
-          session, processor: { message: { id: MessageID.ascending() }, updateToolCall: () => Effect.void, completeToolCall: () => Effect.void },
+          session, processor: { message: { id: MessageID.ascending() }, toolCall: () => ({ update: () => Effect.void, complete: () => Effect.void }) },
           bypassAgentCheck: false, messages: [], promptOps: {}, executionFence: 42,
           managedRuntime: { runManagedCommand: () => Effect.die("unexpected WorkQueue dispatch") },
         }
@@ -568,9 +582,8 @@ it.live("managed tools without WorkQueue policy do not require a runtime for res
       session: { id: sessionID, permission: [] } as unknown as Session.Info,
       processor: {
         message: { id: messageID },
-        updateToolCall: () => Effect.void,
-        completeToolCall: () => Effect.void,
-      } as unknown as Pick<SessionProcessor.Handle, "message" | "updateToolCall" | "completeToolCall">,
+        toolCall: () => ({ update: () => Effect.void, complete: () => Effect.void }),
+      } as unknown as Pick<SessionProcessor.Handle, "message" | "toolCall">,
       bypassAgentCheck: false,
       messages: [],
       promptOps: {} as never,
