@@ -3,7 +3,7 @@ import { env } from "node:process"
 import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { Image } from "@/image/image"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
-import { Cause, Deferred, Duration, Effect, Exit, Layer, Context, Scope, Schema } from "effect"
+import { Cause, Deferred, Duration, Effect, Exit, Layer, Context, Scope, Schema, Option } from "effect"
 import * as Stream from "effect/Stream"
 import { Agent } from "@/agent/agent"
 import { Config } from "@/config/config"
@@ -96,7 +96,10 @@ const layer = Layer.effect(
     const image = yield* Image.Service
     const events = yield* EventV2Bridge.Service
     const database = yield* Database.Service
-    const runtime = RuntimeLifecycle.current() ?? RuntimeLifecycle.unavailable()
+    const runtime = Option.getOrElse(
+      yield* Effect.serviceOption(RuntimeLifecycle.Service),
+      () => RuntimeLifecycle.current() ?? RuntimeLifecycle.unavailable(),
+    )
 
     const create = Effect.fn("SessionProcessor.create")(function* (input: Input) {
       // Pre-capture snapshot before the LLM stream starts. The AI SDK

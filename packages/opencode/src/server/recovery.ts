@@ -1,7 +1,9 @@
 import { SessionV1 } from "@opencode-ai/core/v1/session"
-import { Cause, Effect, Exit } from "effect"
-import type { Database } from "@opencode-ai/core/database/database"
-import type { Session } from "../session/session"
+import { Cause, Context, Effect, Exit, Layer } from "effect"
+import { Database } from "@opencode-ai/core/database/database"
+import { InstanceStore } from "../project/instance-store"
+import { Session } from "../session/session"
+import { SessionPrompt } from "../session/prompt"
 import { RuntimeLifecycle } from "./runtime-lifecycle"
 
 type ForegroundTaskRecord = {
@@ -11,7 +13,12 @@ type ForegroundTaskRecord = {
   parentCallID?: string
 }
 
-function taskOutcome(sessionID: string, result: SessionV1.WithParts) {
+function taskOutcome(sessionID: string, result?: SessionV1.WithParts) {
+  if (!result)
+    return {
+      state: "error" as const,
+      text: `Subagent failed (task_id: ${sessionID}): child execution was cancelled`,
+    }
   const text = result.parts.findLast((part) => part.type === "text")?.text ?? ""
   const assistant = result.info.role === "assistant" ? result.info : undefined
   const failed = result.parts.findLast((part) => part.type === "tool" && part.state.status === "error")
@@ -67,7 +74,7 @@ export const settleForeground = Effect.fn("ServerRecovery.settleForeground")(fun
   database: Database.Interface
   sessions: Session.Interface
   record: ForegroundTaskRecord
-  result: SessionV1.WithParts
+  result?: SessionV1.WithParts
 }) {
   const { database, sessions, record, result } = input
   const parentID = record.parentSessionID
@@ -225,32 +232,30 @@ export const settleForeground = Effect.fn("ServerRecovery.settleForeground")(fun
   )
 })
 
-export const initialize = Effect.fn("ServerRecovery.initialize")(function* () {
-  const current = RuntimeLifecycle.current()
-  if (!current) return
-  const runtime = current
+export class Service extends Context.Service<Service, { readonly initialize: Effect.Effect<void, unknown> }>()(
+  "@opencode/ServerRecovery",
+) {}
 
-  const { AppRuntime } = yield* Effect.promise(() => import("../effect/app-runtime"))
-  const { InstanceStore } = yield* Effect.promise(() => import("../project/instance-store"))
-  const { Session } = yield* Effect.promise(() => import("../session/session"))
-  const { SessionPrompt } = yield* Effect.promise(() => import("../session/prompt"))
-  const { SessionID, MessageID, PartID } = yield* Effect.promise(() => import("../session/schema"))
-  const { Database } = yield* Effect.promise(() => import("@opencode-ai/core/database/database"))
-  const { sql } = yield* Effect.promise(() => import("drizzle-orm"))
-  const { renderOutput } = yield* Effect.promise(() => import("../tool/task"))
-
-  yield* Effect.logInfo("runtime recovery startup", {
-    lineage: runtime.identity.lineage,
-    instance: runtime.identity.instance,
-    restartSupported: runtime.identity.restartSupported,
-  })
-  yield* Effect.promise(() =>
-    AppRuntime.runPromise(
-      Effect.gen(function* () {
-        const store = yield* InstanceStore.Service
-        const database = yield* Database.Service
-        const prompt = yield* SessionPrompt.Service
-        const sessions = yield* Session.Service
+export const layer = Layer.effect(
+  Service,
+  Effect.gen(function* () {
+    const runtime = yield* RuntimeLifecycle.Service
+    const store = yield* InstanceStore.Service
+    const database = yield* Database.Service
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    runtime.bindDatabase(database)
+    return Service.of({
+      initialize: Effect.gen(function* () {
+        const { SessionID, MessageID, PartID } = yield* Effect.promise(() => import("../session/schema"))
+        const { sql } = yield* Effect.promise(() => import("drizzle-orm"))
+        const { renderOutput } = yield* Effect.promise(() => import("../tool/task"))
+        yield* Effect.logInfo("runtime recovery startup", {
+          lineage: runtime.identity.lineage,
+          instance: runtime.identity.instance,
+          restartSupported: runtime.identity.restartSupported,
+        })
+        const childPrompts = new Map<string, SessionPrompt.PromptInput>()
         const staleParents = yield* database.db.all<{ session_id: string; directory: string }>(sql`
           SELECT session_id, directory FROM runtime_execution
           WHERE owner_lineage = ${runtime.identity.lineage}
@@ -353,7 +358,11 @@ export const initialize = Effect.fn("ServerRecovery.initialize")(function* () {
                 if (result && record.parentMode === "background") yield* notifyBackground(record, result)
                 return
               }
-              const result = yield* prompt.recover(SessionID.make(record.sessionID), record.fence)
+              const result = yield* prompt.recover(
+                SessionID.make(record.sessionID),
+                record.fence,
+                childPrompts.get(record.sessionID),
+              )
               if (record.parentMode === "foreground") yield* settleForeground({ database, sessions, record, result })
             }),
           ),
@@ -447,7 +456,7 @@ export const initialize = Effect.fn("ServerRecovery.initialize")(function* () {
                   process.env.OPENCODE_MANAGED_PROFILE === "1"
                     ? [{ type: "text" as const, text: taskInput.prompt }]
                     : yield* prompt.resolvePromptParts(taskInput.prompt)
-                yield* prompt.prompt({
+                const input = {
                   sessionID: childID,
                   messageID: MessageID.make(childMessageID),
                   agent,
@@ -464,7 +473,7 @@ export const initialize = Effect.fn("ServerRecovery.initialize")(function* () {
                     ...item,
                     id: PartID.ascending(`prt_task_recovery_${childMessageID}_${index}`),
                   })),
-                })
+                } satisfies SessionPrompt.PromptInput
                 const recovered = existing
                   ? true
                   : yield* runtime.reconstructChild({
@@ -475,7 +484,10 @@ export const initialize = Effect.fn("ServerRecovery.initialize")(function* () {
                       parentCallID: part.callID,
                       parentMode: metadata.background === true ? "background" : "foreground",
                     })
-                if (recovered) count++
+                if (recovered) {
+                  childPrompts.set(childSessionID, input)
+                  count++
+                }
               }
             }
             return count
@@ -558,14 +570,14 @@ export const initialize = Effect.fn("ServerRecovery.initialize")(function* () {
             }
           })
         }
+        yield* Effect.logInfo("runtime recovery scheduling complete", {
+          lineage: runtime.identity.lineage,
+          instance: runtime.identity.instance,
+          note: "Eligible executions are claimed atomically and recovered asynchronously.",
+        })
       }),
-    ),
-  )
-  yield* Effect.logInfo("runtime recovery scheduling complete", {
-    lineage: runtime.identity.lineage,
-    instance: runtime.identity.instance,
-    note: "Eligible executions are claimed atomically and recovered asynchronously.",
-  })
-})
+    })
+  }),
+)
 
 export * as ServerRecovery from "./recovery"

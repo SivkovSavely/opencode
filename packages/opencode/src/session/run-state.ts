@@ -3,7 +3,7 @@ import { InstanceState } from "@/effect/instance-state"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { Runner } from "@/effect/runner"
 import { BackgroundJob } from "@/background/job"
-import { Effect, Latch, Layer, Scope, Context } from "effect"
+import { Effect, Latch, Layer, Scope, Context, Option, Cause } from "effect"
 import { Session } from "./session"
 import { SessionID } from "./schema"
 import { SessionStatus } from "./status"
@@ -44,7 +44,10 @@ const layer = Layer.effect(
     const background = yield* BackgroundJob.Service
     const sessions = yield* Session.Service
     const status = yield* SessionStatus.Service
-    const runtime = RuntimeLifecycle.current() ?? RuntimeLifecycle.unavailable()
+    const runtime = Option.getOrElse(
+      yield* Effect.serviceOption(RuntimeLifecycle.Service),
+      () => RuntimeLifecycle.current() ?? RuntimeLifecycle.unavailable(),
+    )
 
     const state = yield* InstanceState.make(
       Effect.fn("SessionRunState.state")(function* () {
@@ -63,10 +66,7 @@ const layer = Layer.effect(
       }),
     )
 
-    const runner = Effect.fn("SessionRunState.runner")(function* (
-      sessionID: SessionID,
-      onInterrupt: Effect.Effect<SessionV1.WithParts>,
-    ) {
+    const runner = Effect.fn("SessionRunState.runner")(function* (sessionID: SessionID) {
       const data = yield* InstanceState.get(state)
       const existing = data.runners.get(sessionID)
       if (existing) return existing
@@ -80,11 +80,21 @@ const layer = Layer.effect(
           yield* status.set(sessionID, { type: "idle" })
         }),
         onBusy: status.set(sessionID, { type: "busy" }),
-        onInterrupt,
       })
       data.runners.set(sessionID, next)
       return next
     })
+
+    // Cancellation belongs to each waiter, not to the shared session runner.
+    const onCancellation = <E>(
+      work: Effect.Effect<SessionV1.WithParts, E>,
+      onInterrupt: Effect.Effect<SessionV1.WithParts>,
+    ) =>
+      work.pipe(
+        Effect.catchCause((cause) =>
+          Cause.squash(cause) instanceof Runner.Cancelled ? onInterrupt : Effect.failCause(cause),
+        ),
+      )
 
     const assertNotBusy = Effect.fn("SessionRunState.assertNotBusy")(function* (sessionID: SessionID) {
       const data = yield* InstanceState.get(state)
@@ -114,7 +124,7 @@ const layer = Layer.effect(
       onInterrupt: Effect.Effect<SessionV1.WithParts>,
       work: Effect.Effect<SessionV1.WithParts>,
     ) {
-      return yield* (yield* runner(sessionID, onInterrupt)).ensureRunning(work)
+      return yield* onCancellation((yield* runner(sessionID)).ensureRunning(work), onInterrupt)
     })
 
     const enqueue = Effect.fn("SessionRunState.enqueue")(function* (
@@ -122,7 +132,7 @@ const layer = Layer.effect(
       onInterrupt: Effect.Effect<SessionV1.WithParts>,
       work: Effect.Effect<SessionV1.WithParts>,
     ) {
-      return yield* (yield* runner(sessionID, onInterrupt)).enqueue(work)
+      return yield* onCancellation((yield* runner(sessionID)).enqueue(work), onInterrupt)
     })
 
     const startShell = Effect.fn("SessionRunState.startShell")(function* (
@@ -131,18 +141,18 @@ const layer = Layer.effect(
       work: Effect.Effect<SessionV1.WithParts>,
       ready?: Latch.Latch,
     ) {
-      return yield* (yield* runner(sessionID, onInterrupt))
-        .startShell(work, ready)
-        .pipe(Effect.catchTag("RunnerBusy", () => Effect.fail(busyError(sessionID))))
+      return yield* onCancellation((yield* runner(sessionID)).startShell(work, ready), onInterrupt).pipe(
+        Effect.catchTag("RunnerBusy", () => Effect.fail(busyError(sessionID))),
+      )
     })
 
     const startIfIdle = Effect.fn("SessionRunState.startIfIdle")(function* (
       sessionID: SessionID,
-      onInterrupt: Effect.Effect<SessionV1.WithParts>,
+      _onInterrupt: Effect.Effect<SessionV1.WithParts>,
       work: Effect.Effect<SessionV1.WithParts, never, Scope.Scope>,
       prepare: Effect.Effect<boolean, never, Scope.Scope>,
     ) {
-      return yield* (yield* runner(sessionID, onInterrupt)).startIfIdle(work, prepare)
+      return yield* (yield* runner(sessionID)).startIfIdle(work, prepare)
     })
 
     return Service.of({ assertNotBusy, cancel, ensureRunning, enqueue, startShell, startIfIdle })

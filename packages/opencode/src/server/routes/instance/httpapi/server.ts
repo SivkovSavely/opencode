@@ -120,6 +120,7 @@ import { fenceLayer } from "./middleware/fence"
 import { schemaErrorLayer } from "./middleware/schema-error"
 import { GlobalProjectList } from "@/server/global-project-list"
 import { RuntimeLifecycle } from "@/server/runtime-lifecycle"
+import { ServerRecovery } from "@/server/recovery"
 import { historicalFenceHandlers } from "./handlers/historical-fence"
 
 export const context = Context.makeUnsafe<unknown>(new Map())
@@ -281,7 +282,7 @@ const app = LayerNode.group([
 export function createRoutes(
   corsOptions?: CorsOptions,
   runtime?: RuntimeLifecycle.Interface,
-): Layer.Layer<never, EffectConfig.ConfigError, RouteRequirements> {
+): Layer.Layer<ServerRecovery.Service, EffectConfig.ConfigError, RouteRequirements> {
   const locationServiceMapV2 = buildLocationServiceMap()
   const lifecycle = runtime ?? RuntimeLifecycle.unavailable()
   RuntimeLifecycle.setCurrent(lifecycle)
@@ -315,8 +316,9 @@ export function createRoutes(
       ]),
     ),
     Layer.provide(locationServiceMapV2),
-    Layer.provide(Layer.succeed(RuntimeLifecycle.Service)(lifecycle)),
+    Layer.provideMerge(ServerRecovery.layer),
     Layer.provide(AppNodeBuilderV1.build(app)),
+    Layer.provide(Layer.succeed(RuntimeLifecycle.Service)(lifecycle)),
     // Must stay last: layers provided later in this pipe build beneath earlier ones,
     // so Observability must come after every service graph. Otherwise eagerly forked
     // fibers (e.g. the ModelsDev background refresh) capture Effect's default stdout

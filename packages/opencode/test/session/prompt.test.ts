@@ -2579,7 +2579,7 @@ it.instance("crash recovery preserves completed tools and continues after uncert
       (part): part is SessionV1.ToolPart => part.type === "tool" && part.callID === failed.callID,
     )
 
-    expect(result.parts.some((part) => part.type === "text" && part.text === "recovered continuation")).toBe(true)
+    expect(result?.parts.some((part) => part.type === "text" && part.text === "recovered continuation")).toBe(true)
     expect(userMessages).toHaveLength(1)
     expect(restored?.state.status).toBe("error")
     if (restored?.state.status === "error") {
@@ -2693,7 +2693,7 @@ it.instance("crash recovery does not repeat an assistant turn with durable compl
     yield* sessions.updateMessage(assistant)
 
     const result = yield* prompt.recover(session.id)
-    expect(result.info.id).toBe(assistant.id)
+    expect(result?.info.id).toBe(assistant.id)
     expect(yield* llm.calls).toBe(0)
   }),
 )
@@ -3788,6 +3788,149 @@ raceNoLLMServer.instance(
     }),
   { config: cfg },
   3_000,
+)
+
+for (const point of ["initial queue block", "runner registration", "resumed runner registration"] as const)
+  ownedRuntime.instance(
+    `recovery cancellation during ${point} does not revive a child`,
+    () =>
+      Effect.gen(function* () {
+        const { llm } = yield* useServerConfig(providerCfg)
+        const events = yield* EventV2Bridge.Service
+        const database = yield* Database.Service
+        const sessions = yield* Session.Service
+        const prompt = yield* SessionPrompt.Service
+        const runtime = yield* RuntimeLifecycle.Service
+        const scope = yield* Scope.Scope
+        const parent = yield* sessions.create({ title: "Recovered parent" })
+        const chat = yield* sessions.create({ title: "Empty recovered child", parentID: parent.id })
+        if (point === "resumed runner registration") yield* seed(chat.id, { finish: "stop" })
+        const history = yield* sessions.messages({ sessionID: chat.id })
+        const abandoned = RuntimeLifecycle.make(
+          { lineage: runtime.identity.lineage, instance: randomUUID() },
+          scope,
+          database,
+        )
+        yield* abandoned.admit({ sessionID: chat.id, directory: chat.directory, parentSessionID: parent.id })
+        yield* database.db.run(
+          sql`UPDATE runtime_execution SET owner_start_time = ${"0"} WHERE session_id = ${chat.id}`,
+        )
+        const entered = yield* Deferred.make<void>()
+        const release = yield* Deferred.make<void>()
+        const result = yield* Deferred.make<Exit.Exit<SessionV1.WithParts | undefined>>()
+        let first = true
+        const off = yield* events.listen((event) => {
+          if (point !== "initial queue block" || event.type !== SessionQueueV1.Event.Changed.type || !first)
+            return Effect.void
+          const data = event.data as typeof SessionQueueV1.Event.Changed.data.Type
+          if (data.sessionID !== chat.id) return Effect.void
+          first = false
+          return Deferred.succeed(entered, undefined).pipe(Effect.andThen(Deferred.await(release)))
+        })
+        yield* Effect.addFinalizer(() => Deferred.succeed(release, undefined).pipe(Effect.andThen(off), Effect.asVoid))
+        yield* runtime.recover((record) =>
+          Effect.gen(function* () {
+            if (point !== "initial queue block") {
+              yield* Deferred.succeed(entered, undefined)
+              yield* Deferred.await(release)
+            }
+            return yield* prompt.recover(
+              chat.id,
+              record.fence,
+              point === "resumed runner registration"
+                ? undefined
+                : {
+                    sessionID: chat.id,
+                    agent: "build",
+                    model: ref,
+                    parts: [{ type: "text", text: "reconstructed input" }],
+                  },
+            )
+          }).pipe(
+            Effect.exit,
+            Effect.flatMap((exit) => Deferred.succeed(result, exit)),
+            Effect.asVoid,
+          ),
+        )
+        yield* awaitWithTimeout(Deferred.await(entered), `recovery did not reach ${point}`, "10 seconds")
+        yield* awaitWithTimeout(prompt.cancel(chat.id), "stop blocked on recovery queue event", "10 seconds")
+        expect(
+          yield* database.db.get(
+            sql`SELECT state, desired_active FROM runtime_execution WHERE session_id = ${chat.id}`,
+          ),
+        ).toEqual({ state: "cancelled", desired_active: 0 })
+        yield* Deferred.succeed(release, undefined)
+        const exit = yield* awaitWithTimeout(Deferred.await(result), "recovery did not settle after stop", "10 seconds")
+        expect(exit).toEqual(Exit.succeed(undefined))
+        expect(yield* sessions.messages({ sessionID: chat.id })).toEqual(history)
+        expect(yield* llm.calls).toBe(0)
+        expect(
+          yield* database.db.get(
+            sql`SELECT state, desired_active FROM runtime_execution WHERE session_id = ${chat.id}`,
+          ),
+        ).toEqual({ state: "cancelled", desired_active: 0 })
+      }),
+    15_000,
+  )
+
+ownedRuntime.instance(
+  "a foreground prompt sharing a recovered runner keeps its own stop fallback",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const database = yield* Database.Service
+      const sessions = yield* Session.Service
+      const prompt = yield* SessionPrompt.Service
+      const runtime = yield* RuntimeLifecycle.Service
+      const scope = yield* Scope.Scope
+      const chat = yield* sessions.create({ title: "Shared recovered runner" })
+      yield* user(chat.id, "recovered input")
+      const abandoned = RuntimeLifecycle.make(
+        { lineage: runtime.identity.lineage, instance: randomUUID() },
+        scope,
+        database,
+      )
+      yield* abandoned.admit({ sessionID: chat.id, directory: chat.directory })
+      yield* database.db.run(sql`UPDATE runtime_execution SET owner_start_time = ${"0"} WHERE session_id = ${chat.id}`)
+      yield* llm.hang
+      const recovered = yield* Deferred.make<Exit.Exit<SessionV1.WithParts | undefined>>()
+      yield* runtime.recover((record) =>
+        prompt.recover(chat.id, record.fence).pipe(
+          Effect.exit,
+          Effect.flatMap((exit) => Deferred.succeed(recovered, exit)),
+          Effect.asVoid,
+        ),
+      )
+      yield* awaitWithTimeout(llm.wait(1), "recovered runner did not start", "10 seconds")
+      const foreground = yield* prompt
+        .prompt({ sessionID: chat.id, agent: "build", model: ref, parts: [{ type: "text", text: "foreground input" }] })
+        .pipe(Effect.exit, Effect.forkChild({ startImmediately: true }))
+      yield* pollWithTimeout(
+        sessions
+          .messages({ sessionID: chat.id })
+          .pipe(
+            Effect.map((messages) =>
+              messages.some((message) =>
+                message.parts.some((part) => part.type === "text" && part.text === "foreground input"),
+              )
+                ? true
+                : undefined,
+            ),
+          ),
+        "foreground prompt was not admitted",
+      )
+      yield* Effect.yieldNow
+      yield* awaitWithTimeout(prompt.cancel(chat.id), "stop did not finish", "10 seconds")
+      expect(yield* awaitWithTimeout(Deferred.await(recovered), "recovery did not settle", "10 seconds")).toEqual(
+        Exit.succeed(undefined),
+      )
+      const exit = yield* awaitWithTimeout(Fiber.join(foreground), "foreground prompt did not settle", "10 seconds")
+      const result = yield* exit
+      expect(result.info.role).toBe("assistant")
+      if (result.info.role === "assistant") expect(result.info.error?.name).toBe("MessageAbortedError")
+      expect(yield* llm.calls).toBe(1)
+    }),
+  15_000,
 )
 
 ownedBlockingRuntime.instance(

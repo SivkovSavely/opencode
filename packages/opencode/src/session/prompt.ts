@@ -120,7 +120,11 @@ export interface Interface {
     task?: TaskAdmission,
   ) => Effect.Effect<SessionV1.WithParts, Image.Error | RuntimeLifecycle.RuntimeDrainingError>
   readonly loop: (input: LoopInput) => Effect.Effect<SessionV1.WithParts>
-  readonly recover: (sessionID: SessionID, executionFence?: number) => Effect.Effect<SessionV1.WithParts>
+  readonly recover: (
+    sessionID: SessionID,
+    executionFence?: number,
+    input?: PromptInput,
+  ) => Effect.Effect<SessionV1.WithParts | undefined>
   readonly shell: (
     input: ShellInput,
   ) => Effect.Effect<SessionV1.WithParts, Session.BusyError | RuntimeLifecycle.RuntimeDrainingError>
@@ -146,6 +150,7 @@ type TaskAdmission = {
   parentCallID?: string
   parentMode?: "foreground" | "background"
   notification?: boolean
+  recoveryFence?: number
   admission?: Deferred.Deferred<void, RuntimeLifecycle.RuntimeDrainingError>
 }
 
@@ -183,7 +188,10 @@ const layer = Layer.effect(
     const database = yield* Database.Service
     const queue = yield* SessionQueue.Service
     const queueState = yield* InstanceState.make(() => Effect.sync(() => new Map<SessionID, Set<string>>()))
-    const runtime = RuntimeLifecycle.current() ?? RuntimeLifecycle.unavailable()
+    const runtime = Option.getOrElse(
+      yield* Effect.serviceOption(RuntimeLifecycle.Service),
+      () => RuntimeLifecycle.current() ?? RuntimeLifecycle.unavailable(),
+    )
     const { db } = database
     const releaseInterrupted = Effect.fnUntraced(function* (sessionID: SessionID, fence: number) {
       const result = yield* runtime
@@ -1575,8 +1583,9 @@ const layer = Layer.effect(
             parentMessageID: task?.parentMessageID,
             parentCallID: task?.parentCallID,
             parentMode: task?.parentMode,
-            rejectCancelled: task?.notification,
+            rejectCancelled: task?.notification || input.noReply,
             rejectRecoveryNeeded: task?.notification,
+            recoveryFence: task?.recoveryFence,
             manualRecovery: task === undefined || task.admission !== undefined,
           })
           .pipe(Effect.tapError((error) => (task?.admission ? Deferred.fail(task.admission, error) : Effect.void))),
@@ -2639,17 +2648,47 @@ const layer = Layer.effect(
       )
     })
 
-    const recover = Effect.fn("SessionPrompt.recover")(function* (sessionID: SessionID, executionFence?: number) {
-      yield* queue.block(sessionID).pipe(Effect.orDie)
-      return yield* state.ensureRunning(
-        sessionID,
-        lastAssistant(sessionID),
-        Effect.gen(function* () {
-          yield* reconcileCrashTools(sessionID)
-          yield* runtime.recoveryPrepared(sessionID)
-          return yield* runLoop(sessionID, true, false, false, true, executionFence)
-        }),
-      )
+    const recover = Effect.fn("SessionPrompt.recover")(function* (
+      sessionID: SessionID,
+      executionFence?: number,
+      input?: PromptInput,
+    ) {
+      const exit = yield* state
+        .ensureRunning(
+          sessionID,
+          Effect.die(new Runner.Cancelled()),
+          Effect.gen(function* () {
+            yield* queue.block(sessionID).pipe(Effect.orDie)
+            if (input)
+              yield* prompt({ ...input, sessionID, noReply: true }, { recoveryFence: executionFence }).pipe(
+                Effect.orDie,
+              )
+            yield* reconcileCrashTools(sessionID)
+            yield* runtime.recoveryPrepared(sessionID)
+            return yield* runLoop(sessionID, true, false, false, true, executionFence)
+          }),
+        )
+        .pipe(Effect.exit)
+      const error = Exit.isFailure(exit) ? Cause.squash(exit.cause) : undefined
+      if (error instanceof Runner.Cancelled) return
+      if (
+        executionFence !== undefined &&
+        (Exit.isSuccess(exit) || error instanceof RuntimeLifecycle.RuntimeDrainingError)
+      ) {
+        // Stop can revoke this claim before its runner is registered to receive the interruption.
+        const cancelled = yield* db
+          .get(
+            sql`
+            SELECT session_id FROM runtime_execution
+            WHERE session_id = ${sessionID} AND state = ${"cancelled"} AND desired_active = 0
+              AND owner_lineage = ${runtime.identity.lineage} AND owner_instance = ${runtime.identity.instance}
+              AND fence = ${executionFence + 1}
+          `,
+          )
+          .pipe(Effect.orDie)
+        if (cancelled) return
+      }
+      return yield* exit
     })
 
     const shell = Effect.fn("SessionPrompt.shell")(function* (input: ShellInput) {

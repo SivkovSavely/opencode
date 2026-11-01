@@ -16,6 +16,7 @@ import { lazy } from "@/util/lazy"
 import { startHangDiagnostics } from "@/diagnostics/hang"
 import { Database } from "@opencode-ai/core/database/database"
 import { RuntimeLifecycle } from "./runtime-lifecycle"
+import { ServerRecovery } from "./recovery"
 import { createHash } from "node:crypto"
 
 // @ts-ignore This global is needed to prevent ai-sdk from logging warnings to stdout https://github.com/vercel/ai/blob/2dc67e0ef538307f21368db32d5a12345d98831b/packages/ai/src/logger/log-warnings.ts#L85
@@ -45,8 +46,10 @@ type ListenerState = {
   server: Context.Service.Shape<typeof HttpServer.HttpServer>
   http: ListenerServer
   websockets: WebSocketTracker.Interface
+  initializeRecovery: Effect.Effect<void, unknown>
 }
 type EffectListener = Omit<Listener, "stop"> & {
+  initializeRecovery: Effect.Effect<void, unknown>
   stop: (close?: boolean) => Effect.Effect<void>
 }
 
@@ -78,8 +81,7 @@ export let url: URL | undefined
 export async function listen(opts: ListenOptions): Promise<Listener> {
   const listener = await Effect.runPromise(listenEffect(opts))
   try {
-    const { ServerRecovery } = await import("./recovery")
-    await Effect.runPromise(ServerRecovery.initialize())
+    await Effect.runPromise(listener.initializeRecovery)
   } catch (error) {
     await Effect.runPromiseExit(listener.stop(true))
     throw error
@@ -129,6 +131,7 @@ const listenEffect: (opts: ListenOptions) => Effect.Effect<EffectListener, unkno
       port: address.port,
       url: listenerUrl,
       lifecycle,
+      initializeRecovery: state.initializeRecovery,
       stop: yield* makeStop(state, unpublishMdns, listenerUrl),
     }
   },
@@ -167,6 +170,7 @@ function startListener(opts: ListenOptions, port: number, lifecycle: RuntimeLife
         server: Context.get(ctx, HttpServer.HttpServer),
         http: Context.get(ctx, ListenerServerService),
         websockets: Context.get(ctx, WebSocketTracker.Service),
+        initializeRecovery: Context.get(ctx, ServerRecovery.Service).initialize,
       }),
     ),
   )

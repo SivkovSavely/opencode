@@ -184,6 +184,7 @@ type Row = {
 type LocalExecution = {
   fence: number
   leases: number
+  recoveryOwner?: boolean
   mode: "active" | "retry_wait" | "parked"
   retryAt?: number
 }
@@ -211,6 +212,8 @@ type AdmissionInput = {
   rejectRecoveryNeeded?: boolean
   manualRecovery?: boolean
   managedChildAuthorization?: object
+  /** Internal capability for admission by the current recovery continuation. */
+  recoveryFence?: number
 }
 
 type AdmissionDecision =
@@ -1088,24 +1091,38 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
       process.env.OPENCODE_MANAGED_PLUGIN_ALLOWLIST.trim() !== "[]"
     )
       return yield* new RuntimeDrainingError({ message: "Managed model execution requires an empty plugin allowlist" })
-    if (startupReady) yield* Deferred.await(startupReady)
+    if (startupReady && input.recoveryFence === undefined) yield* Deferred.await(startupReady).pipe(Effect.interruptible)
     while (true) {
       const wait = yield* SynchronizedRef.modifyEffect(
         ref,
         Effect.fnUntraced(function* (state) {
           yield* rejectRetired(input)
+          const row = yield* read(input.sessionID)
+          const local = state.active.get(input.sessionID)
+          if (
+            input.recoveryFence !== undefined &&
+            (!local?.recoveryOwner ||
+              local.mode !== "active" ||
+              local.fence !== input.recoveryFence ||
+              row?.fence !== input.recoveryFence ||
+              row.owner_lineage !== identity.lineage ||
+              row.owner_instance !== identity.instance ||
+              row.desired_active !== 1 ||
+              row.state !== "active")
+          )
+            return yield* rejectAdmission(input, "Recovery admission is no longer owned by this runtime", row)
           const cancelling = state.cancelling.get(input.sessionID)
           if (cancelling)
             return [{ _tag: "wait" as const, deferred: cancelling.deferred } as AdmissionDecision, state] as const
           const recovering = state.startupPending.get(input.sessionID)
-          if (recovering) return [{ _tag: "wait" as const, deferred: recovering } as AdmissionDecision, state] as const
+          if (recovering && input.recoveryFence === undefined)
+            return [{ _tag: "wait" as const, deferred: recovering } as AdmissionDecision, state] as const
           if (state.phase !== "running") {
             return yield* new RuntimeDrainingError({ message: "Runtime is draining" })
           }
 
           const parentMode = state.parentModeOverrides.get(input.sessionID)
           const admissionInput = parentMode ? { ...input, parentMode } : input
-          const row = yield* read(input.sessionID)
           if (process.env.OPENCODE_MANAGED_PROFILE === "1") {
             const database = databaseRef.current ?? (yield* Database.Service)
             const projected = yield* database.db.get<{
@@ -1144,7 +1161,6 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
           }
           if (input.rejectCancelled && row?.state === "cancelled")
             return yield* rejectAdmission(input, "Session was cancelled", row)
-          const local = state.active.get(input.sessionID)
           const lease = state.leases.get(input.sessionID)
           if (lease && (!local || row?.desired_active !== 1 || row.state !== "active" || row.fence !== lease.fence))
             return [{ _tag: "wait" as const, deferred: lease.released } as AdmissionDecision, state] as const
@@ -1167,7 +1183,7 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
             const claimed = yield* admitDurably(admissionInput, row)
             if (input.managedChildAuthorization) childAuthorizations.delete(input.managedChildAuthorization)
             const active = new Map(state.active)
-            active.set(input.sessionID, { fence: claimed.row.fence, leases: local.leases + 1, mode: "active" })
+            active.set(input.sessionID, { ...local, fence: claimed.row.fence, leases: local.leases + 1, mode: "active" })
             const parentModeOverrides = new Map(state.parentModeOverrides)
             parentModeOverrides.delete(input.sessionID)
             return [
@@ -1216,7 +1232,7 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
         }),
       )
       if (wait._tag === "admitted") return wait.result
-      if (!(yield* Deferred.await(wait.deferred)))
+      if (!(yield* Deferred.await(wait.deferred).pipe(Effect.interruptible)))
         return yield* rejectAdmission(
           input,
           "Automatic session recovery could not safely prepare the existing execution",
@@ -1735,9 +1751,9 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
           const result: ReleaseResult = { released: false, reason: "absent", phase: state.phase }
           return [result, state] as const
         }
-        if (current.leases > 1) {
+        if (current.leases > 1 || current.recoveryOwner) {
           const active = new Map(state.active)
-          active.set(sessionID, { ...current, leases: current.leases - 1 })
+          active.set(sessionID, { ...current, leases: Math.max(0, current.leases - 1) })
           const result: ReleaseResult = {
             released: false,
             reason: "lease_decrement",
@@ -1815,9 +1831,9 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
         const state = yield* releaseLease(previous, sessionID, fence)
         const current = state.active.get(sessionID)
         if (!current || current.fence !== fence) return ["absent" as const, state] as const
-        if (current.leases > 1) {
+        if (current.leases > 1 || current.recoveryOwner) {
           const active = new Map(state.active)
-          active.set(sessionID, { ...current, leases: current.leases - 1 })
+          active.set(sessionID, { ...current, leases: Math.max(0, current.leases - 1) })
           return ["active" as const, { ...state, active }] as const
         }
         const expectedState = current.mode === "retry_wait" ? "retry_wait" : "active"
@@ -1904,7 +1920,11 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
       Effect.fnUntraced(function* (state) {
         const current = state.active.get(sessionID)
         if (!current) return [undefined, state] as const
-        if (current.leases > 0) return [null, state] as const
+        if (current.leases > 0) {
+          const active = new Map(state.active)
+          active.set(sessionID, { ...current, recoveryOwner: false })
+          return [null, { ...state, active }] as const
+        }
         yield* update({
           sessionID,
           operation: "complete",
@@ -2193,6 +2213,7 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
         active.set(record.sessionID, {
           fence: record.fence,
           leases: 0,
+          recoveryOwner: true,
           mode: record.state === "retry_wait" ? "retry_wait" : "active",
           retryAt: record.retryAt,
         })

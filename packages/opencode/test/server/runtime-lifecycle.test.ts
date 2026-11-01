@@ -452,6 +452,72 @@ describe("runtime lifecycle", () => {
     }),
   )
 
+  it.effect("allows only the current recovery fence through startup admission", () =>
+    Effect.gen(function* () {
+      const database = yield* Database.Service
+      const scope = yield* Scope.Scope
+      const lineage = randomUUID()
+      const sessionID = yield* seedSession(database)
+      const old = RuntimeLifecycle.make({ lineage }, scope, database)
+      const lease = yield* old.admit({ sessionID, directory: "/tmp" })
+      yield* old.request("shutdown")
+      yield* old.release(sessionID, lease.fence)
+      const runtime = RuntimeLifecycle.make({ lineage, startupRecovery: true }, scope, database)
+      const started = yield* Deferred.make<number>()
+      const finish = yield* Deferred.make<void>()
+      yield* runtime.recover((record) =>
+        Effect.gen(function* () {
+          yield* Deferred.succeed(started, record.fence)
+          yield* Deferred.await(finish)
+        }),
+      )
+      const fence = yield* Deferred.await(started)
+      expect(
+        Exit.isFailure(
+          yield* runtime.admit({ sessionID, directory: "/tmp", recoveryFence: fence + 1 }).pipe(Effect.exit),
+        ),
+      ).toBe(true)
+      const nested = yield* runtime.admit({ sessionID, directory: "/tmp", recoveryFence: fence })
+      expect(yield* runtime.releaseInterrupted(sessionID, nested.fence)).toBe("active")
+      expect((yield* executionDetails(database, sessionID))?.state).toBe("active")
+      expect(yield* runtime.cancel(sessionID)).toBe(true)
+      expect(
+        Exit.isFailure(yield* runtime.admit({ sessionID, directory: "/tmp", recoveryFence: fence }).pipe(Effect.exit)),
+      ).toBe(true)
+      expect((yield* executionDetails(database, sessionID))?.state).toBe("cancelled")
+      yield* runtime.finishCancel(sessionID)
+      yield* Deferred.succeed(finish, undefined)
+      yield* runtime.waitForIdle(sessionID)
+      yield* runtime.finishStartupRecovery()
+    }),
+  )
+
+  it.effect("interrupts a masked pending admission before cancellation joins it", () =>
+    Effect.gen(function* () {
+      const database = yield* Database.Service
+      const sessionID = yield* seedSession(database)
+      const runtime = RuntimeLifecycle.make({ lineage: randomUUID() }, yield* Scope.Scope, database)
+      const lease = yield* runtime.admit({ sessionID, directory: "/tmp" })
+      expect(yield* runtime.cancel(sessionID)).toBe(true)
+      const started = yield* Deferred.make<void>()
+      const admission = yield* Effect.acquireUseRelease(
+        Effect.gen(function* () {
+          yield* Deferred.succeed(started, undefined)
+          return yield* runtime.admit({ sessionID, directory: "/tmp" })
+        }),
+        () => Effect.void,
+        (acquired) => runtime.release(sessionID, acquired.fence),
+      ).pipe(Effect.forkChild)
+      yield* Deferred.await(started)
+      yield* Effect.yieldNow
+      yield* Fiber.interrupt(admission)
+      expect(Exit.isFailure(yield* Fiber.await(admission))).toBe(true)
+      yield* runtime.finishCancel(sessionID)
+      yield* runtime.release(sessionID, lease.fence)
+      expect((yield* runtime.status()).active).toBe(0)
+    }),
+  )
+
   it.effect("does not charge recovery attempts while rows wait for one of two worker permits", () =>
     Effect.gen(function* () {
       const database = yield* Database.Service
@@ -1356,6 +1422,39 @@ describe("runtime lifecycle", () => {
       expect((yield* executionDetails(database, sessionID))?.state).toBe("active")
 
       yield* replacement.release(sessionID)
+      expect((yield* executionDetails(database, sessionID))?.state).toBe("completed")
+    }),
+  )
+
+  it.effect("nested admission release retains the recovery owner until its continuation returns", () =>
+    Effect.gen(function* () {
+      const database = yield* Database.Service
+      const scope = yield* Scope.Scope
+      const lineage = randomUUID()
+      const sessionID = yield* seedSession(database)
+      const old = RuntimeLifecycle.make({ lineage }, scope, database)
+      const lease = yield* old.admit({ sessionID, directory: "/tmp" })
+      yield* old.request("shutdown")
+      yield* old.release(sessionID, lease.fence)
+
+      const replacement = RuntimeLifecycle.make({ lineage }, scope, database)
+      const notified = yield* Deferred.make<void>()
+      const finish = yield* Deferred.make<void>()
+      yield* replacement.recover(() =>
+        Effect.gen(function* () {
+          yield* replacement.recoveryPrepared(sessionID)
+          const nested = yield* replacement.admit({ sessionID, directory: "/tmp" })
+          yield* replacement.release(sessionID, nested.fence)
+          yield* Deferred.succeed(notified, undefined)
+          yield* Deferred.await(finish)
+        }),
+      )
+      yield* Deferred.await(notified)
+      expect((yield* executionDetails(database, sessionID))?.state).toBe("active")
+      expect(yield* replacement.beforeTurn(sessionID)).toBe(true)
+      expect((yield* replacement.status()).active).toBe(1)
+      yield* Deferred.succeed(finish, undefined)
+      yield* replacement.waitForIdle(sessionID)
       expect((yield* executionDetails(database, sessionID))?.state).toBe("completed")
     }),
   )
