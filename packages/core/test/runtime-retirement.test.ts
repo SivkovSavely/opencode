@@ -20,6 +20,9 @@ describe("runtime retirement persistence", () => {
           "session_retired_reparent",
           "runtime_retired_insert",
           "runtime_retired_update",
+          "historical_fence_before_root_prune",
+          "historical_fence_before_child_prune",
+          "managed_command_session_child",
         ])
           yield* database.db.run(sql`DROP TRIGGER ${sql.identifier(name)}`)
         yield* database.db.run(sql`DROP TABLE runtime_retirement`)

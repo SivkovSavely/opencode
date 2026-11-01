@@ -12,7 +12,7 @@ import { Plugin } from "@/plugin"
 import { Config } from "@/config/config"
 import { NotFoundError } from "@/storage/storage"
 
-import { Effect, Layer, Context } from "effect"
+import { Effect, Layer, Context, Schema } from "effect"
 import { InstanceState } from "@/effect/instance-state"
 import { isOverflow as overflow, usable } from "./overflow"
 import { serviceUse } from "@opencode-ai/core/effect/service-use"
@@ -179,6 +179,7 @@ export interface Interface {
     sessionID: SessionID
     agent: string
     model: { providerID: ProviderV2.ID; modelID: ModelV2.ID }
+    format?: SessionV1.User["format"]
     auto: boolean
     overflow?: boolean
   }) => Effect.Effect<void>
@@ -475,7 +476,7 @@ const layer = Layer.effect(
             time: { created: Date.now() },
             agent: original.agent,
             model: original.model,
-            format: original.format,
+            format: original.format ? Schema.decodeUnknownSync(SessionV1.Format)(original.format) : undefined,
             tools: original.tools,
             system: original.system,
           })
@@ -492,6 +493,15 @@ const layer = Layer.effect(
               sessionID: input.sessionID,
             })
           }
+          yield* session.updatePart({
+            id: PartID.ascending(),
+            messageID: replayMsg.id,
+            sessionID: input.sessionID,
+            type: "text",
+            synthetic: true,
+            metadata: { compaction_continue: true },
+            text: "Continue the same request after context compaction.",
+          })
         }
 
         if (!replay) {
@@ -523,6 +533,7 @@ const layer = Layer.effect(
               time: { created: Date.now() },
               agent: userMessage.agent,
               model: userMessage.model,
+              format: userMessage.format ? Schema.decodeUnknownSync(SessionV1.Format)(userMessage.format) : undefined,
             })
             const text =
               (input.overflow
@@ -560,6 +571,7 @@ const layer = Layer.effect(
       sessionID: SessionID
       agent: string
       model: { providerID: ProviderV2.ID; modelID: ModelV2.ID }
+      format?: SessionV1.User["format"]
       auto: boolean
       overflow?: boolean
     }) {
@@ -567,6 +579,7 @@ const layer = Layer.effect(
         id: MessageID.ascending(),
         role: "user",
         model: input.model,
+        format: input.format ? Schema.decodeUnknownSync(SessionV1.Format)(input.format) : undefined,
         sessionID: input.sessionID,
         agent: input.agent,
         time: { created: Date.now() },

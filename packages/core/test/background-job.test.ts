@@ -1,12 +1,97 @@
 import { describe, expect } from "bun:test"
 import { BackgroundJob } from "@opencode-ai/core/background-job"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
-import { Deferred, Effect, Exit, Scope } from "effect"
+import { Deferred, Effect, Exit, Fiber, Scope } from "effect"
 import { it } from "./lib/effect"
 
 const jobsLayer = LayerNode.compile(BackgroundJob.node)
 
 describe("BackgroundJob", () => {
+  it.live("same-ID restarts join old cleanup and coalesce without making replacement work uninterruptible", () =>
+    Effect.gen(function* () {
+      const jobs = yield* BackgroundJob.Service
+      const cleaning = yield* Deferred.make<void>()
+      const release = yield* Deferred.make<void>()
+      const joined = yield* Deferred.make<void>()
+      const started = yield* Deferred.make<void>()
+      const runs: string[] = []
+      const id = "job_restart_cleanup"
+      yield* Effect.addFinalizer(() => Deferred.succeed(release, undefined))
+      const job = yield* jobs.start({
+        id,
+        type: "test",
+        run: Effect.never.pipe(
+          Effect.ensuring(
+            Effect.gen(function* () {
+              yield* Deferred.succeed(cleaning, undefined)
+              yield* Deferred.await(release)
+              expect((yield* jobs.get(id))?.status).toBe("cancelled")
+              yield* Deferred.succeed(joined, undefined)
+            }),
+          ),
+        ),
+      })
+      const cancelling = yield* jobs.cancel(job.id).pipe(Effect.forkChild)
+      yield* Deferred.await(cleaning)
+      const input = {
+        id: job.id,
+        type: "replacement",
+        run: Effect.gen(function* () {
+          expect(yield* Deferred.isDone(joined)).toBe(true)
+          runs.push("replacement")
+          yield* Deferred.succeed(started, undefined)
+          return yield* Effect.never
+        }),
+      }
+      const first = yield* jobs.start(input).pipe(Effect.forkChild)
+      const second = yield* jobs.start(input).pipe(Effect.forkChild)
+      yield* Effect.yieldNow
+      expect(first.pollUnsafe()).toBeUndefined()
+      expect(second.pollUnsafe()).toBeUndefined()
+      expect(runs).toEqual([])
+      yield* Deferred.succeed(release, undefined)
+      yield* Fiber.join(cancelling)
+      expect(yield* Fiber.join(first)).toEqual(yield* Fiber.join(second))
+      yield* Deferred.await(started)
+      expect((yield* jobs.start(input)).status).toBe("running")
+      expect(runs).toEqual(["replacement"])
+      expect((yield* jobs.cancel(job.id).pipe(Effect.timeout("2 seconds")))?.status).toBe("cancelled")
+    }).pipe(Effect.provide(jobsLayer)),
+  )
+
+  it.live("concurrent cancellation joins held finalizers and preserves restart semantics", () =>
+    Effect.gen(function* () {
+      const jobs = yield* BackgroundJob.Service
+      const started = yield* Deferred.make<void>()
+      const cleaning = yield* Deferred.make<void>()
+      const release = yield* Deferred.make<void>()
+      yield* Effect.addFinalizer(() => Deferred.succeed(release, undefined))
+      const job = yield* jobs.start({
+        type: "test",
+        run: Deferred.succeed(started, undefined).pipe(
+          Effect.andThen(Effect.never),
+          Effect.ensuring(Deferred.succeed(cleaning, undefined).pipe(Effect.andThen(Deferred.await(release)))),
+        ),
+      })
+      yield* Deferred.await(started)
+      const first = yield* jobs.cancel(job.id).pipe(Effect.forkChild)
+      yield* Deferred.await(cleaning)
+      expect((yield* jobs.get(job.id))?.status).toBe("cancelled")
+      const second = yield* jobs.cancel(job.id).pipe(Effect.forkChild)
+      yield* Effect.yieldNow
+      expect(first.pollUnsafe()).toBeUndefined()
+      expect(second.pollUnsafe()).toBeUndefined()
+      yield* Deferred.succeed(release, undefined)
+      expect((yield* Fiber.join(first))?.status).toBe("cancelled")
+      expect((yield* Fiber.join(second))?.status).toBe("cancelled")
+      expect((yield* jobs.start({ id: job.id, type: "test", run: Effect.succeed("resumed") })).status).toBe("running")
+      expect((yield* jobs.wait({ id: job.id })).info?.output).toBe("resumed")
+      expect((yield* jobs.cancel(job.id))?.status).toBe("completed")
+      yield* jobs.start({ id: job.id, type: "test", run: Effect.succeed("again") })
+      expect((yield* jobs.wait({ id: job.id })).info?.output).toBe("again")
+    }).pipe(Effect.provide(jobsLayer)),
+  )
+
   it.live("tracks process-local work through explicit observation", () =>
     Effect.gen(function* () {
       const jobs = yield* BackgroundJob.Service

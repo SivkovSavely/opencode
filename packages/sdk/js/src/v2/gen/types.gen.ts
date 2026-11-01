@@ -2057,6 +2057,39 @@ export type EffectHttpApiErrorInternalServerError = {
   _tag: "InternalServerError"
 }
 
+export type HistoricalFenceIdentity = {
+  databaseID: string
+  projectID: string
+  directory: string
+  workspaceID: string | null
+}
+
+export type HistoricalFenceError = {
+  reason: string
+}
+
+export type HistoricalFenceAttestation = {
+  version: 1
+  databaseID: string
+  projectID: string
+  directory: string
+  workspaceID: string | null
+  rootSessionID: string
+  members: Array<{
+    sessionID: string
+    parentSessionID: string | null
+    role: "root" | "descendant"
+  }>
+  membershipCoverage: "attested-partial"
+  artifact: {
+    reference: string
+    sha256: string
+  }
+  issuer: string
+  issuedAt: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+  nonce: string
+}
+
 export type Model = {
   id: string
   providerID: string
@@ -7981,6 +8014,83 @@ export type EventSubscribeResponses = {
 
 export type EventSubscribeResponse = EventSubscribeResponses[keyof EventSubscribeResponses]
 
+export type HistoricalFenceIdentityData = {
+  body?: never
+  path?: never
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/maintenance/historical-fence/identity"
+}
+
+export type HistoricalFenceIdentityErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+  /**
+   * HistoricalFenceError
+   */
+  403: HistoricalFenceError
+}
+
+export type HistoricalFenceIdentityError = HistoricalFenceIdentityErrors[keyof HistoricalFenceIdentityErrors]
+
+export type HistoricalFenceIdentityResponses = {
+  /**
+   * HistoricalFenceIdentity
+   */
+  200: HistoricalFenceIdentity
+}
+
+export type HistoricalFenceIdentityResponse = HistoricalFenceIdentityResponses[keyof HistoricalFenceIdentityResponses]
+
+export type HistoricalFenceEnrollData = {
+  body?: {
+    attestation: HistoricalFenceAttestation
+    signature: string
+  }
+  path?: never
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/maintenance/historical-fence"
+}
+
+export type HistoricalFenceEnrollErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+  /**
+   * HistoricalFenceError
+   */
+  403: HistoricalFenceError
+}
+
+export type HistoricalFenceEnrollError = HistoricalFenceEnrollErrors[keyof HistoricalFenceEnrollErrors]
+
+export type HistoricalFenceEnrollResponses = {
+  /**
+   * Success
+   */
+  200: {
+    rootSessionID: string
+    sessionIDs: Array<string>
+    membershipCoverage: "attested-partial"
+    admissionFence: "permanent"
+    historicalCleanup: "unknown"
+    commandStatus: "unknown"
+    evidenceHash: string
+    recordedAt: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    signer: string
+  }
+}
+
+export type HistoricalFenceEnrollResponse = HistoricalFenceEnrollResponses[keyof HistoricalFenceEnrollResponses]
+
 export type ConfigGetData = {
   body?: never
   path?: never
@@ -10610,6 +10720,9 @@ export type SessionRetireResponses = {
     rootSessionID: string
     sessionIDs: Array<string>
     commandStatus: "draining" | "drained" | "unknown"
+    membershipCoverage?: "attested-partial" | "observed-partial"
+    historicalCleanup?: "unknown"
+    evidenceHash?: string
   }
 }
 

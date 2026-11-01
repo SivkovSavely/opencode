@@ -108,7 +108,7 @@ test("source Serve managed model-to-bash staging", async () => {
       const tools = body.tools?.map((tool) => tool.function.name) ?? []
       seen.push(key)
       await record("model-request", { key, tools, path: new URL(request.url).pathname })
-      expect(tools).toEqual(["bash"])
+      expect(tools.toSorted()).toEqual(["bash", "compress", "task"])
       const call = !turn.some((message) => message.role === "tool")
       if (key === "race" && call) {
         raceRequested.resolve()

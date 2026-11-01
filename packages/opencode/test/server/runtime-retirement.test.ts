@@ -3,6 +3,7 @@ import { Database } from "@opencode-ai/core/database/database"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { RuntimeRetirement } from "@opencode-ai/core/runtime-retirement"
 import { ManagedCommand } from "@opencode-ai/core/managed-command"
+import { HistoricalFence } from "@opencode-ai/core/historical-fence"
 import { sql } from "drizzle-orm"
 import { Deferred, Effect, Exit, Fiber, Scope } from "effect"
 import { randomUUID } from "node:crypto"
@@ -28,6 +29,186 @@ const seedSession = Effect.fnUntraced(function* (database: Database.Interface, p
 })
 
 describe("durable root retirement", () => {
+  for (const target of ["root", "child"] as const) {
+    it.live(
+      `raw ${target} pruning revokes a surviving execution-only descendant before its next turn or dispatch`,
+      () =>
+        Effect.gen(function* () {
+          const database = yield* Database.Service
+          const root = yield* seedSession(database)
+          const child = yield* seedSession(database, root)
+          const sibling = yield* seedSession(database, root)
+          // The projection survives pruning because only runtime ancestry points into the pruned tree.
+          const descendant = yield* seedSession(database)
+          const runtime = RuntimeLifecycle.make({ lineage: randomUUID() }, yield* Effect.scope, database)
+          const lease = yield* runtime.admit({ sessionID: descendant, directory: "/tmp", parentSessionID: child })
+          expect(yield* runtime.beforeTurn(descendant)).toBe(true)
+          yield* database.db.run(sql`UPDATE runtime_execution SET retry_at = 123 WHERE session_id = ${descendant}`)
+          yield* database.db.run(sql`DELETE FROM session WHERE id = ${target === "root" ? root : child}`)
+          expect(yield* database.db.get(sql`SELECT id FROM session WHERE id = ${descendant}`)).toEqual({
+            id: descendant,
+          })
+          expect(yield* RuntimeRetirement.lookup(database, descendant)).toEqual({ root_session_id: root })
+          expect(
+            yield* database.db.get(sql`SELECT state, desired_active, fence, retry_at FROM runtime_execution
+          WHERE session_id = ${descendant}`),
+          ).toEqual({ state: "cancelled", desired_active: 0, fence: lease.fence + 1, retry_at: null })
+          expect(yield* runtime.beforeTurn(descendant)).toBe(false)
+          expect(yield* runtime.checkpoint(descendant)).toBe(false)
+          expect(yield* runtime.ownershipFence(descendant)).toBeUndefined()
+          expect(
+            yield* runtime
+              .runManagedCommand(
+                descendant,
+                async () => {
+                  throw new Error("Pruned generation dispatched a command")
+                },
+                lease.fence,
+              )
+              .pipe(Effect.flip),
+          ).toBeInstanceOf(ManagedCommand.AdmissionError)
+          if (target === "child") {
+            expect(yield* RuntimeRetirement.lookup(database, root)).toBeUndefined()
+            expect(yield* RuntimeRetirement.lookup(database, sibling)).toBeUndefined()
+          }
+          yield* runtime.release(descendant, lease.fence)
+        }),
+    )
+
+    it.live(`raw ${target} pruning denies an already prepared dispatch gate`, () =>
+      Effect.gen(function* () {
+        const database = yield* Database.Service
+        const root = yield* seedSession(database)
+        const child = yield* seedSession(database, root)
+        const descendant = yield* seedSession(database, child)
+        const runtime = RuntimeLifecycle.make({ lineage: randomUUID() }, yield* Effect.scope, database)
+        const lease = yield* runtime.admit({ sessionID: descendant, directory: "/tmp", parentSessionID: child })
+        const prepared = Promise.withResolvers<RuntimeLifecycle.ManagedAuthorization>()
+        const proceed = Promise.withResolvers<void>()
+        yield* Effect.addFinalizer(() => Effect.sync(() => proceed.resolve()))
+        const worker = yield* runtime
+          .runManagedCommand(
+            descendant,
+            async (authorize) => {
+              prepared.resolve(authorize)
+              await proceed.promise
+              return {
+                start: async () => ({ cleanup: "confirmed" as const }),
+                cancel: async () => ({ cleanup: "confirmed" as const }),
+              }
+            },
+            lease.fence,
+          )
+          .pipe(Effect.forkScoped)
+        const authorize = yield* awaitWithTimeout(
+          Effect.promise(() => prepared.promise),
+          "Dispatch did not prepare",
+        )
+        yield* database.db.run(sql`DELETE FROM session WHERE id = ${target === "root" ? root : child}`)
+        expect(yield* runtime.beforeTurn(descendant)).toBe(false)
+        expect(
+          yield* Effect.promise(() =>
+            authorize(() => {
+              throw new Error("Pruned generation opened a paused dispatch gate")
+            }),
+          ),
+        ).toBe(false)
+        proceed.resolve()
+        yield* Fiber.join(worker)
+        yield* runtime.release(descendant, lease.fence)
+      }),
+    )
+  }
+
+  it.live("historical enrollment blocks late notifications and actual recovery after runtime replacement", () =>
+    Effect.gen(function* () {
+      const database = yield* Database.Service
+      const root = yield* seedSession(database)
+      const child = yield* seedSession(database, root)
+      const grandchild = yield* seedSession(database, child)
+      const projected = yield* database.db.get<{ project_id: string }>(
+        sql`SELECT project_id FROM session WHERE id = ${root}`,
+      )
+      if (!projected) return yield* Effect.die("Missing fixture root")
+      yield* database.db.run(
+        sql`UPDATE session SET project_id = ${projected.project_id} WHERE id IN (${child}, ${grandchild})`,
+      )
+      const lineage = randomUUID()
+      const runtime = RuntimeLifecycle.make({ lineage }, yield* Effect.scope, database)
+      yield* runtime.admit({ sessionID: root, directory: "/tmp" })
+      yield* runtime.park(root)
+      yield* runtime.admit({
+        sessionID: child,
+        directory: "/tmp",
+        parentSessionID: root,
+        parentCallID: "call",
+        parentMessageID: "message",
+        parentMode: "background",
+      })
+      yield* runtime.release(child)
+      yield* runtime.admit({ sessionID: grandchild, directory: "/tmp", parentSessionID: child })
+      yield* runtime.park(grandchild)
+      yield* HistoricalFence.enroll(
+        database,
+        {
+          version: 1,
+          databaseID: yield* HistoricalFence.identity(database),
+          projectID: projected.project_id,
+          directory: "/tmp",
+          workspaceID: null,
+          rootSessionID: root,
+          members: [{ sessionID: root, parentSessionID: null, role: "root" }],
+          membershipCoverage: "attested-partial",
+          artifact: { reference: "archive:verified", sha256: "a".repeat(64) },
+          issuer: "operator",
+          issuedAt: 1,
+          nonce: randomUUID(),
+        },
+        "verified-configured-signer",
+        "verified-signature",
+      )
+      // Exercise the durable boundary before the maintenance handler's local cancellation runs.
+      expect(yield* runtime.claimParentNotification(child, "call")).toBe(false)
+      for (const sessionID of [root, child, grandchild]) {
+        expect(
+          yield* runtime.admit({ sessionID, directory: "/tmp", manualRecovery: true }).pipe(Effect.flip),
+        ).toMatchObject({ reason: "retired" })
+        expect(
+          yield* database.db.get(
+            sql`SELECT state, desired_active FROM runtime_execution WHERE session_id = ${sessionID}`,
+          ),
+        ).toEqual({ state: "cancelled", desired_active: 0 })
+      }
+      const scope = yield* Scope.make()
+      yield* Effect.addFinalizer(() => Scope.close(scope, Exit.void))
+      const replacement = RuntimeLifecycle.make({ lineage }, scope, database)
+      const recovered: string[] = []
+      yield* replacement.recover((record) =>
+        Effect.sync(() => {
+          recovered.push(record.sessionID)
+        }),
+      )
+      yield* Scope.close(scope, Exit.void)
+      expect(recovered).toEqual([])
+      expect(yield* replacement.commandStatus(root)).toBe("unknown")
+    }),
+  )
+
+  it.live("partial prune evidence stays unknown across runtime replacement despite managed coverage", () =>
+    Effect.gen(function* () {
+      const database = yield* Database.Service
+      const root = yield* seedSession(database)
+      yield* ManagedCommand.coverRoot(database, root)
+      const runtime = RuntimeLifecycle.make({ lineage: randomUUID() }, yield* Effect.scope, database)
+      yield* runtime.retireRoot(root)
+      expect(yield* runtime.commandStatus(root)).toBe("drained")
+      yield* database.db.run(sql`DELETE FROM session WHERE id = ${root}`)
+      expect(yield* runtime.commandStatus(root)).toBe("unknown")
+      const replacement = RuntimeLifecycle.make({ lineage: randomUUID() }, yield* Effect.scope, database)
+      expect(yield* replacement.commandStatus(root)).toBe("unknown")
+    }),
+  )
+
   it.live("foreign no-row cancellation durably denies a pending gate even after its local marker clears", () =>
     Effect.gen(function* () {
       const database = yield* Database.Service

@@ -40,7 +40,8 @@ export type Context<M extends Metadata = Metadata> = {
   agent: string
   abort: AbortSignal
   callID?: string
-  managedRuntime?: Pick<RuntimeLifecycle.Interface, "runManagedCommand">
+  managedRuntime?: Pick<RuntimeLifecycle.Interface, "runManagedCommand"> &
+    Partial<Pick<RuntimeLifecycle.Interface, "authorizeChild">>
   executionFence?: number
   extra?: { [key: string]: unknown }
   messages: SessionV1.WithParts[]

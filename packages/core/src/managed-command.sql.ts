@@ -21,3 +21,19 @@ export const ManagedCommandTable = sqliteTable(
   },
   (table) => [index("managed_command_root_idx").on(table.root_session_id)],
 )
+
+export const ManagedSessionMemberTable = sqliteTable(
+  "managed_session_member",
+  {
+    session_id: text().primaryKey().notNull(),
+    parent_session_id: text().notNull(),
+    root_session_id: text().notNull(),
+    owner_instance: text().notNull(),
+    parent_fence: integer().notNull(),
+    directory: text().notNull(),
+    workspace_id: text(),
+    permission_policy: text().notNull().default("[]"),
+    time_created: integer().notNull(),
+  },
+  (table) => [index("managed_session_member_root_idx").on(table.root_session_id)],
+)

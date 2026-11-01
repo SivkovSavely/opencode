@@ -18,6 +18,7 @@ import { RuntimeFlags } from "@/effect/runtime-flags"
 import { McpActivation } from "@/session/mcp-activation"
 import { Effect, Layer, Schema } from "effect"
 import { testEffect } from "../lib/effect"
+import { tmpdir } from "../fixture/fixture"
 
 const callID = "call-test"
 const sessionID = SessionID.make("ses_test")
@@ -113,6 +114,110 @@ const layer = Layer.mergeAll(
 )
 
 const it = testEffect(layer)
+
+it.live("managed parent allow exceptions intersect child and ancestor restrictions", () =>
+  Effect.gen(function* () {
+    const previous = process.env.OPENCODE_MANAGED_PROFILE
+    yield* Effect.acquireRelease(
+      Effect.sync(() => {
+        process.env.OPENCODE_MANAGED_PROFILE = "1"
+      }),
+      () =>
+        Effect.sync(() => {
+          if (previous === undefined) delete process.env.OPENCODE_MANAGED_PROFILE
+          else process.env.OPENCODE_MANAGED_PROFILE = previous
+        }),
+    )
+    const sessions = yield* Session.Service
+    const registry = yield* ToolRegistry.Service
+    const current = {
+      ...(yield* sessions.get(sessionID)),
+      parentID: SessionID.make("ses_parent"),
+      permission: Permission.fromConfig({ bash: { "echo session": "deny" } }),
+    }
+    const executed: string[] = []
+    const decisions: { command: string | undefined; action: string }[] = []
+    const tools = yield* SessionTools.resolve({
+      agent: {
+        ...agent,
+        permission: [
+          ...agent.permission,
+          ...Permission.fromConfig({ bash: { "*": "allow", "echo secret": "deny", "echo ask": "ask" } }),
+        ],
+      },
+      model,
+      session: current,
+      processor: {
+        message: { id: messageID },
+        updateToolCall: () => Effect.void,
+        completeToolCall: () => Effect.void,
+      } as unknown as Pick<SessionProcessor.Handle, "message" | "updateToolCall" | "completeToolCall">,
+      bypassAgentCheck: false,
+      messages: [],
+      promptOps: {} as never,
+    }).pipe(
+      Effect.provideService(Permission.Service, {
+        ...fakePermission,
+        ask: (input) =>
+          Effect.sync(() => {
+            decisions.push({
+              command: input.patterns[0],
+              action: Permission.evaluate(input.permission, input.patterns[0] ?? "", input.ruleset).action,
+            })
+          }),
+      }),
+      Effect.provideService(Session.Service, {
+        ...sessions,
+        get: () => Effect.succeed(current),
+        managedPolicies: () =>
+          Effect.succeed([
+            Permission.fromConfig({ bash: { "*": "deny", "echo *": "allow" } }),
+            Permission.fromConfig({ "*": "allow", bash: { "echo ancestor": "deny" } }),
+          ]),
+      }),
+      Effect.provideService(ToolRegistry.Service, {
+        ...registry,
+        tools: () =>
+          Effect.succeed([
+            {
+              id: "bash",
+              description: "Permission-only shell fixture",
+              parameters: Schema.Struct({ command: Schema.String }),
+              jsonSchema: { type: "object", properties: { command: { type: "string" } } },
+              execute: (args: { command: string }, ctx: Tool.Context) =>
+                Effect.gen(function* () {
+                  yield* ctx.ask({ permission: "bash", patterns: [args.command], always: ["*"], metadata: {} })
+                  executed.push(args.command)
+                  return { title: "bash", metadata: {}, output: args.command }
+                }),
+            },
+          ]),
+      }),
+    )
+    const execute = tools.bash?.execute
+    if (!execute) throw new Error("Parent allow exception should keep bash visible")
+    const call = (command: string) =>
+      Effect.promise(async () =>
+        execute(
+          { command },
+          {
+            toolCallId: callID,
+            messages: [],
+            abortSignal: new AbortController().signal,
+          },
+        ),
+      )
+    expect(yield* call("echo ok")).toMatchObject({ output: "echo ok" })
+    expect(yield* call("echo ask")).toMatchObject({ output: "echo ask" })
+    for (const command of ["rm file", "echo secret", "echo session", "echo ancestor"])
+      expect(yield* call(command).pipe(Effect.exit)).toMatchObject({ _tag: "Failure" })
+    expect(executed).toEqual(["echo ok", "echo ask"])
+    expect(decisions).toEqual([
+      { command: "echo ok", action: "allow" },
+      { command: "echo ask", action: "ask" },
+    ])
+  }),
+)
 
 const sessionWithActivation = (activated: string[]) =>
   Session.Service.of({
@@ -221,5 +326,175 @@ it.effect("refreshes MCP tools from current session metadata without leaking the
 
     expect(activated.lazy_lookup).toBeDefined()
     expect(hidden.lazy_lookup).toBeUndefined()
+  }),
+)
+
+it.live("managed WorkQueue wrapper applies inherited permissions, tracked dispatch and truncation", () =>
+  Effect.gen(function* () {
+    const tmp = yield* Effect.acquireRelease(
+      Effect.promise(() => tmpdir()),
+      (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
+    )
+    const calls: string[] = []
+    const hold = { metadata: false }
+    const listed = Promise.withResolvers<void>()
+    const metadata = Promise.withResolvers<void>()
+    const called = Promise.withResolvers<void>()
+    const response = Promise.withResolvers<void>()
+    const server = yield* Effect.acquireRelease(
+      Effect.sync(() =>
+        Bun.serve({
+          hostname: "127.0.0.1",
+          port: 0,
+          async fetch(request) {
+            const route = new URL(request.url).pathname
+            if (route === "/test/hold-metadata") {
+              hold.metadata = true
+              return new Response()
+            }
+            if (route === "/test/listed") {
+              await listed.promise
+              return new Response()
+            }
+            if (route === "/test/release-metadata") {
+              metadata.resolve()
+              return new Response()
+            }
+            if (route === "/test/called") {
+              await called.promise
+              return new Response()
+            }
+            if (route === "/test/release-response") {
+              response.resolve()
+              return new Response()
+            }
+            const body = await request.json()
+            if (body.method === "initialize")
+              return Response.json(
+                {
+                  jsonrpc: "2.0",
+                  id: body.id,
+                  result: {
+                    protocolVersion: "2025-03-26",
+                    capabilities: { tools: {} },
+                    serverInfo: { name: "workqueue-gateway", version: "0.1.0" },
+                  },
+                },
+                { headers: { "mcp-session-id": "session" } },
+              )
+            if (body.method === "notifications/initialized") return new Response(null, { status: 202 })
+            if (body.method === "tools/list") {
+              if (hold.metadata) {
+                listed.resolve()
+                await metadata.promise
+              }
+              return Response.json({
+                jsonrpc: "2.0",
+                id: body.id,
+                result: {
+                  tools: [
+                    { name: "wq_ping", inputSchema: { type: "object", properties: {}, additionalProperties: false } },
+                    {
+                      name: "wq_update_progress",
+                      inputSchema: {
+                        type: "object",
+                        properties: {
+                          issueId: { type: "string" },
+                        },
+                        required: ["issueId"],
+                        additionalProperties: false,
+                      },
+                    },
+                  ],
+                },
+              })
+            }
+            expect(body.method).toBe("tools/call")
+            calls.push(body.params.name)
+            if (body.params.arguments.issueId === "BAILA-3") {
+              called.resolve()
+              await response.promise
+            }
+            return Response.json({
+              jsonrpc: "2.0",
+              id: body.id,
+              result: { content: [{ type: "text", text: "completed" }] },
+            })
+          },
+        }),
+      ),
+      (server) =>
+        Effect.promise(() => {
+          metadata.resolve()
+          response.resolve()
+          return server.stop(true)
+        }),
+    )
+    const child = yield* Effect.acquireRelease(
+      Effect.sync(() =>
+        Bun.spawn([process.execPath, "test/session/fixtures/managed-workqueue.ts"], {
+          cwd: new URL("../..", import.meta.url).pathname,
+          env: {
+            ...process.env,
+            OPENCODE_MANAGED_PROFILE: "1",
+            OPENCODE_MANAGED_PLUGIN_ALLOWLIST: "[]",
+            OPENCODE_MANAGED_WORK_QUEUE: JSON.stringify({
+              url: `http://127.0.0.1:${server.port}/mcp?project=BAILA`,
+              project: "BAILA",
+              directory: tmp.path,
+              tools: ["wq_ping", "wq_update_progress"],
+            }),
+          },
+          stdout: "pipe",
+          stderr: "pipe",
+        }),
+      ),
+      (child) =>
+        Effect.sync(() => {
+          child.kill()
+        }),
+    )
+    const result = yield* Effect.promise(async () => {
+      const [stdout, stderr, code] = await Promise.all([
+        new Response(child.stdout).text(),
+        new Response(child.stderr).text(),
+        child.exited,
+      ])
+      return { stdout, stderr, code }
+    })
+    expect(result.stderr).toBe("")
+    expect(result.code).toBe(0)
+    expect(result.stdout).toContain("managed WorkQueue wrapper passed")
+    expect(calls).toEqual(["wq_update_progress", "wq_update_progress"])
+  }),
+)
+
+it.live("managed tools without WorkQueue policy do not require a runtime for resolution", () =>
+  Effect.gen(function* () {
+    const previous = process.env.OPENCODE_MANAGED_PROFILE
+    yield* Effect.acquireRelease(
+      Effect.sync(() => {
+        process.env.OPENCODE_MANAGED_PROFILE = "1"
+      }),
+      () =>
+        Effect.sync(() => {
+          if (previous === undefined) delete process.env.OPENCODE_MANAGED_PROFILE
+          else process.env.OPENCODE_MANAGED_PROFILE = previous
+        }),
+    )
+    const tools = yield* SessionTools.resolve({
+      agent,
+      model,
+      session: { id: sessionID, permission: [] } as unknown as Session.Info,
+      processor: {
+        message: { id: messageID },
+        updateToolCall: () => Effect.void,
+        completeToolCall: () => Effect.void,
+      } as unknown as Pick<SessionProcessor.Handle, "message" | "updateToolCall" | "completeToolCall">,
+      bypassAgentCheck: false,
+      messages: [],
+      promptOps: {} as never,
+    })
+    expect(tools).toEqual({})
   }),
 )

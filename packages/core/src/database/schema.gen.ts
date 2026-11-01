@@ -24,6 +24,33 @@ export default {
         );
       `)
       yield* tx.run(`
+        CREATE TABLE \`historical_fence_evidence\` (
+          \`root_session_id\` text PRIMARY KEY,
+          \`evidence_hash\` text NOT NULL UNIQUE,
+          \`payload\` text NOT NULL,
+          \`observed_payload\` text NOT NULL,
+          \`signer\` text NOT NULL,
+          \`signature\` text NOT NULL,
+          \`issuer\` text NOT NULL,
+          \`nonce\` text NOT NULL,
+          \`time_created\` integer NOT NULL
+        );
+      `)
+      yield* tx.run(`
+        CREATE TABLE \`historical_fence_identity\` (
+          \`singleton\` integer PRIMARY KEY,
+          \`database_id\` text NOT NULL UNIQUE,
+          CONSTRAINT "historical_fence_identity_singleton" CHECK("singleton" = 1)
+        );
+      `)
+      yield* tx.run(`
+        CREATE TABLE \`historical_fence_prune\` (
+          \`root_session_id\` text PRIMARY KEY,
+          \`payload\` text NOT NULL,
+          \`time_created\` integer NOT NULL
+        );
+      `)
+      yield* tx.run(`
         CREATE TABLE \`managed_command_coverage\` (
           \`root_session_id\` text PRIMARY KEY,
           \`state\` text NOT NULL,
@@ -40,6 +67,19 @@ export default {
           \`state\` text NOT NULL,
           \`time_created\` integer NOT NULL,
           \`time_updated\` integer NOT NULL
+        );
+      `)
+      yield* tx.run(`
+        CREATE TABLE \`managed_session_member\` (
+          \`session_id\` text PRIMARY KEY,
+          \`parent_session_id\` text NOT NULL,
+          \`root_session_id\` text NOT NULL,
+          \`owner_instance\` text NOT NULL,
+          \`parent_fence\` integer NOT NULL,
+          \`directory\` text NOT NULL,
+          \`workspace_id\` text,
+          \`permission_policy\` text DEFAULT '[]' NOT NULL,
+          \`time_created\` integer NOT NULL
         );
       `)
       yield* tx.run(`
@@ -345,7 +385,13 @@ export default {
           CONSTRAINT \`fk_session_share_session_id_session_id_fk\` FOREIGN KEY (\`session_id\`) REFERENCES \`session\`(\`id\`) ON DELETE CASCADE
         );
       `)
+      yield* tx.run(
+        `CREATE UNIQUE INDEX \`historical_fence_nonce_idx\` ON \`historical_fence_evidence\` (\`signer\`,\`nonce\`);`,
+      )
       yield* tx.run(`CREATE INDEX \`managed_command_root_idx\` ON \`managed_command\` (\`root_session_id\`);`)
+      yield* tx.run(
+        `CREATE INDEX \`managed_session_member_root_idx\` ON \`managed_session_member\` (\`root_session_id\`);`,
+      )
       yield* tx.run(`CREATE UNIQUE INDEX \`runtime_execution_session_idx\` ON \`runtime_execution\` (\`session_id\`);`)
       yield* tx.run(
         `CREATE INDEX \`runtime_execution_owner_state_idx\` ON \`runtime_execution\` (\`owner_lineage\`,\`state\`);`,

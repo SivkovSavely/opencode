@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect } from "bun:test"
-import { Effect, Exit, Layer, Option } from "effect"
+import { Deferred, Effect, Exit, Fiber, Layer, Option } from "effect"
 import { HttpClient, HttpClientRequest, HttpClientResponse } from "effect/unstable/http"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { httpClient } from "@opencode-ai/core/effect/app-node-platform"
@@ -14,7 +14,7 @@ import type { SessionID } from "../../src/session/schema"
 import { ShareNext } from "@/share/share-next"
 import { SessionShareTable } from "@opencode-ai/core/share/sql"
 import { Database } from "@opencode-ai/core/database/database"
-import { eq } from "drizzle-orm"
+import { eq, sql } from "drizzle-orm"
 import { provideTmpdirInstance } from "../fixture/fixture"
 import { resetDatabase } from "../fixture/db"
 import { pollWithTimeout, testEffect } from "../lib/effect"
@@ -82,6 +82,53 @@ beforeEach(async () => {
 })
 
 describe("ShareNext", () => {
+  it.live("Session removal commits before a held shared-session HTTP DELETE", () =>
+    provideTmpdirInstance(() =>
+      Effect.gen(function* () {
+        const entered = yield* Deferred.make<void>()
+        const release = yield* Deferred.make<void>()
+        yield* Effect.addFinalizer(() => Deferred.succeed(release, undefined))
+        const requests: HttpClientRequest.HttpClientRequest[] = []
+        const client = HttpClient.make((req) => {
+          if (req.method === "DELETE") {
+            requests.push(req)
+            return Deferred.succeed(entered, undefined).pipe(
+              Effect.andThen(Deferred.await(release)),
+              Effect.as(json(req, { ok: true })),
+            )
+          }
+          return Effect.succeed(json(req, { id: "shr_held", url: "https://share.example/held", secret: "sec_held" }))
+        })
+        yield* Effect.gen(function* () {
+          const sessions = yield* Session.Service
+          const sharing = yield* ShareNext.Service
+          const database = yield* Database.Service
+          const session = yield* sessions.create({})
+          yield* sharing.create(session.id)
+          const removal = yield* sessions.remove(session.id).pipe(Effect.forkChild)
+          yield* Deferred.await(entered).pipe(Effect.timeout("2 seconds"))
+          yield* database.db
+            .transaction(
+              () =>
+                Effect.gen(function* () {
+                  expect(yield* database.db.get(sql`SELECT id FROM session WHERE id = ${session.id}`)).toBeUndefined()
+                  expect(yield* share(session.id)).toBeUndefined()
+                }),
+              { behavior: "immediate" },
+            )
+            .pipe(Effect.timeout("2 seconds"))
+          yield* Deferred.succeed(release, undefined)
+          yield* Fiber.join(removal)
+          expect(requests).toHaveLength(1)
+          expect(requests[0].url).toBe("https://opncd.ai/api/share/shr_held")
+          expect(requests[0].body._tag).toBe("Uint8Array")
+          if (requests[0].body._tag === "Uint8Array")
+            expect(JSON.parse(new TextDecoder().decode(requests[0].body.body))).toEqual({ secret: "sec_held" })
+        }).pipe(Effect.provide(integrationLayer(client)))
+      }),
+    ),
+  )
+
   it.live("request uses legacy share API without active org account", () =>
     provideTmpdirInstance(
       () =>

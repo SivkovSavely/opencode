@@ -98,6 +98,11 @@ import type {
   GlobalRuntimeShutdownResponses,
   GlobalUpgradeErrors,
   GlobalUpgradeResponses,
+  HistoricalFenceAttestation,
+  HistoricalFenceEnrollErrors,
+  HistoricalFenceEnrollResponses,
+  HistoricalFenceIdentityErrors,
+  HistoricalFenceIdentityResponses,
   InstanceDisposeErrors,
   InstanceDisposeResponses,
   LocationRef,
@@ -1682,6 +1687,83 @@ export class Event extends HeyApiClient {
       url: "/event",
       ...options,
       ...params,
+    })
+  }
+}
+
+export class HistoricalFence extends HeyApiClient {
+  /**
+   * Get historical fence signing binding
+   */
+  public identity<ThrowOnError extends boolean = false>(
+    parameters?: {
+      directory?: string
+      workspace?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).get<
+      HistoricalFenceIdentityResponses,
+      HistoricalFenceIdentityErrors,
+      ThrowOnError
+    >({
+      url: "/maintenance/historical-fence/identity",
+      ...options,
+      ...params,
+    })
+  }
+
+  /**
+   * Fence attested historical Session identities
+   *
+   * Opt-in operator maintenance. Verifies a configured Ed25519 authority; records immutable ownership evidence and permanent admission tombstones. Attested membership is partial, never proof of command termination. Exact signed retries return the same durable proof.
+   */
+  public enroll<ThrowOnError extends boolean = false>(
+    parameters?: {
+      directory?: string
+      workspace?: string
+      attestation?: HistoricalFenceAttestation
+      signature?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+            { in: "body", key: "attestation" },
+            { in: "body", key: "signature" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).post<
+      HistoricalFenceEnrollResponses,
+      HistoricalFenceEnrollErrors,
+      ThrowOnError
+    >({
+      url: "/maintenance/historical-fence",
+      ...options,
+      ...params,
+      headers: {
+        "Content-Type": "application/json",
+        ...options?.headers,
+        ...params.headers,
+      },
     })
   }
 }
@@ -7603,6 +7685,11 @@ export class OpencodeClient extends HeyApiClient {
   private _event?: Event
   get event(): Event {
     return (this._event ??= new Event({ client: this.client }))
+  }
+
+  private _historicalFence?: HistoricalFence
+  get historicalFence(): HistoricalFence {
+    return (this._historicalFence ??= new HistoricalFence({ client: this.client }))
   }
 
   private _config?: Config2

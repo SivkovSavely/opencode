@@ -1,6 +1,6 @@
 import { describe, expect } from "bun:test"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
-import { Deferred, Effect } from "effect"
+import { Deferred, Effect, Fiber } from "effect"
 import { BackgroundJob } from "@/background/job"
 import { testEffect } from "../lib/effect"
 
@@ -151,12 +151,13 @@ describe("background.job", () => {
     }),
   )
 
-  it.instance("ignores stale settlements after restarting a failed job", () =>
+  it.instance("joins failed job cleanup before restarting the same ID", () =>
     Effect.gen(function* () {
       const jobs = yield* BackgroundJob.Service
       const fail = yield* Deferred.make<void>()
       const interrupted = yield* Deferred.make<void>()
       const release = yield* Deferred.make<void>()
+      yield* Effect.addFinalizer(() => Deferred.succeed(release, undefined))
       const id = "job_test"
       yield* jobs.start({
         id,
@@ -173,10 +174,13 @@ describe("background.job", () => {
       yield* Deferred.succeed(fail, undefined)
       expect((yield* jobs.wait({ id })).info?.status).toBe("error")
       yield* Deferred.await(interrupted)
-      yield* jobs.start({ id, type: "test", run: Effect.never })
+      const restarting = yield* jobs.start({ id, type: "test", run: Effect.never }).pipe(Effect.forkChild)
+      yield* Effect.yieldNow
+      expect(restarting.pollUnsafe()).toBeUndefined()
+      expect((yield* jobs.get(id))?.status).toBe("error")
 
       yield* Deferred.succeed(release, undefined)
-      yield* Effect.yieldNow
+      yield* Fiber.join(restarting)
       expect((yield* jobs.get(id))?.status).toBe("running")
       yield* jobs.cancel(id)
     }),

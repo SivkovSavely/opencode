@@ -1,9 +1,11 @@
 import { Agent } from "@/agent/agent"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
+import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { Provider } from "@/provider/provider"
 import { ProviderTransform } from "@/provider/transform"
 import { MCP } from "@/mcp"
 import { McpCatalog } from "@/mcp/catalog"
+import { ManagedWorkQueue } from "@/mcp/managed-workqueue"
 import { Permission } from "@/permission"
 import { Tool } from "@/tool/tool"
 import { ToolJsonSchema } from "@/tool/json-schema"
@@ -48,8 +50,9 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
   bypassAgentCheck: boolean
   messages: SessionV1.WithParts[]
   promptOps: TaskPromptOps
+  requestCompaction?: () => Effect.Effect<void>
   executionFence?: number
-  managedRuntime?: Pick<RuntimeLifecycle.Interface, "runManagedCommand">
+  managedRuntime?: Tool.Context["managedRuntime"]
 }) {
   const tools: Record<string, AITool> = {}
   const run = yield* EffectBridge.make()
@@ -58,6 +61,10 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
   const registry = yield* ToolRegistry.Service
   const sessions = yield* Session.Service
   const current = yield* sessions.get(input.session.id).pipe(Effect.orDie)
+  const inheritedPolicies =
+    process.env.OPENCODE_MANAGED_PROFILE === "1" && current.parentID
+      ? yield* sessions.managedPolicies(input.session.id)
+      : []
   const activated = McpActivation.names(current.metadata)
   const truncate = yield* Truncate.Service
   const flags = yield* RuntimeFlags.Service
@@ -73,6 +80,7 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
       model: input.model,
       bypassAgentCheck: input.bypassAgentCheck,
       promptOps: input.promptOps,
+      requestCompaction: input.requestCompaction,
       mcpActivated: activated,
     },
     agent: input.agent.name,
@@ -92,14 +100,34 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
         }
       }),
     ask: (req) =>
-      permission
-        .ask({
+      Effect.gen(function* () {
+        const request = {
           ...req,
           sessionID: input.session.id,
           tool: { messageID: input.processor.message.id, callID: options.toolCallId },
           ruleset: Permission.merge(input.agent.permission, input.session.permission ?? []),
-        })
-        .pipe(Effect.orDie),
+        }
+        // Delegation policy gates this Task call, rather than every descendant's Task policy.
+        if (req.permission === "task" || inheritedPolicies.length === 0) return yield* permission.ask(request)
+        for (const pattern of req.patterns) {
+          const decisions = [request.ruleset, ...inheritedPolicies].map((ruleset) =>
+            Permission.evaluate(req.permission, pattern, ruleset),
+          )
+          if (decisions.some((rule) => rule.action === "deny"))
+            return yield* new PermissionV1.DeniedError({ ruleset: decisions })
+          yield* permission.ask({
+            ...request,
+            patterns: [pattern],
+            ruleset: [
+              {
+                permission: req.permission,
+                pattern: "*",
+                action: decisions.some((rule) => rule.action === "ask") ? "ask" : "allow",
+              },
+            ],
+          })
+        }
+      }).pipe(Effect.orDie),
   })
 
   for (const item of yield* registry.tools({
@@ -110,7 +138,9 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
     sessionID: input.session.id,
     mcpActivated: activated,
   })) {
-    if (process.env.OPENCODE_MANAGED_PROFILE === "1" && item.id !== "bash") continue
+    if (process.env.OPENCODE_MANAGED_PROFILE === "1" && !["bash", "task", "compress"].includes(item.id)) continue
+    if (item.id !== "task" && inheritedPolicies.some((policy) => Permission.disabled([item.id], policy).has(item.id)))
+      continue
     const schema = ProviderTransform.schema(input.model, ToolJsonSchema.fromTool(item))
     tools[item.id] = tool({
       description: item.description,
@@ -149,8 +179,84 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
     })
   }
 
-  // MCP, task delegation and arbitrary tools do not have joined managed retirement contracts.
-  if (process.env.OPENCODE_MANAGED_PROFILE === "1") return tools
+  // Arbitrary MCP servers and custom tools do not have joined managed retirement contracts.
+  if (process.env.OPENCODE_MANAGED_PROFILE === "1") {
+    const policy = yield* Effect.promise(() => ManagedWorkQueue.loadPolicy())
+    if (!policy) return tools
+    const runtime = input.managedRuntime
+    const fence = input.executionFence
+    if (!runtime || fence === undefined) throw new Error("Managed WorkQueue requires a tracked execution lease")
+    // Join metadata-only discovery before interruption can release the provider's execution lease.
+    const catalog = yield* Effect.promise(() => ManagedWorkQueue.discover(policy, input.session.directory)).pipe(
+      Effect.uninterruptible,
+    )
+    const visible = inheritedPolicies.reduce(
+      (tools, policy) => Permission.visibleTools(tools, policy),
+      Permission.visibleTools(
+        Object.fromEntries(catalog.map((item) => [item.name, item])),
+        Permission.merge(input.agent.permission, input.session.permission ?? []),
+      ),
+    )
+    for (const item of Object.values(visible)) {
+      tools[item.name] = tool({
+        description: item.description,
+        inputSchema: jsonSchema(ProviderTransform.schema(input.model, item.inputSchema)),
+        execute(args, options) {
+          return run.promise(
+            Effect.gen(function* () {
+              const ctx = context(args, options)
+              yield* ctx.ask({
+                permission: item.name,
+                patterns: ["*"],
+                always: ["*"],
+                metadata: { project: policy.project, readOnly: ManagedWorkQueue.isReadOnly(item.name) },
+              })
+              options.abortSignal?.throwIfAborted()
+              const outcome = yield* runtime.runManagedCommand(
+                input.session.id,
+                (authorize) =>
+                  ManagedWorkQueue.prepare(
+                    policy,
+                    input.session.directory,
+                    item.name,
+                    args,
+                    authorize,
+                    options.abortSignal,
+                  ),
+                fence,
+                { preparation: "process-free" },
+              )
+              const text =
+                outcome.result?.content.map((content) =>
+                  content.type === "text" ? content.text : JSON.stringify(content),
+                ) ?? []
+              const truncated = yield* truncate.output(
+                [outcome.error, ...text].filter((part) => part !== undefined).join("\n\n"),
+                {},
+                input.agent,
+              )
+              const output = {
+                title: item.name,
+                output: truncated.content,
+                metadata: {
+                  project: policy.project,
+                  cleanup: outcome.cleanup,
+                  isError: !!outcome.error || !!outcome.result?.isError,
+                  truncated: truncated.truncated,
+                  ...(truncated.truncated && { outputPath: truncated.outputPath }),
+                },
+              }
+              if (options.abortSignal?.aborted) {
+                yield* input.processor.completeToolCall(options.toolCallId, output)
+              }
+              return output
+            }),
+          )
+        },
+      })
+    }
+    return tools
+  }
 
   const mcp = yield* MCP.Service
   const hasMcpResourceServer = Object.values(yield* mcp.clients(activated)).some(

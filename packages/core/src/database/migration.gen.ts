@@ -56,5 +56,7 @@ export const migrations = (
     import("./migration/20261028173819_managed_command_generation"),
     import("./migration/20261028174200_managed_command_ancestry"),
     import("./migration/20261031090000_managed_execution_accounting"),
+    import("./migration/20261101090000_historical_admission_fence"),
+    import("./migration/20261101091000_managed_capabilities"),
   ])
 ).map((module) => module.default) satisfies DatabaseMigration.Migration[]

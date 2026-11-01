@@ -342,10 +342,11 @@ describe("native queue HttpApi SDK", () => {
       expect((yield* Effect.promise(() => sdk.session.prompt(payload))).response.status).toBe(409)
       expect((yield* Effect.promise(() => sdk.session.promptAsync(payload))).response.status).toBe(409)
       expect((yield* Effect.promise(() => sdk.session.summarize({ sessionID, ...model }))).response.status).toBe(409)
-      expect(
-        (yield* Effect.promise(() => sdk.session.shell({ sessionID, agent: "build", command: "echo forbidden" })))
-          .response.status,
-      ).toBe(409)
+      const shell = yield* Effect.promise(() =>
+        sdk.session.shell({ sessionID, agent: "build", command: "echo forbidden" }),
+      )
+      expect(shell.response.status).toBe(409)
+      expect(shell.error).toMatchObject({ _tag: "ConflictError", resource: sessionID })
       expect(
         (yield* Effect.promise(() => sdk.session.command({ sessionID, command: "missing", arguments: "" }))).response
           .status,

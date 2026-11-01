@@ -1,9 +1,9 @@
 {
   "version": "7",
   "dialect": "sqlite",
-  "id": "e291bea9-577c-49f2-9aae-84c70f50078b",
+  "id": "ba223fc8-0f47-4a0e-a839-03c45d791748",
   "prevIds": [
-    "b7ddd2e9-8193-4d90-8ed6-00a92a0696f7"
+    "e291bea9-577c-49f2-9aae-84c70f50078b"
   ],
   "ddl": [
     {
@@ -15,11 +15,27 @@
       "entityType": "tables"
     },
     {
+      "name": "historical_fence_evidence",
+      "entityType": "tables"
+    },
+    {
+      "name": "historical_fence_identity",
+      "entityType": "tables"
+    },
+    {
+      "name": "historical_fence_prune",
+      "entityType": "tables"
+    },
+    {
       "name": "managed_command_coverage",
       "entityType": "tables"
     },
     {
       "name": "managed_command",
+      "entityType": "tables"
+    },
+    {
+      "name": "managed_session_member",
       "entityType": "tables"
     },
     {
@@ -230,6 +246,146 @@
       "generated": null,
       "name": "root_session_id",
       "entityType": "columns",
+      "table": "historical_fence_evidence"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "evidence_hash",
+      "entityType": "columns",
+      "table": "historical_fence_evidence"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "payload",
+      "entityType": "columns",
+      "table": "historical_fence_evidence"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "observed_payload",
+      "entityType": "columns",
+      "table": "historical_fence_evidence"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "signer",
+      "entityType": "columns",
+      "table": "historical_fence_evidence"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "signature",
+      "entityType": "columns",
+      "table": "historical_fence_evidence"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "issuer",
+      "entityType": "columns",
+      "table": "historical_fence_evidence"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "nonce",
+      "entityType": "columns",
+      "table": "historical_fence_evidence"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "time_created",
+      "entityType": "columns",
+      "table": "historical_fence_evidence"
+    },
+    {
+      "type": "integer",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "singleton",
+      "entityType": "columns",
+      "table": "historical_fence_identity"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "database_id",
+      "entityType": "columns",
+      "table": "historical_fence_identity"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "root_session_id",
+      "entityType": "columns",
+      "table": "historical_fence_prune"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "payload",
+      "entityType": "columns",
+      "table": "historical_fence_prune"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "time_created",
+      "entityType": "columns",
+      "table": "historical_fence_prune"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "root_session_id",
+      "entityType": "columns",
       "table": "managed_command_coverage"
     },
     {
@@ -331,6 +487,96 @@
       "name": "time_updated",
       "entityType": "columns",
       "table": "managed_command"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "session_id",
+      "entityType": "columns",
+      "table": "managed_session_member"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "parent_session_id",
+      "entityType": "columns",
+      "table": "managed_session_member"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "root_session_id",
+      "entityType": "columns",
+      "table": "managed_session_member"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "owner_instance",
+      "entityType": "columns",
+      "table": "managed_session_member"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "parent_fence",
+      "entityType": "columns",
+      "table": "managed_session_member"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "directory",
+      "entityType": "columns",
+      "table": "managed_session_member"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "workspace_id",
+      "entityType": "columns",
+      "table": "managed_session_member"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "'[]'",
+      "generated": null,
+      "name": "permission_policy",
+      "entityType": "columns",
+      "table": "managed_session_member"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "time_created",
+      "entityType": "columns",
+      "table": "managed_session_member"
     },
     {
       "type": "text",
@@ -2485,6 +2731,33 @@
         "root_session_id"
       ],
       "nameExplicit": false,
+      "name": "historical_fence_evidence_pk",
+      "table": "historical_fence_evidence",
+      "entityType": "pks"
+    },
+    {
+      "columns": [
+        "singleton"
+      ],
+      "nameExplicit": false,
+      "name": "historical_fence_identity_pk",
+      "table": "historical_fence_identity",
+      "entityType": "pks"
+    },
+    {
+      "columns": [
+        "root_session_id"
+      ],
+      "nameExplicit": false,
+      "name": "historical_fence_prune_pk",
+      "table": "historical_fence_prune",
+      "entityType": "pks"
+    },
+    {
+      "columns": [
+        "root_session_id"
+      ],
+      "nameExplicit": false,
       "name": "managed_command_coverage_pk",
       "table": "managed_command_coverage",
       "entityType": "pks"
@@ -2496,6 +2769,15 @@
       "nameExplicit": false,
       "name": "managed_command_pk",
       "table": "managed_command",
+      "entityType": "pks"
+    },
+    {
+      "columns": [
+        "session_id"
+      ],
+      "nameExplicit": false,
+      "name": "managed_session_member_pk",
+      "table": "managed_session_member",
       "entityType": "pks"
     },
     {
@@ -2690,6 +2972,24 @@
     {
       "columns": [
         {
+          "value": "signer",
+          "isExpression": false
+        },
+        {
+          "value": "nonce",
+          "isExpression": false
+        }
+      ],
+      "isUnique": true,
+      "where": null,
+      "origin": "manual",
+      "name": "historical_fence_nonce_idx",
+      "entityType": "indexes",
+      "table": "historical_fence_evidence"
+    },
+    {
+      "columns": [
+        {
           "value": "root_session_id",
           "isExpression": false
         }
@@ -2700,6 +3000,20 @@
       "name": "managed_command_root_idx",
       "entityType": "indexes",
       "table": "managed_command"
+    },
+    {
+      "columns": [
+        {
+          "value": "root_session_id",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "origin": "manual",
+      "name": "managed_session_member_root_idx",
+      "entityType": "indexes",
+      "table": "managed_session_member"
     },
     {
       "columns": [
@@ -3096,6 +3410,30 @@
       "name": "todo_session_idx",
       "entityType": "indexes",
       "table": "todo"
+    },
+    {
+      "columns": [
+        "evidence_hash"
+      ],
+      "nameExplicit": false,
+      "name": "historical_fence_evidence_evidence_hash_unique",
+      "entityType": "uniques",
+      "table": "historical_fence_evidence"
+    },
+    {
+      "columns": [
+        "database_id"
+      ],
+      "nameExplicit": false,
+      "name": "historical_fence_identity_database_id_unique",
+      "entityType": "uniques",
+      "table": "historical_fence_identity"
+    },
+    {
+      "value": "\"singleton\" = 1",
+      "name": "historical_fence_identity_singleton",
+      "entityType": "checks",
+      "table": "historical_fence_identity"
     }
   ],
   "renames": []

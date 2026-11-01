@@ -29,6 +29,9 @@ import { disposeAllInstances, provideInstance, TestInstance, tmpdirScoped } from
 import { testEffect } from "../lib/effect"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
+import { ManagedCommand } from "@opencode-ai/core/managed-command"
+import { RuntimeLifecycle } from "@/server/runtime-lifecycle"
+import { Permission } from "@/permission"
 
 afterEach(async () => {
   await disposeAllInstances()
@@ -178,6 +181,401 @@ function reply(
 }
 
 describe("tool.task", () => {
+  it.instance(
+    "managed reviewers and verifiers are independent joined foreground children",
+    () =>
+      Effect.gen(function* () {
+        const previous = process.env.OPENCODE_MANAGED_PROFILE
+        yield* Effect.acquireRelease(
+          Effect.sync(() => {
+            process.env.OPENCODE_MANAGED_PROFILE = "1"
+          }),
+          () =>
+            Effect.sync(() => {
+              if (previous === undefined) delete process.env.OPENCODE_MANAGED_PROFILE
+              else process.env.OPENCODE_MANAGED_PROFILE = previous
+            }),
+        )
+        const database = yield* Database.Service
+        const sessions = yield* Session.Service
+        const jobs = yield* BackgroundJob.Service
+        const agents = yield* Agent.Service
+        const { chat, assistant } = yield* seed()
+        const runtime = RuntimeLifecycle.make({ lineage: "managed-task-test" }, yield* Effect.scope, database)
+        const parent = yield* runtime.admit({ sessionID: chat.id, directory: chat.directory })
+        const tool = yield* TaskTool.pipe(Effect.flatMap((tool) => tool.init()))
+        const children: SessionID[] = []
+        const ops: TaskPromptOps = {
+          ...stubOps(),
+          resolvePromptParts: () => Effect.die("Managed Task text must not enter trusted mention expansion"),
+          prompt: (input, parent) =>
+            Effect.acquireUseRelease(
+              runtime.admit({
+                sessionID: input.sessionID,
+                directory: chat.directory,
+                parentSessionID: chat.id,
+                parentMode: "foreground",
+                managedChildAuthorization: parent?.managedChildAuthorization?.prompt,
+              }),
+              () =>
+                Effect.gen(function* () {
+                  children.push(input.sessionID)
+                  expect(yield* jobs.get(input.sessionID)).toBeUndefined()
+                  const child = yield* sessions.get(input.sessionID)
+                  expect(child.parentID).toBe(chat.id)
+                  expect(child.workspaceID).toBe(chat.workspaceID)
+                  expect(child.directory).toBe(chat.directory)
+                  const selected = yield* agents.get(input.agent ?? "reviewer")
+                  const policies = yield* sessions.managedPolicies(child.id)
+                  if (children.length <= 2)
+                    expect(
+                      policies.every((policy) => Permission.evaluate("bash", "echo ok", policy).action === "allow"),
+                    ).toBe(true)
+                  expect(
+                    policies.some((policy) => Permission.evaluate("bash", "rm file", policy).action === "deny"),
+                  ).toBe(true)
+                  expect(
+                    Permission.evaluate(
+                      "task",
+                      "verifier",
+                      Permission.merge(selected?.permission ?? [], child.permission ?? []),
+                    ).action,
+                  ).toBe("allow")
+                  yield* runtime.complete(input.sessionID)
+                  return reply(input, `${input.agent} complete`)
+                }),
+              (admitted) => runtime.release(input.sessionID, admitted.fence),
+            ).pipe(Effect.orDie),
+        }
+        const execute = (name: string, background?: boolean, task_id?: string) =>
+          tool.execute(
+            {
+              description: `${name} review`,
+              prompt: "Review without detaching",
+              subagent_type: name,
+              background,
+              task_id,
+            },
+            {
+              sessionID: chat.id,
+              messageID: assistant.id,
+              agent: "build",
+              abort: new AbortController().signal,
+              callID: `call-${name}`,
+              managedRuntime: runtime,
+              executionFence: parent.fence,
+              extra: { promptOps: ops },
+              messages: [],
+              metadata: () => Effect.void,
+              ask: () => Effect.void,
+            },
+          )
+        expect(yield* execute("reviewer", true).pipe(Effect.exit)).toMatchObject({ _tag: "Failure" })
+        expect(children).toHaveLength(0)
+        expect(yield* execute("build").pipe(Effect.exit)).toMatchObject({ _tag: "Failure" })
+        const results = yield* Effect.all([execute("reviewer"), execute("verifier")], { concurrency: "unbounded" })
+        expect(results.map((result) => result.output)).toEqual([
+          expect.stringContaining("reviewer complete"),
+          expect.stringContaining("verifier complete"),
+        ])
+        expect(children).toHaveLength(2)
+        expect(new Set(children).size).toBe(2)
+        yield* sessions.setPermission({
+          sessionID: chat.id,
+          permission: [{ permission: "bash", pattern: "echo *", action: "deny" }],
+        })
+        const firstChild = children[0]
+        if (!firstChild) throw new Error("Missing first managed child")
+        yield* execute("reviewer", false, firstChild)
+        const policies = yield* sessions.managedPolicies(firstChild)
+        expect(policies.some((policy) => Permission.evaluate("bash", "echo unsafe", policy).action === "deny")).toBe(
+          true,
+        )
+        // Managed reuse is valid only for an explicitly reserved child, never an old root.
+        expect(yield* execute("reviewer", false, chat.id).pipe(Effect.exit)).toMatchObject({ _tag: "Failure" })
+        yield* runtime.complete(chat.id)
+        yield* runtime.release(chat.id, parent.fence)
+        expect(yield* runtime.commandStatus(chat.id)).toBe("drained")
+        expect(yield* ManagedCommand.status(database, chat.id)).toBe("drained")
+      }),
+    {
+      config: {
+        agent: {
+          build: { permission: { bash: { "*": "deny", "echo *": "allow", "rm *": "deny" }, task: "deny" } },
+          reviewer: { mode: "subagent", permission: { bash: { "*": "allow", "echo secret": "deny" }, task: "allow" } },
+          verifier: { mode: "subagent", permission: { bash: { "*": "allow", "echo secret": "deny" }, task: "allow" } },
+        },
+      },
+    },
+  )
+
+  for (const concurrentCancel of [false, true]) {
+    it.instance(
+      `managed interruption joins the child's cleanup before returning (${concurrentCancel ? "already cancelling" : "active"})`,
+      () =>
+        Effect.gen(function* () {
+          const previous = process.env.OPENCODE_MANAGED_PROFILE
+          yield* Effect.acquireRelease(
+            Effect.sync(() => {
+              process.env.OPENCODE_MANAGED_PROFILE = "1"
+            }),
+            () =>
+              Effect.sync(() => {
+                if (previous === undefined) delete process.env.OPENCODE_MANAGED_PROFILE
+                else process.env.OPENCODE_MANAGED_PROFILE = previous
+              }),
+          )
+          const database = yield* Database.Service
+          const { chat, assistant } = yield* seed()
+          const runtime = RuntimeLifecycle.make(
+            { lineage: "managed-task-interrupt-test" },
+            yield* Effect.scope,
+            database,
+          )
+          const parent = yield* runtime.admit({ sessionID: chat.id, directory: chat.directory })
+          const started = yield* Deferred.make<void>()
+          const cleaning = yield* Deferred.make<void>()
+          const joined = yield* Deferred.make<void>()
+          const reserved = yield* Deferred.make<void>()
+          const proceed = yield* Deferred.make<void>()
+          const parentCancelling = yield* Deferred.make<void>()
+          const tool = yield* TaskTool.pipe(Effect.flatMap((tool) => tool.init()))
+          let cancelled = 0
+          const runners = yield* SessionRunState.Service
+          const ops: TaskPromptOps = {
+            ...stubOps(),
+            cancel: (sessionID) =>
+              Effect.gen(function* () {
+                cancelled++
+                if (cancelled === (concurrentCancel ? 2 : 1)) yield* Deferred.succeed(parentCancelling, undefined)
+                yield* Effect.acquireUseRelease(
+                  runtime.cancel(sessionID),
+                  () => runners.cancel(sessionID),
+                  (owner) => (owner ? runtime.finishCancel(sessionID) : Effect.void),
+                )
+              }),
+            prompt: (input, parent) =>
+              Effect.acquireUseRelease(
+                runtime.admit({
+                  sessionID: input.sessionID,
+                  directory: chat.directory,
+                  parentSessionID: chat.id,
+                  parentMode: "foreground",
+                  managedChildAuthorization: parent?.managedChildAuthorization?.prompt,
+                }),
+                () =>
+                  runners.enqueue(
+                    input.sessionID,
+                    Effect.succeed(reply(input, "idle")),
+                    Effect.acquireUseRelease(
+                      runtime
+                        .admit({
+                          sessionID: input.sessionID,
+                          directory: chat.directory,
+                          parentSessionID: chat.id,
+                          managedChildAuthorization: parent?.managedChildAuthorization?.runner,
+                        })
+                        .pipe(Effect.orDie),
+                      () => Deferred.succeed(started, undefined).pipe(Effect.andThen(Effect.never)),
+                      (admitted) =>
+                        Effect.gen(function* () {
+                          yield* Deferred.succeed(cleaning, undefined)
+                          yield* Deferred.await(joined)
+                          yield* runtime.complete(input.sessionID)
+                          yield* runtime.release(input.sessionID, admitted.fence)
+                        }),
+                    ),
+                  ),
+                (admitted) => runtime.release(input.sessionID, admitted.fence),
+              ).pipe(Effect.orDie),
+          }
+          const abort = new AbortController()
+          const task = yield* tool
+            .execute(
+              { description: "Review", prompt: "Review", subagent_type: "general" },
+              {
+                sessionID: chat.id,
+                messageID: assistant.id,
+                agent: "build",
+                abort: abort.signal,
+                callID: "call-review",
+                managedRuntime: runtime,
+                executionFence: parent.fence,
+                extra: { promptOps: ops },
+                messages: [],
+                metadata: () => Deferred.succeed(reserved, undefined).pipe(Effect.andThen(Deferred.await(proceed))),
+                ask: () => Effect.void,
+              },
+            )
+            .pipe(Effect.forkScoped)
+          yield* Deferred.await(reserved)
+          const sessions = yield* Session.Service
+          const child = (yield* sessions.children(chat.id))[0]
+          if (!child) throw new Error("Missing owned managed child")
+          const competingAbort = new AbortController()
+          const resume = () =>
+            tool.execute(
+              { description: "Concurrent review", prompt: "Resume", subagent_type: "general", task_id: child.id },
+              {
+                sessionID: chat.id,
+                messageID: assistant.id,
+                agent: "build",
+                abort: competingAbort.signal,
+                callID: "competing-review",
+                managedRuntime: runtime,
+                executionFence: parent.fence,
+                extra: { promptOps: ops },
+                messages: [],
+                metadata: () => Effect.void,
+                ask: () => Effect.void,
+              },
+            )
+          expect(yield* resume().pipe(Effect.exit)).toMatchObject({ _tag: "Failure" })
+          expect(yield* Deferred.isDone(started)).toBe(false)
+          yield* Deferred.succeed(proceed, undefined)
+          yield* Deferred.await(started)
+          expect(yield* resume().pipe(Effect.exit)).toMatchObject({ _tag: "Failure" })
+          competingAbort.abort()
+          expect(cancelled).toBe(0)
+          expect(yield* Deferred.isDone(cleaning)).toBe(false)
+          expect(task.pollUnsafe()).toBeUndefined()
+          const firstCancel = concurrentCancel ? yield* ops.cancel(child.id).pipe(Effect.forkScoped) : undefined
+          if (firstCancel) yield* Deferred.await(cleaning)
+          yield* Effect.gen(function* () {
+            abort.abort()
+            yield* Deferred.await(parentCancelling)
+            yield* Deferred.await(cleaning)
+            yield* Effect.yieldNow
+            expect(cancelled).toBe(concurrentCancel ? 2 : 1)
+            expect(task.pollUnsafe()).toBeUndefined()
+            // The claim remains exclusive until the original child's cleanup has joined.
+            expect(yield* resume().pipe(Effect.exit)).toMatchObject({ _tag: "Failure" })
+            expect(cancelled).toBe(concurrentCancel ? 2 : 1)
+            if (firstCancel) expect(firstCancel.pollUnsafe()).toBeUndefined()
+            expect(yield* runtime.commandStatus(chat.id)).toBe("draining")
+          }).pipe(Effect.ensuring(Deferred.succeed(joined, undefined)))
+          expect(yield* Fiber.await(task)).toMatchObject({ _tag: "Failure" })
+          if (firstCancel) yield* Fiber.join(firstCancel)
+          expect(cancelled).toBe(concurrentCancel ? 2 : 1)
+          yield* runtime.authorizeChild(child.id, chat.id, parent.fence).pipe(Effect.scoped)
+          yield* runtime.complete(chat.id)
+          yield* runtime.release(chat.id, parent.fence)
+          expect(yield* runtime.commandStatus(chat.id)).toBe("drained")
+        }),
+    )
+  }
+
+  it.instance("managed abort fences a paused admission before cancelling the instance runner", () =>
+    Effect.gen(function* () {
+      const previous = process.env.OPENCODE_MANAGED_PROFILE
+      yield* Effect.acquireRelease(
+        Effect.sync(() => {
+          process.env.OPENCODE_MANAGED_PROFILE = "1"
+        }),
+        () =>
+          Effect.sync(() => {
+            if (previous === undefined) delete process.env.OPENCODE_MANAGED_PROFILE
+            else process.env.OPENCODE_MANAGED_PROFILE = previous
+          }),
+      )
+      const database = yield* Database.Service
+      const sessions = yield* Session.Service
+      const runners = yield* SessionRunState.Service
+      const { chat, assistant } = yield* seed()
+      const runtime = RuntimeLifecycle.make({ lineage: "paused-child-admission" }, yield* Effect.scope, database)
+      const parent = yield* runtime.admit({ sessionID: chat.id, directory: chat.directory })
+      const entered = yield* Deferred.make<SessionID>()
+      const admit = yield* Deferred.make<void>()
+      const cleaning = yield* Deferred.make<void>()
+      const joined = yield* Deferred.make<void>()
+      const events: string[] = []
+      let providerCalls = 0
+      const ops: TaskPromptOps = {
+        ...stubOps(),
+        cancel: (sessionID) =>
+          Effect.gen(function* () {
+            events.push("cancel")
+            yield* Effect.acquireUseRelease(
+              runtime.cancel(sessionID),
+              () => runners.cancel(sessionID),
+              (owner) => (owner ? runtime.finishCancel(sessionID) : Effect.void),
+            )
+          }),
+        prompt: (input, task) =>
+          Effect.acquireUseRelease(
+            Effect.gen(function* () {
+              yield* Deferred.succeed(entered, input.sessionID)
+              yield* Deferred.await(admit)
+              events.push("admit")
+              return yield* runtime.admit({
+                sessionID: input.sessionID,
+                directory: chat.directory,
+                parentSessionID: chat.id,
+                managedChildAuthorization: task?.managedChildAuthorization?.prompt,
+              })
+            }),
+            () =>
+              runners.enqueue(
+                input.sessionID,
+                Effect.succeed(reply(input, "idle")),
+                Effect.gen(function* () {
+                  providerCalls++
+                  return reply(input, "late provider could launch bash")
+                }),
+              ),
+            (owner) =>
+              Effect.gen(function* () {
+                yield* Deferred.succeed(cleaning, undefined)
+                yield* Deferred.await(joined)
+                yield* runtime.release(input.sessionID, owner.fence)
+                events.push("caller-joined")
+              }),
+          ).pipe(Effect.orDie),
+      }
+      const tool = yield* TaskTool.pipe(Effect.flatMap((tool) => tool.init()))
+      const abort = new AbortController()
+      const task = yield* tool
+        .execute(
+          { description: "Review", prompt: "Review", subagent_type: "general" },
+          {
+            sessionID: chat.id,
+            messageID: assistant.id,
+            agent: "build",
+            abort: abort.signal,
+            callID: "paused-review",
+            managedRuntime: runtime,
+            executionFence: parent.fence,
+            extra: { promptOps: ops },
+            messages: [],
+            metadata: () => Effect.void,
+            ask: () => Effect.void,
+          },
+        )
+        .pipe(Effect.forkScoped)
+      const child = yield* Deferred.await(entered)
+      abort.abort()
+      expect(
+        yield* runtime.authorizeChild(child, chat.id, parent.fence).pipe(Effect.scoped, Effect.flip),
+      ).toMatchObject({ message: "Managed child already has a foreground Task owner" })
+      yield* Deferred.succeed(admit, undefined)
+      yield* Deferred.await(cleaning)
+      expect(task.pollUnsafe()).toBeUndefined()
+      expect(providerCalls).toBe(0)
+      expect(events).toEqual(["admit"])
+      expect(
+        yield* runtime.authorizeChild(child, chat.id, parent.fence).pipe(Effect.scoped, Effect.flip),
+      ).toMatchObject({ message: "Managed child already has a foreground Task owner" })
+      yield* Deferred.succeed(joined, undefined)
+      expect(yield* Fiber.await(task)).toMatchObject({ _tag: "Failure" })
+      expect(events).toEqual(["admit", "caller-joined", "cancel"])
+      expect(providerCalls).toBe(0)
+      yield* runtime.authorizeChild(child, chat.id, parent.fence).pipe(Effect.scoped)
+      yield* runtime.release(chat.id, parent.fence)
+      expect(yield* runtime.commandStatus(chat.id)).toBe("drained")
+      expect(yield* sessions.messages({ sessionID: child })).toEqual([])
+    }),
+  )
+
   it.instance(
     "description sorts subagents by name and is stable across calls",
     () =>

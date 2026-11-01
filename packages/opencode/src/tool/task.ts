@@ -10,7 +10,7 @@ import { Agent } from "../agent/agent"
 import { deriveSubagentSessionPermission } from "../agent/subagent-permissions"
 import type { SessionPrompt } from "../session/prompt"
 import { Config } from "@/config/config"
-import { Cause, Effect, Exit, Schema, Scope } from "effect"
+import { Cause, Effect, Exit, Fiber, Schema, Scope } from "effect"
 import { EffectBridge } from "@/effect/bridge"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { Database } from "@opencode-ai/core/database/database"
@@ -25,6 +25,7 @@ export interface TaskPromptOps {
       parentCallID?: string
       parentMode?: "foreground" | "background"
       notification?: boolean
+      managedChildAuthorization?: { prompt: object; runner: object }
     },
   ): Effect.Effect<SessionV1.WithParts>
   claimParentNotification?(sessionID: SessionID, parentCallID?: string): Effect.Effect<boolean>
@@ -106,7 +107,10 @@ export const TaskTool = Tool.define(
       ctx: Tool.Context,
     ) {
       const cfg = yield* config.get()
+      const managed = process.env.OPENCODE_MANAGED_PROFILE === "1"
       const runInBackground = params.background === true
+      if (managed && (runInBackground || !ctx.managedRuntime?.authorizeChild || ctx.executionFence === undefined))
+        return yield* Effect.fail(new Error("Managed tasks require a tracked parent and foreground execution"))
       if (runInBackground && !flags.experimentalBackgroundSubagents) {
         return yield* Effect.fail(
           new Error("Background subagents require OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS=true"),
@@ -144,10 +148,14 @@ export const TaskTool = Tool.define(
       if (!next) {
         return yield* Effect.fail(new Error(`Unknown agent type: ${params.subagent_type} is not a valid agent type`))
       }
+      if (managed && next.mode !== "subagent")
+        return yield* Effect.fail(new Error("Managed tasks require an agent configured with mode subagent"))
 
       const session = params.task_id
         ? yield* sessions.get(SessionID.make(params.task_id)).pipe(Effect.catchCause(() => Effect.succeed(undefined)))
         : undefined
+      if (managed && params.task_id && !session)
+        return yield* Effect.fail(new Error("Cannot resume a missing managed task session"))
       if (
         session &&
         (session.parentID !== parent.id ||
@@ -156,10 +164,14 @@ export const TaskTool = Tool.define(
       ) {
         return yield* Effect.fail(new Error("Cannot resume a task session from another parent or workspace"))
       }
+      const parentAgent = managed ? yield* agent.get(ctx.agent) : undefined
       const childPermission = deriveSubagentSessionPermission({
-        parentSessionPermission: parent.permission ?? [],
+        parentSessionPermission: managed ? [] : (parent.permission ?? []),
         subagent: next,
       })
+      const managedParentPolicy = managed
+        ? [...(parentAgent?.permission ?? []), ...(parent.permission ?? [])]
+        : undefined
       const childToolDenies = [
         ...(next.permission.some((rule) => rule.permission === "todowrite")
           ? []
@@ -206,25 +218,39 @@ export const TaskTool = Tool.define(
         variant: next.model ? undefined : variant,
         ...(runInBackground ? { background: true } : {}),
       }
+      const permission = [
+        ...childPermission,
+        ...childToolDenies.filter(
+          (deny) =>
+            !childPermission.some(
+              (rule) =>
+                rule.permission === deny.permission && rule.pattern === deny.pattern && rule.action === deny.action,
+            ),
+        ),
+      ]
       const nextSession =
         session ??
         (yield* sessions.create({
           parentID: ctx.sessionID,
+          managedParentFence: managed ? ctx.executionFence : undefined,
+          managedParentPolicy,
+          workspaceID: parent.workspaceID,
           title: params.description + ` (@${next.name} subagent)`,
           agent: next.name,
           metadata: { task: taskLink },
-          permission: [
-            ...childPermission,
-            ...childToolDenies.filter(
-              (deny) =>
-                !childPermission.some(
-                  (rule) =>
-                    rule.permission === deny.permission && rule.pattern === deny.pattern && rule.action === deny.action,
-                ),
-            ),
-          ],
+          permission,
         }))
       const metadata = { ...taskLink, sessionId: nextSession.id }
+      const managedChildAuthorization =
+        managed && ctx.executionFence !== undefined && ctx.managedRuntime?.authorizeChild
+          ? yield* ctx.managedRuntime.authorizeChild(nextSession.id, parent.id, ctx.executionFence).pipe(Effect.orDie)
+          : undefined
+      if (managed && session && ctx.executionFence !== undefined)
+        yield* sessions.setPermission({
+          sessionID: session.id,
+          permission: [...(session.permission ?? []), ...permission],
+          managedParent: { sessionID: parent.id, fence: ctx.executionFence, policy: managedParentPolicy },
+        })
 
       const taskDiagnostic = (event: string, fields: Record<string, unknown> = {}) =>
         Effect.logInfo(`restart diagnostic TaskTool ${event}`, {
@@ -247,8 +273,11 @@ export const TaskTool = Tool.define(
 
       const runTask = Effect.fn("TaskTool.runTask")(function* () {
         yield* taskDiagnostic("runTask started")
-        const parts = yield* ops.resolvePromptParts(params.prompt)
-        const job = yield* background.get(nextSession.id)
+        // Model-authored text cannot grant file attachment or agent-mention authority.
+        const parts = managed
+          ? [{ type: "text" as const, text: params.prompt }]
+          : yield* ops.resolvePromptParts(params.prompt)
+        const job = managed ? undefined : yield* background.get(nextSession.id)
         const result = yield* ops.prompt(
           {
             messageID: childMessageID,
@@ -265,6 +294,7 @@ export const TaskTool = Tool.define(
             parentMessageID: ctx.messageID,
             parentCallID: ctx.callID,
             parentMode: runInBackground || job?.metadata?.background === true ? "background" : "foreground",
+            managedChildAuthorization,
           },
         )
         const text = result.parts.findLast((item) => item.type === "text")?.text ?? ""
@@ -290,6 +320,34 @@ export const TaskTool = Tool.define(
         }
         return text
       })
+
+      if (managed) {
+        // Never register a BackgroundJob: managed children have no promotion or late-notification path.
+        // The finalizer joins interruption, so the parent's execution lease outlives child cleanup.
+        const text = yield* Effect.scoped(
+          Effect.gen(function* () {
+            const fiber = yield* runTask().pipe(Effect.forkScoped)
+            // Join the admitting waiter before cancelling any instance runner it may have created.
+            const cancel = Fiber.interrupt(fiber).pipe(Effect.andThen(ops.cancel(nextSession.id)))
+            const abort = Effect.callback<never>((resume) => {
+              if (ctx.abort.aborted) return resume(Effect.interrupt)
+              const onAbort = () => resume(Effect.interrupt)
+              ctx.abort.addEventListener("abort", onAbort, { once: true })
+              return Effect.sync(() => ctx.abort.removeEventListener("abort", onAbort))
+            })
+            return yield* Effect.acquireUseRelease(
+              Effect.void,
+              () => Effect.raceFirst(Fiber.join(fiber), abort),
+              (_, exit) => (Exit.isFailure(exit) ? cancel : Effect.void),
+            )
+          }),
+        )
+        return {
+          title: params.description,
+          metadata,
+          output: renderOutput({ sessionID: nextSession.id, state: "completed", text }),
+        }
+      }
 
       const inject = Effect.fn("TaskTool.injectBackgroundResult")(function* (
         state: "completed" | "error",
@@ -500,19 +558,19 @@ export const TaskTool = Tool.define(
     })
 
     return {
-      description: flags.experimentalBackgroundSubagents
-        ? [DESCRIPTION, BACKGROUND_DESCRIPTION].join("\n\n")
-        : DESCRIPTION,
+      description:
+        process.env.OPENCODE_MANAGED_PROFILE === "1"
+          ? [
+              DESCRIPTION,
+              "Managed delegation is foreground only, with at most eight nested child levels. Use configured subagents for independent reviews and verification. Background execution and promotion are prohibited; the caller waits for joined child completion. Children inherit the same managed tool restrictions and workspace. The prompt is literal text: @file paths and @agent mentions do not attach files or grant agent permissions.",
+            ].join("\n\n")
+          : flags.experimentalBackgroundSubagents
+            ? [DESCRIPTION, BACKGROUND_DESCRIPTION].join("\n\n")
+            : DESCRIPTION,
       parameters: Parameters,
       jsonSchema: flags.experimentalBackgroundSubagents ? undefined : ToolJsonSchema.fromSchema(BaseParameters),
       execute: (params: Schema.Schema.Type<typeof Parameters>, ctx: Tool.Context) =>
-        Effect.suspend(() =>
-          process.env.OPENCODE_MANAGED_PROFILE === "1"
-            ? Effect.die(
-                new Error("Task delegation is unavailable in the managed profile: child execution is not accounted"),
-              )
-            : run(params, ctx).pipe(Effect.orDie),
-        ),
+        run(params, ctx).pipe(Effect.scoped, Effect.orDie),
     }
   }),
 )

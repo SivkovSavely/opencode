@@ -66,6 +66,7 @@ export const make = <A, E = never>(
   const onBusy = opts?.onBusy ?? Effect.void
   const onInterrupt = opts?.onInterrupt
   const cancellations = new Map<number, CancelReason>()
+  const cancelling = new Set<Deferred.Deferred<void>>()
   let ids = 0
   let advisory:
     | { work: Effect.Effect<A, E, Scope.Scope>; prepare: Effect.Effect<boolean, never, Scope.Scope> }
@@ -336,61 +337,83 @@ export const make = <A, E = never>(
       }),
     ).pipe(Effect.flatten)
 
+  // Idle permits replacement work, but does not mean interrupted fibers have
+  // finished cleanup. Register under the state lock so concurrent cancels join it.
+  const joinCancellation = (work: Effect.Effect<void>) => {
+    const pending = Array.from(cancelling)
+    const done = Deferred.makeUnsafe<void>()
+    cancelling.add(done)
+    return work.pipe(
+      Effect.andThen(Effect.forEach(pending, Deferred.await, { discard: true })),
+      Effect.ensuring(
+        Effect.sync(() => cancelling.delete(done)).pipe(Effect.andThen(Deferred.succeed(done, undefined))),
+      ),
+    )
+  }
+
   const cancelWithReason = (reason: CancelReason) =>
     SynchronizedRef.modify(ref, (st) => {
       advisory = undefined
       switch (st._tag) {
         case "Idle":
-          return [Effect.void, st] as const
+          return [Effect.forEach(Array.from(cancelling), Deferred.await, { discard: true }), st] as const
         case "Running":
           return [
-            Effect.gen(function* () {
-              cancellations.set(st.run.id, reason)
-              yield* Fiber.interrupt(st.run.fiber)
-              yield* Deferred.fail(st.run.done, cancellationError(reason)).pipe(Effect.asVoid)
-              yield* idleIfCurrent()
-            }),
+            joinCancellation(
+              Effect.gen(function* () {
+                cancellations.set(st.run.id, reason)
+                yield* Fiber.interrupt(st.run.fiber)
+                yield* Deferred.fail(st.run.done, cancellationError(reason)).pipe(Effect.asVoid)
+                yield* idleIfCurrent()
+              }),
+            ),
             { _tag: "Idle" } as const,
           ] as const
         case "RunningQueued":
           return [
-            Effect.gen(function* () {
-              cancellations.set(st.run.id, reason)
-              yield* Fiber.interrupt(st.run.fiber)
-              yield* Deferred.fail(st.run.done, cancellationError(reason)).pipe(Effect.asVoid)
-              yield* Effect.forEach(
-                st.queue,
-                (pending) => Deferred.fail(pending.done, cancellationError(reason)).pipe(Effect.asVoid),
-                { concurrency: "unbounded", discard: true },
-              )
-              yield* idleIfCurrent()
-            }),
+            joinCancellation(
+              Effect.gen(function* () {
+                cancellations.set(st.run.id, reason)
+                yield* Fiber.interrupt(st.run.fiber)
+                yield* Deferred.fail(st.run.done, cancellationError(reason)).pipe(Effect.asVoid)
+                yield* Effect.forEach(
+                  st.queue,
+                  (pending) => Deferred.fail(pending.done, cancellationError(reason)).pipe(Effect.asVoid),
+                  { concurrency: "unbounded", discard: true },
+                )
+                yield* idleIfCurrent()
+              }),
+            ),
             { _tag: "Idle" } as const,
           ] as const
         case "Shell":
           return [
-            Effect.gen(function* () {
-              yield* stopShell(st.shell, reason)
-              yield* idleIfCurrent()
-            }),
+            joinCancellation(
+              Effect.gen(function* () {
+                yield* stopShell(st.shell, reason)
+                yield* idleIfCurrent()
+              }),
+            ),
             { _tag: "Idle" } as const,
           ] as const
         case "ShellThenRun":
           return [
-            Effect.gen(function* () {
-              yield* stopShell(st.shell, reason)
-              yield* Deferred.fail(st.run.done, cancellationError(reason)).pipe(Effect.asVoid)
-              yield* Effect.forEach(
-                st.queue,
-                (pending) => Deferred.fail(pending.done, cancellationError(reason)).pipe(Effect.asVoid),
-                { concurrency: "unbounded", discard: true },
-              )
-              yield* idleIfCurrent()
-            }),
+            joinCancellation(
+              Effect.gen(function* () {
+                yield* stopShell(st.shell, reason)
+                yield* Deferred.fail(st.run.done, cancellationError(reason)).pipe(Effect.asVoid)
+                yield* Effect.forEach(
+                  st.queue,
+                  (pending) => Deferred.fail(pending.done, cancellationError(reason)).pipe(Effect.asVoid),
+                  { concurrency: "unbounded", discard: true },
+                )
+                yield* idleIfCurrent()
+              }),
+            ),
             { _tag: "Idle" } as const,
           ] as const
       }
-    }).pipe(Effect.flatten)
+    }).pipe(Effect.flatten, Effect.uninterruptible)
 
   const cancel = cancelWithReason("user")
 

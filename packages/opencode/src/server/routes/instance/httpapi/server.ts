@@ -120,6 +120,7 @@ import { fenceLayer } from "./middleware/fence"
 import { schemaErrorLayer } from "./middleware/schema-error"
 import { GlobalProjectList } from "@/server/global-project-list"
 import { RuntimeLifecycle } from "@/server/runtime-lifecycle"
+import { historicalFenceHandlers } from "./handlers/historical-fence"
 
 export const context = Context.makeUnsafe<unknown>(new Map())
 
@@ -159,6 +160,7 @@ const ptyConnectApiRoutes = HttpApiBuilder.layer(PtyConnectApi).pipe(
 )
 const instanceApiRoutes = HttpApiBuilder.layer(InstanceHttpApi).pipe(
   Layer.provide([
+    historicalFenceHandlers,
     configHandlers,
     experimentalHandlers,
     fileHandlers,

@@ -18,6 +18,50 @@ const seed = (database: Database.Interface, id = "root") =>
   })
 
 describe("managed command durable ownership", () => {
+  test("managed child nesting is bounded without losing original-root ownership", async () => {
+    await using tmp = await tmpdir()
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const database = yield* Database.Service
+        yield* seed(database)
+        yield* ManagedCommand.coverRoot(database, "root")
+        const root = yield* ManagedCommand.beginExecution(database, "root", "owner")
+        yield* database.db.run(sql`INSERT INTO runtime_execution
+          (id, session_id, directory, owner_lineage, owner_instance, fence, state, desired_active, time_created, time_updated)
+          VALUES ('root', 'root', '/tmp', 'owner', 'owner', 1, 'active', 1, 0, 0)`)
+        for (const depth of Array.from({ length: 8 }, (_, index) => index + 1)) {
+          const id = `child-${depth}`
+          const parent = depth === 1 ? "root" : `child-${depth - 1}`
+          yield* ManagedCommand.reserveChild(database, id, parent, 1, [
+            { permission: "bash", pattern: "*", action: "deny" },
+            { permission: "bash", pattern: "echo *", action: "allow" },
+          ])
+          expect(yield* ManagedCommand.policies(database, id)).toHaveLength(depth)
+          yield* database.db.run(sql`INSERT INTO session
+            (id, project_id, slug, parent_id, directory, title, version, time_created, time_updated)
+            VALUES (${id}, 'project', ${id}, ${parent}, '/tmp', 'child', '1', 0, 0)`)
+          const child = yield* ManagedCommand.beginExecution(database, id, "owner", parent)
+          expect(child.rootSessionID).toBe(root.rootSessionID)
+          yield* database.db.run(sql`UPDATE session SET parent_id = ${parent}, title = 'updated' WHERE id = ${id}`)
+          expect(
+            yield* database.db.get(sql`SELECT state FROM managed_command_coverage WHERE root_session_id = 'root'`),
+          ).toMatchObject({ state: "managed" })
+          yield* database.db.run(sql`INSERT INTO runtime_execution
+            (id, session_id, directory, parent_session_id, owner_lineage, owner_instance, fence, state, desired_active, time_created, time_updated)
+            VALUES (${id}, ${id}, '/tmp', ${parent}, 'owner', 'owner', 1, 'active', 1, 0, 0)`)
+        }
+        expect(yield* ManagedCommand.reserveChild(database, "child-9", "child-8", 1).pipe(Effect.flip)).toBeInstanceOf(
+          ManagedCommand.AdmissionError,
+        )
+        yield* database.db.run(sql`UPDATE session SET parent_id = NULL WHERE id = 'child-8'`)
+        expect(
+          yield* database.db.get(sql`SELECT state FROM managed_command_coverage WHERE root_session_id = 'root'`),
+        ).toMatchObject({ state: "unknown" })
+        expect((yield* RuntimeRetirement.retireRoot(database, "root")).sessionIDs).toHaveLength(9)
+      }).pipe(Effect.provide(Database.layerFromPath(path.join(tmp.path, "children.sqlite"))), Effect.scoped),
+    )
+  })
+
   test("unresolved model leases survive retirement and reopen without upgrading unknown coverage", async () => {
     await using tmp = await tmpdir()
     const filename = path.join(tmp.path, "execution.sqlite")

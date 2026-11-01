@@ -443,7 +443,10 @@ export const initialize = Effect.fn("ServerRecovery.initialize")(function* () {
                   continue
                 if (existing && metadata.background === true && existing.parent_mode !== "background")
                   yield* runtime.setParentMode(childSessionID, "background")
-                const resolved = yield* prompt.resolvePromptParts(taskInput.prompt)
+                const resolved =
+                  process.env.OPENCODE_MANAGED_PROFILE === "1"
+                    ? [{ type: "text" as const, text: taskInput.prompt }]
+                    : yield* prompt.resolvePromptParts(taskInput.prompt)
                 yield* prompt.prompt({
                   sessionID: childID,
                   messageID: MessageID.make(childMessageID),

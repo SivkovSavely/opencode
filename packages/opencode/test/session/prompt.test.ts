@@ -55,7 +55,7 @@ import { Truncate } from "@/tool/truncate"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { Ripgrep } from "@opencode-ai/core/ripgrep"
 import { Format } from "../../src/format"
-import { provideTmpdirServer, TestInstance } from "../fixture/fixture"
+import { provideTmpdirServer, TestInstance, tmpdirScoped } from "../fixture/fixture"
 import { awaitWithTimeout, pollWithTimeout, testEffect } from "../lib/effect"
 import { reply, TestLLMServer } from "../lib/llm-server"
 import { RuntimeFlags } from "@/effect/runtime-flags"
@@ -334,6 +334,322 @@ const makeOwnedRuntime = (
     ),
   )
 const ownedRuntime = testEffect(makeOwnedRuntime())
+
+ownedRuntime.instance("managed active children reject public prompt, loop and queue admission", () =>
+  Effect.gen(function* () {
+    const previous = process.env.OPENCODE_MANAGED_PROFILE
+    yield* Effect.acquireRelease(
+      Effect.sync(() => {
+        process.env.OPENCODE_MANAGED_PROFILE = "1"
+      }),
+      () =>
+        Effect.sync(() => {
+          if (previous === undefined) delete process.env.OPENCODE_MANAGED_PROFILE
+          else process.env.OPENCODE_MANAGED_PROFILE = previous
+        }),
+    )
+    const sessions = yield* Session.Service
+    const prompt = yield* SessionPrompt.Service
+    const runtime = yield* RuntimeLifecycle.Service
+    const root = yield* sessions.create({ title: "Managed parent" })
+    const parent = yield* runtime.admit({ sessionID: root.id, directory: root.directory })
+    const child = yield* sessions.create({ parentID: root.id, managedParentFence: parent.fence })
+    const authorization = yield* runtime.authorizeChild(child.id, root.id, parent.fence)
+    const owner = yield* runtime.admit({
+      sessionID: child.id,
+      directory: child.directory,
+      parentSessionID: root.id,
+      managedChildAuthorization: authorization.prompt,
+    })
+    for (const noReply of [false, true]) {
+      expect(
+        yield* prompt
+          .prompt({ sessionID: child.id, model: ref, noReply, parts: [{ type: "text", text: "unjoined" }] })
+          .pipe(Effect.flip),
+      ).toMatchObject({ message: "Managed foreground child requires private Task authorization" })
+    }
+    expect(yield* prompt.loop({ sessionID: child.id }).pipe(Effect.exit)).toMatchObject({ _tag: "Failure" })
+    expect(
+      yield* prompt.queueSubmit(child.id, { id: "unjoined", payload: queuedPrompt("unjoined") }).pipe(Effect.flip),
+    ).toMatchObject({ reason: "conflict" })
+    expect(yield* prompt.queueFlush(child.id).pipe(Effect.flip)).toMatchObject({ reason: "conflict" })
+    expect(yield* prompt.queueResume(child.id).pipe(Effect.flip)).toMatchObject({ reason: "conflict" })
+    expect(yield* sessions.messages({ sessionID: child.id })).toEqual([])
+    yield* runtime.release(child.id, owner.fence)
+    yield* runtime.release(root.id, parent.fence)
+    expect(yield* runtime.commandStatus(root.id)).toBe("drained")
+  }),
+)
+
+ownedRuntime.instance("managed input subtasks inherit the actual parent agent's bash deny", () =>
+  Effect.gen(function* () {
+    const previous = process.env.OPENCODE_MANAGED_PROFILE
+    yield* Effect.acquireRelease(
+      Effect.sync(() => {
+        process.env.OPENCODE_MANAGED_PROFILE = "1"
+      }),
+      () =>
+        Effect.sync(() => {
+          if (previous === undefined) delete process.env.OPENCODE_MANAGED_PROFILE
+          else process.env.OPENCODE_MANAGED_PROFILE = previous
+        }),
+    )
+    const { dir, llm } = yield* useServerConfig((url) => ({
+      ...providerCfg(url),
+      agent: {
+        build: { permission: { bash: "deny" } },
+        reviewer: { mode: "subagent", permission: { bash: "allow" } },
+      },
+    }))
+    const sessions = yield* Session.Service
+    const prompt = yield* SessionPrompt.Service
+    const runtime = yield* RuntimeLifecycle.Service
+    const root = yield* sessions.create({ title: "Managed input delegation" })
+    const marker = path.join(dir, "must-not-exist")
+    yield* llm.push(reply().tool("bash", { command: `touch ${marker}`, description: "Attempt forbidden bash" }))
+    yield* llm.push(reply().text("Review finished without bash").stop())
+    yield* llm.push(reply().text("Parent complete").stop())
+    yield* prompt.prompt({
+      sessionID: root.id,
+      agent: "build",
+      model: ref,
+      parts: [{ type: "subtask", agent: "reviewer", description: "Review", prompt: "Review the change", model: ref }],
+    })
+    const child = (yield* sessions.children(root.id))[0]
+    if (!child) throw new Error("Missing subtask child")
+    const policies = yield* sessions.managedPolicies(child.id)
+    expect(policies.some((policy) => Permission.evaluate("bash", `touch ${marker}`, policy).action === "deny")).toBe(
+      true,
+    )
+    expect(yield* Effect.promise(() => Bun.file(marker).exists())).toBe(false)
+    const history = yield* sessions.messages({ sessionID: child.id })
+    expect(
+      history.flatMap((message) => message.parts).some((part) => part.type === "tool" && part.state.status === "error"),
+    ).toBe(true)
+    expect(yield* runtime.commandStatus(root.id)).toBe("drained")
+  }),
+)
+
+ownedRuntime.instance("managed model Task prompts never expand absolute or workspace file mentions", () =>
+  Effect.gen(function* () {
+    const previous = process.env.OPENCODE_MANAGED_PROFILE
+    yield* Effect.acquireRelease(
+      Effect.sync(() => {
+        process.env.OPENCODE_MANAGED_PROFILE = "1"
+      }),
+      () =>
+        Effect.sync(() => {
+          if (previous === undefined) delete process.env.OPENCODE_MANAGED_PROFILE
+          else process.env.OPENCODE_MANAGED_PROFILE = previous
+        }),
+    )
+    const { dir, llm } = yield* useServerConfig((url) => ({
+      ...providerCfg(url),
+      agent: {
+        build: { permission: { read: "deny", task: { "*": "deny", reviewer: "allow" } } },
+        reviewer: { mode: "subagent", permission: { read: "allow" } },
+      },
+    }))
+    const outside = yield* tmpdirScoped()
+    expect(outside.startsWith(dir + path.sep)).toBe(false)
+    const fs = yield* FSUtil.Service
+    const absolute = path.join(outside, "secret.txt")
+    const secret = `OUTSIDE_SECRET_${randomUUID()}`
+    const workspace = `WORKSPACE_CONTENT_${randomUUID()}`
+    yield* fs.writeFileString(absolute, secret)
+    yield* fs.writeFileString(path.join(dir, "workspace-note.txt"), workspace)
+    const text = `Review @${absolute} and @workspace-note.txt as literal text.`
+    const sessions = yield* Session.Service
+    const prompt = yield* SessionPrompt.Service
+    const runtime = yield* RuntimeLifecycle.Service
+    const root = yield* sessions.create({ title: "Untrusted file mentions" })
+    yield* llm.push(reply().tool("task", { description: "Review", subagent_type: "reviewer", prompt: text }))
+    yield* llm.push(reply().text("Review complete").stop())
+    yield* llm.push(reply().text("Parent complete").stop())
+    yield* prompt.prompt({ sessionID: root.id, model: ref, parts: [{ type: "text", text: "Delegate a review" }] })
+    const children = yield* sessions.children(root.id)
+    expect(children).toHaveLength(1)
+    const child = children[0]
+    if (!child) throw new Error("Missing reviewer")
+    const history = yield* sessions.messages({ sessionID: child.id })
+    const user = history.find((message) => message.info.role === "user")
+    expect(user?.parts).toHaveLength(1)
+    expect(user?.parts[0]).toMatchObject({ type: "text", text })
+    expect(
+      history.flatMap((message) => message.parts).some((part) => part.type === "file" || part.type === "agent"),
+    ).toBe(false)
+    const hits = yield* llm.hits
+    expect(hits).toHaveLength(3)
+    for (const hit of hits) {
+      expect(JSON.stringify(hit.body)).not.toContain(secret)
+      expect(JSON.stringify(hit.body)).not.toContain(workspace)
+    }
+    expect(yield* runtime.commandStatus(root.id)).toBe("drained")
+  }),
+)
+
+ownedRuntime.instance("managed model Task agent mentions cannot bypass denied delegation", () =>
+  Effect.gen(function* () {
+    const previous = process.env.OPENCODE_MANAGED_PROFILE
+    yield* Effect.acquireRelease(
+      Effect.sync(() => {
+        process.env.OPENCODE_MANAGED_PROFILE = "1"
+      }),
+      () =>
+        Effect.sync(() => {
+          if (previous === undefined) delete process.env.OPENCODE_MANAGED_PROFILE
+          else process.env.OPENCODE_MANAGED_PROFILE = previous
+        }),
+    )
+    const { llm } = yield* useServerConfig((url) => ({
+      ...providerCfg(url),
+      subagent_depth: 2,
+      agent: {
+        build: { permission: { task: { "*": "deny", reviewer: "allow" } } },
+        reviewer: { mode: "subagent", permission: { task: { "*": "allow", forbidden: "deny" } } },
+        forbidden: { mode: "subagent", description: "Must not receive delegated work" },
+      },
+    }))
+    const sessions = yield* Session.Service
+    const prompt = yield* SessionPrompt.Service
+    const runtime = yield* RuntimeLifecycle.Service
+    const root = yield* sessions.create({ title: "Untrusted agent mentions" })
+    const text = "Review this change with @forbidden."
+    yield* llm.push(reply().tool("task", { description: "Review", subagent_type: "reviewer", prompt: text }))
+    yield* llm.push(
+      reply().tool("task", {
+        description: "Forbidden delegation",
+        subagent_type: "forbidden",
+        prompt: "Attempt nested work",
+      }),
+    )
+    yield* llm.push(reply().text("Review complete without forbidden delegation").stop())
+    yield* llm.push(reply().text("Parent complete").stop())
+    yield* prompt.prompt({ sessionID: root.id, model: ref, parts: [{ type: "text", text: "Delegate a review" }] })
+    const children = yield* sessions.children(root.id)
+    expect(children).toHaveLength(1)
+    const child = children[0]
+    if (!child) throw new Error("Missing reviewer")
+    expect(yield* sessions.children(child.id)).toEqual([])
+    const history = yield* sessions.messages({ sessionID: child.id })
+    const user = history.find((message) => message.info.role === "user")
+    expect(user?.parts).toHaveLength(1)
+    expect(user?.parts[0]).toMatchObject({ type: "text", text })
+    expect(history.flatMap((message) => message.parts).some((part) => part.type === "agent")).toBe(false)
+    expect(history.flatMap((message) => message.parts)).toContainEqual(
+      expect.objectContaining({
+        type: "tool",
+        tool: "task",
+        state: expect.objectContaining({
+          status: "error",
+          input: expect.objectContaining({ subagent_type: "forbidden" }),
+        }),
+      }),
+    )
+    expect(yield* llm.hits).toHaveLength(4)
+    expect(yield* runtime.commandStatus(root.id)).toBe("drained")
+  }),
+)
+
+ownedRuntime.instance("managed overflow replays retain the turn budget until genuinely new input", () =>
+  Effect.gen(function* () {
+    const previous = process.env.OPENCODE_MANAGED_PROFILE
+    yield* Effect.acquireRelease(
+      Effect.sync(() => {
+        process.env.OPENCODE_MANAGED_PROFILE = "1"
+      }),
+      () =>
+        Effect.sync(() => {
+          if (previous === undefined) delete process.env.OPENCODE_MANAGED_PROFILE
+          else process.env.OPENCODE_MANAGED_PROFILE = previous
+        }),
+    )
+    const { llm } = yield* useServerConfig((url) => ({ ...providerCfg(url), agent: { build: { steps: 3 } } }))
+    const sessions = yield* Session.Service
+    const prompt = yield* SessionPrompt.Service
+    const root = yield* sessions.create({ title: "Managed overflow budget" })
+    yield* prompt.prompt({
+      sessionID: root.id,
+      model: ref,
+      noReply: true,
+      parts: [{ type: "text", text: "Earlier context" }],
+    })
+    yield* llm.error(400, { type: "error", error: { code: "context_length_exceeded" } })
+    yield* llm.push(reply().text("First summary").stop())
+    yield* llm.error(400, { type: "error", error: { code: "context_length_exceeded" } })
+    yield* llm.push(reply().text("Second summary").stop())
+    yield* llm.push(reply().text("Budget-limited answer").stop())
+    yield* prompt.prompt({
+      sessionID: root.id,
+      model: ref,
+      parts: [{ type: "text", text: "Repeat this request after overflow" }],
+    })
+    const requests = yield* llm.hits
+    expect(requests).toHaveLength(5)
+    expect(JSON.stringify(requests[0]?.body.messages)).not.toContain("CRITICAL - MAXIMUM STEPS REACHED")
+    expect(JSON.stringify(requests[2]?.body.messages)).toContain("CRITICAL - MAXIMUM STEPS REACHED")
+    expect(JSON.stringify(requests[4]?.body.messages)).toContain("CRITICAL - MAXIMUM STEPS REACHED")
+    const history = yield* sessions.messages({ sessionID: root.id })
+    const replays = history.filter((message) =>
+      message.parts.some((part) => part.type === "text" && part.text === "Repeat this request after overflow"),
+    )
+    expect(replays.length).toBeGreaterThan(1)
+    expect(
+      replays
+        .slice(1)
+        .every((message) =>
+          message.parts.some((part) => part.type === "text" && part.metadata?.compaction_continue === true),
+        ),
+    ).toBe(true)
+    yield* llm.push(reply().text("New input has a new budget").stop())
+    yield* prompt.prompt({
+      sessionID: root.id,
+      model: ref,
+      parts: [{ type: "text", text: "A genuinely new user request" }],
+    })
+    const after = yield* llm.hits
+    expect(JSON.stringify(after[5]?.body.messages)).not.toContain("CRITICAL - MAXIMUM STEPS REACHED")
+  }),
+)
+
+ownedRuntime.instance("managed compression preserves structured-output enforcement on the next provider turn", () =>
+  Effect.gen(function* () {
+    const previous = process.env.OPENCODE_MANAGED_PROFILE
+    yield* Effect.acquireRelease(
+      Effect.sync(() => {
+        process.env.OPENCODE_MANAGED_PROFILE = "1"
+      }),
+      () =>
+        Effect.sync(() => {
+          if (previous === undefined) delete process.env.OPENCODE_MANAGED_PROFILE
+          else process.env.OPENCODE_MANAGED_PROFILE = previous
+        }),
+    )
+    const { llm } = yield* useServerConfig((url) => providerCfg(url))
+    const sessions = yield* Session.Service
+    const prompt = yield* SessionPrompt.Service
+    const runtime = yield* RuntimeLifecycle.Service
+    const root = yield* sessions.create({ title: "Managed structured compression" })
+    yield* llm.push(reply().tool("compress", {}))
+    yield* llm.push(reply().text("Retained task summary").stop())
+    yield* llm.push(reply().text("Plain text is not structured output").stop())
+    const result = yield* prompt.prompt({
+      sessionID: root.id,
+      model: ref,
+      parts: [{ type: "text", text: "Compress then return the required object" }],
+      format: new SessionV1.OutputFormatJsonSchema({
+        type: "json_schema",
+        schema: { type: "object", properties: { answer: { type: "string" } }, required: ["answer"] },
+        retryCount: 0,
+      }),
+    })
+    expect(result.info.role === "assistant" && result.info.error?.name).toBe("StructuredOutputError")
+    const hits = yield* llm.hits
+    expect(hits).toHaveLength(3)
+    expect(JSON.stringify(hits[2]?.body.tools)).toContain("StructuredOutput")
+    expect(yield* runtime.commandStatus(root.id)).toBe("drained")
+  }),
+)
 
 ownedRuntime.instance("managed runner retains its execution lease after the prompt caller is interrupted", () =>
   Effect.gen(function* () {

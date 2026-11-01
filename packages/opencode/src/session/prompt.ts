@@ -141,6 +141,7 @@ export interface Interface {
 }
 
 type TaskAdmission = {
+  managedChildAuthorization?: { prompt: object; runner: object }
   parentMessageID?: MessageID
   parentCallID?: string
   parentMode?: "foreground" | "background"
@@ -474,6 +475,7 @@ const layer = Layer.effect(
       sessionID: SessionID
       session: Session.Info
       msgs: SessionV1.WithParts[]
+      executionFence?: number
     }) {
       const { task, model, lastUser, sessionID, session, msgs } = input
       const ctx = yield* InstanceState.context
@@ -688,11 +690,13 @@ const layer = Layer.effect(
       const taskAbort = new AbortController()
       const result = yield* taskTool
         .execute(linkedChild ? { ...args, task_id: linkedChild.id } : args, {
-          agent: args.subagent_type,
+          agent: process.env.OPENCODE_MANAGED_PROFILE === "1" ? lastUser.agent : args.subagent_type,
           messageID: assistantMessage.id,
           sessionID,
           abort: taskAbort.signal,
           callID: part.callID,
+          managedRuntime: runtime,
+          executionFence: input.executionFence,
           extra: { bypassAgentCheck: true, promptOps },
           messages: msgs,
           metadata: (val: { title?: string; metadata?: Record<string, any> }) =>
@@ -1567,6 +1571,7 @@ const layer = Layer.effect(
             sessionID: input.sessionID,
             directory: session.directory,
             parentSessionID: session.parentID,
+            managedChildAuthorization: task?.managedChildAuthorization?.prompt,
             parentMessageID: task?.parentMessageID,
             parentCallID: task?.parentCallID,
             parentMode: task?.parentMode,
@@ -1589,6 +1594,7 @@ const layer = Layer.effect(
               admission.manualRecovery,
               true,
               admission.fence,
+              task?.managedChildAuthorization?.runner,
             ).pipe(
               Effect.onExit((exit) =>
                 Effect.sync(() => (interrupted = Exit.isFailure(exit) && Cause.hasInterrupts(exit.cause))),
@@ -1872,10 +1878,21 @@ const layer = Layer.effect(
       )
     })
 
+    const requireManagedRootQueue = Effect.fnUntraced(function* (sessionID: SessionID) {
+      if (process.env.OPENCODE_MANAGED_PROFILE !== "1") return
+      const session = yield* sessions.get(sessionID).pipe(Effect.orDie)
+      if (session.parentID)
+        return yield* new SessionQueue.QueueError({
+          reason: "conflict",
+          message: "Managed foreground children accept only their joined Task prompt",
+        })
+    })
+
     const queueSubmit = Effect.fn("SessionPrompt.queueSubmit")(function* (
       sessionID: SessionID,
       input: SessionQueueV1.Submit,
     ) {
+      yield* requireManagedRootQueue(sessionID)
       yield* queue.enqueue(sessionID, input)
       yield* wakeQueue(sessionID)
       return yield* notifyQueue(sessionID)
@@ -1885,6 +1902,7 @@ const layer = Layer.effect(
       sessionID: SessionID,
       input: SessionQueueV1.Update,
     ) {
+      yield* requireManagedRootQueue(sessionID)
       // Hooks may call back into the server. Resolve outside the writer transaction;
       // the revision and pending-state checks below still fence the actual conversion.
       const entry =
@@ -1951,6 +1969,7 @@ const layer = Layer.effect(
     })
 
     const queueFlush = Effect.fn("SessionPrompt.queueFlush")(function* (sessionID: SessionID) {
+      yield* requireManagedRootQueue(sessionID)
       const snapshot = yield* queue.list(sessionID)
       const flush = yield* InstanceState.get(queueState)
       if (!flush.has(sessionID))
@@ -1967,6 +1986,7 @@ const layer = Layer.effect(
     })
 
     const queueResume = Effect.fn("SessionPrompt.queueResume")(function* (sessionID: SessionID) {
+      yield* requireManagedRootQueue(sessionID)
       yield* db
         .transaction(
           () =>
@@ -2158,6 +2178,7 @@ const layer = Layer.effect(
       manualRecovery?: boolean,
       deferInterruptedPark?: boolean,
       executionFence?: number,
+      managedChildAuthorization?: object,
     ) => Effect.Effect<SessionV1.WithParts> = Effect.fn("SessionPrompt.run")(
       function* (
         sessionID: SessionID,
@@ -2166,6 +2187,7 @@ const layer = Layer.effect(
         manualRecovery = false,
         deferInterruptedPark = false,
         executionFence?: number,
+        managedChildAuthorization?: object,
       ) {
         if (process.env.OPENCODE_MANAGED_PROFILE !== "1")
           yield* ManagedCommand.invalidateCoverage(database, sessionID).pipe(Effect.orDie)
@@ -2221,8 +2243,18 @@ const layer = Layer.effect(
 
           if (!lastUser) throw new Error("No user message found in stream. This should never happen.")
           if (userID !== lastUser.id) {
-            step = 0
-            structured = undefined
+            const internalCompaction =
+              process.env.OPENCODE_MANAGED_PROFILE === "1" &&
+              msgs
+                .find((message) => message.info.id === lastUser.id)
+                ?.parts.some(
+                  (part) =>
+                    part.type === "compaction" || (part.type === "text" && part.metadata?.compaction_continue === true),
+                )
+            if (!internalCompaction) {
+              step = 0
+              structured = undefined
+            }
             userID = lastUser.id
           }
 
@@ -2279,9 +2311,7 @@ const layer = Layer.effect(
           const task = tasks.pop()
 
           if (task?.type === "subtask") {
-            if (process.env.OPENCODE_MANAGED_PROFILE === "1")
-              throw new Error("Task delegation is unavailable in the managed profile: child execution is not accounted")
-            yield* handleSubtask({ task, model, lastUser, sessionID, session, msgs })
+            yield* handleSubtask({ task, model, lastUser, sessionID, session, msgs, executionFence })
             continue
           }
 
@@ -2317,7 +2347,13 @@ const layer = Layer.effect(
             lastFinished.summary !== true &&
             (yield* compaction.isOverflow({ tokens: lastFinished.tokens, model }))
           ) {
-            yield* compaction.create({ sessionID, agent: lastUser.agent, model: lastUser.model, auto: true })
+            yield* compaction.create({
+              sessionID,
+              agent: lastUser.agent,
+              model: lastUser.model,
+              format: lastUser.format,
+              auto: true,
+            })
             continue
           }
 
@@ -2385,6 +2421,14 @@ const layer = Layer.effect(
               bypassAgentCheck,
               messages: msgs,
               promptOps,
+              requestCompaction: () =>
+                compaction.create({
+                  sessionID,
+                  agent: lastUser.agent,
+                  model: lastUser.model,
+                  format: lastUser.format,
+                  auto: true,
+                }),
               executionFence,
               managedRuntime: runtime,
             }).pipe(
@@ -2483,6 +2527,7 @@ const layer = Layer.effect(
                 agent: lastUser.agent,
                 model: lastUser.model,
                 auto: true,
+                format: lastUser.format,
                 overflow: !handle.message.finish,
               })
             }
@@ -2517,7 +2562,16 @@ const layer = Layer.effect(
           yield* compaction.prune({ sessionID }).pipe(Effect.ignore, Effect.forkIn(scope))
         return yield* lastAssistant(sessionID)
       },
-      (effect, sessionID, recovery, reconcile, manualRecovery, deferInterruptedPark) =>
+      (
+        effect,
+        sessionID,
+        recovery,
+        reconcile,
+        manualRecovery,
+        deferInterruptedPark,
+        executionFence,
+        managedChildAuthorization,
+      ) =>
         effect.pipe(
           Effect.onExit((exit) =>
             Effect.gen(function* () {
@@ -2545,13 +2599,27 @@ const layer = Layer.effect(
           ),
         ),
       // Runner owns this lease, independently of the interruptible caller waiting on enqueue.
-      (effect, sessionID) =>
+      (
+        effect,
+        sessionID,
+        recovery,
+        reconcile,
+        manualRecovery,
+        deferInterruptedPark,
+        executionFence,
+        managedChildAuthorization,
+      ) =>
         process.env.OPENCODE_MANAGED_PROFILE !== "1"
           ? effect
           : Effect.acquireUseRelease(
               Effect.gen(function* () {
                 const session = yield* sessions.get(sessionID).pipe(Effect.orDie)
-                return yield* runtime.admit({ sessionID, directory: session.directory })
+                return yield* runtime.admit({
+                  sessionID,
+                  directory: session.directory,
+                  parentSessionID: session.parentID,
+                  managedChildAuthorization,
+                })
               }).pipe(Effect.orDie),
               () => effect,
               (admission, exit) =>

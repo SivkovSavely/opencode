@@ -10,6 +10,7 @@ import { GlobTool } from "./glob"
 import { GrepTool } from "./grep"
 import { ReadTool } from "./read"
 import { TaskTool } from "./task"
+import { CompressTool } from "./compress"
 import { Database } from "@opencode-ai/core/database/database"
 import { TodoWriteTool } from "./todo"
 import { WebFetchTool } from "./webfetch"
@@ -105,6 +106,7 @@ const layer = Layer.effect(
 
     const invalid = yield* InvalidTool
     const task = yield* TaskTool
+    const compress = yield* CompressTool
     const read = yield* ReadTool
     const question = yield* QuestionTool
     const todo = yield* TodoWriteTool
@@ -223,6 +225,7 @@ const layer = Layer.effect(
           edit: Tool.init(edit),
           write: Tool.init(writetool),
           task: Tool.init(task),
+          compress: Tool.init(compress),
           fetch: Tool.init(webfetch),
           todo: Tool.init(todo),
           search: Tool.init(websearch),
@@ -247,6 +250,7 @@ const layer = Layer.effect(
             tool.edit,
             tool.write,
             tool.task,
+            ...(process.env.OPENCODE_MANAGED_PROFILE === "1" ? [tool.compress] : []),
             tool.fetch,
             tool.todo,
             tool.search,
@@ -273,7 +277,9 @@ const layer = Layer.effect(
     })
 
     const describeTask = Effect.fn("ToolRegistry.describeTask")(function* (agent: Agent.Info) {
-      const items = (yield* agents.list()).filter((item) => item.mode !== "primary")
+      const items = (yield* agents.list()).filter((item) =>
+        process.env.OPENCODE_MANAGED_PROFILE === "1" ? item.mode === "subagent" : item.mode !== "primary",
+      )
       const filtered = items.filter(
         (item) => Permission.evaluate("task", item.name, agent.permission).action !== "deny",
       )
@@ -308,7 +314,7 @@ const layer = Layer.effect(
 
     const tools: Interface["tools"] = Effect.fn("ToolRegistry.tools")(function* (input) {
       const filtered = (yield* all()).filter((tool) => {
-        if (process.env.OPENCODE_MANAGED_PROFILE === "1") return tool.id === "bash"
+        if (process.env.OPENCODE_MANAGED_PROFILE === "1") return ["bash", "task", "compress"].includes(tool.id)
         if (tool.id === WebSearchTool.id) {
           return webSearchEnabled(input.providerID, { exa: flags.enableExa, parallel: flags.enableParallel })
         }

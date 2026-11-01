@@ -1,6 +1,7 @@
 import { Database } from "@opencode-ai/core/database/database"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { RuntimeRetirement } from "@opencode-ai/core/runtime-retirement"
+import { HistoricalFence } from "@opencode-ai/core/historical-fence"
 import { ManagedCommand } from "@opencode-ai/core/managed-command"
 import { sql } from "drizzle-orm"
 import {
@@ -81,6 +82,18 @@ export type Interface = {
   readonly recoveryPrepared: (sessionID: string) => Effect.Effect<void>
   /** Each successful admission requires exactly one owner release, even after cancellation. */
   readonly admit: (input: AdmissionInput) => Effect.Effect<AdmissionResult, RuntimeDrainingError>
+  readonly authorizeChild: (
+    sessionID: string,
+    parentSessionID: string,
+    parentFence: number,
+  ) => Effect.Effect<
+    {
+      prompt: object
+      runner: object
+    },
+    RuntimeDrainingError,
+    Scope.Scope
+  >
   readonly retireRoot: (
     sessionID: string,
   ) => Effect.Effect<RuntimeRetirement.Result, RuntimeRetirement.RootRetirementError>
@@ -197,6 +210,7 @@ type AdmissionInput = {
   rejectCancelled?: boolean
   rejectRecoveryNeeded?: boolean
   manualRecovery?: boolean
+  managedChildAuthorization?: object
 }
 
 type AdmissionDecision =
@@ -383,6 +397,9 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
   const databaseRef: { current?: Database.Interface } = { current: database }
   const managed = new Map<string, { sessionID: string; cancel: () => void }>()
   const executionPermits = new Map<string, ManagedCommand.Permit>()
+  // Identity-only, single-use capabilities never cross the public HTTP schema.
+  const childAuthorizations = new WeakMap<object, { sessionID: string; parentSessionID: string; parentFence: number }>()
+  const childTaskOwners = new Map<string, object>()
   // Preserve column order: this is compared with Core's persisted admission-generation snapshot.
   const managedAncestors = (database: Database.Interface, sessionID: string) =>
     database.db.all<{ id: string }>(sql`
@@ -504,6 +521,7 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
 
   const commandStatus = Effect.fn("RuntimeLifecycle.commandStatus")(function* (rootSessionID: string) {
     const database = databaseRef.current ?? (yield* Database.Service)
+    if (yield* HistoricalFence.partialEvidence(database, rootSessionID)) return "unknown" as const
     const local = SynchronizedRef.getUnsafe(ref)
     const members = yield* database.db.all<{ session_id: string }>(sql`
       WITH RECURSIVE tree(session_id) AS (
@@ -727,15 +745,17 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
     Scope.addFinalizer(
       scope,
       Effect.gen(function* () {
-        yield* SynchronizedRef.update(ref, (local): LocalState =>
-          local.phase !== "running"
-            ? local
-            : {
-                ...local,
-                phase: "draining",
-                action: "shutdown",
-                drainStarted: true,
-              },
+        yield* SynchronizedRef.update(
+          ref,
+          (local): LocalState =>
+            local.phase !== "running"
+              ? local
+              : {
+                  ...local,
+                  phase: "draining",
+                  action: "shutdown",
+                  drainStarted: true,
+                },
         )
         yield* Deferred.succeed(draining, undefined).pipe(Effect.ignore)
         for (const entry of managed.values()) entry.cancel()
@@ -1024,10 +1044,44 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
     yield* settleStartupPending(sessionID, prepared)
   })
 
+  const authorizeChild = Effect.fn("RuntimeLifecycle.authorizeChild")(function* (
+    sessionID: string,
+    parentSessionID: string,
+    parentFence: number,
+  ) {
+    const prompt = {}
+    const runner = {}
+    yield* Effect.acquireRelease(
+      Effect.suspend(() => {
+        if (childTaskOwners.has(sessionID))
+          return Effect.fail(new RuntimeDrainingError({ message: "Managed child already has a foreground Task owner" }))
+        childTaskOwners.set(sessionID, prompt)
+        return Effect.void
+      }),
+      () =>
+        Effect.sync(() => {
+          if (childTaskOwners.get(sessionID) === prompt) childTaskOwners.delete(sessionID)
+          childAuthorizations.delete(prompt)
+          childAuthorizations.delete(runner)
+        }),
+    )
+    const state = SynchronizedRef.getUnsafe(ref)
+    if (state.active.get(parentSessionID)?.fence !== parentFence || !state.leases.has(parentSessionID))
+      return yield* new RuntimeDrainingError({ message: "Managed child requires its live foreground parent" })
+    const database = databaseRef.current ?? (yield* Database.Service)
+    yield* ManagedCommand.reserveChild(database, sessionID, parentSessionID, parentFence).pipe(
+      Effect.mapError(() => new RuntimeDrainingError({ message: "Managed child authorization was fenced" })),
+    )
+    const binding = { sessionID, parentSessionID, parentFence }
+    childAuthorizations.set(prompt, binding)
+    childAuthorizations.set(runner, binding)
+    return { prompt, runner }
+  })
+
   const admit = Effect.fn("RuntimeLifecycle.admit")(function* (input: AdmissionInput) {
     yield* rejectRetired(input)
-    if (process.env.OPENCODE_MANAGED_PROFILE === "1" && input.parentSessionID)
-      return yield* new RuntimeDrainingError({ message: "Child execution is unavailable in the managed profile" })
+    if (process.env.OPENCODE_MANAGED_PROFILE === "1" && input.parentMode === "background")
+      return yield* new RuntimeDrainingError({ message: "Managed child execution must remain foreground" })
     if (
       process.env.OPENCODE_MANAGED_PROFILE === "1" &&
       process.env.OPENCODE_MANAGED_PLUGIN_ALLOWLIST &&
@@ -1052,6 +1106,42 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
           const parentMode = state.parentModeOverrides.get(input.sessionID)
           const admissionInput = parentMode ? { ...input, parentMode } : input
           const row = yield* read(input.sessionID)
+          if (process.env.OPENCODE_MANAGED_PROFILE === "1") {
+            const database = databaseRef.current ?? (yield* Database.Service)
+            const projected = yield* database.db.get<{
+              parent_id: string | null
+              managed_parent_id: string | null
+            }>(sql`
+              SELECT s.parent_id, m.parent_session_id AS managed_parent_id FROM session s
+              LEFT JOIN managed_session_member m ON m.session_id = s.id WHERE s.id = ${input.sessionID}`)
+            if (
+              projected?.parent_id ||
+              projected?.managed_parent_id ||
+              row?.parent_session_id ||
+              input.parentSessionID
+            ) {
+              const authorized = input.managedChildAuthorization
+                ? childAuthorizations.get(input.managedChildAuthorization)
+                : undefined
+              const parent = authorized ? yield* read(authorized.parentSessionID) : undefined
+              if (
+                !authorized ||
+                authorized.sessionID !== input.sessionID ||
+                authorized.parentSessionID !== projected?.parent_id ||
+                authorized.parentSessionID !== projected.managed_parent_id ||
+                (input.parentSessionID !== undefined && authorized.parentSessionID !== input.parentSessionID) ||
+                state.active.get(authorized.parentSessionID)?.fence !== authorized.parentFence ||
+                !state.leases.has(authorized.parentSessionID) ||
+                parent?.owner_instance !== identity.instance ||
+                parent.fence !== authorized.parentFence ||
+                parent.state !== "active" ||
+                parent.desired_active !== 1
+              )
+                return yield* new RuntimeDrainingError({
+                  message: "Managed foreground child requires private Task authorization",
+                })
+            }
+          }
           if (input.rejectCancelled && row?.state === "cancelled")
             return yield* rejectAdmission(input, "Session was cancelled", row)
           const local = state.active.get(input.sessionID)
@@ -1075,6 +1165,7 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
               return yield* rejectAdmission(admissionInput, "Session is no longer owned by this runtime", row)
             }
             const claimed = yield* admitDurably(admissionInput, row)
+            if (input.managedChildAuthorization) childAuthorizations.delete(input.managedChildAuthorization)
             const active = new Map(state.active)
             active.set(input.sessionID, { fence: claimed.row.fence, leases: local.leases + 1, mode: "active" })
             const parentModeOverrides = new Map(state.parentModeOverrides)
@@ -1091,7 +1182,12 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
           const database = databaseRef.current ?? (yield* Database.Service)
           const permit =
             process.env.OPENCODE_MANAGED_PROFILE === "1"
-              ? yield* ManagedCommand.beginExecution(database, input.sessionID, identity.instance).pipe(
+              ? yield* ManagedCommand.beginExecution(
+                  database,
+                  input.sessionID,
+                  identity.instance,
+                  input.parentSessionID,
+                ).pipe(
                   Effect.catchTag("ManagedCommandAdmissionError", () =>
                     Effect.fail(
                       new RuntimeDrainingError({ message: "Managed execution requires a live root session" }),
@@ -1105,6 +1201,7 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
             ),
           )
           if (permit) executionPermits.set(input.sessionID, permit)
+          if (input.managedChildAuthorization) childAuthorizations.delete(input.managedChildAuthorization)
           const active = new Map(state.active)
           active.set(input.sessionID, { fence: claimed.row.fence, leases: 1, mode: "active" })
           const parentModeOverrides = new Map(state.parentModeOverrides)
@@ -1446,6 +1543,8 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
     sessionID: string,
     mode: "foreground" | "background",
   ) {
+    if (process.env.OPENCODE_MANAGED_PROFILE === "1" && mode === "background")
+      return yield* Effect.die(new Error("Managed child execution cannot be promoted"))
     yield* SynchronizedRef.modifyEffect(
       ref,
       Effect.fnUntraced(function* (state) {
@@ -2686,6 +2785,7 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
     finishStartupRecovery,
     recoveryPrepared,
     admit,
+    authorizeChild,
     retireRoot,
     runManagedCommand,
     commandStatus,
@@ -2730,6 +2830,8 @@ export function unavailable(): Interface {
     bindDatabase() {},
     finishStartupRecovery: () => Effect.void,
     recoveryPrepared: () => Effect.void,
+    authorizeChild: () =>
+      Effect.fail(new RuntimeDrainingError({ message: "Managed child requires a tracked runtime" })),
     admit: () =>
       Effect.suspend(() =>
         process.env.OPENCODE_MANAGED_PROFILE === "1"

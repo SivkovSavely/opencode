@@ -3,6 +3,8 @@ import path from "node:path"
 import { Agent } from "@/agent/agent"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { SessionV2 } from "@opencode-ai/core/session"
+import { Database } from "@opencode-ai/core/database/database"
+import { HistoricalFence } from "@opencode-ai/core/historical-fence"
 import { SessionSchema } from "@opencode-ai/core/session/schema"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { Command } from "@/command"
@@ -72,6 +74,7 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
     const permissionSvc = yield* Permission.Service
     const statusSvc = yield* SessionStatus.Service
     const runtime = yield* RuntimeLifecycle.Service
+    const database = yield* Database.Service
     const todoSvc = yield* Todo.Service
     const summary = yield* SessionSummary.Service
     const events = yield* EventV2Bridge.Service
@@ -291,6 +294,15 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
           return result
         }),
       )
+      const evidence = yield* HistoricalFence.partialEvidence(database, ctx.params.sessionID).pipe(Effect.orDie)
+      if (evidence)
+        return {
+          ...result,
+          commandStatus: "unknown" as const,
+          membershipCoverage: evidence.membershipCoverage,
+          historicalCleanup: "unknown" as const,
+          evidenceHash: evidence.evidenceHash,
+        }
       return { ...result, commandStatus: yield* runtime.commandStatus(ctx.params.sessionID) }
     })
 

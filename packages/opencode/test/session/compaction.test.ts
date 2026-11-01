@@ -33,6 +33,11 @@ import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
+import { ManagedCommand } from "@opencode-ai/core/managed-command"
+import { RuntimeLifecycle } from "@/server/runtime-lifecycle"
+import { CompressTool } from "@/tool/compress"
+import { Truncate } from "@/tool/truncate"
+import { Agent } from "@/agent/agent"
 
 const summary = Layer.succeed(
   SessionSummary.Service,
@@ -224,6 +229,8 @@ function cfg(compaction?: ConfigV1.Info["compaction"]) {
 
 const defaultProvider = wide()
 const compactionTestNode = LayerNode.group([
+  Agent.node,
+  Truncate.node,
   SessionCompaction.node,
   SessionNs.node,
   SessionProjector.node,
@@ -812,6 +819,96 @@ describe("session.compaction.prune", () => {
 })
 
 describe("session.compaction.process", () => {
+  itCompaction.instance("native compress queues history and keeps the summary provider inside the root permit", () => {
+    const provider = llm()
+    return Effect.gen(function* () {
+      const previous = process.env.OPENCODE_MANAGED_PROFILE
+      yield* Effect.acquireRelease(
+        Effect.sync(() => {
+          process.env.OPENCODE_MANAGED_PROFILE = "1"
+        }),
+        () =>
+          Effect.sync(() => {
+            if (previous === undefined) delete process.env.OPENCODE_MANAGED_PROFILE
+            else process.env.OPENCODE_MANAGED_PROFILE = previous
+          }),
+      )
+      const ssn = yield* SessionNs.Service
+      const compact = yield* SessionCompaction.Service
+      const database = yield* Database.Service
+      const session = yield* ssn.create({})
+      yield* ManagedCommand.coverRoot(database, session.id)
+      const runtime = RuntimeLifecycle.make({ lineage: "managed-compress-test" }, yield* Effect.scope, database)
+      const owner = yield* runtime.admit({ sessionID: session.id, directory: session.directory })
+      const user = yield* createUserMessage(session.id, "Remember the original task and its constraints")
+      const format = new SessionV1.OutputFormatJsonSchema({
+        type: "json_schema",
+        schema: { type: "object", properties: { answer: { type: "string" } }, required: ["answer"] },
+        retryCount: 0,
+      })
+      yield* ssn.updateMessage({ ...user, format })
+      const started = yield* Deferred.make<void>()
+      const finish = yield* Deferred.make<void>()
+      provider.push((input) =>
+        Stream.fromEffect(Deferred.succeed(started, undefined).pipe(Effect.andThen(Deferred.await(finish)))).pipe(
+          Stream.flatMap(() => reply("Retained task and constraints")(input)),
+        ),
+      )
+      const tool = yield* CompressTool.pipe(Effect.flatMap((tool) => tool.init()))
+      const context = {
+        sessionID: session.id,
+        messageID: user.id,
+        agent: "build",
+        abort: new AbortController().signal,
+        messages: [],
+        ask: () => Effect.void,
+        metadata: () => Effect.void,
+        extra: {
+          requestCompaction: () =>
+            compact.create({ sessionID: session.id, agent: "build", model: ref, format, auto: true }),
+        },
+      }
+      expect(yield* tool.execute({}, context).pipe(Effect.exit)).toMatchObject({ _tag: "Failure" })
+      const result = yield* tool.execute({}, { ...context, managedRuntime: runtime, executionFence: owner.fence })
+      expect(result.metadata.queued).toBe(true)
+      expect(yield* Deferred.isDone(started)).toBe(false)
+      const messages = yield* ssn.messages({ sessionID: session.id })
+      const marker = messages.at(-1)
+      if (!marker) throw new Error("Missing durable compaction marker")
+      expect(marker.info.role === "user" && marker.info.format).toEqual(format)
+      expect(marker.parts).toEqual([expect.objectContaining({ type: "compaction", auto: true })])
+      yield* runtime.beforeTurn(session.id)
+      const summary = yield* compact
+        .process({
+          parentID: marker.info.id,
+          messages,
+          sessionID: session.id,
+          auto: true,
+        })
+        .pipe(Effect.forkScoped)
+      yield* Deferred.await(started)
+      expect(yield* runtime.commandStatus(session.id)).toBe("draining")
+      yield* Deferred.succeed(finish, undefined)
+      expect(yield* Fiber.join(summary)).toBe("continue")
+      const history = yield* ssn.messages({ sessionID: session.id })
+      expect(history.some((message) => message.info.id === user.id)).toBe(true)
+      expect(history.some((message) => message.info.role === "assistant" && message.info.summary)).toBe(true)
+      const continuation = history.at(-1)
+      expect(continuation?.info.role === "user" && continuation.info.format).toEqual(format)
+      expect(history.at(-1)?.parts).toContainEqual(
+        expect.objectContaining({
+          type: "text",
+          synthetic: true,
+          metadata: { compaction_continue: true },
+        }),
+      )
+      expect(yield* runtime.commandStatus(session.id)).toBe("draining")
+      yield* runtime.complete(session.id)
+      yield* runtime.release(session.id, owner.fence)
+      expect(yield* runtime.commandStatus(session.id)).toBe("drained")
+    }).pipe(withCompaction({ llm: provider.llmLayer }))
+  })
+
   it.instance(
     "throws when parent is not a user message",
     Effect.gen(function* () {
@@ -1141,6 +1238,12 @@ describe("session.compaction.process", () => {
       const session = yield* ssn.create({})
       yield* createUserMessage(session.id, "root")
       const replay = yield* createUserMessage(session.id, "image")
+      const format = new SessionV1.OutputFormatJsonSchema({
+        type: "json_schema",
+        schema: { type: "object", properties: { answer: { type: "string" } } },
+        retryCount: 0,
+      })
+      yield* ssn.updateMessage({ ...replay, format })
       yield* ssn.updatePart({
         id: PartID.ascending(),
         messageID: replay.id,
@@ -1165,6 +1268,14 @@ describe("session.compaction.process", () => {
 
       expect(result).toBe("continue")
       expect(last?.info.role).toBe("user")
+      expect(last?.info.role === "user" && last.info.format).toEqual(format)
+      expect(last?.parts).toContainEqual(
+        expect.objectContaining({
+          type: "text",
+          synthetic: true,
+          metadata: { compaction_continue: true },
+        }),
+      )
       expect(last?.parts.some((part) => part.type === "file")).toBe(false)
       expect(
         last?.parts.some((part) => part.type === "text" && part.text.includes("Attached image/png: cat.png")),

@@ -84,6 +84,62 @@ const it = testEffect(
 const itWithoutLocation = testEffect(AppNodeBuilder.build(LayerNode.group([Database.node, EventV2.node])))
 
 describe("EventV2", () => {
+  it.effect("records durable projections and metadata without notifying until explicitly dispatched", () =>
+    Effect.gen(function* () {
+      const events = yield* EventV2.Service
+      const database = yield* Database.Service
+      const projected: EventV2.Payload[] = []
+      const notified: EventV2.Payload[] = []
+      yield* events.project(DurableMessage, (event) =>
+        Effect.sync(() => {
+          projected.push(event)
+        }),
+      )
+      const unsubscribe = yield* events.listen((event) =>
+        Effect.sync(() => {
+          notified.push(event)
+        }),
+      )
+      yield* Effect.addFinalizer(() => unsubscribe)
+      const sessionID = Session.ID.create()
+      const recorded = yield* database.db.transaction(() =>
+        events.record(DurableMessage, durableData(sessionID, "recorded"), { metadata: { source: "transaction" } }),
+      )
+      expect(projected).toHaveLength(1)
+      expect(notified).toEqual([])
+      expect(
+        yield* database.db.select().from(EventTable).where(eq(EventTable.id, recorded.event.id)).all(),
+      ).toHaveLength(1)
+      expect(recorded.event.durable).toMatchObject({
+        aggregateID: sessionID,
+        seq: 0,
+        version: DurableMessage.durable?.version,
+      })
+      expect(recorded.event.metadata).toEqual({ source: "transaction" })
+      expect(recorded.event.location?.directory).toBe(AbsolutePath.make("project"))
+      yield* recorded.dispatch
+      expect(notified).toEqual([recorded.event])
+      expect(projected).toHaveLength(1)
+    }),
+  )
+
+  it.effect("records live events without notifying until dispatch", () =>
+    Effect.gen(function* () {
+      const events = yield* EventV2.Service
+      const notified: EventV2.Payload[] = []
+      const unsubscribe = yield* events.listen((event) =>
+        Effect.sync(() => {
+          notified.push(event)
+        }),
+      )
+      yield* Effect.addFinalizer(() => unsubscribe)
+      const recorded = yield* events.record(Message, { text: "deferred" })
+      expect(notified).toEqual([])
+      yield* recorded.dispatch
+      expect(notified).toEqual([recorded.event])
+    }),
+  )
+
   it.effect("publishes events with the current location", () =>
     Effect.gen(function* () {
       const events = yield* EventV2.Service

@@ -93,6 +93,8 @@ function matchLegacyOpenApi(input: Record<string, unknown>) {
   // but the legacy SDK expected plain `T` for optional fields. Strip null
   // from all component schemas so both request and response types match.
   for (const [name, schema] of Object.entries(spec.components?.schemas ?? {})) {
+    // Signed maintenance payloads distinguish explicit null from omission.
+    if (name.startsWith("HistoricalFence")) continue
     spec.components!.schemas![name] = stripOptionalNull(structuredClone(schema))
   }
   normalizeComponentNames(spec)
@@ -112,7 +114,8 @@ function matchLegacyOpenApi(input: Record<string, unknown>) {
         // Keep that SDK surface stable while the HttpApi spec is tightened.
         if (!isV2Api) delete operation.requestBody.required
         const body = operation.requestBody.content?.["application/json"]
-        if (body?.schema) body.schema = stripOptionalNull(structuredClone(body.schema))
+        if (body?.schema && !path.startsWith("/maintenance/historical-fence"))
+          body.schema = stripOptionalNull(structuredClone(body.schema))
         if (path === "/experimental/workspace" && method === "post") {
           // Workspace creation fields `branch` and `extra` are Schema.NullOr —
           // genuinely nullable, not just optional. Re-add the null that the
@@ -140,7 +143,8 @@ function matchLegacyOpenApi(input: Record<string, unknown>) {
       }
       for (const response of Object.values(operation.responses ?? {})) {
         for (const content of Object.values(response.content ?? {})) {
-          if (content.schema) content.schema = stripOptionalNull(structuredClone(content.schema))
+          if (content.schema && !path.startsWith("/maintenance/historical-fence"))
+            content.schema = stripOptionalNull(structuredClone(content.schema))
         }
       }
       if (!isV2Api) {

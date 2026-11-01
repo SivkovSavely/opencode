@@ -409,6 +409,45 @@ describe("Runner", () => {
 
   // --- cancel semantics ---
 
+  for (const mode of ["Running", "RunningQueued", "Shell", "ShellThenRun"] as const) {
+    it.live(
+      `concurrent cancellation joins cleanup for ${mode}`,
+      Effect.gen(function* () {
+        const runner = Runner.make<string>(yield* Scope.Scope, { onInterrupt: Effect.succeed("cancelled") })
+        const started = yield* Deferred.make<void>()
+        const cleaning = yield* Deferred.make<void>()
+        const release = yield* Deferred.make<void>()
+        yield* Effect.gen(function* () {
+          const work = Deferred.succeed(started, undefined).pipe(
+            Effect.andThen(Effect.never),
+            Effect.ensuring(Deferred.succeed(cleaning, undefined).pipe(Effect.andThen(Deferred.await(release)))),
+            Effect.as("work"),
+          )
+          const active = yield* (mode.startsWith("Shell") ? runner.startShell(work) : runner.ensureRunning(work)).pipe(
+            Effect.forkChild,
+          )
+          yield* Deferred.await(started)
+          const queued =
+            mode === "RunningQueued" || mode === "ShellThenRun"
+              ? yield* runner.enqueue(Effect.die("cancelled queue must not run")).pipe(Effect.forkChild)
+              : undefined
+          yield* waitForState(runner, mode)
+          const first = yield* runner.cancel.pipe(Effect.forkChild)
+          yield* Deferred.await(cleaning)
+          const second = yield* runner.cancelWithReason("scope").pipe(Effect.forkChild({ startImmediately: true }))
+          expect(first.pollUnsafe()).toBeUndefined()
+          expect(second.pollUnsafe()).toBeUndefined()
+          yield* Deferred.succeed(release, undefined)
+          yield* Fiber.join(first)
+          yield* Fiber.join(second)
+          expect(yield* Fiber.join(active)).toBe("cancelled")
+          if (queued) expect(yield* Fiber.join(queued)).toBe("cancelled")
+          expect(yield* runner.ensureRunning(Effect.succeed("resumed"))).toBe("resumed")
+        }).pipe(Effect.ensuring(Deferred.succeed(release, undefined)))
+      }),
+    )
+  }
+
   it.live(
     "cancel interrupts running work",
     Effect.gen(function* () {

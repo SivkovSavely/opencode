@@ -283,6 +283,9 @@ export const SessionApi = HttpApi.make("session")
             rootSessionID: Schema.String,
             sessionIDs: Schema.Array(Schema.String),
             commandStatus: Schema.Literals(["draining", "drained", "unknown"]),
+            membershipCoverage: Schema.optional(Schema.Literals(["attested-partial", "observed-partial"])),
+            historicalCleanup: Schema.optional(Schema.Literal("unknown")),
+            evidenceHash: Schema.optional(Schema.String),
           }),
           error: [SessionNotFoundError, ConflictError, HttpApiError.ServiceUnavailable],
         }).annotateMerge(

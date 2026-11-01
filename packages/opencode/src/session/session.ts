@@ -10,6 +10,7 @@ import type { ProviderMetadata, Usage } from "@opencode-ai/llm"
 import { InstallationVersion } from "@opencode-ai/core/installation/version"
 import { Database } from "@opencode-ai/core/database/database"
 import { EventV2Bridge } from "@/event-v2-bridge"
+import { EventV2 } from "@opencode-ai/core/event"
 import { SessionV2 } from "@opencode-ai/core/session"
 import * as SessionExecutionLocal from "@opencode-ai/core/session/execution/local"
 import { locationServiceMapLayer } from "@opencode-ai/core/location-services"
@@ -46,6 +47,7 @@ import { ModelV2 } from "@opencode-ai/core/model"
 import { SessionMessage } from "@opencode-ai/schema/session-message"
 import { McpActivation } from "./mcp-activation"
 import { ManagedCommand } from "@opencode-ai/core/managed-command"
+import { RuntimeRetirement } from "@opencode-ai/core/runtime-retirement"
 
 const parentTitlePrefix = "New session - "
 const childTitlePrefix = "Child session - "
@@ -416,10 +418,13 @@ export class BusyError extends Schema.TaggedErrorClass<BusyError>()("SessionBusy
 export type NotFound = NotFoundError
 
 export interface Interface {
+  readonly managedPolicies: (sessionID: SessionID) => Effect.Effect<ReadonlyArray<PermissionV1.Ruleset>>
   readonly list: (input?: ListInput) => Effect.Effect<Info[]>
   readonly listGlobal: (input?: GlobalListInput) => Effect.Effect<GlobalInfo[]>
   readonly create: (input?: {
     parentID?: SessionID
+    managedParentFence?: number
+    managedParentPolicy?: PermissionV1.Ruleset
     title?: string
     agent?: string
     model?: Schema.Schema.Type<typeof Model>
@@ -445,7 +450,11 @@ export interface Interface {
     model: NonNullable<Info["model"]>
     time: number
   }) => Effect.Effect<void>
-  readonly setPermission: (input: { sessionID: SessionID; permission: PermissionV1.Ruleset }) => Effect.Effect<void>
+  readonly setPermission: (input: {
+    sessionID: SessionID
+    permission: PermissionV1.Ruleset
+    managedParent?: { sessionID: SessionID; fence: number; policy?: PermissionV1.Ruleset }
+  }) => Effect.Effect<void>
   readonly setRevert: (input: {
     sessionID: SessionID
     revert: Info["revert"]
@@ -522,6 +531,8 @@ const layer: Layer.Layer<
       agent?: string
       model?: Schema.Schema.Type<typeof Model>
       parentID?: SessionID
+      managedParentFence?: number
+      managedParentPolicy?: PermissionV1.Ruleset
       workspaceID?: WorkspaceV2.ID
       directory: string
       path?: string
@@ -553,9 +564,22 @@ const layer: Layer.Layer<
       }
       yield* Effect.logInfo("created", result)
 
-      yield* events.publish(SessionV1.Event.Created, { sessionID: result.id, info: result }, {
-        commit: () => input.parentID ? Effect.void : ManagedCommand.enrollCreatedRoot(database, result.id),
-      })
+      if (input.parentID && input.managedParentFence !== undefined)
+        yield* ManagedCommand.reserveChild(
+          database,
+          result.id,
+          input.parentID,
+          input.managedParentFence,
+          input.managedParentPolicy,
+        ).pipe(Effect.orDie)
+
+      yield* events.publish(
+        SessionV1.Event.Created,
+        { sessionID: result.id, info: result },
+        {
+          commit: () => (input.parentID ? Effect.void : ManagedCommand.enrollCreatedRoot(database, result.id)),
+        },
+      )
 
       return result
     })
@@ -627,26 +651,52 @@ const layer: Layer.Layer<
     })
 
     const remove: Interface["remove"] = Effect.fnUntraced(function* (sessionID: SessionID) {
+      yield* Effect.uninterruptible(
+        Effect.gen(function* () {
+          const removed = yield* db
+            .transaction(() => removeTree(sessionID), { behavior: "immediate" })
+            .pipe(Effect.catchTag("SqlError", Effect.die))
+          // Once committed, join cleanup and deliver notifications even if the caller leaves.
+          // Finalizers and listeners may use the DB, so both run outside the transaction.
+          const hasInstance = yield* InstanceState.directory.pipe(
+            Effect.as(true),
+            Effect.catchCause(() => Effect.succeed(false)),
+          )
+          if (hasInstance)
+            yield* Effect.forEach(removed, ({ event }) => cancelBackgroundJobs(background, event.data.sessionID), {
+              discard: true,
+            })
+          yield* Effect.forEach(removed, (recorded) => recorded.dispatch, { discard: true })
+        }),
+      )
+    })
+
+    const removeTree: (
+      sessionID: SessionID,
+    ) => Effect.Effect<
+      { event: EventV2.Payload<typeof SessionV1.Event.Deleted>; dispatch: Effect.Effect<void> }[],
+      NotFound
+    > = Effect.fnUntraced(function* (sessionID: SessionID) {
       const session = yield* get(sessionID)
-      try {
-        // `remove` needs to work in all cases, such as broken sessions that
-        // run cleanup without instance state.
-        const hasInstance = yield* InstanceState.directory.pipe(
-          Effect.as(true),
-          Effect.catchCause(() => Effect.succeed(false)),
-        )
-
-        if (hasInstance) yield* cancelBackgroundJobs(background, sessionID)
-        const kids = yield* children(sessionID)
-        for (const child of kids) {
-          yield* remove(child.id)
-        }
-
-        yield* events.publish(SessionV1.Event.Deleted, { sessionID, info: session })
-        yield* events.remove(sessionID)
-      } catch (error) {
-        yield* Effect.logError("failed to remove session", { sessionID, error })
+      // Preserve the complete currently observed tree before recursive deletion erases ancestry.
+      const executionParent = yield* db
+        .get(sql`SELECT 1 FROM runtime_execution WHERE session_id = ${sessionID} AND parent_session_id IS NOT NULL`)
+        .pipe(Effect.orDie)
+      if (
+        (session.parentID || executionParent) &&
+        !(yield* RuntimeRetirement.lookup(database, sessionID).pipe(Effect.orDie))
+      ) {
+        yield* RuntimeRetirement.validateChildPrune(database, sessionID).pipe(Effect.orDie)
       }
+      if (!session.parentID) {
+        if (!executionParent)
+          yield* RuntimeRetirement.retireRoot(database, sessionID, { validateAncestry: true }).pipe(Effect.orDie)
+      }
+      const kids = yield* children(sessionID)
+      const removed = yield* Effect.forEach(kids, (child) => removeTree(child.id))
+      const recorded = yield* events.record(SessionV1.Event.Deleted, { sessionID, info: session })
+      yield* events.remove(sessionID)
+      return [...removed.flat(), recorded]
     })
 
     const updateMessage = <T extends SessionV1.Info>(msg: T): Effect.Effect<T> =>
@@ -689,6 +739,8 @@ const layer: Layer.Layer<
 
     const create = Effect.fn("Session.create")(function* (input?: {
       parentID?: SessionID
+      managedParentFence?: number
+      managedParentPolicy?: PermissionV1.Ruleset
       title?: string
       agent?: string
       model?: Schema.Schema.Type<typeof Model>
@@ -700,6 +752,8 @@ const layer: Layer.Layer<
       const workspace = yield* InstanceState.workspaceID
       return yield* createNext({
         parentID: input?.parentID,
+        managedParentFence: input?.managedParentFence,
+        managedParentPolicy: input?.managedParentPolicy,
         directory: ctx.directory,
         path: sessionPath(ctx.worktree, ctx.directory),
         title: input?.title,
@@ -754,7 +808,12 @@ const layer: Layer.Layer<
       return session
     })
 
-    const patchLocked = (sessionID: SessionID, info: Patch, updatedFields?: Array<"bookmarked">) =>
+    const patchLocked = (
+      sessionID: SessionID,
+      info: Patch,
+      updatedFields?: Array<"bookmarked">,
+      commit?: () => Effect.Effect<void>,
+    ) =>
       Effect.gen(function* () {
         const current = yield* get(sessionID)
         const next = {
@@ -766,11 +825,15 @@ const layer: Layer.Layer<
           revert: info.revert === null ? undefined : (info.revert ?? current.revert),
           permission: info.permission === null ? undefined : (info.permission ?? current.permission),
         } as Info
-        yield* events.publish(SessionV1.Event.Updated, {
-          sessionID,
-          info: next,
-          ...(updatedFields ? { updatedFields } : {}),
-        })
+        yield* events.publish(
+          SessionV1.Event.Updated,
+          {
+            sessionID,
+            info: next,
+            ...(updatedFields ? { updatedFields } : {}),
+          },
+          { commit },
+        )
       })
 
     const patch = (sessionID: SessionID, info: Patch) =>
@@ -854,7 +917,28 @@ const layer: Layer.Layer<
     const setPermission = Effect.fn("Session.setPermission")(function* (input: {
       sessionID: SessionID
       permission: PermissionV1.Ruleset
+      managedParent?: { sessionID: SessionID; fence: number; policy?: PermissionV1.Ruleset }
     }) {
+      if (input.managedParent) {
+        const parent = input.managedParent
+        return yield* mcpActivationLock(input.sessionID)
+          .withPermits(1)(
+            patchLocked(
+              input.sessionID,
+              { permission: [...input.permission], time: { updated: Date.now() } },
+              undefined,
+              () =>
+                ManagedCommand.reserveChild(
+                  database,
+                  input.sessionID,
+                  parent.sessionID,
+                  parent.fence,
+                  parent.policy,
+                ).pipe(Effect.orDie),
+            ),
+          )
+          .pipe(Effect.orDie)
+      }
       yield* patch(input.sessionID, { permission: [...input.permission], time: { updated: Date.now() } }).pipe(
         Effect.orDie,
       )
@@ -993,6 +1077,7 @@ const layer: Layer.Layer<
       addMcpActivation,
       setAgentModel,
       setPermission,
+      managedPolicies: (sessionID) => ManagedCommand.policies(database, sessionID).pipe(Effect.orDie),
       setRevert,
       clearRevert,
       setSummary,
@@ -1020,7 +1105,6 @@ const cancelBackgroundJobs = Effect.fn("Session.cancelBackgroundJobs")(function*
   const jobs = yield* background.list()
   yield* Effect.forEach(
     jobs.filter((job) => {
-      if (job.status !== "running") return false
       if (job.id === sessionID) return true
       if (job.metadata?.sessionId === sessionID) return true
       return job.metadata?.parentSessionId === sessionID

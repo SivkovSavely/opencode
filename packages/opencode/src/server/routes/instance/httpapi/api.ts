@@ -32,6 +32,7 @@ import { GlobalApi } from "./groups/global"
 import { TranscriptSearchApi } from "./groups/transcript-search"
 import { Authorization } from "./middleware/authorization"
 import { SchemaErrorMiddleware } from "./middleware/schema-error"
+import { HistoricalFenceApi } from "./groups/historical-fence"
 
 const EventSchema = Schema.Union([
   ...EventManifest.Latest.values()
@@ -61,6 +62,7 @@ export const RootHttpApi = HttpApi.make("opencode-root")
   .middleware(Authorization)
 
 export const InstanceHttpApi = HttpApi.make("opencode-instance")
+  .addHttpApi(HistoricalFenceApi)
   .addHttpApi(ConfigApi)
   .addHttpApi(ExperimentalApi)
   .addHttpApi(FileApi)

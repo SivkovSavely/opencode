@@ -125,6 +125,12 @@ export interface PublishOptions {
 }
 
 export interface Interface {
+  /** Record/project only. Dispatch exactly once after the enclosing transaction commits; discard on rollback. */
+  readonly record: <D extends Definition>(
+    definition: D,
+    data: Data<D>,
+    options?: PublishOptions,
+  ) => Effect.Effect<{ readonly event: Payload<D>; readonly dispatch: Effect.Effect<void> }>
   readonly publish: <D extends Definition>(
     definition: D,
     data: Data<D>,
@@ -225,6 +231,7 @@ export const layerWith = (options?: LayerOptions) =>
           readonly strictOwner?: boolean
         },
         commit?: (seq: number) => Effect.Effect<void>,
+        deferWake = false,
       ) {
         return Effect.gen(function* () {
           const durable = definition?.durable
@@ -364,7 +371,7 @@ export const layerWith = (options?: LayerOptions) =>
                       { behavior: "immediate" },
                     )
                     .pipe(Effect.orDie)
-                  if (committed) {
+                  if (committed && !deferWake) {
                     yield* Effect.forEach(
                       pubsub.durable.get(committed.aggregateID) ?? [],
                       (wake) => PubSub.publish(wake, undefined),
@@ -379,7 +386,12 @@ export const layerWith = (options?: LayerOptions) =>
         })
       }
 
-      function publishEvent<D extends Definition>(definition: D, event: Payload<D>, commit?: PublishOptions["commit"]) {
+      function recordEvent<D extends Definition>(
+        definition: D,
+        event: Payload<D>,
+        commit: PublishOptions["commit"],
+        deferWake: boolean,
+      ) {
         return Effect.gen(function* () {
           if (!definition?.durable && commit)
             return yield* Effect.die(
@@ -389,7 +401,7 @@ export const layerWith = (options?: LayerOptions) =>
               }),
             )
           if (definition?.durable) {
-            const committed = yield* commitDurableEvent(definition, event as Payload, undefined, commit)
+            const committed = yield* commitDurableEvent(definition, event as Payload, undefined, commit, deferWake)
             if (committed) {
               event = {
                 ...event,
@@ -399,12 +411,10 @@ export const layerWith = (options?: LayerOptions) =>
                   version: definition.durable.version,
                 },
               }
-              yield* notify(event as Payload, true)
-              return event
+              return { event, dispatch: notify(event as Payload, true, deferWake) }
             }
           }
-          yield* notify(event as Payload, false)
-          return event
+          return { event, dispatch: notify(event as Payload, false) }
         })
       }
 
@@ -416,9 +426,16 @@ export const layerWith = (options?: LayerOptions) =>
           ),
         )
 
-      function notify(event: Payload, isolateListeners: boolean) {
-        EventDiagnostics.logicalEvent(event.type)
+      function notify(event: Payload, isolateListeners: boolean, wake = false) {
         return Effect.gen(function* () {
+          EventDiagnostics.logicalEvent(event.type)
+          if (wake && event.durable) {
+            yield* Effect.forEach(
+              pubsub.durable.get(event.durable.aggregateID) ?? [],
+              (wake) => PubSub.publish(wake, undefined),
+              { discard: true },
+            )
+          }
           yield* Effect.forEach(
             listeners,
             (listener) => (isolateListeners ? observe(event, listener) : listener(event)),
@@ -430,7 +447,7 @@ export const layerWith = (options?: LayerOptions) =>
         })
       }
 
-      function publish<D extends Definition>(definition: D, data: Data<D>, options?: PublishOptions) {
+      function record<D extends Definition>(definition: D, data: Data<D>, options?: PublishOptions, deferWake = true) {
         return Effect.gen(function* () {
           const serviceLocation = Option.getOrUndefined(yield* Effect.serviceOption(Location.Service))
           const location =
@@ -438,7 +455,7 @@ export const layerWith = (options?: LayerOptions) =>
             (serviceLocation
               ? { directory: serviceLocation.directory, workspaceID: serviceLocation.workspaceID }
               : undefined)
-          return yield* publishEvent(
+          return yield* recordEvent(
             definition,
             {
               id: options?.id ?? ID.create(),
@@ -448,9 +465,15 @@ export const layerWith = (options?: LayerOptions) =>
               data,
             } as Payload<D>,
             options?.commit,
+            deferWake,
           )
         })
       }
+
+      const publish: Interface["publish"] = (definition, data, options) =>
+        record(definition, data, options, false).pipe(
+          Effect.flatMap((recorded) => recorded.dispatch.pipe(Effect.as(recorded.event))),
+        )
 
       function replay(
         event: SerializedEvent,
@@ -634,6 +657,7 @@ export const layerWith = (options?: LayerOptions) =>
         })
 
       return Service.of({
+        record,
         publish,
         subscribe,
         all: streamAll,
