@@ -55,12 +55,12 @@ capabilities validation; the expensive optional compiler fixture is unnecessary.
 
 ## Integrated Result
 
-Both complete E2E files passed together on 2026-10-31: two tests, 1,186 assertions,
-109.77 seconds. Evidence is retained at:
+Both complete E2E files passed together on 2026-11-01 at `e5be972147`: two tests,
+1,186 assertions, 110.36 seconds. Evidence is retained at:
 
-- `/tmp/opencode/managed-ai-bTEU1j`: the existing shell, abort/resume, output,
+- `/tmp/opencode/managed-ai-tHAS7V`: the existing shell, abort/resume, output,
   cancellation, replacement and durable restart workflow.
-- `/tmp/opencode/managed-capabilities-U6cbee`: WorkQueue JSON/SSE operations, both
+- `/tmp/opencode/managed-capabilities-5SAWw6`: WorkQueue JSON/SSE operations, both
   reviewer and verifier children, compression, post-summary execution, retirement
   during child execution, late admission denial and pending-MCP join.
 
@@ -70,6 +70,35 @@ The trigger now distinguishes unchanged projection updates from actual
 reparenting. Both real child executions and all later retirement assertions pass;
 summary text is not accepted as proof of child execution. This is isolated source
 validation, not a production recovery or external-provider validation result.
+
+## Validation Summary
+
+Final validation after the recovery fixes, from package directories:
+
+| Scope                                                                           | Result                                  |
+| ------------------------------------------------------------------------------- | --------------------------------------- |
+| Full Core suite, 154 files                                                      | 1,338 passed, 0 failed                  |
+| Recovery, lifecycle, retirement and historical-fence HTTP/server tests, 5 files | 100 passed, 0 failed                    |
+| Full Session directory plus background-job and sharing tests, 23 files          | 568 passed, 7 skipped, 1 todo, 0 failed |
+| Both isolated source-Serve E2E files                                            | 2 passed, 0 failed                      |
+| Core and OpenCode `bun typecheck`                                               | Passed                                  |
+| Core migration generation `--check`                                             | Passed                                  |
+
+Session tests ran with `OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX` unset: an inherited
+value of `65536` overrides the fixtures' expected default of `32000`. No token-limit
+assertions or runtime behavior were changed to accommodate that environment.
+
+Earlier completed validation remains applicable: the focused capability set passed
+277 tests with 2 skipped; the native/MCP/provider safety set passed 174 tests;
+Client passed all 16 tests and SDK passed its test, with both package typechecks
+passing. Public clients and the CLI catalog were regenerated; the catalog covers
+205 operations, including both maintenance routes.
+
+An additional, unchanged `test/event-manifest.test.ts` assertion remains failing:
+it expects 89 public event types, but the manifest contains 90. The manifest test
+and Schema event definitions are unchanged from `9d3731afa90a`. This baseline
+assertion drift was not hidden or changed as part of this task; these results do
+not claim a completely green repository-wide OpenCode suite.
 
 ## Orchestrator Consumer Requirements
 
