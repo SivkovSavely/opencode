@@ -3,6 +3,7 @@ import * as Context from "effect/Context"
 import * as Effect from "effect/Effect"
 import * as Exit from "effect/Exit"
 import * as Scope from "effect/Scope"
+import { References } from "effect"
 import type { SqlClient } from "effect/unstable/sql/SqlClient"
 import type { SqlError } from "effect/unstable/sql/SqlError"
 import type { EffectCacheShape } from "drizzle-orm/cache/core/cache-effect"
@@ -128,11 +129,11 @@ export class EffectSQLiteSession<TRelations extends AnyRelations> extends SQLite
             ? Effect.succeed([undefined, connectionOption.value[0]] as const)
             : Scope.make().pipe(
                 Effect.flatMap((scope) =>
-                  Scope.provide(this.client.reserve, scope).pipe(
+                  restore(Scope.provide(this.client.reserve, scope)).pipe(
+                    // beta.83 drivers can yield between taking the permit and registering its release.
+                    Effect.provideService(References.PreventSchedulerYield, true),
+                    Effect.onExit((exit) => (Exit.isFailure(exit) ? Scope.close(scope, exit) : Effect.void)),
                     Effect.map((connection) => [scope, connection] as const),
-                    Effect.catch((error) =>
-                      Scope.close(scope, Exit.fail(error)).pipe(Effect.andThen(Effect.fail(error))),
-                    ),
                   ),
                 ),
               )

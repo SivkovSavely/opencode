@@ -1,5 +1,5 @@
 import { describe, expect } from "bun:test"
-import { DateTime, Effect, Schema } from "effect"
+import { DateTime, Deferred, Effect, Schema } from "effect"
 import { asc, eq, sql } from "drizzle-orm"
 import { Database } from "@opencode-ai/core/database/database"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
@@ -20,7 +20,13 @@ import { SessionMessageUpdater } from "@opencode-ai/core/session/message-updater
 import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { SessionExecution } from "@opencode-ai/core/session/execution"
 import { SessionInput } from "@opencode-ai/core/session/input"
-import { SessionInputTable, SessionMessageTable, SessionTable } from "@opencode-ai/core/session/sql"
+import {
+  MessageTable,
+  PartTable,
+  SessionInputTable,
+  SessionMessageTable,
+  SessionTable,
+} from "@opencode-ai/core/session/sql"
 import { testEffect } from "./lib/effect"
 import { Snapshot } from "@opencode-ai/core/snapshot"
 import { Location } from "@opencode-ai/core/location"
@@ -46,6 +52,165 @@ const assistantRow = (
 }
 
 describe("SessionProjector", () => {
+  it.live(
+    "projects concurrent related sessions' tool output in durable order while reads continue",
+    () =>
+      Effect.gen(function* () {
+        const db = (yield* Database.Service).db
+        const events = yield* EventV2.Service
+        const ids = Array.from({ length: 5 }, (_, i) => SessionV2.ID.make(`ses_burst_${i}`))
+        const messages = ids.map((_, i) => SessionV1.MessageID.make(`msg_burst_${i}`))
+        const parts = ids.map((_, i) => SessionV1.PartID.make(`prt_burst_${i}`))
+        const chunks = Array.from({ length: 12 }, (_, i) => `output-${i}\n`)
+        const started = yield* Deferred.make<void>()
+        const read = yield* Deferred.make<void>()
+
+        yield* db
+          .insert(ProjectTable)
+          .values({ id: Project.ID.global, worktree: AbsolutePath.make("/project"), sandboxes: [] })
+          .run()
+        yield* db
+          .insert(SessionTable)
+          .values(
+            ids.map((id, i) => ({
+              id,
+              project_id: Project.ID.global,
+              parent_id: i < 2 ? null : ids[i === 4 ? 1 : 0],
+              slug: `burst-${i}`,
+              directory: "/project",
+              title: `burst-${i}`,
+              version: "test",
+            })),
+          )
+          .run()
+        yield* db
+          .insert(MessageTable)
+          .values(
+            ids.map((id, i) => ({
+              id: messages[i]!,
+              session_id: id,
+              data: {
+                role: "user" as const,
+                time: { created: 0 },
+                agent: "build",
+                model: { providerID: model.providerID, modelID: model.id },
+              },
+            })),
+          )
+          .run()
+
+        yield* Effect.all(
+          [
+            Effect.forEach(
+              ids,
+              (id, i) =>
+                Effect.gen(function* () {
+                  const base = {
+                    id: parts[i]!,
+                    messageID: messages[i]!,
+                    sessionID: id,
+                    type: "tool" as const,
+                    callID: `call-${i}`,
+                    tool: "bash",
+                  }
+                  yield* Effect.forEach(
+                    chunks,
+                    (_, n) =>
+                      Effect.gen(function* () {
+                        yield* events.publish(SessionV1.Event.PartUpdated, {
+                          sessionID: id,
+                          time: n,
+                          part: {
+                            ...base,
+                            state: {
+                              status: "running",
+                              input: { command: "test" },
+                              metadata: { output: chunks.slice(0, n + 1).join("") },
+                              time: { start: 0 },
+                            },
+                          },
+                        })
+                        if (n === 0) {
+                          yield* Deferred.succeed(started, undefined)
+                          yield* Deferred.await(read)
+                        }
+                      }),
+                    { discard: true },
+                  )
+                  yield* events.publish(SessionV1.Event.PartUpdated, {
+                    sessionID: id,
+                    time: chunks.length,
+                    part: {
+                      ...base,
+                      state: {
+                        status: "completed",
+                        input: { command: "test" },
+                        output: chunks.join(""),
+                        title: "test",
+                        metadata: {},
+                        time: { start: 0, end: chunks.length },
+                      },
+                    },
+                  })
+                }),
+              { concurrency: "unbounded", discard: true },
+            ),
+            Effect.gen(function* () {
+              yield* Deferred.await(started)
+              const rows = yield* db.select({ id: EventTable.id }).from(EventTable).all()
+              expect(rows.length).toBeGreaterThan(0)
+              expect(rows.length).toBeLessThanOrEqual(5)
+              yield* Deferred.succeed(read, undefined)
+              yield* Effect.forEach(
+                Array.from({ length: 30 }),
+                () =>
+                  Effect.gen(function* () {
+                    expect(yield* db.select({ id: SessionTable.id }).from(SessionTable).all()).toHaveLength(5)
+                    yield* Effect.yieldNow
+                  }),
+                { discard: true },
+              )
+            }),
+          ],
+          { concurrency: "unbounded" },
+        )
+
+        yield* Effect.forEach(
+          ids,
+          (id, i) =>
+            Effect.gen(function* () {
+              const rows = yield* db
+                .select()
+                .from(EventTable)
+                .where(eq(EventTable.aggregate_id, id))
+                .orderBy(asc(EventTable.seq))
+                .all()
+              expect(rows.map((row) => row.seq)).toEqual(Array.from({ length: chunks.length + 1 }, (_, n) => n))
+              expect(rows.map((row) => row.data.part)).toEqual([
+                ...chunks.map((_, n) =>
+                  expect.objectContaining({
+                    state: expect.objectContaining({
+                      status: "running",
+                      metadata: { output: chunks.slice(0, n + 1).join("") },
+                    }),
+                  }),
+                ),
+                expect.objectContaining({
+                  state: expect.objectContaining({ status: "completed", output: chunks.join("") }),
+                }),
+              ])
+              expect(yield* db.select().from(PartTable).where(eq(PartTable.id, parts[i]!)).get()).toMatchObject({
+                session_id: id,
+                message_id: messages[i],
+                data: { type: "tool", state: { status: "completed", output: chunks.join("") } },
+              })
+            }),
+          { discard: true },
+        )
+      }),
+    15_000,
+  )
+
   it.effect("projects bookmark updates without overwriting usage totals", () =>
     Effect.gen(function* () {
       const { db } = yield* Database.Service
@@ -85,7 +250,8 @@ describe("SessionProjector", () => {
       })
 
       expect(
-        yield* db.select({ bookmarked: SessionTable.bookmarked, cost: SessionTable.cost, tokens: SessionTable.tokens_input })
+        yield* db
+          .select({ bookmarked: SessionTable.bookmarked, cost: SessionTable.cost, tokens: SessionTable.tokens_input })
           .from(SessionTable)
           .get(),
       ).toEqual({ bookmarked: true, cost: 12, tokens: 34 })

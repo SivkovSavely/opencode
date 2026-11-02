@@ -4,10 +4,8 @@ import { DatabaseCompatibility } from "./compatibility"
 import { drizzle } from "drizzle-orm/node-sqlite"
 import * as Context from "effect/Context"
 import * as Effect from "effect/Effect"
-import * as Fiber from "effect/Fiber"
 import { identity } from "effect/Function"
 import * as Layer from "effect/Layer"
-import * as Scope from "effect/Scope"
 import * as Semaphore from "effect/Semaphore"
 import * as Stream from "effect/Stream"
 import * as Reactivity from "effect/unstable/reactivity/Reactivity"
@@ -16,6 +14,7 @@ import type { Connection } from "effect/unstable/sql/SqlConnection"
 import { classifySqliteError, SqlError } from "effect/unstable/sql/SqlError"
 import * as Statement from "effect/unstable/sql/Statement"
 import { Sqlite } from "./sqlite"
+import { DatabaseDiagnostics } from "./diagnostics"
 
 const ATTR_DB_SYSTEM_NAME = "db.system.name"
 
@@ -49,6 +48,12 @@ interface SqliteConnection extends Connection {
 const make = (options: Config) =>
   Effect.gen(function* () {
     const native = (yield* Sqlite.Native) as DatabaseSync
+    const tracker = DatabaseDiagnostics.diagnostics.enabled
+      ? yield* Effect.acquireRelease(
+          Effect.sync(() => DatabaseDiagnostics.diagnostics.register()),
+          (tracker) => Effect.sync(() => tracker?.close()),
+        )
+      : undefined
 
     const compiler = Statement.makeCompilerSqlite(options.transformQueryNames)
     const transformRows = options.transformResultNames
@@ -60,7 +65,9 @@ const make = (options: Config) =>
         const statement = native.prepare(query)
         statement.setReadBigInts(Context.get(fiber.context, Client.SafeIntegers))
         try {
-          return Effect.succeed(statement.all(...(params as SQLInputValue[])) as Array<Record<string, unknown>>)
+          const rows = statement.all(...(params as SQLInputValue[])) as Array<Record<string, unknown>>
+          tracker?.query(query, fiber.id)
+          return Effect.succeed(rows)
         } catch (cause) {
           return Effect.fail(
             new SqlError({
@@ -76,9 +83,9 @@ const make = (options: Config) =>
         statement.setReadBigInts(Context.get(fiber.context, Client.SafeIntegers))
         statement.setReturnArrays(true)
         try {
-          return Effect.succeed(
-            statement.all(...(params as SQLInputValue[])) as unknown as ReadonlyArray<ReadonlyArray<unknown>>,
-          )
+          const rows = statement.all(...(params as SQLInputValue[])) as unknown as ReadonlyArray<ReadonlyArray<unknown>>
+          tracker?.query(query, fiber.id)
+          return Effect.succeed(rows)
         } catch (cause) {
           return Effect.fail(
             new SqlError({
@@ -115,15 +122,7 @@ const make = (options: Config) =>
     })
 
     const semaphore = yield* Semaphore.make(1)
-    const acquirer = semaphore.withPermits(1)(Effect.succeed(connection))
-    const transactionAcquirer = Effect.uninterruptibleMask((restore) => {
-      const fiber = Fiber.getCurrent()!
-      const scope = Context.getUnsafe(fiber.context, Scope.Scope)
-      return Effect.as(
-        Effect.tap(restore(semaphore.take(1)), () => Scope.addFinalizer(scope, semaphore.release(1))),
-        connection,
-      )
-    })
+    const { acquirer, transactionAcquirer } = DatabaseDiagnostics.acquisitions(connection, semaphore, tracker)
 
     const client = Object.assign(
       (yield* Client.make({
