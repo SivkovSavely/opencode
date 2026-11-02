@@ -1,5 +1,6 @@
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
-import { Effect, Layer, Context, Schema } from "effect"
+import { Effect, Layer, Context, Schema, Semaphore } from "effect"
+import { isDeepStrictEqual } from "node:util"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { Snapshot } from "@/snapshot"
@@ -82,6 +83,7 @@ const layer = Layer.effect(
     const snapshot = yield* Snapshot.Service
     const events = yield* EventV2Bridge.Service
     const config = yield* Config.Service
+    const locks = new Map<MessageID, { semaphore: Semaphore.Semaphore; users: number }>()
 
     const computeDiff = Effect.fn("SessionSummary.computeDiff")(function* (input: {
       messages: SessionV1.WithParts[]
@@ -123,17 +125,46 @@ const layer = Layer.effect(
       })
       yield* events.publish(Session.Event.Diff, { sessionID: input.sessionID, diff: [] })
       if ((yield* config.get()).snapshot === false) return
-      const all = yield* sessions.messages({ sessionID: input.sessionID }).pipe(Effect.orDie)
-      if (!all.length) return
-
-      const messages = all.filter(
-        (m) => m.info.id === input.messageID || (m.info.role === "assistant" && m.info.parentID === input.messageID),
+      yield* Effect.acquireUseRelease(
+        Effect.sync(() => {
+          const lock = locks.get(input.messageID) ?? { semaphore: Semaphore.makeUnsafe(1), users: 0 }
+          lock.users++
+          locks.set(input.messageID, lock)
+          return lock
+        }),
+        (lock) =>
+          Effect.gen(function* () {
+            const all = yield* sessions.messages({ sessionID: input.sessionID }).pipe(Effect.orDie)
+            const messages = all.filter(
+              (m) =>
+                m.info.id === input.messageID || (m.info.role === "assistant" && m.info.parentID === input.messageID),
+            )
+            const target = messages.find((m) => m.info.id === input.messageID)
+            if (!target || target.info.role !== "user") return
+            const msgDiffs = yield* computeDiff({ messages, sessionID: input.sessionID, messageID: input.messageID })
+            const current = (yield* sessions.messages({ sessionID: input.sessionID }).pipe(Effect.orDie)).find(
+              (m) => m.info.id === input.messageID,
+            )
+            if (!current || current.info.role !== "user") return
+            const summary = { ...current.info.summary, diffs: msgDiffs }
+            if (isDeepStrictEqual(current.info.summary, summary)) return
+            // Persisted formats are plain JSON, but message events require schema class instances.
+            yield* sessions.updateMessage({
+              ...current.info,
+              ...(current.info.format && {
+                format:
+                  current.info.format.type === "text"
+                    ? new SessionV1.OutputFormatText(current.info.format)
+                    : new SessionV1.OutputFormatJsonSchema(current.info.format),
+              }),
+              summary,
+            })
+          }).pipe(lock.semaphore.withPermits(1)),
+        (lock) =>
+          Effect.sync(() => {
+            if (--lock.users === 0) locks.delete(input.messageID)
+          }),
       )
-      const target = messages.find((m) => m.info.id === input.messageID)
-      if (!target || target.info.role !== "user") return
-      const msgDiffs = yield* computeDiff({ messages, sessionID: input.sessionID, messageID: input.messageID })
-      target.info.summary = { ...target.info.summary, diffs: msgDiffs }
-      yield* sessions.updateMessage(target.info)
     })
 
     const diff = Effect.fn("SessionSummary.diff")(function* (input: { sessionID: SessionID; messageID?: MessageID }) {
