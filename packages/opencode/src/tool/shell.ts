@@ -1,4 +1,4 @@
-import { Effect, Stream } from "effect"
+import { Deferred, Effect, Exit, Fiber, Queue, Stream } from "effect"
 import os from "os"
 import { createWriteStream } from "node:fs"
 import * as Tool from "./tool"
@@ -299,6 +299,7 @@ function cmd(shell: string, command: string, cwd: string, env: NodeJS.ProcessEnv
       env,
       stdin: "ignore",
       detached: false,
+      forceKillAfter: "3 seconds",
     })
   }
 
@@ -308,6 +309,7 @@ function cmd(shell: string, command: string, cwd: string, env: NodeJS.ProcessEnv
     env,
     stdin: "ignore",
     detached: process.platform !== "win32",
+    forceKillAfter: "3 seconds",
   })
 }
 const parser = lazy(async () => {
@@ -484,55 +486,57 @@ export const ShellTool = Tool.define(
         Effect.gen(function* () {
           yield* Effect.addFinalizer(closeSink)
           const handle = yield* spawner.spawn(cmd(input.shell, input.command, input.cwd, input.env))
-
-          yield* Effect.forkScoped(
-            Stream.runForEach(Stream.decodeText(handle.all), (chunk) => {
-              const size = Buffer.byteLength(chunk, "utf-8")
-              list.push({ text: chunk, size })
-              used += size
-              while (used > keep && list.length > 1) {
-                const item = list.shift()
-                if (!item) break
-                used -= item.size
-                cut = true
+          const updates = yield* Queue.sliding<void>(1)
+          const first = yield* Deferred.make<void>()
+          let published = false
+          const publisher = yield* Effect.forkScoped(
+            Effect.gen(function* () {
+              yield* Deferred.await(first)
+              while (true) {
+                yield* Effect.sleep("250 millis")
+                yield* Queue.take(updates)
+                yield* ctx.metadata({ metadata: { output: last, ...(file ? { outputPath: file } : {}) } })
               }
-
-              last = preview(last + chunk)
-
-              if (file) {
-                sink?.write(chunk)
-              } else {
-                full += chunk
-                if (Buffer.byteLength(full, "utf-8") > limits.maxBytes) {
-                  return trunc.write(full).pipe(
-                    Effect.andThen((next) =>
-                      Effect.sync(() => {
-                        file = next
-                        cut = true
-                        sink = createWriteStream(next, { flags: "a" })
-                        full = ""
-                      }).pipe(
-                        Effect.andThen(
-                          ctx.metadata({
-                            metadata: {
-                              output: last,
-                              outputPath: next,
-                            },
-                          }),
-                        ),
-                      ),
-                    ),
-                  )
-                }
-              }
-
-              return ctx.metadata({
-                metadata: {
-                  output: last,
-                  ...(file ? { outputPath: file } : {}),
-                },
-              })
             }),
+          )
+
+          const reader = yield* Effect.forkScoped(
+            Stream.runForEach(Stream.decodeText(handle.all), (chunk) =>
+              Effect.gen(function* () {
+                const size = Buffer.byteLength(chunk, "utf-8")
+                list.push({ text: chunk, size })
+                used += size
+                while (used > keep && list.length > 1) {
+                  const item = list.shift()
+                  if (!item) break
+                  used -= item.size
+                  cut = true
+                }
+
+                last = preview(last + chunk)
+
+                if (file) {
+                  sink?.write(chunk)
+                } else {
+                  full += chunk
+                  if (Buffer.byteLength(full, "utf-8") > limits.maxBytes) {
+                    const next = yield* trunc.write(full)
+                    file = next
+                    cut = true
+                    sink = createWriteStream(next, { flags: "a" })
+                    full = ""
+                  }
+                }
+
+                if (!published) {
+                  yield* ctx.metadata({ metadata: { output: last, ...(file ? { outputPath: file } : {}) } })
+                  published = true
+                  yield* Deferred.succeed(first, undefined)
+                  return
+                }
+                yield* Queue.offer(updates, undefined)
+              }),
+            ),
           )
 
           const abort = Effect.callback<void>((resume) => {
@@ -544,22 +548,47 @@ export const ShellTool = Tool.define(
 
           const timeout = Effect.sleep(`${input.timeout + 100} millis`)
 
-          const exit = yield* Effect.raceAll([
-            handle.exitCode.pipe(Effect.map((code) => ({ kind: "exit" as const, code }))),
-            abort.pipe(Effect.map(() => ({ kind: "abort" as const, code: null }))),
-            timeout.pipe(Effect.map(() => ({ kind: "timeout" as const, code: null }))),
-          ])
+          // Start process cleanup even when the enclosing tool fiber is interrupted.
+          return yield* Effect.uninterruptibleMask((restore) =>
+            Effect.gen(function* () {
+              const outcome = yield* restore(
+                Effect.raceFirst(
+                  Effect.raceFirst(
+                    Effect.all([handle.exitCode, Fiber.join(reader)], { concurrency: "unbounded" }).pipe(
+                      Effect.map(([code]) => ({ kind: "exit" as const, code })),
+                    ),
+                    Fiber.join(publisher).pipe(Effect.andThen(Effect.never)),
+                  ),
+                  Effect.raceFirst(
+                    abort.pipe(Effect.map(() => ({ kind: "abort" as const, code: null }))),
+                    timeout.pipe(Effect.map(() => ({ kind: "timeout" as const, code: null }))),
+                  ),
+                ),
+              ).pipe(Effect.exit)
 
-          if (exit.kind === "abort") {
-            aborted = true
-            yield* handle.kill({ forceKillAfter: "3 seconds" }).pipe(Effect.orDie)
-          }
-          if (exit.kind === "timeout") {
-            expired = true
-            yield* handle.kill({ forceKillAfter: "3 seconds" }).pipe(Effect.orDie)
-          }
+              if (Exit.isFailure(outcome) || outcome.value.kind !== "exit") {
+                const results = yield* Effect.all(
+                  [
+                    handle.kill({ forceKillAfter: "3 seconds" }).pipe(Effect.exit),
+                    // Allow TERM handlers to flush, but do not wait indefinitely for inherited pipes.
+                    restore(Fiber.await(reader)).pipe(
+                      Effect.timeoutOption("3500 millis"),
+                      Effect.andThen(Fiber.interrupt(reader)),
+                    ),
+                  ],
+                  { concurrency: "unbounded" },
+                )
+                if (Exit.isSuccess(outcome) && Exit.isFailure(results[0]) && (yield* handle.isRunning)) {
+                  yield* results[0]
+                }
+              }
 
-          return exit.kind === "exit" ? exit.code : null
+              const exit = yield* outcome
+              if (exit.kind === "abort") aborted = true
+              if (exit.kind === "timeout") expired = true
+              return exit.kind === "exit" ? exit.code : null
+            }),
+          )
         }),
       ).pipe(Effect.orDie)
 

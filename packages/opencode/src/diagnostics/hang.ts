@@ -1,6 +1,7 @@
 import fs from "node:fs"
 import path from "node:path"
 import { EventDiagnostics, type DiagnosticRecord } from "@opencode-ai/core/event-diagnostics"
+import { DatabaseDiagnostics } from "@opencode-ai/core/database/diagnostics"
 import { Global } from "@opencode-ai/core/global"
 import { InstallationVersion } from "@opencode-ai/core/installation/version"
 
@@ -58,6 +59,7 @@ function sample() {
     sseTransports: aggregate.transports,
     activeSnapshotDiffs: EventDiagnostics.activeDiffCount(),
     subscribers: subscriberRecords,
+    database: DatabaseDiagnostics.diagnostics.snapshot(),
     omittedSubscriberRecords: Math.max(0, EventDiagnostics.activeSubscriberCount() - subscriberRecords.length),
   })
   expected = actual + intervalMs

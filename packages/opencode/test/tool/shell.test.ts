@@ -1,7 +1,7 @@
 import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { describe, expect } from "bun:test"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
-import { Cause, Effect, Exit, Fiber, Layer } from "effect"
+import { Cause, Deferred, Effect, Exit, Fiber, Layer, Option, Stream } from "effect"
 import type * as Scope from "effect/Scope"
 import os from "os"
 import path from "path"
@@ -15,6 +15,7 @@ import { Agent } from "../../src/agent/agent"
 import { Truncate } from "@/tool/truncate"
 import { SessionID, MessageID } from "../../src/session/schema"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
+import { ChildProcessSpawner } from "effect/unstable/process/ChildProcessSpawner"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import { Plugin } from "../../src/plugin"
 import { testEffect } from "../lib/effect"
@@ -188,6 +189,293 @@ const mustTruncate = (result: {
 }
 
 describe("tool.shell", () => {
+  wintest(
+    "coalesces concurrent output without losing final output or publishing after completion",
+    () =>
+      Effect.gen(function* () {
+        const snapshots: string[][] = [[], []]
+        const command = (label: string) =>
+          `${bin} -e ${squote(`let i=0; const t=setInterval(()=>{process.stdout.write("${label}"+(i++)+"\\n"); if(i===30) clearInterval(t)}, 20)`)}`
+        const execute = (index: number, label: string) =>
+          run(
+            { command: command(label) },
+            {
+              ...ctx,
+              metadata: (value) =>
+                Effect.sleep("40 millis").pipe(
+                  Effect.andThen(
+                    Effect.sync(() => {
+                      snapshots[index].push(String(value.metadata?.output ?? ""))
+                    }),
+                  ),
+                ),
+            },
+          )
+        const results = yield* Effect.all([execute(0, "A"), execute(1, "B")], { concurrency: "unbounded" })
+        for (const [index, label] of ["A", "B"].entries()) {
+          const expected = Array.from({ length: 30 }, (_, i) => `${label}${i}\n`).join("")
+          expect(results[index].output).toBe(expected)
+          expect(results[index].metadata.output).toBe(expected)
+          const updates = snapshots[index].filter(Boolean)
+          expect(updates.length).toBeGreaterThan(0)
+          expect(updates.length).toBeLessThan(8)
+          expect(updates[0]).toContain(`${label}0\n`)
+          expect(updates.every((item) => expected.startsWith(item))).toBe(true)
+          expect(updates.every((item, i) => i === 0 || item.startsWith(updates[i - 1]))).toBe(true)
+        }
+        const counts = snapshots.map((items) => items.length)
+        yield* Effect.sleep("350 millis")
+        expect(snapshots.map((items) => items.length)).toEqual(counts)
+      }),
+    10000,
+  )
+
+  wintest(
+    "preserves output and stops metadata on cancellation",
+    () =>
+      Effect.gen(function* () {
+        const controller = new AbortController()
+        const updates: string[] = []
+        const code = `process.stdout.write("ready\\n"); setInterval(()=>process.stdout.write("tick\\n"),20)`
+        const result = yield* run(
+          { command: `${bin} -e ${squote(code)}` },
+          {
+            ...ctx,
+            abort: controller.signal,
+            metadata: (value) =>
+              Effect.sync(() => {
+                const output = String(value.metadata?.output ?? "")
+                updates.push(output)
+                if (output.includes("ready")) controller.abort()
+              }),
+          },
+        )
+        expect(result.output).toContain("ready\n")
+        expect(result.output).toContain("User aborted the command")
+        expect(result.metadata.output).toContain("ready\n")
+        const count = updates.length
+        yield* Effect.sleep("350 millis")
+        expect(updates.length).toBe(count)
+      }),
+    10000,
+  )
+
+  wintest(
+    "escalates termination after a metadata failure",
+    () =>
+      Effect.gen(function* () {
+        const start = Date.now()
+        const error = yield* fail(
+          { command: "trap '' TERM; printf ready; sleep 5", timeout: 300 },
+          {
+            ...ctx,
+            metadata: (value) =>
+              Effect.sync(() => {
+                if (value.metadata?.output) throw new Error("metadata failed")
+              }),
+          },
+        )
+        expect(error.message).toContain("metadata failed")
+        expect(Date.now() - start).toBeLessThan(4500)
+      }),
+    10000,
+  )
+
+  wintest(
+    "retains output written by a TERM handler",
+    () =>
+      Effect.gen(function* () {
+        const result = yield* run({
+          command: "trap 'printf final; exit 0' TERM; printf ready; while :; do sleep 0.1; done",
+          timeout: 250,
+        })
+        expect(result.output).toContain("ready")
+        expect(result.output).toContain("final")
+        expect(result.metadata.output).toContain("final")
+        expect(result.output).toContain("exceeding timeout")
+      }),
+    10000,
+  )
+
+  for (const mode of ["timeout", "interrupt"] as const)
+    wintest(
+      `kills on ${mode} while metadata persistence is uninterruptible`,
+      () =>
+        Effect.gen(function* () {
+          const spawner = yield* ChildProcessSpawner
+          const entered = yield* Deferred.make<void>()
+          const release = yield* Deferred.make<void>()
+          const killed = yield* Deferred.make<void>()
+          const tracked = {
+            ...spawner,
+            spawn: (command: Parameters<typeof spawner.spawn>[0]) =>
+              spawner.spawn(command).pipe(
+                Effect.map(
+                  (handle) =>
+                    new Proxy(handle, {
+                      get(target, property, receiver) {
+                        if (property === "kill") {
+                          return (options: Parameters<typeof handle.kill>[0]) =>
+                            Deferred.succeed(killed, undefined).pipe(Effect.andThen(handle.kill(options)))
+                        }
+                        return Reflect.get(target, property, receiver)
+                      },
+                    }),
+                ),
+              ),
+          }
+          const running = yield* run(
+            { command: "printf ready; sleep 3", timeout: mode === "timeout" ? 100 : 3000 },
+            {
+              ...ctx,
+              metadata: (value) =>
+                value.metadata?.output
+                  ? Deferred.succeed(entered, undefined).pipe(
+                      Effect.andThen(Deferred.await(release)),
+                      Effect.uninterruptible,
+                    )
+                  : Effect.void,
+            },
+          ).pipe(Effect.provideService(ChildProcessSpawner, tracked), Effect.forkScoped)
+          const started = yield* Deferred.await(entered).pipe(Effect.timeoutOption("2 seconds"))
+          if (mode === "interrupt") yield* Fiber.interrupt(running).pipe(Effect.forkScoped)
+          const terminated = yield* Deferred.await(killed).pipe(Effect.timeoutOption("1 second"))
+          yield* Deferred.succeed(release, undefined)
+          const result = yield* Fiber.await(running)
+          expect(Option.isSome(started)).toBe(true)
+          expect(Option.isSome(terminated)).toBe(true)
+          if (mode === "interrupt") {
+            expect(Exit.isFailure(result)).toBe(true)
+            return
+          }
+          if (Exit.isFailure(result)) return yield* result
+          expect(result.value.output).toContain("ready")
+          expect(result.value.output).toContain("exceeding timeout")
+        }),
+      10000,
+    )
+
+  wintest(
+    "bounds the output drain after termination",
+    () =>
+      Effect.gen(function* () {
+        const spawner = yield* ChildProcessSpawner
+        const tracked = {
+          ...spawner,
+          spawn: (command: Parameters<typeof spawner.spawn>[0]) =>
+            spawner.spawn(command).pipe(
+              Effect.map(
+                (handle) =>
+                  new Proxy(handle, {
+                    get(target, property, receiver) {
+                      if (property === "all") return Stream.concat(target.all, Stream.never)
+                      return Reflect.get(target, property, receiver)
+                    },
+                  }),
+              ),
+            ),
+        }
+        const start = Date.now()
+        const result = yield* run({ command: "printf ready; sleep 3", timeout: 100 }).pipe(
+          Effect.provideService(ChildProcessSpawner, tracked),
+        )
+        expect(result.output).toContain("ready")
+        expect(result.output).toContain("exceeding timeout")
+        expect(Date.now() - start).toBeLessThan(5500)
+      }),
+    10000,
+  )
+
+  wintest(
+    "publishes first output before a fast command completes",
+    () =>
+      Effect.gen(function* () {
+        const updates: string[] = []
+        const result = yield* run(
+          { command: "printf fast" },
+          {
+            ...ctx,
+            metadata: (value) =>
+              Effect.sync(() => {
+                updates.push(String(value.metadata?.output ?? ""))
+              }),
+          },
+        )
+        expect(result.output).toBe("fast")
+        expect(updates).toContain("fast")
+      }),
+    10000,
+  )
+
+  wintest(
+    "keeps the deadline active while inherited output pipes remain open",
+    () =>
+      Effect.gen(function* () {
+        const start = Date.now()
+        const result = yield* run({ command: "(sleep 2; printf late) & exit 0", timeout: 150 })
+        expect(result.output).toContain("exceeding timeout")
+        expect(Date.now() - start).toBeLessThan(1800)
+      }),
+    10000,
+  )
+
+  wintest(
+    "drains inherited output before normal completion",
+    () =>
+      Effect.gen(function* () {
+        const result = yield* run({ command: "(sleep 0.2; printf late) & exit 0", timeout: 3000 })
+        expect(result.output).toBe("late")
+        expect(result.metadata.exit).toBe(0)
+      }),
+    10000,
+  )
+
+  wintest(
+    "cancels while inherited output pipes remain open",
+    () =>
+      Effect.gen(function* () {
+        const controller = new AbortController()
+        const start = Date.now()
+        const result = yield* run(
+          { command: "(printf ready; sleep 2) & exit 0", timeout: 3000 },
+          {
+            ...ctx,
+            abort: controller.signal,
+            metadata: (value) =>
+              Effect.sync(() => {
+                if (value.metadata?.output === "ready") controller.abort()
+              }),
+          },
+        )
+        expect(result.output).toContain("ready")
+        expect(result.output).toContain("User aborted the command")
+        expect(Date.now() - start).toBeLessThan(1800)
+      }),
+    10000,
+  )
+
+  wintest(
+    "propagates intermediate metadata failures",
+    () =>
+      Effect.gen(function* () {
+        let count = 0
+        const start = Date.now()
+        const error = yield* fail(
+          { command: "trap '' TERM; printf ready; while :; do printf x; sleep 0.05; done", timeout: 5000 },
+          {
+            ...ctx,
+            metadata: (value) =>
+              Effect.sync(() => {
+                if (value.metadata?.output && ++count === 2) throw new Error("metadata failed")
+              }),
+          },
+        )
+        expect(error.message).toContain("metadata failed")
+        expect(Date.now() - start).toBeLessThan(4500)
+      }),
+    10000,
+  )
+
   wintest(
     "managed shell runs through durable runtime admission",
     () =>
@@ -1303,7 +1591,7 @@ describe("tool.shell abort", () => {
         const updates: string[] = []
         const result = yield* run(
           {
-            command: `echo first && sleep 0.1 && echo second`,
+            command: `echo first && sleep 0.1 && echo second && sleep 0.5`,
           },
           {
             ...ctx,
