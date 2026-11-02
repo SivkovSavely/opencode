@@ -3,7 +3,7 @@ export * as EventV2 from "./event"
 import { Cause, Context, Effect, Layer, Option, PubSub, Queue, Schema, Stream } from "effect"
 import { Event } from "@opencode-ai/schema/event"
 import type { Data, Definition, Payload } from "@opencode-ai/schema/event"
-import { and, asc, eq, gt, inArray } from "drizzle-orm"
+import { and, asc, eq, gt, inArray, sql } from "drizzle-orm"
 import { Database } from "./database/database"
 import { EventSequenceTable, EventTable } from "./event/sql"
 import { Location } from "./location"
@@ -11,6 +11,7 @@ import { makeGlobalNode } from "./effect/app-node"
 import { EventDiagnostics, type SubscriberHandle } from "./event-diagnostics"
 import { isDeepStrictEqual } from "node:util"
 import { Durable } from "@opencode-ai/schema/durable-event-manifest"
+import { EventData } from "./event/data"
 
 export const ID = Event.ID
 export type ID = import("@opencode-ai/schema/event").ID
@@ -254,6 +255,9 @@ export const layerWith = (options?: LayerOptions) =>
                 )
               }
               const list = projectors.get(event.type) ?? []
+              const encoded = Schema.encodeUnknownSync(definition.data)(event.data) as Record<string, unknown>
+              // Prepare storage before acquiring this transaction's SQLite writer lock.
+              const data = EventData.encode(encoded)
               return yield* Effect.uninterruptible(
                 Effect.gen(function* () {
                   const committed = yield* db
@@ -267,10 +271,6 @@ export const layerWith = (options?: LayerOptions) =>
                             .get()
                             .pipe(Effect.orDie)
                           const latest = row?.seq ?? -1
-                          const encoded = Schema.encodeUnknownSync(definition.data)(event.data) as Record<
-                            string,
-                            unknown
-                          >
                           if (input?.strictOwner && row?.ownerID && row.ownerID !== input.ownerID) {
                             yield* Effect.die(
                               new InvalidDurableEventError({
@@ -361,7 +361,7 @@ export const layerWith = (options?: LayerOptions) =>
                                 aggregate_id: aggregateID,
                                 seq,
                                 type: versionedType(definition.type, durable.version),
-                                data: encoded,
+                                data: sql`${data}`,
                               },
                             ])
                             .run()

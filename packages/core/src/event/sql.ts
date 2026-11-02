@@ -1,5 +1,12 @@
-import { sqliteTable, text, integer, index, uniqueIndex } from "drizzle-orm/sqlite-core"
+import { sqliteTable, text, integer, index, uniqueIndex, customType } from "drizzle-orm/sqlite-core"
 import type { EventV2 } from "../event"
+import { EventData } from "./data"
+
+const eventData = customType<{ data: Record<string, unknown>; driverData: string | Uint8Array }>({
+  dataType: () => "text",
+  toDriver: EventData.encode,
+  fromDriver: EventData.decode,
+})
 
 export const EventSequenceTable = sqliteTable("event_sequence", {
   aggregate_id: text().notNull().primaryKey(),
@@ -16,7 +23,7 @@ export const EventTable = sqliteTable(
       .references(() => EventSequenceTable.aggregate_id, { onDelete: "cascade" }),
     seq: integer().notNull(),
     type: text().notNull(),
-    data: text({ mode: "json" }).$type<Record<string, unknown>>().notNull(),
+    data: eventData().notNull(),
   },
   (table) => [
     uniqueIndex("event_aggregate_seq_idx").on(table.aggregate_id, table.seq),

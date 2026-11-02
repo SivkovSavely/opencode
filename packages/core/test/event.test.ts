@@ -475,6 +475,106 @@ describe("EventV2", () => {
     }),
   )
 
+  it.effect("persists mixed text and compressed session events as logical data", () =>
+    Effect.gen(function* () {
+      const events = yield* EventV2.Service
+      const { db } = yield* Database.Service
+      const aggregateID = Session.ID.create()
+      const part = {
+        id: SessionV1.PartID.ascending(),
+        messageID: SessionV1.MessageID.ascending(),
+        sessionID: aggregateID,
+        type: "text" as const,
+      }
+      const small = { sessionID: aggregateID, time: 0, part: { ...part, text: "legacy" } }
+      const large = { sessionID: aggregateID, time: 1, part: { ...part, text: "compressible text ".repeat(5000) } }
+      const tail = { sessionID: aggregateID, time: 2, part: { ...part, text: "tail" } }
+      yield* events.publish(SessionV1.Event.PartUpdated, small)
+      const published = yield* events.publish(SessionV1.Event.PartUpdated, large)
+      const storage = yield* db.all<{ seq: number; kind: string }>(
+        `SELECT seq, typeof(data) AS kind FROM event WHERE aggregate_id = '${aggregateID}' ORDER BY seq`,
+      )
+      expect(storage).toEqual([
+        { seq: 0, kind: "text" },
+        { seq: 1, kind: "blob" },
+      ])
+
+      const manifest = {
+        definitions: Event.durable([SessionV1.Event.PartUpdated]),
+        schema: SessionV1.Event.PartUpdated,
+      }
+      const first = yield* EventV2.readAggregate(db, { aggregateID, limit: 1, manifest })
+      const second = yield* EventV2.readAggregate(db, { aggregateID, after: 0, limit: 1, manifest })
+      expect(first.hasMore).toBeTrue()
+      expect(first.events[0]?.data).toEqual(small)
+      expect(second.hasMore).toBeFalse()
+      expect(second.events[0]?.data).toEqual(large)
+      expect(JSON.parse(JSON.stringify(second.events[0])).data).toEqual(large)
+
+      const fiber = yield* events.durable({ aggregateID }).pipe(Stream.take(3), Stream.runCollect, Effect.forkScoped)
+      yield* Effect.yieldNow
+      yield* events.publish(SessionV1.Event.PartUpdated, tail)
+      expect(Array.from(yield* Fiber.join(fiber)).map((event) => event.data)).toEqual([small, large, tail])
+
+      const replayed = {
+        id: published.id,
+        type: EventV2.versionedType(SessionV1.Event.PartUpdated.type, 1),
+        seq: 1,
+        aggregateID,
+        data: large,
+      }
+      const replayNotifications: EventV2.Payload[] = []
+      yield* events.listen((event) => Effect.sync(() => replayNotifications.push(event)))
+      yield* events.replay(replayed, { publish: true })
+      const exit = yield* events
+        .replay({ ...replayed, data: { ...large, part: { ...large.part, text: large.part.text + "different" } } })
+        .pipe(Effect.exit)
+      expect(String(exit)).toContain("Replay diverged")
+      expect(replayNotifications).toEqual([])
+      expect(yield* db.select().from(EventTable).where(eq(EventTable.aggregate_id, aggregateID)).all()).toHaveLength(3)
+    }),
+  )
+
+  it.effect("rolls back a compressed event and its projector inside an outer transaction", () =>
+    Effect.gen(function* () {
+      const events = yield* EventV2.Service
+      const { db } = yield* Database.Service
+      const sessionID = Session.ID.create()
+      yield* db.run("CREATE TABLE IF NOT EXISTS event_compressed_probe (value text NOT NULL)")
+      yield* db.run("DELETE FROM event_compressed_probe")
+      yield* events.project(SessionV1.Event.PartUpdated, () =>
+        db.run("INSERT INTO event_compressed_probe (value) VALUES ('projected')").pipe(Effect.orDie, Effect.asVoid),
+      )
+      const exit = yield* db
+        .transaction(() =>
+          Effect.gen(function* () {
+            yield* events.record(SessionV1.Event.PartUpdated, {
+              sessionID,
+              time: 0,
+              part: {
+                id: SessionV1.PartID.ascending(),
+                messageID: SessionV1.MessageID.ascending(),
+                sessionID,
+                type: "text",
+                text: "rollback ".repeat(10000),
+              },
+            })
+            expect(yield* db.all(`SELECT typeof(data) AS kind FROM event WHERE aggregate_id = '${sessionID}'`)).toEqual(
+              [{ kind: "blob" }],
+            )
+            yield* Effect.die("outer rollback")
+          }),
+        )
+        .pipe(Effect.exit)
+      expect(String(exit)).toContain("outer rollback")
+      expect(yield* db.all("SELECT value FROM event_compressed_probe")).toEqual([])
+      expect(yield* db.select().from(EventTable).where(eq(EventTable.aggregate_id, sessionID)).all()).toEqual([])
+      expect(
+        yield* db.select().from(EventSequenceTable).where(eq(EventSequenceTable.aggregate_id, sessionID)).all(),
+      ).toEqual([])
+    }),
+  )
+
   it.effect("replays durable aggregate events after a sequence and tails new events", () =>
     Effect.gen(function* () {
       const events = yield* EventV2.Service
