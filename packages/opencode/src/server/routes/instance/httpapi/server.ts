@@ -34,6 +34,8 @@ import { LLM } from "@/session/llm"
 import { SessionProcessor } from "@/session/processor"
 import { SessionPrompt } from "@/session/prompt"
 import { SessionQueue } from "@/session/queue"
+import { SessionSchedule } from "@/session/schedule"
+import { ServerScheduler } from "@/server/scheduler"
 import { SessionRevert } from "@/session/revert"
 import { SessionRunState } from "@/session/run-state"
 import { Session } from "@/session/session"
@@ -100,6 +102,7 @@ import { providerHandlers } from "./handlers/provider"
 import { ptyConnectHandlers, ptyHandlers } from "./handlers/pty"
 import { questionHandlers } from "./handlers/question"
 import { sessionHandlers } from "./handlers/session"
+import { sessionScheduleHandlers } from "./handlers/session-schedule"
 import { syncHandlers } from "./handlers/sync"
 import { tuiHandlers } from "./handlers/tui"
 import { handlers } from "@opencode-ai/server/handlers"
@@ -125,6 +128,29 @@ import { historicalFenceHandlers } from "./handlers/historical-fence"
 import { managedWorkspaceMiddleware } from "./middleware/managed-workspace"
 
 export const context = Context.makeUnsafe<unknown>(new Map())
+
+export class Startup extends Context.Service<Startup, { readonly initialize: Effect.Effect<void, unknown> }>()(
+  "@opencode/ServerStartup",
+) {}
+
+const startupLayer = Layer.effect(
+  Startup,
+  Effect.gen(function* () {
+    const recovery = yield* ServerRecovery.Service
+    const scheduler = yield* ServerScheduler.Service
+    const lifecycle = yield* RuntimeLifecycle.Service
+    const context = yield* Effect.context<never>()
+    const initialize = yield* Effect.cached(
+      recovery.initialize.pipe(
+        Effect.andThen(lifecycle.finishStartupRecovery()),
+        Effect.andThen(scheduler.start),
+        // Startup is invoked outside layer construction; retain server logging for the TUI.
+        Effect.provide(context),
+      ),
+    )
+    return Startup.of({ initialize })
+  }),
+)
 
 const cors = (corsOptions?: CorsOptions) =>
   HttpRouter.middleware(
@@ -175,6 +201,7 @@ const instanceApiRoutes = HttpApiBuilder.layer(InstanceHttpApi).pipe(
     permissionHandlers,
     providerHandlers,
     sessionHandlers,
+    sessionScheduleHandlers,
     syncHandlers,
     tuiHandlers,
     workspaceHandlers,
@@ -256,6 +283,7 @@ const app = LayerNode.group([
   SessionSummary.node,
   SessionPrompt.node,
   SessionQueue.node,
+  SessionSchedule.node,
   Instruction.node,
   LLM.node,
   LSP.node,
@@ -283,10 +311,22 @@ const app = LayerNode.group([
 export function createRoutes(
   corsOptions?: CorsOptions,
   runtime?: RuntimeLifecycle.Interface,
-): Layer.Layer<ServerRecovery.Service, EffectConfig.ConfigError, RouteRequirements> {
+): Layer.Layer<
+  Startup | ServerRecovery.Service | ServerScheduler.Service,
+  EffectConfig.ConfigError,
+  RouteRequirements
+> {
   const locationServiceMapV2 = buildLocationServiceMap()
-  const lifecycle = runtime ?? RuntimeLifecycle.unavailable()
-  RuntimeLifecycle.setCurrent(lifecycle)
+  const lifecycle = Layer.effect(
+    RuntimeLifecycle.Service,
+    Effect.gen(function* () {
+      // Embedded TUI execution needs the same durable claims as a listening server.
+      const lifecycle =
+        runtime ?? RuntimeLifecycle.make({ lineage: `embedded:${Database.path()}` }, yield* Effect.scope)
+      RuntimeLifecycle.setCurrent(lifecycle)
+      return lifecycle
+    }),
+  )
 
   return Layer.mergeAll(
     rootApiRoutes,
@@ -318,9 +358,11 @@ export function createRoutes(
       ]),
     ),
     Layer.provide(locationServiceMapV2),
+    Layer.provideMerge(startupLayer),
     Layer.provideMerge(ServerRecovery.layer),
+    Layer.provideMerge(ServerScheduler.layer),
     Layer.provide(AppNodeBuilderV1.build(app)),
-    Layer.provide(Layer.succeed(RuntimeLifecycle.Service)(lifecycle)),
+    Layer.provide(lifecycle),
     // Must stay last: layers provided later in this pipe build beneath earlier ones,
     // so Observability must come after every service graph. Otherwise eagerly forked
     // fibers (e.g. the ModelsDev background refresh) capture Effect's default stdout
@@ -332,7 +374,8 @@ export function createRoutes(
 export const routes = createRoutes()
 
 export const webHandler = lazy(() =>
-  HttpRouter.toWebHandler(routes, {
+  // Initialize once in the handler's scope, never in a request or instance scope.
+  HttpRouter.toWebHandler(routes.pipe(Layer.tap((context) => Context.get(context, Startup).initialize)), {
     disableLogger: true,
     memoMap,
     middleware: disposeMiddleware,

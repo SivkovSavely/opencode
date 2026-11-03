@@ -60,6 +60,7 @@ import { useLocation } from "../../context/location"
 import { QueueCommand } from "@opencode-ai/schema/queue-command"
 import { queuePayload, queueSubmissionKey } from "../../queue/payload"
 import { DialogQueue } from "../dialog-queue"
+import { DialogSchedules } from "../dialog-schedules"
 import { DialogConfirm } from "../../ui/dialog-confirm"
 
 registerOpencodeSpinner()
@@ -360,6 +361,17 @@ export function Prompt(props: PromptProps) {
         slashName: "queues",
         run: () => {
           if (props.sessionID) dialog.replace(() => <DialogQueue sessionID={props.sessionID!} />)
+        },
+      },
+      {
+        title: "Manage schedules",
+        desc: "Create, preview, edit and inspect recurring session messages",
+        name: "session.schedules",
+        category: "Session",
+        enabled: Boolean(props.sessionID),
+        slashName: "schedules",
+        run: () => {
+          if (props.sessionID) dialog.replace(() => <DialogSchedules sessionID={props.sessionID!} />)
         },
       },
       {

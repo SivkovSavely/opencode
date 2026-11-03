@@ -490,6 +490,20 @@ export const useSessionCommands = (actions: SessionCommandContext) => {
 
   const sessionCmds = () => [
     sessionCommand({
+      id: "session.schedule",
+      title: language.t("schedule.title"),
+      slash: "schedule",
+      disabled: !params.id,
+      onSelect: () => {
+        const sessionID = params.id
+        if (!sessionID) return
+        void openDialog(
+          () => import("@/components/dialog-session-schedule"),
+          (x) => dialog.show(() => <x.DialogSessionSchedule sessionID={sessionID} />),
+        )
+      },
+    }),
+    sessionCommand({
       id: "session.new",
       title: language.t("command.session.new"),
       keybind: "mod+shift+s",

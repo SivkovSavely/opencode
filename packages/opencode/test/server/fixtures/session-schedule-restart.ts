@@ -1,0 +1,135 @@
+import assert from "node:assert/strict"
+import { setTimeout } from "node:timers/promises"
+import { Database } from "@opencode-ai/core/database/database"
+import type { SessionScheduleV1 } from "@opencode-ai/schema/v1/session-schedule"
+import { createOpencodeClient } from "@opencode-ai/sdk/v2"
+import { AppRuntime } from "../../../src/effect/app-runtime"
+import { Server } from "../../../src/server/server"
+
+const directory = process.env.SCHEDULE_DIRECTORY!
+const stateFile = `${directory}/restart-state.json`
+const text = "Scheduled restart message\nPreserve exactly: <schedule> & whitespace."
+type State = { schedule: SessionScheduleV1.Info; history?: SessionScheduleV1.History }
+
+async function poll<T>(read: () => Promise<T | undefined>) {
+  const deadline = Date.now() + 20_000
+  while (Date.now() < deadline) {
+    const result = await read()
+    if (result !== undefined) return result
+    await setTimeout(25)
+  }
+  throw new Error("Timed out waiting for scheduled restart state")
+}
+
+assert.equal(Database.path(), process.env.OPENCODE_DB)
+assert.notEqual(Database.path(), ":memory:")
+const listener = await Server.listen({ hostname: "127.0.0.1", port: 0 })
+const sdk = createOpencodeClient({ baseUrl: listener.url.toString(), directory, throwOnError: true })
+async function request<T>(path: string, body?: unknown) {
+  const url = new URL(path, listener.url)
+  url.searchParams.set("directory", directory)
+  const response = await fetch(
+    url,
+    body === undefined
+      ? undefined
+      : {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(body),
+        },
+  )
+  assert.equal(response.status, 200, await response.clone().text())
+  return (await response.json()) as T
+}
+
+try {
+  if (process.argv[2] === "accept") {
+    const session = (await sdk.session.create({ title: "durable scheduled restart" })).data!
+    await sdk.session.queueUpdate({ sessionID: session.id, revision: 0, mutation: { action: "pause", paused: true } })
+    const schedule = await request<SessionScheduleV1.Info>(`/session/${session.id}/schedule`, {
+      message: text,
+      spec: { mode: "interval", amount: 1, unit: "minutes", immediate: true },
+      sessionState: "always",
+      deferUntilIdle: false,
+      missed: "all",
+      limit: 1,
+    })
+    const history = await poll(async () => {
+      const value = await request<SessionScheduleV1.History>(`/session/${session.id}/schedule/${schedule.id}/history`)
+      return value.items[0]?.state === "accepted" ? value : undefined
+    })
+    assert.equal(history.items.length, 1)
+    assert.equal(history.items[0].id, `occ_${schedule.id}_${schedule.anchor}`)
+    assert.equal(history.items[0].scheduled, schedule.anchor)
+    const queue = (await sdk.session.queueList({ sessionID: session.id })).data!
+    assert.equal(queue.paused, true)
+    assert.equal(queue.items.length, 1)
+    assert.equal(queue.items[0].id, history.items[0].id)
+    assert.equal(queue.items[0].state, "pending")
+    assert.deepEqual(queue.items[0].origin, {
+      type: "scheduled",
+      scheduleID: schedule.id,
+      occurrenceID: history.items[0].id,
+    })
+    assert(queue.items[0].payload.kind === "prompt")
+    assert.deepEqual(queue.items[0].payload.parts, [{ type: "text", text }])
+    assert.deepEqual((await sdk.session.messages({ sessionID: session.id })).data, [])
+    assert.equal((await request<SessionScheduleV1.Info>(`/session/${session.id}/schedule/${schedule.id}`)).completed, 0)
+    await Bun.write(stateFile, JSON.stringify({ schedule, history }))
+  } else {
+    const saved = (await Bun.file(stateFile).json()) as State
+    const sessionID = saved.schedule.sessionID
+    const root = `/session/${sessionID}/schedule/${saved.schedule.id}`
+    const before = await request<SessionScheduleV1.Info>(root)
+    assert.equal(before.anchor, saved.schedule.anchor)
+    assert.deepEqual(before.spec, saved.schedule.spec)
+    const persisted = await request<SessionScheduleV1.History>(`${root}/history`)
+    assert.deepEqual(persisted, saved.history)
+    if (process.argv[2] === "deliver") {
+      assert.equal(before.completed, 0)
+      assert.equal(before.next, saved.schedule.anchor + 60_000)
+      const queue = (await sdk.session.queueList({ sessionID })).data!
+      assert.equal(queue.items.length, 1)
+      assert.equal(queue.items[0].id, persisted.items[0].id)
+      await sdk.session.queueUpdate({
+        sessionID,
+        revision: queue.revision,
+        mutation: { action: "pause", paused: false },
+      })
+    }
+    const history = await poll(async () => {
+      const value = await request<SessionScheduleV1.History>(`${root}/history`)
+      return value.items[0]?.state === "delivered" ? value : undefined
+    })
+    assert.equal(history.items.length, 1)
+    assert.equal(history.items[0].id, saved.history!.items[0].id)
+    const completed = await request<SessionScheduleV1.Info>(root)
+    assert.equal(completed.status, "completed")
+    assert.equal(completed.completed, 1)
+    assert.equal(completed.next, undefined)
+    await poll(async () => {
+      const status = (await sdk.session.status()).data!
+      return !status[sessionID] || status[sessionID].type === "idle" ? true : undefined
+    })
+    const users = (await sdk.session.messages({ sessionID })).data!.filter((message) => message.info.role === "user")
+    assert.equal(users.length, 1)
+    assert(users[0].info.role === "user")
+    assert.equal(users[0].info.id, history.items[0].messageID)
+    assert.deepEqual(users[0].info.origin, {
+      type: "scheduled",
+      scheduleID: saved.schedule.id,
+      occurrenceID: history.items[0].id,
+    })
+    assert.deepEqual(
+      users[0].parts.filter((part) => part.type === "text").map((part) => part.text),
+      [text],
+    )
+    const queue = (await sdk.session.queueList({ sessionID })).data!
+    assert.equal(queue.items.filter((item) => item.state === "pending" || item.state === "claimed").length, 0)
+    await Bun.write(stateFile, JSON.stringify({ schedule: saved.schedule, history }))
+  }
+} finally {
+  await listener.stop(true)
+  await AppRuntime.dispose()
+}
+console.log(`schedule restart ${process.argv[2]} verified`)

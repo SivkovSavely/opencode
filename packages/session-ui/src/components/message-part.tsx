@@ -173,6 +173,7 @@ export interface MessageProps {
   showReasoningSummaries?: boolean
   useV2Actions?: boolean
   comments?: UserMessageComment[]
+  scheduledLabel?: string
 }
 
 export type SessionAction = (input: { sessionID: string; messageID: string }) => Promise<void> | void
@@ -930,6 +931,7 @@ export function Message(props: MessageProps) {
             actions={props.actions}
             useV2Actions={props.useV2Actions}
             comments={props.comments}
+            scheduledLabel={props.scheduledLabel}
           />
         )}
       </Match>
@@ -1175,6 +1177,7 @@ export function UserMessageDisplay(props: {
   actions?: UserActions
   useV2Actions?: boolean
   comments?: UserMessageComment[]
+  scheduledLabel?: string
 }) {
   const data = useData()
   const dialog = useDialog()
@@ -1357,7 +1360,13 @@ export function UserMessageDisplay(props: {
         </div>
       </Show>
       <Show when={props.useV2Actions}>{renderAttachments()}</Show>
-      <Show when={text() || (props.useV2Actions && messageComments().length > 0)}>
+      <Show
+        when={
+          text() ||
+          (props.useV2Actions && messageComments().length > 0) ||
+          (props.message.origin && props.scheduledLabel)
+        }
+      >
         <div data-slot="user-message-copy-wrapper">
           <Show when={metaHead() || metaTail()}>
             <span data-slot="user-message-meta-wrap">
@@ -1375,6 +1384,19 @@ export function UserMessageDisplay(props: {
                 <span data-slot="user-message-meta-tail" class="text-12-regular text-text-weak cursor-default">
                   {metaTail()}
                 </span>
+              </Show>
+              <Show when={props.scheduledLabel ? props.message.origin : undefined}>
+                {(origin) => (
+                  <span
+                    data-slot="user-message-scheduled"
+                    data-schedule-id={origin().scheduleID}
+                    data-occurrence-id={origin().occurrenceID}
+                    class="text-12-regular text-text-weak cursor-default"
+                    title={props.scheduledLabel}
+                  >
+                    {props.scheduledLabel}
+                  </span>
+                )}
               </Show>
             </span>
           </Show>

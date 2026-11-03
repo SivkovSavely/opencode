@@ -150,10 +150,36 @@ export default {
           \`position\` integer NOT NULL,
           \`payload\` text NOT NULL,
           \`submission\` text NOT NULL,
+          \`origin\` text,
           \`message_id\` text,
           \`owner\` text,
           \`time_created\` integer NOT NULL,
           CONSTRAINT \`fk_session_queue_session_id_session_id_fk\` FOREIGN KEY (\`session_id\`) REFERENCES \`session\`(\`id\`) ON DELETE CASCADE
+        );
+      `)
+      yield* tx.run(`
+        CREATE TABLE \`session_schedule_occurrence\` (
+          \`id\` text PRIMARY KEY,
+          \`schedule_id\` text NOT NULL,
+          \`scheduled\` integer NOT NULL,
+          \`processed\` integer,
+          \`state\` text NOT NULL,
+          \`message_id\` text,
+          \`error\` text,
+          CONSTRAINT \`fk_session_schedule_occurrence_schedule_id_session_schedule_id_fk\` FOREIGN KEY (\`schedule_id\`) REFERENCES \`session_schedule\`(\`id\`) ON DELETE CASCADE
+        );
+      `)
+      yield* tx.run(`
+        CREATE TABLE \`session_schedule\` (
+          \`id\` text PRIMARY KEY,
+          \`session_id\` text NOT NULL,
+          \`input\` text NOT NULL,
+          \`anchor\` integer NOT NULL,
+          \`time_created\` integer NOT NULL,
+          \`status\` text NOT NULL,
+          \`completed\` integer DEFAULT 0 NOT NULL,
+          \`next\` integer,
+          CONSTRAINT \`fk_session_schedule_session_id_session_id_fk\` FOREIGN KEY (\`session_id\`) REFERENCES \`session\`(\`id\`) ON DELETE CASCADE
         );
       `)
       yield* tx.run(`
@@ -401,6 +427,14 @@ export default {
       yield* tx.run(
         `CREATE INDEX \`session_queue_session_state_delivery_position_idx\` ON \`session_queue\` (\`session_id\`,\`state\`,\`delivery\`,\`position\`);`,
       )
+      yield* tx.run(
+        `CREATE UNIQUE INDEX \`session_schedule_occurrence_time_idx\` ON \`session_schedule_occurrence\` (\`schedule_id\`,\`scheduled\`);`,
+      )
+      yield* tx.run(
+        `CREATE INDEX \`session_schedule_occurrence_state_idx\` ON \`session_schedule_occurrence\` (\`state\`);`,
+      )
+      yield* tx.run(`CREATE INDEX \`session_schedule_due_idx\` ON \`session_schedule\` (\`status\`,\`next\`);`)
+      yield* tx.run(`CREATE INDEX \`session_schedule_session_idx\` ON \`session_schedule\` (\`session_id\`);`)
       yield* tx.run(`CREATE UNIQUE INDEX \`event_aggregate_seq_idx\` ON \`event\` (\`aggregate_id\`,\`seq\`);`)
       yield* tx.run(`CREATE INDEX \`event_aggregate_type_seq_idx\` ON \`event\` (\`aggregate_id\`,\`type\`,\`seq\`);`)
       yield* tx.run(

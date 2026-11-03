@@ -13,6 +13,7 @@ import {
   Effect,
   Exit,
   Layer,
+  References,
   Schema,
   Scope,
   Semaphore,
@@ -78,6 +79,10 @@ export type Interface = {
     readonly restartSupported: boolean
   }
   readonly bindDatabase: (database: Database.Interface) => void
+  /** Short durable mutations only; acquire before the database writer lock, without nesting. */
+  readonly withDurableAdmission: <A, E, R>(
+    effect: Effect.Effect<A, E, R>,
+  ) => Effect.Effect<A, E | RuntimeDrainingError, R>
   readonly finishStartupRecovery: () => Effect.Effect<void>
   readonly recoveryPrepared: (sessionID: string) => Effect.Effect<void>
   /** Each successful admission requires exactly one owner release, even after cancellation. */
@@ -393,6 +398,22 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
   const draining = Deferred.makeUnsafe<void>()
   const stopped = Deferred.makeUnsafe<{ action: Action }>()
   const recoveryPermits = Semaphore.makeUnsafe(2)
+  const durableAdmission = Semaphore.makeUnsafe(1)
+  const withDurablePermit = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+    Effect.flatMap(Effect.service(References.PreventSchedulerYield), (prevent) =>
+      durableAdmission
+        .withPermit(effect.pipe(Effect.provideService(References.PreventSchedulerYield, prevent)))
+        // beta.83 can yield after taking a permit but before registering its release.
+        .pipe(Effect.provideService(References.PreventSchedulerYield, true)),
+    )
+  const withDurableAdmission: Interface["withDurableAdmission"] = (effect) =>
+    withDurablePermit(
+      Effect.gen(function* () {
+        if (SynchronizedRef.getUnsafe(ref).phase !== "running")
+          return yield* new RuntimeDrainingError({ message: "Runtime is draining" })
+        return yield* effect
+      }),
+    )
   const notificationClaims = new Set<string>()
   const idleWaiters = new Map<string, Deferred.Deferred<boolean>>()
   const retryWakes = new Map<string, { attempt: number; retryAt: number; deferred: Deferred.Deferred<void> }>()
@@ -748,17 +769,19 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
     Scope.addFinalizer(
       scope,
       Effect.gen(function* () {
-        yield* SynchronizedRef.update(
-          ref,
-          (local): LocalState =>
-            local.phase !== "running"
-              ? local
-              : {
-                  ...local,
-                  phase: "draining",
-                  action: "shutdown",
-                  drainStarted: true,
-                },
+        yield* withDurablePermit(
+          SynchronizedRef.update(
+            ref,
+            (local): LocalState =>
+              local.phase !== "running"
+                ? local
+                : {
+                    ...local,
+                    phase: "draining",
+                    action: "shutdown",
+                    drainStarted: true,
+                  },
+          ),
         )
         yield* Deferred.succeed(draining, undefined).pipe(Effect.ignore)
         for (const entry of managed.values()) entry.cancel()
@@ -781,18 +804,20 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
   })
 
   const request = Effect.fn("RuntimeLifecycle.request")(function* (action: Action) {
-    const result = yield* SynchronizedRef.modify(
-      ref,
-      (state): readonly [{ accepted: boolean; action?: Action; started: boolean }, LocalState] => {
-        if (state.phase === "running") {
-          return [
-            { accepted: true, action, started: true },
-            { ...state, phase: "draining", action, drainStarted: true },
-          ] as const
-        }
-        if (state.action === action) return [{ accepted: true, action, started: false }, state] as const
-        return [{ accepted: false, action: state.action, started: false }, state] as const
-      },
+    const result = yield* withDurablePermit(
+      SynchronizedRef.modify(
+        ref,
+        (state): readonly [{ accepted: boolean; action?: Action; started: boolean }, LocalState] => {
+          if (state.phase === "running") {
+            return [
+              { accepted: true, action, started: true },
+              { ...state, phase: "draining", action, drainStarted: true },
+            ] as const
+          }
+          if (state.action === action) return [{ accepted: true, action, started: false }, state] as const
+          return [{ accepted: false, action: state.action, started: false }, state] as const
+        },
+      ),
     )
     if (result.accepted) {
       yield* Deferred.succeed(draining, undefined).pipe(Effect.ignore)
@@ -1091,7 +1116,8 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
       process.env.OPENCODE_MANAGED_PLUGIN_ALLOWLIST.trim() !== "[]"
     )
       return yield* new RuntimeDrainingError({ message: "Managed model execution requires an empty plugin allowlist" })
-    if (startupReady && input.recoveryFence === undefined) yield* Deferred.await(startupReady).pipe(Effect.interruptible)
+    if (startupReady && input.recoveryFence === undefined)
+      yield* Deferred.await(startupReady).pipe(Effect.interruptible)
     while (true) {
       const wait = yield* SynchronizedRef.modifyEffect(
         ref,
@@ -1183,7 +1209,12 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
             const claimed = yield* admitDurably(admissionInput, row)
             if (input.managedChildAuthorization) childAuthorizations.delete(input.managedChildAuthorization)
             const active = new Map(state.active)
-            active.set(input.sessionID, { ...local, fence: claimed.row.fence, leases: local.leases + 1, mode: "active" })
+            active.set(input.sessionID, {
+              ...local,
+              fence: claimed.row.fence,
+              leases: local.leases + 1,
+              mode: "active",
+            })
             const parentModeOverrides = new Map(state.parentModeOverrides)
             parentModeOverrides.delete(input.sessionID)
             return [
@@ -2800,6 +2831,7 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
 
   return {
     identity,
+    withDurableAdmission,
     bindDatabase(database: Database.Interface) {
       databaseRef.current = database
     },
@@ -2848,6 +2880,7 @@ export function unavailable(): Interface {
   const status = { state: "running" as const, active: 0, parked: 0, ...identity }
   return {
     identity,
+    withDurableAdmission: (effect) => effect,
     bindDatabase() {},
     finishStartupRecovery: () => Effect.void,
     recoveryPrepared: () => Effect.void,

@@ -1,9 +1,9 @@
 {
   "version": "7",
   "dialect": "sqlite",
-  "id": "ba223fc8-0f47-4a0e-a839-03c45d791748",
+  "id": "5041f680-12ea-41a1-89ec-93efa8404df7",
   "prevIds": [
-    "e291bea9-577c-49f2-9aae-84c70f50078b"
+    "ba223fc8-0f47-4a0e-a839-03c45d791748"
   ],
   "ddl": [
     {
@@ -60,6 +60,14 @@
     },
     {
       "name": "session_queue",
+      "entityType": "tables"
+    },
+    {
+      "name": "session_schedule_occurrence",
+      "entityType": "tables"
+    },
+    {
+      "name": "session_schedule",
       "entityType": "tables"
     },
     {
@@ -1004,6 +1012,16 @@
       "autoincrement": false,
       "default": null,
       "generated": null,
+      "name": "origin",
+      "entityType": "columns",
+      "table": "session_queue"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
       "name": "message_id",
       "entityType": "columns",
       "table": "session_queue"
@@ -1027,6 +1045,156 @@
       "name": "time_created",
       "entityType": "columns",
       "table": "session_queue"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "id",
+      "entityType": "columns",
+      "table": "session_schedule_occurrence"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "schedule_id",
+      "entityType": "columns",
+      "table": "session_schedule_occurrence"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "scheduled",
+      "entityType": "columns",
+      "table": "session_schedule_occurrence"
+    },
+    {
+      "type": "integer",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "processed",
+      "entityType": "columns",
+      "table": "session_schedule_occurrence"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "state",
+      "entityType": "columns",
+      "table": "session_schedule_occurrence"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "message_id",
+      "entityType": "columns",
+      "table": "session_schedule_occurrence"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "error",
+      "entityType": "columns",
+      "table": "session_schedule_occurrence"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "id",
+      "entityType": "columns",
+      "table": "session_schedule"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "session_id",
+      "entityType": "columns",
+      "table": "session_schedule"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "input",
+      "entityType": "columns",
+      "table": "session_schedule"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "anchor",
+      "entityType": "columns",
+      "table": "session_schedule"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "time_created",
+      "entityType": "columns",
+      "table": "session_schedule"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "status",
+      "entityType": "columns",
+      "table": "session_schedule"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "0",
+      "generated": null,
+      "name": "completed",
+      "entityType": "columns",
+      "table": "session_schedule"
+    },
+    {
+      "type": "integer",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "next",
+      "entityType": "columns",
+      "table": "session_schedule"
     },
     {
       "type": "integer",
@@ -2475,6 +2643,36 @@
     },
     {
       "columns": [
+        "schedule_id"
+      ],
+      "tableTo": "session_schedule",
+      "columnsTo": [
+        "id"
+      ],
+      "onUpdate": "NO ACTION",
+      "onDelete": "CASCADE",
+      "nameExplicit": false,
+      "name": "fk_session_schedule_occurrence_schedule_id_session_schedule_id_fk",
+      "entityType": "fks",
+      "table": "session_schedule_occurrence"
+    },
+    {
+      "columns": [
+        "session_id"
+      ],
+      "tableTo": "session",
+      "columnsTo": [
+        "id"
+      ],
+      "onUpdate": "NO ACTION",
+      "onDelete": "CASCADE",
+      "nameExplicit": false,
+      "name": "fk_session_schedule_session_id_session_id_fk",
+      "entityType": "fks",
+      "table": "session_schedule"
+    },
+    {
+      "columns": [
         "part_id"
       ],
       "tableTo": "part",
@@ -2830,6 +3028,24 @@
         "id"
       ],
       "nameExplicit": false,
+      "name": "session_schedule_occurrence_pk",
+      "table": "session_schedule_occurrence",
+      "entityType": "pks"
+    },
+    {
+      "columns": [
+        "id"
+      ],
+      "nameExplicit": false,
+      "name": "session_schedule_pk",
+      "table": "session_schedule",
+      "entityType": "pks"
+    },
+    {
+      "columns": [
+        "id"
+      ],
+      "nameExplicit": false,
       "name": "transcript_search_state_pk",
       "table": "transcript_search_state",
       "entityType": "pks"
@@ -3100,6 +3316,70 @@
       "name": "session_queue_session_state_delivery_position_idx",
       "entityType": "indexes",
       "table": "session_queue"
+    },
+    {
+      "columns": [
+        {
+          "value": "schedule_id",
+          "isExpression": false
+        },
+        {
+          "value": "scheduled",
+          "isExpression": false
+        }
+      ],
+      "isUnique": true,
+      "where": null,
+      "origin": "manual",
+      "name": "session_schedule_occurrence_time_idx",
+      "entityType": "indexes",
+      "table": "session_schedule_occurrence"
+    },
+    {
+      "columns": [
+        {
+          "value": "state",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "origin": "manual",
+      "name": "session_schedule_occurrence_state_idx",
+      "entityType": "indexes",
+      "table": "session_schedule_occurrence"
+    },
+    {
+      "columns": [
+        {
+          "value": "status",
+          "isExpression": false
+        },
+        {
+          "value": "next",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "origin": "manual",
+      "name": "session_schedule_due_idx",
+      "entityType": "indexes",
+      "table": "session_schedule"
+    },
+    {
+      "columns": [
+        {
+          "value": "session_id",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "origin": "manual",
+      "name": "session_schedule_session_idx",
+      "entityType": "indexes",
+      "table": "session_schedule"
     },
     {
       "columns": [

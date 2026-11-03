@@ -27,6 +27,7 @@ export const SessionQueueTable = sqliteTable(
     payload: text({ mode: "json" }).$type<(typeof SessionQueueV1.Payload)["Encoded"]>().notNull(),
     // Immutable admission identity survives conversion, deletion, and delivery.
     submission: text().notNull(),
+    origin: text({ mode: "json" }).$type<SessionV1.ScheduledOrigin>(),
     message_id: text().$type<SessionV1.MessageID>(),
     owner: text(),
     time_created: integer().notNull(),

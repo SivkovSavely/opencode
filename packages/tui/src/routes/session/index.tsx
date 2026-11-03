@@ -23,6 +23,7 @@ import { useEvent } from "../../context/event"
 import { SplitBorder } from "../../ui/border"
 import { useTuiPaths, useTuiTerminalEnvironment } from "../../context/runtime"
 import { Spinner } from "../../component/spinner"
+import { UserMessageMetadata } from "../../component/user-message-metadata"
 import { createSyntaxStyleMemo, generateSubtleSyntax, selectedForeground, useTheme } from "../../context/theme"
 import { BoxRenderable, ScrollBoxRenderable, addDefaultParsers, TextAttributes, RGBA } from "@opentui/core"
 import { Prompt, type PromptRef } from "../../component/prompt"
@@ -1379,7 +1380,8 @@ function UserMessage(props: {
   const [hover, setHover] = createSignal(false)
   const color = createMemo(() => local.agent.color(props.message.agent))
   const steeringFg = createMemo(() => selectedForeground(theme, color()))
-  const metadataVisible = createMemo(() => props.steering || ctx.showTimestamps())
+  const scheduled = () => props.message.origin?.type === "scheduled"
+  const metadataVisible = createMemo(() => scheduled() || props.steering || ctx.showTimestamps())
 
   const compaction = createMemo(() => props.parts.find((x) => x.type === "compaction"))
 
@@ -1426,22 +1428,14 @@ function UserMessage(props: {
                 </For>
               </box>
             </Show>
-            <Show
-              when={props.steering}
-              fallback={
-                <Show when={ctx.showTimestamps()}>
-                  <text fg={theme.textMuted}>
-                    <span style={{ fg: theme.textMuted }}>
-                      {Locale.todayTimeOrDateTime(props.message.time.created)}
-                    </span>
-                  </text>
-                </Show>
-              }
-            >
-              <text fg={theme.textMuted}>
-                <span style={{ bg: color(), fg: steeringFg(), bold: true }}> STEERING </span>
-              </text>
-            </Show>
+            <UserMessageMetadata
+              scheduled={scheduled()}
+              steering={props.steering}
+              timestamp={ctx.showTimestamps() ? Locale.todayTimeOrDateTime(props.message.time.created) : undefined}
+              color={color()}
+              foreground={steeringFg()}
+              muted={theme.textMuted}
+            />
           </box>
         </box>
       </Show>

@@ -156,6 +156,11 @@ export interface Interface {
     sessionID: SessionID,
     input: SessionQueueV1.Submit,
   ) => Effect.Effect<SessionQueueV1.Snapshot, SessionQueue.QueueError>
+  readonly queueSubmitScheduled: (
+    sessionID: SessionID,
+    input: SessionQueueV1.Submit,
+    origin: SessionV1.ScheduledOrigin,
+  ) => Effect.Effect<SessionQueueV1.Snapshot, SessionQueue.QueueError>
   readonly queueUpdate: (
     sessionID: SessionID,
     input: SessionQueueV1.Update,
@@ -1073,6 +1078,7 @@ const layer = Layer.effect(
       const info: SessionV1.User = {
         id: input.messageID ?? MessageID.ascending(),
         role: "user",
+        ...(delivery?.origin ? { origin: delivery.origin } : {}),
         sessionID: input.sessionID,
         time: { created: Date.now() },
         tools: input.tools,
@@ -1820,7 +1826,11 @@ const layer = Layer.effect(
       return true
     })
 
-    const wakeQueue = Effect.fn("SessionPrompt.wakeQueue")(function* (sessionID: SessionID, explicit = false) {
+    const wakeQueue = Effect.fn("SessionPrompt.wakeQueue")(function* (
+      sessionID: SessionID,
+      explicit = false,
+      scheduled = false,
+    ) {
       const flush = yield* InstanceState.get(queueState)
       let interrupted = false
       const prepare = yield* Effect.cached(
@@ -1849,12 +1859,24 @@ const layer = Layer.effect(
               rejectRecoveryNeeded: true,
             })
             .pipe(
+              Effect.catchCause((cause) => {
+                const error = Cause.squash(cause)
+                return scheduled &&
+                  !Cause.hasInterrupts(cause) &&
+                  error instanceof RuntimeLifecycle.RuntimeFencedTransitionError
+                  ? Effect.succeed(undefined)
+                  : Effect.failCause(cause)
+              }),
               Effect.catchTag("RuntimeDrainingError", () =>
-                queue.block(sessionID).pipe(
-                  Effect.orDie,
-                  Effect.tap(() => Effect.sync(() => flush.delete(sessionID))),
-                  Effect.as(undefined),
-                ),
+                // A competing runtime may win between the scheduler's check and
+                // admission. Leave its input pending for durable reconciliation.
+                scheduled
+                  ? Effect.succeed(undefined)
+                  : queue.block(sessionID).pipe(
+                      Effect.orDie,
+                      Effect.tap(() => Effect.sync(() => flush.delete(sessionID))),
+                      Effect.as(undefined),
+                    ),
               ),
               (acquire) =>
                 Effect.acquireRelease(
@@ -1945,6 +1967,17 @@ const layer = Layer.effect(
       yield* requireManagedRootQueue(sessionID)
       yield* queue.enqueue(sessionID, input)
       yield* wakeQueue(sessionID)
+      return yield* notifyQueue(sessionID)
+    })
+
+    const queueSubmitScheduled = Effect.fn("SessionPrompt.queueSubmitScheduled")(function* (
+      sessionID: SessionID,
+      input: SessionQueueV1.Submit,
+      origin: SessionV1.ScheduledOrigin,
+    ) {
+      yield* requireManagedRootQueue(sessionID)
+      yield* queue.enqueueScheduled(sessionID, input, origin)
+      yield* wakeQueue(sessionID, false, true)
       return yield* notifyQueue(sessionID)
     })
 
@@ -2960,6 +2993,7 @@ const layer = Layer.effect(
       command,
       resolvePromptParts,
       queueSubmit,
+      queueSubmitScheduled,
       queueUpdate,
       queueFlush,
       queueResume,

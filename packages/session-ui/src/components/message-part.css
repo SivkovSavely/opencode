@@ -205,6 +205,12 @@
     text-align: end;
   }
 
+  [data-slot="user-message-scheduled"] {
+    margin-inline-start: 10px;
+    flex: 0 0 auto;
+    white-space: nowrap;
+  }
+
   &:hover [data-slot="user-message-copy-wrapper"],
   &:focus-within [data-slot="user-message-copy-wrapper"] {
     opacity: 1;

@@ -296,6 +296,7 @@ export function MessageTimeline(props: {
   const queueLabel = () =>
     queue.count() ? language.t("queue.menu.count", { count: queue.count() }) : language.t("queue.menu.empty")
   const manageQueue = () => dialog.show(() => <DialogSessionQueue queue={queue} />)
+  const manageSchedules = () => command.trigger("session.schedule")
   const openJumpToMessage = (id: string) => {
     const key = sessionKey()
     let selected = false
@@ -1261,6 +1262,7 @@ export function MessageTimeline(props: {
                   <div data-slot="session-turn-message-content" aria-live="off">
                     <Message
                       message={message()}
+                      scheduledLabel={language.t("schedule.origin")}
                       parts={getMsgParts(userMessageRow().userMessageID)}
                       actions={props.actions}
                       useV2Actions={settings.general.newLayoutDesigns()}
@@ -1697,6 +1699,9 @@ export function MessageTimeline(props: {
                                 <DropdownMenu.Item onSelect={manageQueue}>
                                   <DropdownMenu.ItemLabel>{queueLabel()}</DropdownMenu.ItemLabel>
                                 </DropdownMenu.Item>
+                                <DropdownMenu.Item onSelect={manageSchedules}>
+                                  <DropdownMenu.ItemLabel>{language.t("schedule.title")}</DropdownMenu.ItemLabel>
+                                </DropdownMenu.Item>
                                 <DropdownMenu.Item onSelect={() => exportSession(id)}>
                                   <DropdownMenu.ItemLabel>{language.t("common.export")}...</DropdownMenu.ItemLabel>
                                 </DropdownMenu.Item>
@@ -1780,6 +1785,7 @@ export function MessageTimeline(props: {
                                 </MenuV2.Item>
                               </Show>
                               <MenuV2.Item onSelect={manageQueue}>{queueLabel()}</MenuV2.Item>
+                              <MenuV2.Item onSelect={manageSchedules}>{language.t("schedule.title")}</MenuV2.Item>
                               <MenuV2.Item onSelect={() => exportSession(id)}>
                                 {language.t("common.export")}...
                               </MenuV2.Item>

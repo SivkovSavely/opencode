@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test"
 import { Database } from "@opencode-ai/core/database/database"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
-import { Clock, Deferred, Duration, Effect, Exit, Fiber, Logger, Ref, Scope } from "effect"
+import { Clock, Deferred, Duration, Effect, Exit, Fiber, Logger, Ref, References, Scope } from "effect"
 import * as TestClock from "effect/testing/TestClock"
 import { randomUUID } from "node:crypto"
 import { sql } from "drizzle-orm"
@@ -86,6 +86,139 @@ const replaceOwner = Effect.fnUntraced(function* (
 })
 
 describe("runtime lifecycle", () => {
+  it.live("finishes an admitted durable commit before closing admission for draining", () =>
+    Effect.gen(function* () {
+      const database = yield* Database.Service
+      const runtime = RuntimeLifecycle.make({ lineage: randomUUID() }, yield* Effect.scope, database)
+      const sessionID = yield* seedSession(database)
+      const entered = yield* Deferred.make<void>()
+      const release = yield* Deferred.make<void>()
+      const requesting = yield* Deferred.make<void>()
+      const order: string[] = []
+      const mutation = yield* runtime
+        .withDurableAdmission(
+          Effect.gen(function* () {
+            yield* Deferred.succeed(entered, undefined)
+            yield* Deferred.await(release)
+            yield* database.db.transaction(() =>
+              database.db.run(sql`UPDATE session SET title = 'admitted' WHERE id = ${sessionID}`),
+            )
+            order.push("committed")
+          }),
+        )
+        .pipe(Effect.forkChild)
+      yield* Deferred.await(entered)
+      const request = yield* Effect.gen(function* () {
+        yield* Deferred.succeed(requesting, undefined)
+        const status = yield* runtime.request("shutdown")
+        order.push("draining")
+        return status
+      }).pipe(Effect.forkChild)
+      yield* Deferred.await(requesting)
+      expect((yield* runtime.status()).state).toBe("running")
+      yield* Deferred.succeed(release, undefined)
+      yield* Fiber.join(mutation)
+      yield* Fiber.join(request)
+      expect(order).toEqual(["committed", "draining"])
+      const rejected = yield* runtime
+        .withDurableAdmission(database.db.run(sql`UPDATE session SET title = 'late' WHERE id = ${sessionID}`))
+        .pipe(Effect.exit)
+      expect(Exit.isFailure(rejected)).toBe(true)
+      expect(yield* database.db.get(sql`SELECT title FROM session WHERE id = ${sessionID}`)).toEqual({
+        title: "admitted",
+      })
+    }),
+  )
+
+  it.live("releases durable admission permits on typed failure and interruption", () =>
+    Effect.gen(function* () {
+      const database = yield* Database.Service
+      const runtime = RuntimeLifecycle.make({ lineage: randomUUID() }, yield* Effect.scope, database)
+      const failed = yield* runtime.withDurableAdmission(Effect.fail("expected")).pipe(Effect.exit)
+      expect(Exit.isFailure(failed)).toBe(true)
+      expect(yield* runtime.withDurableAdmission(Effect.succeed(42))).toBe(42)
+      const entered = yield* Deferred.make<void>()
+      const mutation = yield* runtime
+        .withDurableAdmission(Deferred.succeed(entered, undefined).pipe(Effect.andThen(Effect.never)))
+        .pipe(Effect.forkChild)
+      yield* Deferred.await(entered)
+      yield* Fiber.interrupt(mutation)
+      expect((yield* runtime.request("shutdown")).state).not.toBe("running")
+      expect(Exit.isFailure(yield* runtime.withDurableAdmission(Effect.void).pipe(Effect.exit))).toBe(true)
+    }),
+  )
+
+  it.live("does not leak durable admission at automatic yield boundaries", () =>
+    Effect.gen(function* () {
+      for (const budget of [32, 2048]) {
+        const scope = yield* Scope.make()
+        const runtime = RuntimeLifecycle.make({ lineage: randomUUID() }, scope)
+        const leaks: number[] = []
+        for (let padding = Math.max(0, budget - 68); padding < budget + 52; padding++) {
+          const mutation = yield* Effect.gen(function* () {
+            for (let i = 0; i < padding; i++) yield* Effect.sync(() => {})
+            yield* runtime.withDurableAdmission(Effect.never)
+          }).pipe(
+            Effect.provideService(References.MaxOpsBeforeYield, budget),
+            Effect.forkChild({ startImmediately: true }),
+          )
+          yield* Fiber.interrupt(mutation)
+          const reused = yield* runtime
+            .withDurableAdmission(Effect.service(References.PreventSchedulerYield))
+            .pipe(Effect.timeoutOption("50 millis"))
+          if (reused._tag === "None") {
+            leaks.push(padding)
+            break
+          }
+          expect(reused.value).toBe(false)
+        }
+        expect(leaks).toEqual([])
+        expect((yield* runtime.request("shutdown").pipe(Effect.timeoutOption("200 millis")))._tag).toBe("Some")
+        yield* Scope.close(scope, Exit.void)
+      }
+    }),
+  )
+
+  it.live("interrupts a durable admission waiter without affecting its owner", () =>
+    Effect.gen(function* () {
+      const runtime = RuntimeLifecycle.make({ lineage: randomUUID() }, yield* Effect.scope)
+      const entered = yield* Deferred.make<void>()
+      const release = yield* Deferred.make<void>()
+      const owner = yield* runtime
+        .withDurableAdmission(Deferred.succeed(entered, undefined).pipe(Effect.andThen(Deferred.await(release))))
+        .pipe(Effect.forkChild)
+      yield* Deferred.await(entered)
+      const waiter = yield* runtime.withDurableAdmission(Effect.void).pipe(Effect.forkChild)
+      yield* Effect.yieldNow
+      expect((yield* Fiber.interrupt(waiter).pipe(Effect.timeoutOption("200 millis")))._tag).toBe("Some")
+      yield* Deferred.succeed(release, undefined)
+      yield* Fiber.join(owner)
+      expect(yield* runtime.withDurableAdmission(Effect.succeed("reused"))).toBe("reused")
+      expect((yield* runtime.request("shutdown")).state).not.toBe("running")
+    }),
+  )
+
+  it.live("coordinates scope-finalizer draining with in-flight durable admission", () =>
+    Effect.gen(function* () {
+      const scope = yield* Scope.make()
+      yield* Effect.addFinalizer(() => Scope.close(scope, Exit.void))
+      const database = yield* Database.Service
+      const runtime = RuntimeLifecycle.make({ lineage: randomUUID() }, scope, database)
+      const entered = yield* Deferred.make<void>()
+      const release = yield* Deferred.make<void>()
+      const mutation = yield* runtime
+        .withDurableAdmission(Deferred.succeed(entered, undefined).pipe(Effect.andThen(Deferred.await(release))))
+        .pipe(Effect.forkChild)
+      yield* Deferred.await(entered)
+      const closing = yield* Scope.close(scope, Exit.void).pipe(Effect.forkChild)
+      expect((yield* runtime.status()).state).toBe("running")
+      yield* Deferred.succeed(release, undefined)
+      yield* Fiber.join(mutation)
+      yield* Fiber.join(closing)
+      expect(Exit.isFailure(yield* runtime.withDurableAdmission(Effect.void).pipe(Effect.exit))).toBe(true)
+    }),
+  )
+
   test("reports the listener runtime and rejects unsupported restart", async () => {
     const listener = await Server.listen({ hostname: "127.0.0.1", port: 0 })
     try {

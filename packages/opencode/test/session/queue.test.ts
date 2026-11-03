@@ -65,6 +65,28 @@ const bubble = Effect.fnUntraced(function* (sessionID: SessionID) {
 })
 
 describe("legacy session queue store", () => {
+  it.instance("keeps scheduled origin durable and outside the public submission identity", () =>
+    Effect.gen(function* () {
+      const s = yield* setup
+      const origin = { type: "scheduled" as const, scheduleID: "sch_test", occurrenceID: "occ_test" }
+      const submitted = yield* s.queue.enqueueScheduled(s.sessionID, { id: origin.occurrenceID, payload }, origin)
+      expect(submitted.items[0]?.origin).toEqual(origin)
+      expect(yield* s.queue.enqueueScheduled(s.sessionID, { id: origin.occurrenceID, payload }, origin)).toEqual(
+        submitted,
+      )
+      const publicRetry = yield* s.queue
+        .enqueue(s.sessionID, { id: origin.occurrenceID, payload })
+        .pipe(Effect.result)
+      expect(Result.isFailure(publicRetry) && publicRetry.failure.reason).toBe("conflict")
+      const decoded = Schema.decodeUnknownSync(SessionQueueV1.Submit)({ id: "ordinary", payload, origin })
+      yield* s.queue.enqueue(s.sessionID, decoded)
+      expect((yield* s.queue.get(s.sessionID, "ordinary")).origin).toBeUndefined()
+      expect((yield* s.queue.claimNext(s.sessionID))?.origin).toEqual(origin)
+      yield* s.queue.delivered(s.sessionID, origin.occurrenceID)
+      expect((yield* s.queue.get(s.sessionID, origin.occurrenceID)).origin).toEqual(origin)
+    }),
+  )
+
   it.instance("rejects empty inputs and expiring attachments without changing durable state", () =>
     Effect.gen(function* () {
       const s = yield* setup

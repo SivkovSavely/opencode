@@ -236,6 +236,24 @@ import type {
   SessionRetryResponses,
   SessionRevertErrors,
   SessionRevertResponses,
+  SessionScheduleCreateErrors,
+  SessionScheduleCreateResponses,
+  SessionScheduleGetErrors,
+  SessionScheduleGetResponses,
+  SessionScheduleHistoryErrors,
+  SessionScheduleHistoryResponses,
+  SessionScheduleListErrors,
+  SessionScheduleListResponses,
+  SessionSchedulePauseErrors,
+  SessionSchedulePauseResponses,
+  SessionSchedulePreviewErrors,
+  SessionSchedulePreviewResponses,
+  SessionScheduleRemoveErrors,
+  SessionScheduleRemoveResponses,
+  SessionScheduleUpdateErrors,
+  SessionScheduleUpdateResponses,
+  SessionScheduleV1Input,
+  SessionScheduleV1Spec,
   SessionShareErrors,
   SessionShareResponses,
   SessionShellErrors,
@@ -4979,6 +4997,314 @@ export class Part extends HeyApiClient {
   }
 }
 
+export class SessionSchedule extends HeyApiClient {
+  /**
+   * List session schedules
+   */
+  public list<ThrowOnError extends boolean = false>(
+    parameters: {
+      sessionID: string
+      directory?: string
+      workspace?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "sessionID" },
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).get<SessionScheduleListResponses, SessionScheduleListErrors, ThrowOnError>({
+      url: "/session/{sessionID}/schedule",
+      ...options,
+      ...params,
+    })
+  }
+
+  /**
+   * Create session schedule
+   */
+  public create<ThrowOnError extends boolean = false>(
+    parameters: {
+      sessionID: string
+      directory?: string
+      workspace?: string
+      sessionScheduleV1Input?: SessionScheduleV1Input
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "sessionID" },
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+            { key: "sessionScheduleV1Input", map: "body" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).post<
+      SessionScheduleCreateResponses,
+      SessionScheduleCreateErrors,
+      ThrowOnError
+    >({
+      url: "/session/{sessionID}/schedule",
+      ...options,
+      ...params,
+      headers: {
+        "Content-Type": "application/json",
+        ...options?.headers,
+        ...params.headers,
+      },
+    })
+  }
+
+  /**
+   * Preview session schedule
+   */
+  public preview<ThrowOnError extends boolean = false>(
+    parameters: {
+      sessionID: string
+      directory?: string
+      workspace?: string
+      spec?: SessionScheduleV1Spec
+      scheduleID?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "sessionID" },
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+            { in: "body", key: "spec" },
+            { in: "body", key: "scheduleID" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).post<
+      SessionSchedulePreviewResponses,
+      SessionSchedulePreviewErrors,
+      ThrowOnError
+    >({
+      url: "/session/{sessionID}/schedule/preview",
+      ...options,
+      ...params,
+      headers: {
+        "Content-Type": "application/json",
+        ...options?.headers,
+        ...params.headers,
+      },
+    })
+  }
+
+  /**
+   * Delete session schedule
+   */
+  public remove<ThrowOnError extends boolean = false>(
+    parameters: {
+      sessionID: string
+      scheduleID: string
+      directory?: string
+      workspace?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "sessionID" },
+            { in: "path", key: "scheduleID" },
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).delete<
+      SessionScheduleRemoveResponses,
+      SessionScheduleRemoveErrors,
+      ThrowOnError
+    >({
+      url: "/session/{sessionID}/schedule/{scheduleID}",
+      ...options,
+      ...params,
+    })
+  }
+
+  /**
+   * Get session schedule
+   */
+  public get<ThrowOnError extends boolean = false>(
+    parameters: {
+      sessionID: string
+      scheduleID: string
+      directory?: string
+      workspace?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "sessionID" },
+            { in: "path", key: "scheduleID" },
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).get<SessionScheduleGetResponses, SessionScheduleGetErrors, ThrowOnError>({
+      url: "/session/{sessionID}/schedule/{scheduleID}",
+      ...options,
+      ...params,
+    })
+  }
+
+  /**
+   * Update session schedule
+   */
+  public update<ThrowOnError extends boolean = false>(
+    parameters: {
+      sessionID: string
+      scheduleID: string
+      directory?: string
+      workspace?: string
+      sessionScheduleV1Input?: SessionScheduleV1Input
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "sessionID" },
+            { in: "path", key: "scheduleID" },
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+            { key: "sessionScheduleV1Input", map: "body" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).put<
+      SessionScheduleUpdateResponses,
+      SessionScheduleUpdateErrors,
+      ThrowOnError
+    >({
+      url: "/session/{sessionID}/schedule/{scheduleID}",
+      ...options,
+      ...params,
+      headers: {
+        "Content-Type": "application/json",
+        ...options?.headers,
+        ...params.headers,
+      },
+    })
+  }
+
+  /**
+   * Pause or resume session schedule
+   */
+  public pause<ThrowOnError extends boolean = false>(
+    parameters: {
+      sessionID: string
+      scheduleID: string
+      directory?: string
+      workspace?: string
+      paused?: boolean
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "sessionID" },
+            { in: "path", key: "scheduleID" },
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+            { in: "body", key: "paused" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).post<
+      SessionSchedulePauseResponses,
+      SessionSchedulePauseErrors,
+      ThrowOnError
+    >({
+      url: "/session/{sessionID}/schedule/{scheduleID}/pause",
+      ...options,
+      ...params,
+      headers: {
+        "Content-Type": "application/json",
+        ...options?.headers,
+        ...params.headers,
+      },
+    })
+  }
+
+  /**
+   * Get session schedule history
+   */
+  public history<ThrowOnError extends boolean = false>(
+    parameters: {
+      sessionID: string
+      scheduleID: string
+      directory?: string
+      workspace?: string
+      cursor?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "sessionID" },
+            { in: "path", key: "scheduleID" },
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+            { in: "query", key: "cursor" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).get<
+      SessionScheduleHistoryResponses,
+      SessionScheduleHistoryErrors,
+      ThrowOnError
+    >({
+      url: "/session/{sessionID}/schedule/{scheduleID}/history",
+      ...options,
+      ...params,
+    })
+  }
+}
+
 export class History extends HeyApiClient {
   /**
    * List sync events
@@ -7785,6 +8111,11 @@ export class OpencodeClient extends HeyApiClient {
   private _part?: Part
   get part(): Part {
     return (this._part ??= new Part({ client: this.client }))
+  }
+
+  private _sessionSchedule?: SessionSchedule
+  get sessionSchedule(): SessionSchedule {
+    return (this._sessionSchedule ??= new SessionSchedule({ client: this.client }))
   }
 
   private _sync?: Sync

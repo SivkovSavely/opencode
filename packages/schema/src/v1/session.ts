@@ -329,9 +329,17 @@ const messageBase = {
   sessionID: partBase.sessionID,
 }
 
+export const ScheduledOrigin = Schema.Struct({
+  type: Schema.Literal("scheduled"),
+  scheduleID: Schema.String,
+  occurrenceID: Schema.String,
+}).annotate({ identifier: "SessionV1.ScheduledOrigin" })
+export type ScheduledOrigin = typeof ScheduledOrigin.Type
+
 export const User = Schema.Struct({
   ...messageBase,
   role: Schema.Literal("user"),
+  origin: optional(ScheduledOrigin),
   time: Schema.Struct({
     created: Timestamp,
   }),

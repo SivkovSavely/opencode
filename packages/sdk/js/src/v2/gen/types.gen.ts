@@ -243,6 +243,7 @@ export type UserMessage = {
   id: string
   sessionID: string
   role: "user"
+  origin?: SessionV1ScheduledOrigin
   time: {
     created: number
   }
@@ -3107,6 +3108,12 @@ export type MoveSessionDestination = {
   directory: string
 }
 
+export type SessionV1ScheduledOrigin = {
+  type: "scheduled"
+  scheduleID: string
+  occurrenceID: string
+}
+
 export type ModelRef = {
   id: string
   providerID: string
@@ -3986,6 +3993,7 @@ export type SessionQueueV1Entry = {
   state: SessionQueueV1State
   position: number
   payload: SessionQueueV1Payload
+  origin?: SessionV1ScheduledOrigin
   messageID?: string
   created: number
 }
@@ -4020,6 +4028,82 @@ export type SessionQueueV1Mutation =
       delivery: SessionQueueV1Delivery
       ids: Array<string>
     }
+
+export type SessionScheduleV1Spec =
+  | {
+      mode: "interval"
+      amount: number
+      unit: "minutes" | "hours" | "days" | "weeks"
+      immediate: boolean
+    }
+  | {
+      mode: "calendar"
+      rule: "daily" | "weekly" | "monthly" | "last-day"
+      time: string
+      weekdays?: Array<number>
+      day?: number
+      timeZone: string
+    }
+  | {
+      mode: "cron"
+      expression: string
+      timeZone: string
+    }
+
+export type SessionScheduleV1Info = {
+  message: string
+  spec: SessionScheduleV1Spec
+  sessionState: "always" | "busy" | "idle"
+  deferUntilIdle: boolean
+  missed: "latest" | "all" | "none"
+  limit?: number
+  id: string
+  sessionID: string
+  created: number
+  anchor: number
+  status: "active" | "paused" | "completed"
+  completed: number
+  next?: number
+  summary: string
+}
+
+export type SessionScheduleV1Input = {
+  message: string
+  spec: SessionScheduleV1Spec
+  sessionState: "always" | "busy" | "idle"
+  deferUntilIdle: boolean
+  missed: "latest" | "all" | "none"
+  limit?: number
+}
+
+export type SessionScheduleV1Preview = {
+  times: Array<number>
+  summary: string
+}
+
+export type SessionScheduleV1Occurrence = {
+  id: string
+  scheduleID: string
+  scheduled: number
+  processed?: number
+  state:
+    | "pending"
+    | "deferred"
+    | "accepted"
+    | "delivered"
+    | "skipped_busy"
+    | "skipped_idle"
+    | "discarded"
+    | "failed"
+    | "uncertain"
+  messageID?: string
+  error?: string
+}
+
+export type SessionScheduleV1History = {
+  items: Array<SessionScheduleV1Occurrence>
+  cursor?: number
+}
 
 export type WorkspaceEventConnectionStatus = {
   workspaceID: string
@@ -11444,6 +11528,353 @@ export type PartUpdateResponses = {
 }
 
 export type PartUpdateResponse = PartUpdateResponses[keyof PartUpdateResponses]
+
+export type SessionScheduleListData = {
+  body?: never
+  path: {
+    sessionID: string
+  }
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/session/{sessionID}/schedule"
+}
+
+export type SessionScheduleListErrors = {
+  /**
+   * InvalidRequestError
+   */
+  400: InvalidRequestError
+  /**
+   * ForbiddenError
+   */
+  403: ForbiddenError
+  /**
+   * SessionNotFoundError
+   */
+  404: SessionNotFoundError
+  /**
+   * ConflictError
+   */
+  409: ConflictError
+}
+
+export type SessionScheduleListError = SessionScheduleListErrors[keyof SessionScheduleListErrors]
+
+export type SessionScheduleListResponses = {
+  /**
+   * Success
+   */
+  200: Array<SessionScheduleV1Info>
+}
+
+export type SessionScheduleListResponse = SessionScheduleListResponses[keyof SessionScheduleListResponses]
+
+export type SessionScheduleCreateData = {
+  body?: SessionScheduleV1Input
+  path: {
+    sessionID: string
+  }
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/session/{sessionID}/schedule"
+}
+
+export type SessionScheduleCreateErrors = {
+  /**
+   * InvalidRequestError
+   */
+  400: InvalidRequestError
+  /**
+   * ForbiddenError
+   */
+  403: ForbiddenError
+  /**
+   * SessionNotFoundError
+   */
+  404: SessionNotFoundError
+  /**
+   * ConflictError
+   */
+  409: ConflictError
+}
+
+export type SessionScheduleCreateError = SessionScheduleCreateErrors[keyof SessionScheduleCreateErrors]
+
+export type SessionScheduleCreateResponses = {
+  /**
+   * SessionScheduleV1.Info
+   */
+  200: SessionScheduleV1Info
+}
+
+export type SessionScheduleCreateResponse = SessionScheduleCreateResponses[keyof SessionScheduleCreateResponses]
+
+export type SessionSchedulePreviewData = {
+  body?: {
+    spec: SessionScheduleV1Spec
+    scheduleID?: string
+  }
+  path: {
+    sessionID: string
+  }
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/session/{sessionID}/schedule/preview"
+}
+
+export type SessionSchedulePreviewErrors = {
+  /**
+   * InvalidRequestError
+   */
+  400: InvalidRequestError
+  /**
+   * ForbiddenError
+   */
+  403: ForbiddenError
+  /**
+   * SessionNotFoundError
+   */
+  404: SessionNotFoundError
+  /**
+   * ConflictError
+   */
+  409: ConflictError
+}
+
+export type SessionSchedulePreviewError = SessionSchedulePreviewErrors[keyof SessionSchedulePreviewErrors]
+
+export type SessionSchedulePreviewResponses = {
+  /**
+   * SessionScheduleV1.Preview
+   */
+  200: SessionScheduleV1Preview
+}
+
+export type SessionSchedulePreviewResponse = SessionSchedulePreviewResponses[keyof SessionSchedulePreviewResponses]
+
+export type SessionScheduleRemoveData = {
+  body?: never
+  path: {
+    sessionID: string
+    scheduleID: string
+  }
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/session/{sessionID}/schedule/{scheduleID}"
+}
+
+export type SessionScheduleRemoveErrors = {
+  /**
+   * InvalidRequestError
+   */
+  400: InvalidRequestError
+  /**
+   * ForbiddenError
+   */
+  403: ForbiddenError
+  /**
+   * SessionNotFoundError
+   */
+  404: SessionNotFoundError
+  /**
+   * ConflictError
+   */
+  409: ConflictError
+}
+
+export type SessionScheduleRemoveError = SessionScheduleRemoveErrors[keyof SessionScheduleRemoveErrors]
+
+export type SessionScheduleRemoveResponses = {
+  /**
+   * Success
+   */
+  200: boolean
+}
+
+export type SessionScheduleRemoveResponse = SessionScheduleRemoveResponses[keyof SessionScheduleRemoveResponses]
+
+export type SessionScheduleGetData = {
+  body?: never
+  path: {
+    sessionID: string
+    scheduleID: string
+  }
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/session/{sessionID}/schedule/{scheduleID}"
+}
+
+export type SessionScheduleGetErrors = {
+  /**
+   * InvalidRequestError
+   */
+  400: InvalidRequestError
+  /**
+   * ForbiddenError
+   */
+  403: ForbiddenError
+  /**
+   * SessionNotFoundError
+   */
+  404: SessionNotFoundError
+  /**
+   * ConflictError
+   */
+  409: ConflictError
+}
+
+export type SessionScheduleGetError = SessionScheduleGetErrors[keyof SessionScheduleGetErrors]
+
+export type SessionScheduleGetResponses = {
+  /**
+   * SessionScheduleV1.Info
+   */
+  200: SessionScheduleV1Info
+}
+
+export type SessionScheduleGetResponse = SessionScheduleGetResponses[keyof SessionScheduleGetResponses]
+
+export type SessionScheduleUpdateData = {
+  body?: SessionScheduleV1Input
+  path: {
+    sessionID: string
+    scheduleID: string
+  }
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/session/{sessionID}/schedule/{scheduleID}"
+}
+
+export type SessionScheduleUpdateErrors = {
+  /**
+   * InvalidRequestError
+   */
+  400: InvalidRequestError
+  /**
+   * ForbiddenError
+   */
+  403: ForbiddenError
+  /**
+   * SessionNotFoundError
+   */
+  404: SessionNotFoundError
+  /**
+   * ConflictError
+   */
+  409: ConflictError
+}
+
+export type SessionScheduleUpdateError = SessionScheduleUpdateErrors[keyof SessionScheduleUpdateErrors]
+
+export type SessionScheduleUpdateResponses = {
+  /**
+   * SessionScheduleV1.Info
+   */
+  200: SessionScheduleV1Info
+}
+
+export type SessionScheduleUpdateResponse = SessionScheduleUpdateResponses[keyof SessionScheduleUpdateResponses]
+
+export type SessionSchedulePauseData = {
+  body?: {
+    paused: boolean
+  }
+  path: {
+    sessionID: string
+    scheduleID: string
+  }
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/session/{sessionID}/schedule/{scheduleID}/pause"
+}
+
+export type SessionSchedulePauseErrors = {
+  /**
+   * InvalidRequestError
+   */
+  400: InvalidRequestError
+  /**
+   * ForbiddenError
+   */
+  403: ForbiddenError
+  /**
+   * SessionNotFoundError
+   */
+  404: SessionNotFoundError
+  /**
+   * ConflictError
+   */
+  409: ConflictError
+}
+
+export type SessionSchedulePauseError = SessionSchedulePauseErrors[keyof SessionSchedulePauseErrors]
+
+export type SessionSchedulePauseResponses = {
+  /**
+   * SessionScheduleV1.Info
+   */
+  200: SessionScheduleV1Info
+}
+
+export type SessionSchedulePauseResponse = SessionSchedulePauseResponses[keyof SessionSchedulePauseResponses]
+
+export type SessionScheduleHistoryData = {
+  body?: never
+  path: {
+    sessionID: string
+    scheduleID: string
+  }
+  query?: {
+    directory?: string
+    workspace?: string
+    cursor?: string
+  }
+  url: "/session/{sessionID}/schedule/{scheduleID}/history"
+}
+
+export type SessionScheduleHistoryErrors = {
+  /**
+   * InvalidRequestError
+   */
+  400: InvalidRequestError
+  /**
+   * ForbiddenError
+   */
+  403: ForbiddenError
+  /**
+   * SessionNotFoundError
+   */
+  404: SessionNotFoundError
+  /**
+   * ConflictError
+   */
+  409: ConflictError
+}
+
+export type SessionScheduleHistoryError = SessionScheduleHistoryErrors[keyof SessionScheduleHistoryErrors]
+
+export type SessionScheduleHistoryResponses = {
+  /**
+   * SessionScheduleV1.History
+   */
+  200: SessionScheduleV1History
+}
+
+export type SessionScheduleHistoryResponse = SessionScheduleHistoryResponses[keyof SessionScheduleHistoryResponses]
 
 export type SyncStartData = {
   body?: never

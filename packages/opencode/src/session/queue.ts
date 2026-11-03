@@ -25,6 +25,11 @@ type Result<A> = Effect.Effect<A, QueueError>
 export interface Interface {
   readonly list: (sessionID: SessionID) => Result<SessionQueueV1.Snapshot>
   readonly enqueue: (sessionID: SessionID, input: SessionQueueV1.Submit) => Result<SessionQueueV1.Snapshot>
+  readonly enqueueScheduled: (
+    sessionID: SessionID,
+    input: SessionQueueV1.Submit,
+    origin: SessionV1.ScheduledOrigin,
+  ) => Result<SessionQueueV1.Snapshot>
   readonly update: (sessionID: SessionID, input: SessionQueueV1.Update) => Result<SessionQueueV1.Snapshot>
   readonly registerSteer: (
     sessionID: SessionID,
@@ -64,6 +69,7 @@ const entry = (row: Row): SessionQueueV1.Entry => ({
   state: row.state,
   position: row.position,
   payload: Schema.decodeUnknownSync(SessionQueueV1.Payload)(row.payload),
+  ...(row.origin ? { origin: row.origin } : {}),
   ...(row.message_id ? { messageID: row.message_id } : {}),
   created: row.time_created,
 })
@@ -262,6 +268,7 @@ export const layer = Layer.effect(
       input: SessionQueueV1.Submit,
       delivery: SessionQueueV1.Delivery,
       messageID?: MessageID,
+      origin?: SessionV1.ScheduledOrigin,
     ) {
       const encoded = yield* Schema.encodeEffect(SessionQueueV1.Payload)(input.payload).pipe(
         Effect.mapError((error) => new QueueError({ reason: "invalid", message: error.message })),
@@ -273,6 +280,7 @@ export const layer = Layer.effect(
             front: input.front ?? false,
             delivery,
             ...(messageID ? { messageID } : {}),
+            ...(origin ? { origin } : {}),
           }),
         catch: () => new QueueError({ reason: "invalid", message: "Queue payload must be JSON serializable" }),
       })
@@ -310,6 +318,7 @@ export const layer = Layer.effect(
             session_id: sessionID,
             payload: encoded,
             submission,
+            origin: origin ?? null,
             delivery,
             state: "pending" as const,
             position,
@@ -323,7 +332,11 @@ export const layer = Layer.effect(
       )
     })
 
-    const enqueue = Effect.fn("SessionQueue.enqueue")(function* (sessionID: SessionID, input: SessionQueueV1.Submit) {
+    const enqueue = Effect.fn("SessionQueue.enqueue")(function* (
+      sessionID: SessionID,
+      input: SessionQueueV1.Submit,
+      origin?: SessionV1.ScheduledOrigin,
+    ) {
       const payload = input.payload
       if (
         !input.id.trim() ||
@@ -345,7 +358,16 @@ export const layer = Layer.effect(
           reason: "invalid",
           message: "Queue attachments must use durable URLs, not browser blob URLs",
         })
-      return (yield* admit(sessionID, input, "queue")).snapshot
+      return (yield* admit(sessionID, input, "queue", undefined, origin)).snapshot
+    })
+    const enqueueScheduled = Effect.fn("SessionQueue.enqueueScheduled")(function* (
+      sessionID: SessionID,
+      input: SessionQueueV1.Submit,
+      origin: SessionV1.ScheduledOrigin,
+    ) {
+      if (input.payload.kind !== "prompt" || input.id !== origin.occurrenceID)
+        return yield* new QueueError({ reason: "invalid", message: "Invalid scheduled submission identity" })
+      return yield* enqueue(sessionID, input, origin)
     })
     const registerSteer = Effect.fn("SessionQueue.registerSteer")(function* (
       sessionID: SessionID,
@@ -585,6 +607,7 @@ export const layer = Layer.effect(
     return Service.of({
       list,
       enqueue,
+      enqueueScheduled,
       update,
       registerSteer,
       attachSteer,

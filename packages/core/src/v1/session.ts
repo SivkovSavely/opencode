@@ -26,6 +26,7 @@ export {
   ReasoningPart,
   ResourceSource,
   RetryPart,
+  ScheduledOrigin,
   SessionInfo,
   SnapshotPart,
   StepFinishPart,

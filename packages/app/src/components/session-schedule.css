@@ -1,0 +1,30 @@
+.session-schedule-editor {
+  label:not(.schedule-check) {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+  input:not([type="checkbox"]),
+  select,
+  textarea {
+    width: 100%;
+    min-width: 0;
+    padding: 8px 10px;
+    border: 1px solid var(--border-weak-base);
+    border-radius: 6px;
+    background: var(--background-base);
+    color: var(--text-base);
+    &:focus-visible {
+      outline: 2px solid var(--border-focus);
+      outline-offset: 2px;
+    }
+  }
+  textarea {
+    resize: vertical;
+  }
+  .schedule-check {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+  }
+}

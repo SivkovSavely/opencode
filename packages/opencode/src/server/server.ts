@@ -16,7 +16,6 @@ import { lazy } from "@/util/lazy"
 import { startHangDiagnostics } from "@/diagnostics/hang"
 import { Database } from "@opencode-ai/core/database/database"
 import { RuntimeLifecycle } from "./runtime-lifecycle"
-import { ServerRecovery } from "./recovery"
 import { createHash } from "node:crypto"
 
 // @ts-ignore This global is needed to prevent ai-sdk from logging warnings to stdout https://github.com/vercel/ai/blob/2dc67e0ef538307f21368db32d5a12345d98831b/packages/ai/src/logger/log-warnings.ts#L85
@@ -170,7 +169,7 @@ function startListener(opts: ListenOptions, port: number, lifecycle: RuntimeLife
         server: Context.get(ctx, HttpServer.HttpServer),
         http: Context.get(ctx, ListenerServerService),
         websockets: Context.get(ctx, WebSocketTracker.Service),
-        initializeRecovery: Context.get(ctx, ServerRecovery.Service).initialize,
+        initializeRecovery: Context.get(ctx, HttpApiApp.Startup).initialize,
       }),
     ),
   )

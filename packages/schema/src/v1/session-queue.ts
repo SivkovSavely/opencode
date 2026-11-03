@@ -55,6 +55,7 @@ export const Entry = Schema.Struct({
   state: State,
   position: Schema.Int,
   payload: Payload,
+  origin: optional(SessionV1.ScheduledOrigin),
   messageID: optional(SessionV1.MessageID),
   created: NonNegativeInt,
 }).annotate({ identifier: "SessionQueueV1.Entry" })
