@@ -1,4 +1,4 @@
-import { createStore } from "solid-js/store"
+import { createStore, unwrap } from "solid-js/store"
 import { createSimpleContext } from "./helper"
 import { batch, createEffect, createMemo } from "solid-js"
 import { useSync } from "./sync"
@@ -13,6 +13,7 @@ import { useTheme } from "./theme"
 import { useToast } from "../ui/toast"
 import { useRoute } from "./route"
 import { usePermission } from "./permission"
+import { Flock } from "@opencode-ai/core/util/flock"
 
 export type LocalTheme = {
   secondary: RGBA
@@ -50,7 +51,7 @@ export function recentModels(
 
 export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
   name: "Local",
-  init: () => {
+  init: (input: { onFlush?: (flush: () => Promise<void>) => void }) => {
     const sync = useSync()
     const sdk = useSDK()
     const toast = useToast()
@@ -153,17 +154,22 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
           modelID: string
         }[]
         variant: Record<string, string | undefined>
+        session: Record<string, { providerID: string; modelID: string; variant?: string }>
       }>({
         ready: false,
         model: {},
         recent: [],
         favorite: [],
         variant: {},
+        session: {},
       })
 
       const filePath = path.join(paths.state, "model.json")
       const state = {
         pending: false,
+        write: Promise.resolve(),
+        session: new Map<string, { mode: "select" | "remember" }>(),
+        initializing: new Set<Promise<void>>(),
       }
 
       function save() {
@@ -172,15 +178,42 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
           return
         }
         state.pending = false
-        void writeJsonAtomic(filePath, {
-          model: modelStore.model,
-          recent: modelStore.recent,
-          favorite: modelStore.favorite,
-          variant: modelStore.variant,
-        })
+        const snapshot = structuredClone(unwrap(modelStore))
+        const session = Array.from(state.session, ([id, change]) => ({ id, change, selection: snapshot.session[id] }))
+        state.write = state.write
+          .then(() =>
+            Flock.withLock(
+              `tui-model:${filePath}`,
+              async () => {
+                // Retain failed changes without replaying superseded or already-persisted selections.
+                const pending = session.filter((item) => state.session.get(item.id) === item.change)
+                const current = await readJson<{ session?: typeof modelStore.session }>(filePath).catch(() => undefined)
+                // Merge only changed sessions so another TUI's selections survive unrelated saves.
+                await writeJsonAtomic(filePath, {
+                  model: snapshot.model,
+                  recent: snapshot.recent,
+                  favorite: snapshot.favorite,
+                  variant: snapshot.variant,
+                  session: {
+                    ...current?.session,
+                    ...Object.fromEntries(
+                      pending
+                        .filter((item) => item.change.mode === "select" || !current?.session?.[item.id])
+                        .map((item) => [item.id, item.selection]),
+                    ),
+                  },
+                })
+                pending.forEach((item) => {
+                  if (state.session.get(item.id) === item.change) state.session.delete(item.id)
+                })
+              },
+              { dir: path.join(paths.state, "locks") },
+            ),
+          )
+          .catch((error) => console.error("Failed to write model state", { error }))
       }
 
-      readJson<unknown>(filePath)
+      const loaded = readJson<unknown>(filePath)
         .then((x) => {
           if (!x || typeof x !== "object") return
           const value = x as Record<string, unknown>
@@ -206,7 +239,45 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
           if (Array.isArray(value.recent)) setModelStore("recent", value.recent)
           if (Array.isArray(value.favorite)) setModelStore("favorite", value.favorite)
           if (typeof value.variant === "object" && value.variant !== null)
-            setModelStore("variant", value.variant as Record<string, string | undefined>)
+            setModelStore("variant", {
+              ...(value.variant as Record<string, string | undefined>),
+              ...modelStore.variant,
+            })
+          const saved =
+            typeof value.session === "object" && value.session !== null
+              ? Object.fromEntries(
+                  Object.entries(value.session).filter(
+                    (entry): entry is [string, { providerID: string; modelID: string; variant?: string }] => {
+                      const model: unknown = entry[1]
+                      return (
+                        !!model &&
+                        typeof model === "object" &&
+                        "providerID" in model &&
+                        typeof model.providerID === "string" &&
+                        "modelID" in model &&
+                        typeof model.modelID === "string" &&
+                        (!("variant" in model) || model.variant === undefined || typeof model.variant === "string")
+                      )
+                    },
+                  ),
+                )
+              : {}
+          setModelStore("session", {
+            ...saved,
+            ...Object.fromEntries(
+              Object.entries(modelStore.session).map(([id, model]) => [
+                id,
+                {
+                  ...model,
+                  variant:
+                    model.variant ??
+                    (saved[id]?.providerID === model.providerID && saved[id].modelID === model.modelID
+                      ? saved[id].variant
+                      : modelStore.variant[`${model.providerID}/${model.modelID}`]),
+                },
+              ]),
+            ),
+          })
         })
         .catch(() => {})
         .finally(() => {
@@ -257,6 +328,10 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
         const a = agent.current()
         return (
           getFirstValidModel(
+            () => {
+              const saved = route.data.type === "session" ? modelStore.session[route.data.sessionID] : undefined
+              return saved && { providerID: saved.providerID, modelID: saved.modelID }
+            },
             () => a && modelStore.model[a.name],
             () => a && a.model,
             fallbackModel,
@@ -264,8 +339,58 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
         )
       })
 
+      function selectModel(model: { providerID: string; modelID: string }, variant?: string) {
+        const a = agent.current()
+        if (!a) return
+        setModelStore("model", a.name, { ...model })
+        if (route.data.type !== "session") return
+        const saved = modelStore.session[route.data.sessionID]
+        setModelStore("session", route.data.sessionID, {
+          ...model,
+          variant:
+            variant ??
+            (saved?.providerID === model.providerID && saved.modelID === model.modelID
+              ? saved.variant
+              : modelStore.variant[`${model.providerID}/${model.modelID}`]),
+        })
+        state.session.set(route.data.sessionID, { mode: "select" })
+      }
+
       return {
         current: currentModel,
+        async flush() {
+          await loaded
+          // Worker-backed session creation can finish after the renderer has been disposed.
+          while (state.initializing.size) await Promise.allSettled(Array.from(state.initializing))
+          await state.write
+          if (!state.session.size) return
+          save()
+          await state.write
+        },
+        remember(
+          sessionID: string | Promise<string | undefined>,
+          selection: { providerID: string; modelID: string; variant?: string },
+        ) {
+          const pending = Promise.all([sessionID, loaded]).then(([id]) => {
+            if (!id || modelStore.session[id]) return
+            setModelStore("session", id, { ...selection })
+            state.session.set(id, { mode: "remember" })
+            save()
+          })
+          state.initializing.add(pending)
+          return pending.finally(() => state.initializing.delete(pending))
+        },
+        selectInitial() {
+          if (!args.model) return
+          const model = parseModel(args.model)
+          if (!model.providerID || !model.modelID)
+            return toast.show({
+              variant: "warning",
+              message: `Invalid model format: ${args.model}`,
+              duration: 3000,
+            })
+          this.set(model, { recent: true })
+        },
         get ready() {
           return modelStore.ready
         },
@@ -303,9 +428,7 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
           if (next >= recent.length) next = 0
           const val = recent[next]
           if (!val) return
-          const a = agent.current()
-          if (!a) return
-          setModelStore("model", a.name, { ...val })
+          selectModel({ ...val })
           save()
         },
         cycleFavorite(direction: 1 | -1) {
@@ -332,9 +455,7 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
           }
           const next = favorites[index]
           if (!next) return
-          const a = agent.current()
-          if (!a) return
-          setModelStore("model", a.name, { ...next })
+          selectModel({ ...next })
           setModelStore("recent", recentModels(next, modelStore.recent))
           save()
         },
@@ -348,9 +469,7 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
               })
               return
             }
-            const a = agent.current()
-            if (!a) return
-            setModelStore("model", a.name, model)
+            selectModel(model)
             save()
             if (options?.recent) {
               setModelStore("recent", recentModels(model, modelStore.recent))
@@ -386,6 +505,8 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
             const m = currentModel()
             if (!m) return undefined
             const key = `${m.providerID}/${m.modelID}`
+            const saved = route.data.type === "session" ? modelStore.session[route.data.sessionID] : undefined
+            if (saved?.providerID === m.providerID && saved.modelID === m.modelID) return saved.variant
             return modelStore.variant[key]
           },
           current() {
@@ -407,6 +528,7 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
             if (!m) return
             const key = `${m.providerID}/${m.modelID}`
             setModelStore("variant", key, value ?? "default")
+            selectModel(m, value ?? "default")
             save()
           },
           cycle() {
@@ -429,6 +551,7 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
     }
 
     const model = createModel()
+    input.onFlush?.(model.flush)
 
     function createSession() {
       const [sessionStore, setSessionStore] = createStore<{

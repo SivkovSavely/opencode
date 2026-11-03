@@ -61,7 +61,6 @@ import { DialogConfirm } from "./ui/dialog-confirm"
 import { ToastProvider, useToast } from "./ui/toast"
 import { isDefaultTitle } from "./util/session"
 import { KVProvider, useKV } from "./context/kv"
-import * as Model from "./util/model"
 import { ArgsProvider, useArgs, type Args } from "./context/args"
 import open from "open"
 import { PromptRefProvider, usePromptRef } from "./context/prompt"
@@ -185,7 +184,11 @@ function isVersionGreater(left: string, right: string) {
 
 export const run = Effect.fn("Tui.run")(function* (input: TuiInput) {
   const global = yield* Global.Service
-  const exit = { epilogue: undefined as string | undefined, reason: undefined as unknown }
+  const exit = {
+    epilogue: undefined as string | undefined,
+    reason: undefined as unknown,
+    flush: new Set<() => Promise<void>>(),
+  }
   const result = yield* Effect.scoped(
     Effect.gen(function* () {
       const renderer = yield* Effect.acquireRelease(
@@ -227,6 +230,9 @@ export const run = Effect.fn("Tui.run")(function* (input: TuiInput) {
         }),
       )
       yield* Effect.addFinalizer(() => Effect.sync(TuiAudio.dispose))
+      yield* Effect.addFinalizer(() =>
+        Effect.promise(async () => await Promise.all(Array.from(exit.flush, (fn) => fn()))),
+      )
       const shutdown = yield* Deferred.make<unknown>()
       const onSighup = () => destroyRenderer(renderer)
       yield* Effect.acquireRelease(
@@ -307,7 +313,7 @@ export const run = Effect.fn("Tui.run")(function* (input: TuiInput) {
                                               <SyncProvider>
                                                 <DataProvider>
                                                   <ThemeProvider mode={mode}>
-                                                    <LocalProvider>
+                                                    <LocalProvider onFlush={(flush) => exit.flush.add(flush)}>
                                                       <PromptStashProvider>
                                                         <DialogProvider>
                                                           <FrecencyProvider>
@@ -479,22 +485,13 @@ function App(props: { onSnapshot?: () => Promise<string[]>; pluginHost: TuiPlugi
   onMount(() => {
     batch(() => {
       if (args.agent) local.agent.set(args.agent)
-      if (args.model) {
-        const { providerID, modelID } = Model.parse(args.model)
-        if (!providerID || !modelID)
-          return toast.show({
-            variant: "warning",
-            message: `Invalid model format: ${args.model}`,
-            duration: 3000,
-          })
-        local.model.set({ providerID, modelID }, { recent: true })
-      }
       if (args.sessionID && !args.fork) {
         route.navigate({
           type: "session",
           sessionID: args.sessionID,
         })
       }
+      if (!args.continue && !args.fork) local.model.selectInitial()
     })
   })
 
@@ -510,13 +507,19 @@ function App(props: { onSnapshot?: () => Promise<string[]>; pluginHost: TuiPlugi
       if (args.fork) {
         void sdk.client.session.fork({ sessionID: match }).then((result) => {
           if (result.data?.id) {
-            route.navigate({ type: "session", sessionID: result.data.id })
+            batch(() => {
+              route.navigate({ type: "session", sessionID: result.data.id })
+              local.model.selectInitial()
+            })
           } else {
             toast.show({ message: "Failed to fork session", variant: "error" })
           }
         })
       } else {
-        route.navigate({ type: "session", sessionID: match })
+        batch(() => {
+          route.navigate({ type: "session", sessionID: match })
+          local.model.selectInitial()
+        })
       }
     }
   })
@@ -530,7 +533,10 @@ function App(props: { onSnapshot?: () => Promise<string[]>; pluginHost: TuiPlugi
     forked = true
     void sdk.client.session.fork({ sessionID: args.sessionID }).then((result) => {
       if (result.data?.id) {
-        route.navigate({ type: "session", sessionID: result.data.id })
+        batch(() => {
+          route.navigate({ type: "session", sessionID: result.data.id })
+          local.model.selectInitial()
+        })
       } else {
         toast.show({ message: "Failed to fork session", variant: "error" })
       }

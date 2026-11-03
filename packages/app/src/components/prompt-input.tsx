@@ -310,6 +310,7 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
           sync().data.session_working(id),
           id,
           sync().data.session_message?.[id] ?? [],
+          sync().data.part,
         )
       : undefined
     const clean = materializePrompt(parts)

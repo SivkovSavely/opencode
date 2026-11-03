@@ -113,6 +113,7 @@ export async function sendFollowupDraft(input: FollowupSendInput) {
     input.sync.data.session_working(input.draft.sessionID),
     input.draft.sessionID,
     input.sync.data.session_message?.[input.draft.sessionID] ?? [],
+    input.sync.data.part,
   )
   const variant = input.forceDefaultVariant ? "default" : input.draft.variant
   const execution = contemplatedPromptSelection({
@@ -603,6 +604,7 @@ export function createPromptSubmit(input: PromptSubmitInput) {
           sync().data.session_working(params.id),
           params.id,
           sync().data.session_message?.[params.id] ?? [],
+          sync().data.part,
         )
       : undefined
     const enqueue = delivery === "queue" || queueCommand?.type === "enqueue"

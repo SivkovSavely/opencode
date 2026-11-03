@@ -1,5 +1,5 @@
 import type { Prompt } from "@/context/prompt"
-import type { Message } from "@opencode-ai/sdk/v2/client"
+import type { Message, Part } from "@opencode-ai/sdk/v2/client"
 import { QueueCommand } from "@opencode-ai/schema/queue-command"
 
 export type PromptSelection = {
@@ -85,13 +85,27 @@ export function activePromptSelection(
   running = false,
   sessionID?: string,
   admitted: readonly { id: string; type: string }[] = [],
+  parts: Readonly<Record<string, readonly Part[] | undefined>> = {},
 ) {
   if (!running) return
   const assistant = messages.findLast(
     (message) => message.role === "assistant" && !message.summary && (!sessionID || message.sessionID === sessionID),
   )
   if (!assistant || assistant.role !== "assistant") return
-  const continuation = assistant.finish === "tool-calls" || assistant.finish === "unknown"
+  const continuation =
+    assistant.finish === "tool-calls" ||
+    assistant.finish === "unknown" ||
+    parts[assistant.id]?.some(
+      (part) =>
+        part.type === "tool" &&
+        !part.metadata?.providerExecuted &&
+        !(
+          part.state.status === "error" &&
+          part.state.metadata?.interrupted === true &&
+          part.state.metadata?.crashInterrupted !== true
+        ) &&
+        !(part.tool === "StructuredOutput" && assistant.structured !== undefined),
+    )
   const parent = messages.find(
     (message) =>
       message.id === assistant.parentID && message.role === "user" && message.sessionID === assistant.sessionID,

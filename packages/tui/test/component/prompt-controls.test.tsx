@@ -2,7 +2,9 @@
 import { createDefaultOpenTuiKeymap } from "@opentui/keymap/opentui"
 import { testRender, useRenderer } from "@opentui/solid"
 import { expect, test } from "bun:test"
-import { createSignal, onCleanup, onMount } from "solid-js"
+import { mkdir, rename, rm } from "node:fs/promises"
+import { onCleanup, onMount } from "solid-js"
+import { Flock } from "@opencode-ai/core/util/flock"
 import type { AssistantMessage, Model, UserMessage } from "@opencode-ai/sdk/v2"
 import { Prompt, type PromptRef } from "../../src/component/prompt"
 import { TuiConfigProvider } from "../../src/config"
@@ -15,7 +17,7 @@ import { LocalProvider, useLocal } from "../../src/context/local"
 import { LocationProvider } from "../../src/context/location"
 import { PermissionProvider } from "../../src/context/permission"
 import { ProjectProvider } from "../../src/context/project"
-import { RouteProvider } from "../../src/context/route"
+import { RouteProvider, useRoute } from "../../src/context/route"
 import { SDKProvider } from "../../src/context/sdk"
 import { SyncProvider, useSync } from "../../src/context/sync"
 import { ThemeProvider } from "../../src/context/theme"
@@ -36,6 +38,10 @@ test("prompt controls remain one-shot across navigation and persistent model res
   const events = createEventSource()
   const submissions: Record<string, unknown>[] = []
   const queueSubmissions: Record<string, unknown>[] = []
+  const creations: Record<string, unknown>[] = []
+  const flushes: (() => Promise<void>)[] = []
+  const creationRelease = Promise.withResolvers<void>()
+  const shutdownCreationRelease = Promise.withResolvers<void>()
   const calls = createFetch((url) => {
     if (url.pathname === "/api/fs/find")
       return json({ location: { directory }, data: [{ path: "src/components", type: "directory" }] })
@@ -53,6 +59,12 @@ test("prompt controls remain one-shot across navigation and persistent model res
   })
   const transport = (async (input, init) => {
     const request = input instanceof Request ? input : new Request(input, init)
+    if (new URL(request.url).pathname === "/session" && request.method === "POST") {
+      const count = creations.push(await request.json())
+      if (count === 4) await shutdownCreationRelease.promise
+      if (count > 1) await creationRelease.promise
+      return json({ id: ["created", "delayed", "default-created", "shutdown-created"][count - 1], directory })
+    }
     if (new URL(request.url).pathname === "/session/one") return json({ id: "one", directory })
     if (new URL(request.url).pathname === "/session/one/queue") {
       const snapshot = { sessionID: "one", revision: 1, paused: false, blocked: false, items: [] }
@@ -70,24 +82,32 @@ test("prompt controls remain one-shot across navigation and persistent model res
     local: ReturnType<typeof useLocal>
     sync: ReturnType<typeof useSync>
     prompt: () => PromptRef
-    navigate: (id: string) => void
+    navigate: (id?: string) => void
   }>()
-  function Probe() {
+  function Probe(props: { init?: (local: ReturnType<typeof useLocal>, sync: ReturnType<typeof useSync>) => void }) {
     const local = useLocal()
     const sync = useSync()
-    const [session, setSession] = createSignal("one")
+    const route = useRoute()
+    props.init?.(local, sync)
     let prompt: PromptRef | undefined
-    onMount(() => ready.resolve({ local, sync, prompt: () => prompt!, navigate: setSession }))
+    onMount(() =>
+      ready.resolve({
+        local,
+        sync,
+        prompt: () => prompt!,
+        navigate: (sessionID) => route.navigate(sessionID ? { type: "session", sessionID } : { type: "home" }),
+      }),
+    )
     return (
       <Prompt
-        sessionID={session()}
+        sessionID={route.data.type === "session" ? route.data.sessionID : undefined}
         ref={(ref) => {
           prompt = ref
         }}
       />
     )
   }
-  function Harness() {
+  function Harness(props: Parameters<typeof Probe>[0] & { model?: string }) {
     const renderer = useRenderer()
     const keymap = createDefaultOpenTuiKeymap(renderer)
     const config = createTuiResolvedConfig({})
@@ -96,10 +116,10 @@ test("prompt controls remain one-shot across navigation and persistent model res
       <TestTuiContexts paths={{ state }}>
         <OpencodeKeymapProvider keymap={keymap}>
           <TuiConfigProvider config={config}>
-            <ArgsProvider>
+            <ArgsProvider model={props.model}>
               <KVProvider>
                 <ToastProvider>
-                  <RouteProvider>
+                  <RouteProvider initialRoute={{ type: "session", sessionID: "one" }}>
                     <ExitProvider exit={() => {}}>
                       <SDKProvider url="http://test" directory={directory} fetch={transport} events={events.source}>
                         <PermissionProvider>
@@ -107,14 +127,14 @@ test("prompt controls remain one-shot across navigation and persistent model res
                             <SyncProvider>
                               <DataProvider>
                                 <ThemeProvider mode="dark">
-                                  <LocalProvider>
+                                  <LocalProvider onFlush={(flush) => flushes.push(flush)}>
                                     <PromptStashProvider>
                                       <DialogProvider>
                                         <FrecencyProvider>
                                           <PromptHistoryProvider>
                                             <EditorContextProvider>
                                               <LocationProvider>
-                                                <Probe />
+                                                <Probe init={props.init} />
                                               </LocationProvider>
                                             </EditorContextProvider>
                                           </PromptHistoryProvider>
@@ -176,6 +196,8 @@ test("prompt controls remain one-shot across navigation and persistent model res
     ])
     const base = { providerID: "provider", modelID: "base" }
     ctx.local.model.set(base)
+    expect(ctx.local.model.variant.selected(), "unused model still offers the variant chooser").toBeUndefined()
+    ctx.local.model.variant.set("low")
     const user: UserMessage = {
       id: "user",
       sessionID: "one",
@@ -188,10 +210,12 @@ test("prompt controls remain one-shot across navigation and persistent model res
     ctx.sync.set("message", "two", [{ ...user, id: "other", sessionID: "two" }])
     ctx.navigate("two")
     await app.renderOnce()
+    ctx.local.model.set({ providerID: "provider", modelID: "override" })
+    ctx.local.model.variant.set("high")
     ctx.navigate("one")
     await app.renderOnce()
     expect(ctx.local.model.current()).toEqual(base)
-    expect(ctx.local.model.variant.current()).not.toBe("high")
+    expect(ctx.local.model.variant.current()).toBe("low")
     const input = "@model:provider/override text"
     const draft = {
       input,
@@ -345,13 +369,28 @@ test("prompt controls remain one-shot across navigation and persistent model res
       parentID: user.id,
       modelID: "override",
       providerID: "provider",
-      time: { created: 2 },
+      finish: "stop",
+      time: { created: 2, completed: 3 },
       path: { cwd: "/", root: "/" },
       cost: 0,
       tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
     }
     ctx.sync.set("message", "one", [user, running])
+    ctx.sync.set("part", running.id, [
+      {
+        id: "running-tool",
+        messageID: running.id,
+        sessionID: "one",
+        type: "tool",
+        callID: "call",
+        tool: "read",
+        state: { status: "running", input: {}, time: { start: 2 } },
+      },
+    ])
     ctx.sync.set("session_status", "one", { type: "busy" })
+    ctx.prompt().reset()
+    await app.renderOnce()
+    expect(app.captureCharFrame()).toContain("active: provider/override (high)")
     for (const [text, variant] of [
       ["/queue ", "low"],
       ["", "high"],
@@ -371,6 +410,27 @@ test("prompt controls remain one-shot across navigation and persistent model res
     app.mockInput.pressEnter()
     await app.renderOnce()
     expect(materializePrompt(ctx.prompt().current).selection.variant).toBeUndefined()
+    app.mockInput.pressEscape()
+    await app.renderOnce()
+    ctx.prompt().set({
+      input: "@variant:high steer",
+      parts: [
+        { type: "control", kind: "variant", variant: "high", source: { start: 0, end: 13, value: "@variant:high" } },
+      ],
+    })
+    const steered = submissions.length
+    ctx.prompt().submit()
+    for (let count = 0; count < 100 && submissions.length === steered; count++) await Bun.sleep(10)
+    expect(submissions[steered], "steer submission").toMatchObject({
+      model: base,
+      variant: "low",
+      selection: { inheritActive: true, variant: "high" },
+    })
+    expect(ctx.local.model.current()).toEqual(base)
+    expect(ctx.local.model.variant.current()).toBe("low")
+    ctx.sync.set("message", "one", [user, running, { ...running, id: "done" }])
+    await app.renderOnce()
+    expect(app.captureCharFrame()).not.toContain("active:")
     ctx.sync.set("session_status", "one", { type: "idle" })
     app.mockInput.pressEscape()
     await app.renderOnce()
@@ -451,7 +511,7 @@ test("prompt controls remain one-shot across navigation and persistent model res
     ctx.local.model.set({ providerID: "provider", modelID: "override" }, { recent: true })
     ctx.local.model.set({ providerID: "provider", modelID: "base" }, { recent: true })
     ctx.local.model.cycle(1)
-    expect(ctx.local.model.current()).toEqual(draft.parts[0].model)
+    expect(ctx.local.model.current(), "recent cycle").toEqual(draft.parts[0].model)
     for (
       let count = 0;
       count < 100 && (await Bun.file(`${state}/model.json`).json()).model.build.modelID !== "override";
@@ -459,17 +519,293 @@ test("prompt controls remain one-shot across navigation and persistent model res
     )
       await Bun.sleep(10)
     expect((await Bun.file(`${state}/model.json`).json()).model.build).toEqual(draft.parts[0].model)
+    ctx.local.model.set(base)
+    ctx.local.model.variant.set("low")
+    ctx.prompt().set({
+      input: chip + " @variant:high one-shot",
+      parts: [
+        { ...draft.parts[0], source: { start: 0, end: chip.length, value: chip } },
+        {
+          type: "control",
+          kind: "variant",
+          variant: "high",
+          source: { start: chip.length + 1, end: chip.length + 14, value: "@variant:high" },
+        },
+      ],
+    })
+    const overridden = submissions.length
+    ctx.prompt().submit()
+    for (let count = 0; count < 100 && submissions.length === overridden; count++) await Bun.sleep(10)
+    expect(submissions[overridden], "override submission").toMatchObject({
+      model: base,
+      variant: "low",
+      selection: { model: draft.parts[0].model, variant: "high" },
+    })
+    ctx.sync.set("message", "one", [user, { ...running, id: "last-executed" }])
+    ctx.navigate("two")
+    await app.renderOnce()
+    expect(ctx.local.model.current(), "session two").toEqual(draft.parts[0].model)
+    expect(ctx.local.model.variant.current()).toBe("high")
+    ctx.local.model.variant.set(undefined)
+    ctx.navigate("one")
+    await app.renderOnce()
+    expect(ctx.local.model.current()).toEqual(base)
+    expect(ctx.local.model.variant.current()).toBe("low")
+    ctx.navigate("unsaved")
+    await app.renderOnce()
+    expect(ctx.local.model.current(), "unsaved fallback").toEqual(draft.parts[0].model)
+    ctx.local.model.set(base)
+    ctx.local.model.variant.set(undefined)
+    ctx.navigate("one")
+    await app.renderOnce()
+    expect(ctx.local.model.variant.current()).toBe("low")
+    ctx.local.model.set(base)
+    expect(ctx.local.model.variant.current()).toBe("low")
+    ctx.navigate()
+    await app.renderOnce()
+    ctx.local.model.set(base)
+    ctx.local.model.variant.set("low")
+    ctx.prompt().set({
+      input: chip + " first message",
+      parts: [{ ...draft.parts[0], source: { start: 0, end: chip.length, value: chip } }],
+    })
+    const first = submissions.length
+    ctx.prompt().submit()
+    for (let count = 0; count < 100 && submissions.length === first; count++) await Bun.sleep(10)
+    expect(creations).toHaveLength(1)
+    expect(creations[0]).toMatchObject({ model: { providerID: base.providerID, id: base.modelID, variant: "low" } })
+    expect(submissions[first]).toMatchObject({
+      model: base,
+      variant: "low",
+      selection: { model: draft.parts[0].model },
+    })
+    for (let count = 0; count < 100 && !(await Bun.file(`${state}/model.json`).json()).session?.created; count++)
+      await Bun.sleep(10)
+    ctx.navigate("created")
+    await app.renderOnce()
+    expect(ctx.local.model.current()).toEqual(base)
+    expect(ctx.local.model.variant.current()).toBe("low")
+    ctx.navigate()
+    await app.renderOnce()
+    ctx.prompt().set({ input: "delayed first message", parts: [] })
+    const delayed = submissions.length
+    ctx.prompt().submit()
+    for (let count = 0; count < 100 && creations.length < 2; count++) await Bun.sleep(10)
+    expect(creations).toHaveLength(2)
+    ctx.navigate("delayed")
+    await app.renderOnce()
+    ctx.local.model.set(draft.parts[0].model)
+    ctx.local.model.variant.set("high")
+    creationRelease.resolve()
+    for (let count = 0; count < 100 && submissions.length === delayed; count++) await Bun.sleep(10)
+    expect(submissions).toHaveLength(delayed + 1)
+    ctx.navigate("delayed")
+    await app.renderOnce()
+    expect(ctx.local.model.current(), "creation must not overwrite a newer explicit selection").toEqual(
+      draft.parts[0].model,
+    )
+    expect(ctx.local.model.variant.current()).toBe("high")
+    ctx.navigate()
+    await app.renderOnce()
+    ctx.local.model.set(base)
+    ctx.local.model.variant.set(undefined)
+    ctx.prompt().set({ input: "explicit default first message", parts: [] })
+    const defaulted = submissions.length
+    ctx.prompt().submit()
+    for (let count = 0; count < 100 && submissions.length === defaulted; count++) await Bun.sleep(10)
+    expect(creations).toHaveLength(3)
+    expect(creations[2].model).toEqual({ providerID: base.providerID, id: base.modelID })
+    expect(submissions[defaulted].variant).toBeUndefined()
+    ctx.navigate("default-created")
+    await app.renderOnce()
+    expect(ctx.local.model.variant.selected()).toBe("default")
+    ctx.local.model.set(base)
+    expect(ctx.local.model.variant.selected(), "new session retains explicit Default on model reselection").toBe(
+      "default",
+    )
+    ctx.navigate("one")
+    await app.renderOnce()
+    const saved = {
+      one: { ...base, variant: "low" },
+      two: { ...draft.parts[0].model, variant: "default" },
+      unsaved: { ...base, variant: "default" },
+      created: { ...base, variant: "low" },
+      delayed: { ...draft.parts[0].model, variant: "high" },
+      "default-created": { ...base, variant: "default" },
+    }
+    for (
+      let count = 0;
+      count < 100 && JSON.stringify((await Bun.file(`${state}/model.json`).json()).session) !== JSON.stringify(saved);
+      count++
+    )
+      await Bun.sleep(10)
+    expect((await Bun.file(`${state}/model.json`).json()).session).toEqual(saved)
     ctx.prompt().reset()
     app.renderer.destroy()
     ready = Promise.withResolvers()
-    const restarted = await testRender(() => <Harness />, { width: 120, height: 30, kittyKeyboard: true })
+    const restarted = await testRender(
+      () => (
+        <Harness
+          init={(local, sync) => {
+            sync.set("agent", ctx.sync.data.agent)
+            sync.set("provider", ctx.sync.data.provider)
+            expect(local.model.ready).toBe(false)
+            local.model.set(base)
+          }}
+        />
+      ),
+      { width: 120, height: 30, kittyKeyboard: true },
+    )
     try {
       const next = await ready.promise
       while (!next.local.model.ready || next.sync.status === "loading") await Bun.sleep(10)
       next.sync.set("provider", ctx.sync.data.provider)
+      expect(next.local.model.current()).toEqual(base)
+      expect(next.local.model.variant.current()).toBe("low")
+      next.navigate("two")
+      await restarted.renderOnce()
       expect(next.local.model.current()).toEqual(draft.parts[0].model)
+      expect(next.local.model.variant.selected()).toBe("default")
+      next.navigate("one")
+      await restarted.renderOnce()
+      expect(next.local.model.current()).toEqual(base)
+      expect(next.local.model.variant.current()).toBe("low")
+      ready = Promise.withResolvers()
+      const concurrent = await testRender(() => <Harness />, { width: 120, height: 30, kittyKeyboard: true })
+      try {
+        const other = await ready.promise
+        while (!other.local.model.ready || other.sync.status === "loading") await Bun.sleep(10)
+        other.sync.set("provider", ctx.sync.data.provider)
+        next.navigate("parallel-one")
+        other.navigate("parallel-two")
+        await restarted.renderOnce()
+        await concurrent.renderOnce()
+        next.local.model.set(base)
+        next.local.model.variant.set("low")
+        other.local.model.set(draft.parts[0].model)
+        other.local.model.variant.set("high")
+        for (let count = 0; count < 200; count++) {
+          const session = (await Bun.file(`${state}/model.json`).json()).session
+          if (session["parallel-one"]?.variant === "low" && session["parallel-two"]?.variant === "high") break
+          await Bun.sleep(10)
+        }
+        expect((await Bun.file(`${state}/model.json`).json()).session).toMatchObject({
+          ...saved,
+          "parallel-one": { ...base, variant: "low" },
+          "parallel-two": { ...draft.parts[0].model, variant: "high" },
+        })
+        next.local.model.toggleFavorite(base)
+        for (let count = 0; count < 100 && !(await Bun.file(`${state}/model.json`).json()).favorite.length; count++)
+          await Bun.sleep(10)
+        expect((await Bun.file(`${state}/model.json`).json()).session["parallel-two"]).toEqual({
+          ...draft.parts[0].model,
+          variant: "high",
+        })
+        await next.local.model.flush()
+        await other.local.model.flush()
+        // A directory at the destination forces real atomic-rename failures without mocking persistence.
+        await rename(`${state}/model.json`, `${state}/model.saved.json`)
+        await mkdir(`${state}/model.json`)
+        try {
+          other.navigate("retry-one")
+          await concurrent.renderOnce()
+          other.local.model.set(base)
+          await concurrent.renderOnce()
+          other.local.model.variant.set("low")
+          await other.local.model.flush()
+        } finally {
+          await rm(`${state}/model.json`, { recursive: true })
+          await rename(`${state}/model.saved.json`, `${state}/model.json`)
+        }
+        other.navigate("retry-two")
+        await concurrent.renderOnce()
+        other.local.model.set(draft.parts[0].model)
+        await concurrent.renderOnce()
+        other.local.model.variant.set("high")
+        await other.local.model.flush()
+        expect((await Bun.file(`${state}/model.json`).json()).session).toMatchObject({
+          "retry-one": { ...base, variant: "low" },
+          "retry-two": { ...draft.parts[0].model, variant: "high" },
+        })
+        const lock = await Flock.acquire(`tui-model:${state}/model.json`, { dir: `${state}/locks` })
+        try {
+          other.navigate("shutdown")
+          await concurrent.renderOnce()
+          other.local.model.set(base)
+          await concurrent.renderOnce()
+          other.local.model.variant.set("low")
+          other.navigate()
+          await concurrent.renderOnce()
+          other.prompt().set({ input: "create while exiting", parts: [] })
+          const sent = submissions.length
+          other.prompt().submit()
+          for (let count = 0; count < 100 && creations.length < 4; count++) await Bun.sleep(10)
+          expect(creations).toHaveLength(4)
+          other.local.model.set(draft.parts[0].model)
+          await concurrent.renderOnce()
+          other.local.model.variant.set("high")
+          const flush = flushes.find((flush) => flush === other.local.model.flush)
+          expect(flush).toBeDefined()
+          concurrent.renderer.destroy()
+          const finished = { value: false }
+          const shutdown = flush!().then(() => (finished.value = true))
+          await Bun.sleep(20)
+          expect(finished.value, "shutdown must wait for session initialization").toBe(false)
+          shutdownCreationRelease.resolve()
+          await Bun.sleep(20)
+          expect(finished.value, "shutdown must then wait for the locked model save").toBe(false)
+          await lock.release()
+          await shutdown
+          expect((await Bun.file(`${state}/model.json`).json()).session.shutdown).toEqual({ ...base, variant: "low" })
+          expect((await Bun.file(`${state}/model.json`).json()).session["shutdown-created"]).toEqual({
+            ...base,
+            variant: "low",
+          })
+          expect(submissions, "a disposed composer must not send after late creation").toHaveLength(sent)
+        } finally {
+          await lock.release().catch(() => {})
+        }
+      } finally {
+        concurrent.renderer.destroy()
+      }
     } finally {
       restarted.renderer.destroy()
+    }
+    ready = Promise.withResolvers()
+    const startup = await testRender(
+      () => (
+        <Harness
+          model="provider/override"
+          init={(local, sync) => {
+            sync.set("agent", ctx.sync.data.agent)
+            sync.set("provider", ctx.sync.data.provider)
+            local.model.selectInitial()
+          }}
+        />
+      ),
+      { width: 120, height: 30, kittyKeyboard: true },
+    )
+    try {
+      const started = await ready.promise
+      while (!started.local.model.ready || started.sync.status === "loading") await Bun.sleep(10)
+      started.sync.set("provider", ctx.sync.data.provider)
+      expect(started.local.model.current(), "--model overrides the reopened session's saved model").toEqual(
+        draft.parts[0].model,
+      )
+      await started.local.model.flush()
+      expect((await Bun.file(`${state}/model.json`).json()).session.one).toEqual({
+        ...draft.parts[0].model,
+        variant: "high",
+      })
+      started.navigate("two")
+      await startup.renderOnce()
+      expect(started.local.model.variant.selected(), "--model does not overwrite other sessions").toBe("default")
+      started.navigate("shutdown-created")
+      await startup.renderOnce()
+      expect(started.local.model.current()).toEqual(base)
+      expect(started.local.model.variant.current()).toBe("low")
+    } finally {
+      startup.renderer.destroy()
     }
   } finally {
     app.renderer.destroy()

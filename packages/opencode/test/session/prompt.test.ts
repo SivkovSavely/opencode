@@ -1230,54 +1230,139 @@ withTerminalGap.instance(
     }),
 )
 
-it.instance("composer completed tool-call steps retain the active parent selection", () =>
-  Effect.gen(function* () {
-    yield* useServerConfig(composerConfig)
-    const { prompt, sessions, chat, run } = yield* boot()
-    const sol = { providerID: ref.providerID, modelID: ModelV2.ID.make("sol") }
-    const luna = { providerID: ref.providerID, modelID: ModelV2.ID.make("luna") }
-    const parent = yield* prompt.prompt({
-      sessionID: chat.id,
-      model: sol,
-      selection: { model: luna },
-      noReply: true,
-      parts: [{ type: "text", text: "tool parent" }],
-    })
-    const running = yield* run.ensureRunning(chat.id, Effect.succeed(parent), Effect.never).pipe(Effect.forkChild)
-    yield* pollWithTimeout(
-      run.assertNotBusy(chat.id).pipe(
-        Effect.exit,
-        Effect.map((exit) => (Exit.isFailure(exit) ? true : undefined)),
-      ),
-      "tool parent runner started",
-    )
-    yield* sessions.updateMessage({
-      id: MessageID.ascending(),
-      parentID: parent.info.id,
-      sessionID: chat.id,
-      role: "assistant",
-      mode: "build",
-      agent: "build",
-      providerID: luna.providerID,
-      modelID: luna.modelID,
-      cost: 0,
-      path: { cwd: "/tmp", root: "/tmp" },
-      tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
-      finish: "tool-calls",
-      time: { created: Date.now(), completed: Date.now() },
-    })
-    const steer = yield* prompt.prompt({
-      sessionID: chat.id,
-      model: sol,
-      selection: { inheritActive: true },
-      noReply: true,
-      parts: [{ type: "text", text: "during tool continuation" }],
-    })
-    expect(steer.info.role === "user" && steer.info.model).toEqual({ ...luna, variant: "default" })
-    yield* run.cancel(chat.id)
-    yield* Fiber.join(running)
-  }),
-)
+for (const [finish, status, metadata, toolName, structured, retainActive] of [
+  ["tool-calls", undefined, undefined, "read", undefined, true],
+  ["stop", "running", undefined, "read", undefined, true],
+  ["stop", "completed", undefined, "read", undefined, true],
+  ["stop", "completed", { providerExecuted: true }, "read", undefined, false],
+  ["stop", "error", { interrupted: true }, "read", undefined, false],
+  ["stop", "error", { interrupted: true, crashInterrupted: true }, "read", undefined, true],
+  ["stop", "completed", undefined, "StructuredOutput", {}, false],
+] as const) {
+  it.instance(
+    `composer ${finish} steps with ${status ?? "no"} ${toolName} tool parts ${retainActive ? "retain" : "fall back from"} the active parent selection`,
+    () =>
+      Effect.gen(function* () {
+        yield* useServerConfig(composerConfig)
+        const { prompt, sessions, chat, run } = yield* boot()
+        const sol = { providerID: ref.providerID, modelID: ModelV2.ID.make("sol") }
+        const luna = { providerID: ref.providerID, modelID: ModelV2.ID.make("luna") }
+        yield* sessions.setAgentModel({
+          sessionID: chat.id,
+          agent: "build",
+          model: { providerID: sol.providerID, id: sol.modelID, variant: "xhigh" },
+          time: Date.now(),
+        })
+        const parent = yield* prompt.prompt({
+          sessionID: chat.id,
+          model: sol,
+          variant: "xhigh",
+          selection: { model: luna, variant: "high" },
+          noReply: true,
+          parts: [{ type: "text", text: "tool parent" }],
+        })
+        expect(parent.info.role === "user" && parent.info.model).toEqual({ ...luna, variant: "high" })
+        const running = yield* run.ensureRunning(chat.id, Effect.succeed(parent), Effect.never).pipe(Effect.forkChild)
+        yield* pollWithTimeout(
+          run.assertNotBusy(chat.id).pipe(
+            Effect.exit,
+            Effect.map((exit) => (Exit.isFailure(exit) ? true : undefined)),
+          ),
+          "tool parent runner started",
+        )
+        const assistant = yield* sessions.updateMessage({
+          id: MessageID.ascending(),
+          parentID: parent.info.id,
+          sessionID: chat.id,
+          role: "assistant",
+          mode: "build",
+          agent: "build",
+          providerID: luna.providerID,
+          modelID: luna.modelID,
+          cost: 0,
+          path: { cwd: "/tmp", root: "/tmp" },
+          tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+          ...(structured === undefined ? {} : { structured }),
+          finish,
+          time: { created: Date.now(), completed: Date.now() },
+        })
+        if (status) {
+          yield* sessions.updatePart({
+            id: PartID.ascending(),
+            messageID: assistant.id,
+            sessionID: chat.id,
+            type: "tool",
+            callID: "composer-tool",
+            tool: toolName,
+            metadata: metadata?.providerExecuted ? metadata : undefined,
+            state:
+              status === "running"
+                ? {
+                    status,
+                    input: { filePath: "/tmp/probe" },
+                    time: { start: Date.now() },
+                  }
+                : status === "error"
+                  ? {
+                      status,
+                      input: { filePath: "/tmp/probe" },
+                      error: "interrupted",
+                      metadata: metadata ?? {},
+                      time: { start: Date.now(), end: Date.now() },
+                    }
+                  : {
+                      status,
+                      input: { filePath: "/tmp/probe" },
+                      title: "read probe",
+                      output: "probe",
+                      metadata: {},
+                      time: { start: Date.now(), end: Date.now() },
+                    },
+          })
+        }
+        const steer = yield* prompt.prompt({
+          sessionID: chat.id,
+          model: sol,
+          variant: "xhigh",
+          selection: { inheritActive: true },
+          noReply: true,
+          parts: [{ type: "text", text: "during tool continuation" }],
+        })
+        expect(steer.info.role === "user" && steer.info.model).toEqual(
+          retainActive ? { ...luna, variant: "high" } : { ...sol, variant: "xhigh" },
+        )
+        expect((yield* sessions.get(chat.id)).model).toEqual({
+          providerID: sol.providerID,
+          id: sol.modelID,
+          variant: "xhigh",
+        })
+        yield* sessions.updateMessage({
+          ...assistant,
+          id: MessageID.ascending(),
+          parentID: steer.info.id,
+          finish: "stop",
+          time: { created: Date.now(), completed: Date.now() },
+        })
+        expect(Exit.isFailure(yield* run.assertNotBusy(chat.id).pipe(Effect.exit))).toBe(true)
+        const fallback = yield* prompt.prompt({
+          sessionID: chat.id,
+          model: sol,
+          variant: "xhigh",
+          selection: { inheritActive: true },
+          noReply: true,
+          parts: [{ type: "text", text: "after terminal response" }],
+        })
+        expect(fallback.info.role === "user" && fallback.info.model).toEqual({ ...sol, variant: "xhigh" })
+        expect((yield* sessions.get(chat.id)).model).toEqual({
+          providerID: sol.providerID,
+          id: sol.modelID,
+          variant: "xhigh",
+        })
+        yield* run.cancel(chat.id)
+        yield* Fiber.join(running)
+      }),
+  )
+}
 
 it.instance("composer queue conversion publishes selection before an immediate plain steer", () =>
   Effect.gen(function* () {

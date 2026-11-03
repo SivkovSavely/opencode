@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test"
 import type { ModelPart, Prompt, VariantPart } from "@/context/prompt"
-import type { Message } from "@opencode-ai/sdk/v2/client"
+import type { Message, Part } from "@opencode-ai/sdk/v2/client"
 import {
   activePromptSelection,
   commandBody,
@@ -429,5 +429,177 @@ describe("prompt controls", () => {
       ),
     ).toBeUndefined()
     expect(activePromptSelection([parent, child], true, "root")).toBeUndefined()
+  })
+
+  describe("stop-finished tool selection lifecycle", () => {
+    const base = { providerID: "saved", modelID: "saved-model", variant: "saved-only" }
+    const actual = { providerID: "actual", modelID: "actual-model", variant: "actual-only" }
+    const parent = {
+      id: "user",
+      sessionID: "root",
+      role: "user",
+      model: { providerID: "requested", modelID: "requested-model", variant: "requested-only" },
+    } as Extract<Message, { role: "user" }>
+    const assistant = {
+      id: "assistant",
+      sessionID: "root",
+      role: "assistant",
+      parentID: parent.id,
+      ...actual,
+      finish: "stop",
+      time: { created: 1, completed: 2 },
+    } as Extract<Message, { role: "assistant" }>
+    const child = { ...assistant, id: "child-assistant", sessionID: "child", providerID: "wrong" }
+    const optimistic = { ...parent, id: "optimistic", model: { providerID: "wrong", modelID: "wrong" } }
+    const admitted = [{ id: parent.id, type: "user" }]
+    const models = [
+      { ...base, variants: [base.variant] },
+      { ...actual, variants: [actual.variant] },
+    ]
+    const input = { text: "continue", base, selection: {}, commands: [] }
+    const states = [
+      { status: "pending", input: {}, raw: "{}" },
+      { status: "running", input: {}, time: { start: 2 } },
+      { status: "completed", input: {}, output: "done", title: "Read", metadata: {}, time: { start: 2, end: 3 } },
+      { status: "error", input: {}, error: "failed", time: { start: 2, end: 3 } },
+    ] satisfies Extract<Part, { type: "tool" }>["state"][]
+    const tool = {
+      id: "tool",
+      sessionID: "root",
+      messageID: assistant.id,
+      type: "tool",
+      callID: "call",
+      tool: "read",
+      state: states[2],
+    } satisfies Extract<Part, { type: "tool" }>
+
+    test.each(states)("inherits the actual model and validates its variant with a $status tool", (state) => {
+      const parts: Record<string, Part[]> = {
+        [assistant.id]: [{ ...tool, state }],
+        [child.id]: [{ ...tool, messageID: child.id, sessionID: child.sessionID }],
+      }
+      const active = activePromptSelection([parent, assistant, optimistic, child], true, "root", admitted, parts)
+      expect(active).toEqual(actual)
+      expect(contemplatedPromptSelection({ ...input, active })).toEqual(actual)
+
+      const clean = materializePrompt([text("continue"), { ...variant, variant: actual.variant }])
+      const execution = contemplatedPromptSelection({ ...input, text: clean.text, selection: clean.selection, active })
+      expect(resolvePromptSelection(execution, clean.selection, models)).toEqual({
+        model: { providerID: actual.providerID, modelID: actual.modelID },
+        variant: actual.variant,
+      })
+      expect(resolvePromptSelection(base, clean.selection, models)).toEqual({
+        error: "prompt.controls.variantUnavailable",
+      })
+    })
+
+    test.each([
+      {
+        name: "a provider-executed hosted tool",
+        state: states[2],
+        metadata: { providerExecuted: true },
+      },
+      {
+        name: "an interrupted orphan tool",
+        state: { ...states[3], metadata: { interrupted: true } },
+      },
+      {
+        name: "a StructuredOutput finalizer",
+        state: states[2],
+        tool: "StructuredOutput",
+        structured: {},
+      },
+    ])("returns persistent selection for $name", ({ state, tool: toolName, metadata, structured }) => {
+      const finalized = { ...assistant, ...(structured === undefined ? {} : { structured }) }
+      const part = { ...tool, ...(toolName === undefined ? {} : { tool: toolName }), metadata, state }
+      const active = activePromptSelection([parent, finalized], true, "root", admitted, { [assistant.id]: [part] })
+      expect(active).toBeUndefined()
+      expect(contemplatedPromptSelection({ ...input, active })).toEqual(base)
+    })
+
+    test("a crash-interrupted tool remains active continuation", () => {
+      const state = { ...states[3], metadata: { interrupted: true, crashInterrupted: true } }
+      const active = activePromptSelection([parent, assistant], true, "root", admitted, {
+        [assistant.id]: [{ ...tool, state }],
+      })
+      expect(active).toEqual(actual)
+    })
+
+    test("an admitted steer wins during the tool boundary while queued prompts retain persistent selection", () => {
+      const steer = {
+        ...parent,
+        id: "steer",
+        model: { providerID: "steer", modelID: "steer-model", variant: "steer-only" },
+      }
+      const childSteer = { ...steer, id: "child-steer", sessionID: "child", model: optimistic.model }
+      const active = activePromptSelection(
+        [parent, assistant, steer, optimistic, childSteer, child],
+        true,
+        "root",
+        [...admitted, { id: steer.id, type: "user" }, { id: childSteer.id, type: "user" }],
+        { [assistant.id]: [tool] },
+      )
+      expect(active).toEqual(steer.model)
+      expect(contemplatedPromptSelection({ ...input, active })).toEqual(steer.model)
+      expect(contemplatedPromptSelection({ ...input, active, text: "/queue continue" })).toEqual(base)
+      expect(contemplatedPromptSelection({ ...input, active, queue: true })).toEqual(base)
+    })
+
+    test.each([
+      {
+        name: "a later terminal assistant despite old tool parts",
+        messages: [parent, assistant, { ...assistant, id: "done" }],
+        running: true,
+        parts: { [assistant.id]: [tool] },
+      },
+      {
+        name: "a completed assistant without finish or tools",
+        messages: [parent, { ...assistant, finish: undefined }],
+        running: true,
+        parts: {},
+      },
+      {
+        name: "an errored assistant even with tool parts",
+        messages: [parent, { ...assistant, error: { name: "UnknownError", data: { message: "failed" } } }],
+        running: true,
+        parts: { [assistant.id]: [tool] },
+      },
+      {
+        name: "an idle session even with tool parts",
+        messages: [parent, assistant],
+        running: false,
+        parts: { [assistant.id]: [tool] },
+      },
+      {
+        name: "tool parts belonging only to a child assistant",
+        messages: [parent, assistant, child],
+        running: true,
+        parts: { [child.id]: [{ ...tool, messageID: child.id, sessionID: child.sessionID }] },
+      },
+      {
+        name: "tool parts belonging only to an older assistant",
+        messages: [parent, { ...assistant, id: "old" }, assistant],
+        running: true,
+        parts: { old: [{ ...tool, messageID: "old" }] },
+      },
+      {
+        name: "a busy optimistic draft without a real assistant",
+        messages: [parent, optimistic],
+        running: true,
+        parts: { [assistant.id]: [tool] },
+      },
+    ] satisfies { name: string; messages: Message[]; running: boolean; parts: Record<string, Part[]> }[])(
+      "returns persistent selection for $name",
+      ({ messages, running, parts }) => {
+        const active = activePromptSelection(messages, running, "root", admitted, parts)
+        expect(active).toBeUndefined()
+        const execution = contemplatedPromptSelection({ ...input, active })
+        expect(execution).toEqual(base)
+        expect(resolvePromptSelection(execution, input.selection, models)).toEqual({
+          model: { providerID: base.providerID, modelID: base.modelID },
+          variant: base.variant,
+        })
+      },
+    )
   })
 })

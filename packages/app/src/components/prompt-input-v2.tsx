@@ -330,6 +330,7 @@ export function usePromptInputV2Controller(props: PromptInputV2ControllerProps):
             sync().data.session_working(id),
             id,
             sync().data.session_message[id] ?? [],
+            sync().data.part,
           )
         : undefined,
       commands: mode() === "normal" ? sync().data.command : [],

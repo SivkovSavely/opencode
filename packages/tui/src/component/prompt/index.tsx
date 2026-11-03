@@ -227,6 +227,8 @@ export function Prompt(props: PromptProps) {
       sync.data.message[props.sessionID ?? ""] ?? [],
       status().type !== "idle",
       local.agent.list().map((agent) => agent.name),
+      sync.data.part,
+      props.sessionID,
     ),
   )
   const currentProviderLabel = createMemo(() => local.model.parsed().provider)
@@ -1115,6 +1117,7 @@ export function Prompt(props: PromptProps) {
       return false
     }
 
+    const persistentVariant = local.model.variant.selected()
     const variant = local.model.variant.current()
     const queuedCommand =
       queued?.type === "enqueue" && queued.kind === "command"
@@ -1250,9 +1253,10 @@ export function Prompt(props: PromptProps) {
     if (sessionID == null) {
       const directory = await move.getDirectory(inputText)
       if (move.pending() && !directory) return false
+      if (renderer.isDestroyed) return false
       finishMoveProgress = Boolean(move.progress())
 
-      const res = await sdk.client.session.create({
+      const creating = sdk.client.session.create({
         directory,
         workspace: selectedWorkspaceID,
         agent: agent.name,
@@ -1262,6 +1266,12 @@ export function Prompt(props: PromptProps) {
           variant,
         },
       })
+      await local.model.remember(
+        creating.then((res) => res.data?.id),
+        { ...selectedModel, variant: persistentVariant },
+      )
+      const res = await creating
+      if (renderer.isDestroyed) return false
 
       if (res.error) {
         if (finishMoveProgress) move.finishSubmit({ preserveDestination: !!payload })

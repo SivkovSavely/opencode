@@ -152,7 +152,17 @@ const layer = Layer.effect(
           (assistant.error ||
             (assistant.finish &&
               !["tool-calls", "unknown"].includes(assistant.finish) &&
-              !response.value.parts.some((part) => part.type === "tool")))
+              !response.value.parts.some(
+                (part) =>
+                  part.type === "tool" &&
+                  !part.metadata?.providerExecuted &&
+                  !(
+                    part.state.status === "error" &&
+                    part.state.metadata?.interrupted === true &&
+                    part.state.metadata?.crashInterrupted !== true
+                  ) &&
+                  !(part.tool === "StructuredOutput" && assistant.structured !== undefined),
+              )))
         )
           return
       }
