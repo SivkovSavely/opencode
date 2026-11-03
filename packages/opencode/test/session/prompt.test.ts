@@ -256,6 +256,7 @@ function makeHttp(input?: {
   processor?: "blocking"
   snapshot?: Layer.Layer<Snapshot.Service>
   plugin?: Layer.Layer<Plugin.Service>
+  instruction?: Layer.Layer<Instruction.Service>
 }) {
   const root = LayerNode.group([promptRoot, testLLMServerNode])
   const snapshotReplacement = input?.snapshot ? [[Snapshot.node, input.snapshot] as const] : []
@@ -264,6 +265,7 @@ function makeHttp(input?: {
     [LSP.node, lsp],
     [MCP.node, makeMcp(input?.mcpInstructions)],
     [RuntimeFlags.node, runtimeFlags],
+    ...(input?.instruction ? [[Instruction.node, input.instruction] as const] : []),
     ...snapshotReplacement,
   ] as const
   if (input?.plugin) {
@@ -283,6 +285,33 @@ function makeHttpNoLLMServer(input?: { mcpInstructions?: MCP.ServerInstructions[
 }
 
 const it = testEffect(makeHttp())
+const terminalPersisted = Deferred.makeUnsafe<void>()
+const terminalRelease = Deferred.makeUnsafe<void>()
+const withTerminalGap = testEffect(
+  makeHttp({
+    instruction: Layer.effect(
+      Instruction.Service,
+      Effect.gen(function* () {
+        const instruction = yield* Instruction.Service
+        let clears = 0
+        return Instruction.Service.of({
+          ...instruction,
+          clear: (messageID) =>
+            instruction.clear(messageID).pipe(
+              Effect.andThen(
+                Effect.gen(function* () {
+                  // The first clear belongs to user preparation; the next follows the real processor's terminal save.
+                  if (++clears !== 2) return
+                  yield* Deferred.succeed(terminalPersisted, undefined)
+                  yield* Deferred.await(terminalRelease)
+                }),
+              ),
+            ),
+        })
+      }),
+    ).pipe(Layer.provide(LayerNode.compile(Instruction.node, [[RuntimeFlags.node, runtimeFlags]]))),
+  }),
+)
 const makeOwnedRuntime = (
   archiveAfterAdmission = false,
   processor?: "blocking",
@@ -824,6 +853,33 @@ function providerCfg(url: string) {
   }
 }
 
+function composerConfig(url: string) {
+  return {
+    ...providerCfg(url),
+    command: {
+      pick: { template: "pick", model: "test/luna" },
+      "pick-subtask": { template: "pick", model: "test/luna", subtask: true },
+    },
+    provider: {
+      test: {
+        ...providerCfg(url).provider.test,
+        models: {
+          sol: {
+            ...cfg.provider.test.models["test-model"],
+            id: "sol",
+            variants: { xhigh: { reasoningEffort: "xhigh" } },
+          },
+          luna: {
+            ...cfg.provider.test.models["test-model"],
+            id: "luna",
+            variants: { high: { reasoningEffort: "high" } },
+          },
+        },
+      },
+    },
+  }
+}
+
 const writeText = Effect.fn("test.writeText")(function* (file: string, text: string) {
   const fs = yield* FSUtil.Service
   yield* fs.writeWithDirs(file, text)
@@ -971,6 +1027,472 @@ const queuedPrompt = (text: string): SessionQueueV1.Payload => ({
   model: ref,
   parts: [{ type: "text", text }],
 })
+
+it.instance("composer selection inherits admitted parent pairs without changing persistent fallback", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig((url) => ({
+      ...providerCfg(url),
+      command: { pick: { template: "command selection", model: "test/luna" } },
+      provider: {
+        test: {
+          ...providerCfg(url).provider.test,
+          models: {
+            sol: {
+              ...cfg.provider.test.models["test-model"],
+              id: "sol",
+              variants: { xhigh: { reasoningEffort: "xhigh" } },
+            },
+            luna: {
+              ...cfg.provider.test.models["test-model"],
+              id: "luna",
+              variants: { high: { reasoningEffort: "high" } },
+            },
+          },
+        },
+      },
+    }))
+    const { prompt, sessions, chat } = yield* boot()
+    const sol = { providerID: ref.providerID, modelID: ModelV2.ID.make("sol") }
+    const luna = { providerID: ref.providerID, modelID: ModelV2.ID.make("luna") }
+    yield* sessions.setAgentModel({
+      sessionID: chat.id,
+      agent: "build",
+      model: { providerID: ref.providerID, id: sol.modelID, variant: "xhigh" },
+      time: Date.now(),
+    })
+    const first = yield* Deferred.make<void>()
+    const second = yield* Deferred.make<void>()
+    yield* llm.hold("first", deferredAsPromise(first))
+    yield* llm.hold("steered", deferredAsPromise(second))
+    yield* llm.text("queued")
+    const running = yield* prompt
+      .prompt({
+        sessionID: chat.id,
+        model: sol,
+        variant: "xhigh",
+        selection: { inheritActive: true, model: luna },
+        parts: [{ type: "text", text: "normal luna" }],
+      })
+      .pipe(Effect.forkChild)
+    yield* llm.wait(1)
+    for (const text of ["plain one", "plain two"]) {
+      const message = yield* prompt.prompt({
+        sessionID: chat.id,
+        model: sol,
+        variant: "xhigh",
+        selection: { inheritActive: true },
+        noReply: true,
+        parts: [{ type: "text", text }],
+      })
+      expect(message.info.role === "user" && message.info.model).toEqual({ ...luna, variant: "default" })
+    }
+    const high = yield* prompt.prompt({
+      sessionID: chat.id,
+      model: sol,
+      variant: "xhigh",
+      selection: { inheritActive: true, variant: "high" },
+      noReply: true,
+      parts: [{ type: "text", text: "explicit high" }],
+    })
+    expect(high.info.role === "user" && high.info.model).toEqual({ ...luna, variant: "high" })
+    const inherited = yield* prompt.prompt({
+      sessionID: chat.id,
+      model: sol,
+      variant: "xhigh",
+      selection: { inheritActive: true },
+      noReply: true,
+      parts: [{ type: "text", text: "inherited high" }],
+    })
+    expect(inherited.info.role === "user" && inherited.info.model).toEqual({ ...luna, variant: "high" })
+    yield* prompt.queueSubmit(chat.id, {
+      id: "persistent-snapshot",
+      payload: {
+        kind: "prompt",
+        agent: "build",
+        model: sol,
+        variant: "xhigh",
+        selection: {},
+        parts: [{ type: "text", text: "queue snapshot" }],
+      },
+    })
+    expect((yield* sessions.get(chat.id)).model).toMatchObject({ id: "sol", variant: "xhigh" })
+    yield* Deferred.succeed(first, undefined)
+    yield* llm.wait(2)
+    expect((yield* llm.hits)[1].body.model).toBe("luna")
+    yield* Deferred.succeed(second, undefined)
+    yield* Fiber.join(running)
+    expect((yield* llm.hits)[2].body.model).toBe("sol")
+    const fallback = yield* prompt.prompt({
+      sessionID: chat.id,
+      model: sol,
+      variant: "xhigh",
+      selection: { inheritActive: true },
+      noReply: true,
+      parts: [{ type: "text", text: "after completion" }],
+    })
+    expect(fallback.info.role === "user" && fallback.info.model).toEqual({ ...sol, variant: "xhigh" })
+    const invalid = yield* prompt
+      .prompt({
+        sessionID: chat.id,
+        model: sol,
+        selection: { variant: "missing" },
+        noReply: true,
+        parts: [{ type: "text", text: "invalid" }],
+      })
+      .pipe(Effect.exit)
+    expect(Exit.isFailure(invalid) && Cause.pretty(invalid.cause)).toContain("Variant not found")
+    yield* llm.text("command default")
+    yield* prompt.command({
+      sessionID: chat.id,
+      command: "pick",
+      arguments: "",
+      model: "test/sol",
+      variant: "xhigh",
+      selection: {},
+    })
+    expect((yield* llm.hits).at(-1)?.body.model).toBe("luna")
+    yield* llm.text("explicit command override")
+    yield* prompt.command({
+      sessionID: chat.id,
+      command: "pick",
+      arguments: "",
+      model: "test/sol",
+      variant: "xhigh",
+      selection: { model: sol, variant: "xhigh" },
+    })
+    expect((yield* llm.hits).at(-1)?.body.model).toBe("sol")
+    expect((yield* sessions.get(chat.id)).model).toMatchObject({ id: "sol", variant: "xhigh" })
+  }),
+)
+
+withTerminalGap.instance(
+  "composer late admission uses saved selection after terminal persistence before runner cleanup",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(composerConfig)
+      const { prompt, sessions, chat, run } = yield* boot()
+      const sol = { providerID: ref.providerID, modelID: ModelV2.ID.make("sol") }
+      const luna = { providerID: ref.providerID, modelID: ModelV2.ID.make("luna") }
+      yield* sessions.setAgentModel({
+        sessionID: chat.id,
+        agent: "build",
+        model: { providerID: ref.providerID, id: sol.modelID, variant: "xhigh" },
+        time: Date.now(),
+      })
+      yield* llm.text("terminal luna")
+      yield* llm.text("late sol")
+      const running = yield* prompt
+        .prompt({
+          sessionID: chat.id,
+          model: sol,
+          variant: "xhigh",
+          selection: { inheritActive: true, model: luna },
+          parts: [{ type: "text", text: "luna" }],
+        })
+        .pipe(Effect.forkChild)
+      yield* awaitWithTimeout(Deferred.await(terminalPersisted), "terminal persistence")
+      const terminal = (yield* sessions.messages({ sessionID: chat.id })).findLast(
+        (message) => message.info.role === "assistant",
+      )
+      expect(terminal?.info).toMatchObject({ finish: "stop", time: { completed: expect.any(Number) } })
+      expect(Exit.isFailure(yield* run.assertNotBusy(chat.id).pipe(Effect.exit))).toBe(true)
+      const late = yield* prompt.prompt({
+        sessionID: chat.id,
+        model: sol,
+        variant: "xhigh",
+        selection: { inheritActive: true },
+        noReply: true,
+        parts: [{ type: "text", text: "late plain" }],
+      })
+      expect(late.info.role === "user" && late.info.model).toEqual({ ...sol, variant: "xhigh" })
+      // A newer accepted steer owns the pair even while the older terminal assistant remains latest.
+      const newer = yield* prompt.prompt({
+        sessionID: chat.id,
+        model: sol,
+        variant: "xhigh",
+        selection: { inheritActive: true, variant: "default" },
+        noReply: true,
+        parts: [{ type: "text", text: "new default" }],
+      })
+      const inherited = yield* prompt.prompt({
+        sessionID: chat.id,
+        model: sol,
+        variant: "xhigh",
+        selection: { inheritActive: true },
+        noReply: true,
+        parts: [{ type: "text", text: "new inherited" }],
+      })
+      expect(newer.info.role === "user" && newer.info.model.variant).toBe("default")
+      expect(inherited.info.role === "user" && inherited.info.model).toEqual({ ...sol, variant: "default" })
+      yield* Deferred.succeed(terminalRelease, undefined)
+      yield* Fiber.join(running)
+      expect((yield* llm.hits).map((hit) => hit.body.model)).toEqual(["luna", "sol"])
+    }),
+)
+
+it.instance("composer completed tool-call steps retain the active parent selection", () =>
+  Effect.gen(function* () {
+    yield* useServerConfig(composerConfig)
+    const { prompt, sessions, chat, run } = yield* boot()
+    const sol = { providerID: ref.providerID, modelID: ModelV2.ID.make("sol") }
+    const luna = { providerID: ref.providerID, modelID: ModelV2.ID.make("luna") }
+    const parent = yield* prompt.prompt({
+      sessionID: chat.id,
+      model: sol,
+      selection: { model: luna },
+      noReply: true,
+      parts: [{ type: "text", text: "tool parent" }],
+    })
+    const running = yield* run.ensureRunning(chat.id, Effect.succeed(parent), Effect.never).pipe(Effect.forkChild)
+    yield* pollWithTimeout(
+      run.assertNotBusy(chat.id).pipe(
+        Effect.exit,
+        Effect.map((exit) => (Exit.isFailure(exit) ? true : undefined)),
+      ),
+      "tool parent runner started",
+    )
+    yield* sessions.updateMessage({
+      id: MessageID.ascending(),
+      parentID: parent.info.id,
+      sessionID: chat.id,
+      role: "assistant",
+      mode: "build",
+      agent: "build",
+      providerID: luna.providerID,
+      modelID: luna.modelID,
+      cost: 0,
+      path: { cwd: "/tmp", root: "/tmp" },
+      tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+      finish: "tool-calls",
+      time: { created: Date.now(), completed: Date.now() },
+    })
+    const steer = yield* prompt.prompt({
+      sessionID: chat.id,
+      model: sol,
+      selection: { inheritActive: true },
+      noReply: true,
+      parts: [{ type: "text", text: "during tool continuation" }],
+    })
+    expect(steer.info.role === "user" && steer.info.model).toEqual({ ...luna, variant: "default" })
+    yield* run.cancel(chat.id)
+    yield* Fiber.join(running)
+  }),
+)
+
+it.instance("composer queue conversion publishes selection before an immediate plain steer", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(composerConfig)
+    const { prompt, sessions, chat } = yield* boot()
+    const queue = yield* SessionQueue.Service
+    const sol = { providerID: ref.providerID, modelID: ModelV2.ID.make("sol") }
+    const luna = { providerID: ref.providerID, modelID: ModelV2.ID.make("luna") }
+    const release = yield* Deferred.make<void>()
+    yield* llm.hold("initial sol", deferredAsPromise(release))
+    yield* llm.text("steered luna")
+    const running = yield* prompt
+      .prompt({
+        sessionID: chat.id,
+        model: sol,
+        variant: "xhigh",
+        selection: {},
+        parts: [{ type: "text", text: "sol" }],
+      })
+      .pipe(Effect.forkChild)
+    yield* llm.wait(1)
+    const pending = yield* prompt.queueSubmit(chat.id, {
+      id: "converted-luna",
+      payload: {
+        kind: "prompt",
+        agent: "build",
+        model: luna,
+        variant: "high",
+        selection: {},
+        parts: [{ type: "text", text: "converted luna" }],
+      },
+    })
+    yield* prompt.queueUpdate(chat.id, {
+      revision: pending.revision,
+      mutation: { action: "convert", id: "converted-luna", delivery: "steer" },
+    })
+    const immediate = yield* prompt.prompt({
+      sessionID: chat.id,
+      model: sol,
+      variant: "xhigh",
+      selection: { inheritActive: true },
+      noReply: true,
+      parts: [{ type: "text", text: "immediate plain" }],
+    })
+    expect(immediate.info.role === "user" && immediate.info.model).toEqual({ ...luna, variant: "high" })
+    yield* Deferred.succeed(release, undefined)
+    yield* Fiber.join(running)
+    expect((yield* llm.hits).map((hit) => hit.body.model)).toEqual(["sol", "luna"])
+    expect((yield* queue.get(chat.id, "converted-luna")).state).toBe("delivered")
+    expect((yield* sessions.get(chat.id)).model).toBeUndefined()
+  }),
+)
+
+it.instance("composer queue validates explicit variants before enqueue using command defaults then overrides", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(composerConfig)
+    const { prompt, chat } = yield* boot()
+    const queue = yield* SessionQueue.Service
+    const sol = { providerID: ref.providerID, modelID: ModelV2.ID.make("sol") }
+    const paused = yield* prompt.queueUpdate(chat.id, { revision: 0, mutation: { action: "pause", paused: true } })
+    const invalid: SessionQueueV1.Payload[] = [
+      {
+        kind: "prompt",
+        agent: "build",
+        model: sol,
+        selection: { variant: "high" },
+        parts: [{ type: "text", text: "invalid prompt" }],
+      },
+      { kind: "command", agent: "build", model: sol, selection: { variant: "xhigh" }, command: "pick", arguments: "" },
+      {
+        kind: "command",
+        agent: "build",
+        model: sol,
+        selection: { variant: "high" },
+        command: "pick-subtask",
+        arguments: "",
+      },
+    ]
+    for (const [index, payload] of invalid.entries()) {
+      const result = yield* prompt.queueSubmit(chat.id, { id: `invalid-${index}`, payload }).pipe(Effect.exit)
+      expect(Exit.isFailure(result) && Cause.pretty(result.cause)).toContain("Variant not found")
+      expect(yield* queue.list(chat.id)).toMatchObject({ revision: paused.revision, blocked: false, items: [] })
+    }
+    yield* prompt.queueSubmit(chat.id, {
+      id: "valid-default",
+      payload: {
+        kind: "command",
+        agent: "build",
+        model: sol,
+        selection: { variant: "high" },
+        command: "pick",
+        arguments: "",
+      },
+    })
+    const valid = yield* prompt.queueSubmit(chat.id, {
+      id: "valid-override",
+      payload: {
+        kind: "command",
+        agent: "build",
+        model: sol,
+        selection: { model: sol, variant: "xhigh" },
+        command: "pick",
+        arguments: "",
+      },
+    })
+    yield* llm.text("default luna")
+    yield* llm.text("override sol")
+    yield* prompt.queueUpdate(chat.id, { revision: valid.revision, mutation: { action: "pause", paused: false } })
+    yield* pollWithTimeout(
+      queue
+        .get(chat.id, "valid-override")
+        .pipe(Effect.map((entry) => (entry.state === "delivered" ? entry : undefined))),
+      "queued override delivered",
+    )
+    yield* llm.wait(2)
+    expect((yield* llm.hits).map((hit) => hit.body.model)).toEqual(["luna", "sol"])
+    expect((yield* queue.list(chat.id)).blocked).toBe(false)
+  }),
+)
+
+it.instance("composer skills use tool permissions and late admission falls back after parent completion", () =>
+  Effect.gen(function* () {
+    const { dir, llm } = yield* useServerConfig((url) => ({
+      ...providerCfg(url),
+      provider: {
+        test: {
+          ...providerCfg(url).provider.test,
+          models: {
+            "test-model": {
+              ...cfg.provider.test.models["test-model"],
+              variants: { high: { reasoningEffort: "high" } },
+            },
+          },
+        },
+      },
+      permission: { skill: { "*": "allow", "composer-probe": "ask", denied: "deny" } },
+      command: { extra: { template: "real command, not skill" } },
+    }))
+    for (const name of ["composer-probe", "extra", "denied"]) {
+      yield* writeText(
+        path.join(dir, ".opencode", "skills", name, "SKILL.md"),
+        `---\nname: ${name}\ndescription: Test ${name}\n---\n${name} skill instructions`,
+      )
+      yield* writeText(path.join(dir, ".opencode", "skills", name, "reference.txt"), "supporting file")
+    }
+    const { prompt, sessions, chat } = yield* boot()
+    const permission = yield* Permission.Service
+    const commands = yield* Command.Service
+    expect(yield* commands.get("composer-probe")).toBeUndefined()
+    expect((yield* commands.get("extra"))?.source).toBe("command")
+    const marker = (name: string): SessionV1.FilePartInput => ({
+      type: "file",
+      mime: "application/x-opencode-skill",
+      filename: name,
+      url: `skill:${encodeURIComponent(name)}`,
+    })
+    for (const name of ["denied", "missing"]) {
+      const result = yield* prompt
+        .prompt({ sessionID: chat.id, model: ref, noReply: true, parts: [marker(name)] })
+        .pipe(Effect.exit)
+      expect(Exit.isFailure(result)).toBe(true)
+    }
+    expect(yield* sessions.messages({ sessionID: chat.id })).toHaveLength(0)
+    yield* sessions.setAgentModel({
+      sessionID: chat.id,
+      agent: "build",
+      model: { providerID: ref.providerID, id: ref.modelID, variant: "high" },
+      time: Date.now(),
+    })
+    const hold = yield* Deferred.make<void>()
+    yield* llm.hold("parent finished", deferredAsPromise(hold))
+    const running = yield* prompt
+      .prompt({
+        sessionID: chat.id,
+        model: ref,
+        variant: "high",
+        selection: { inheritActive: true, variant: "default" },
+        parts: [{ type: "text", text: "parent" }],
+      })
+      .pipe(Effect.forkChild)
+    yield* llm.wait(1)
+    const late = yield* prompt
+      .prompt({
+        sessionID: chat.id,
+        model: ref,
+        variant: "high",
+        selection: { inheritActive: true },
+        noReply: true,
+        parts: [{ type: "text", text: "$composer-probe args $extra" }, marker("composer-probe"), marker("extra")],
+      })
+      .pipe(Effect.forkChild)
+    const request = yield* pollWithTimeout(
+      permission.list().pipe(Effect.map((requests) => requests.find((request) => request.permission === "skill"))),
+      "skill permission was not requested",
+    )
+    expect(request.patterns).toEqual(["composer-probe"])
+    yield* Deferred.succeed(hold, undefined)
+    yield* Fiber.join(running)
+    yield* permission.reply({ requestID: request.id, reply: "once" })
+    const result = yield* Fiber.join(late)
+    expect(result.info.role === "user" && result.info.model.variant).toBe("high")
+    const text = result.parts
+      .filter((part) => part.type === "text")
+      .map((part) => part.text)
+      .join("\n")
+    expect(text).toContain("composer-probe skill instructions")
+    expect(text).toContain("extra skill instructions")
+    expect(text).toContain("Base directory for this skill:")
+    expect(text).toContain("reference.txt")
+    yield* llm.text("skills consumed")
+    yield* prompt.loop({ sessionID: chat.id })
+    expect(JSON.stringify((yield* llm.hits).at(-1)?.body)).not.toContain("skill:composer-probe")
+    expect(JSON.stringify((yield* llm.hits).at(-1)?.body)).toContain("composer-probe skill instructions")
+  }),
+)
 
 it.instance("native queue waits for success and drains only one input at a time", () =>
   Effect.gen(function* () {

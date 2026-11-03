@@ -217,7 +217,9 @@ export const equivalent = (
 
 const matchesPrompt = (input: Admitted, expected: { readonly sessionID: SessionSchema.ID; readonly prompt: Prompt }) =>
   input.sessionID === expected.sessionID &&
-  JSON.stringify(encodePrompt(input.prompt)) === JSON.stringify(encodePrompt(expected.prompt))
+  // The captured model belongs to the first admission, not the retry's live parent/defaults.
+  JSON.stringify(encodePrompt({ ...input.prompt, model: undefined })) ===
+    JSON.stringify(encodePrompt({ ...expected.prompt, model: undefined }))
 
 const matchesProjection = (
   input: Admitted,
@@ -229,6 +231,7 @@ const matchesProjection = (
   },
 ) =>
   equivalent(input, expected) &&
+  JSON.stringify(encodePrompt(input.prompt)) === JSON.stringify(encodePrompt(expected.prompt)) &&
   DateTime.toEpochMillis(input.timeCreated) === DateTime.toEpochMillis(expected.timeCreated)
 
 const publish = Effect.fn("SessionInput.publish")(function* (

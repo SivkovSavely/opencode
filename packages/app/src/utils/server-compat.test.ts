@@ -1,16 +1,25 @@
 import { describe, expect, test } from "bun:test"
 import { createApiForServer, createSdkForServer } from "./server"
 import { createCompatibleApi } from "./server-compat"
+import { ClientError } from "@opencode-ai/client/promise"
 
 function setup(
   protocol: "v1" | "v2" | Promise<"v1" | "v2"> | (() => Promise<"v1" | "v2">),
-  responses?: { vcs?: { branch: string; default_branch: string }; sessions?: unknown[] },
+  responses?: {
+    vcs?: { branch: string; default_branch: string }
+    sessions?: unknown[]
+    response?: Response
+    error?: Error
+    server?: { url: string; username?: string; password?: string }
+  },
 ) {
   const requests: Request[] = []
   const fetcher = Object.assign(
     async (input: string | URL | Request, init?: RequestInit) => {
       const request = new Request(input, init)
       requests.push(request)
+      if (responses?.error) throw responses.error
+      if (responses?.response) return responses.response.clone()
       if (request.method === "PATCH") {
         return Response.json({
           id: "ses_1",
@@ -24,15 +33,16 @@ function setup(
       }
       if (request.method === "POST" && request.url.endsWith("/prompt_async"))
         return new Response(undefined, { status: 204 })
-      if (request.method === "POST" && request.url.endsWith("/prompt")) {
+      if (request.method === "POST" && ["/prompt", "/command"].some((path) => request.url.endsWith(path))) {
         return Response.json({
-          admittedSeq: 1,
-          id: "msg_1",
-          sessionID: "ses_1",
-          timeCreated: 1,
-          type: "user",
-          data: { text: "hello" },
-          delivery: "steer",
+          data: {
+            admittedSeq: 1,
+            id: "msg_1",
+            sessionID: "ses_1",
+            timeCreated: 1,
+            prompt: { text: "hello" },
+            delivery: "steer",
+          },
         })
       }
       if (request.method === "GET" && new URL(request.url).pathname === "/vcs")
@@ -44,7 +54,7 @@ function setup(
     },
     { preconnect: globalThis.fetch.preconnect },
   )
-  const server = { url: "http://localhost:4096" }
+  const server = responses?.server ?? { url: "http://localhost:4096" }
   const createApi = (directory: string) =>
     createCompatibleApi({
       protocol: typeof protocol === "string" ? Promise.resolve(protocol) : protocol,
@@ -56,6 +66,25 @@ function setup(
 }
 
 describe("createCompatibleApi", () => {
+  test("preserves per-message selection and skill MIME on the legacy wire", async () => {
+    const { api, requests } = setup("v1")
+    const selection = { inheritActive: true, model: { providerID: "p", modelID: "m" }, variant: "high" }
+    await api.session.prompt({ sessionID: "ses_1", id: "msg_1", text: "hello", selection })
+    expect(await requests[0]!.json()).toMatchObject({ selection })
+    await api.session.command({
+      sessionID: "ses_1",
+      id: "msg_2",
+      command: "review",
+      arguments: " x",
+      selection,
+      files: [{ uri: "skill:review", name: "review" }],
+    })
+    expect(await requests[1]!.json()).toMatchObject({
+      selection,
+      parts: [{ type: "file", mime: "application/x-opencode-skill", url: "skill:review" }],
+    })
+  })
+
   /*
   test("routes V1 archive through the legacy session update", async () => {
     const { api, requests } = setup("v1")
@@ -173,6 +202,152 @@ describe("createCompatibleApi", () => {
 
     expect(new URL(requests[0]!.url).pathname).toBe("/api/session/ses_1/prompt")
     expect(requests[0]!.headers.get("x-opencode-directory")).toBeNull()
+    expect(await requests[0]!.json()).toEqual({ id: "msg_1", prompt: { text: "hello" } })
+  })
+
+  test("serializes V2 prompt controls and attachments using the current contract", async () => {
+    const { api, requests } = setup("v2")
+    const mention = { text: "@review", start: 6, end: 13 }
+    const selection = { inheritActive: false, model: { providerID: "p", modelID: "m" }, variant: "high" }
+    const admitted = await api.session.prompt({
+      sessionID: "ses_1",
+      id: "msg_1",
+      text: "hello @review",
+      agent: "build",
+      model: { providerID: "p", modelID: "m" },
+      variant: "high",
+      selection,
+      files: [{ uri: "skill:review", name: "review", mention }],
+      agents: [{ name: "review", mention }],
+      legacyParts: [{ type: "text", text: "legacy only" }],
+    })
+    expect(await requests[0]!.json()).toEqual({
+      id: "msg_1",
+      prompt: {
+        text: "hello @review",
+        agent: "build",
+        model: { providerID: "p", id: "m", variant: "high" },
+        selection,
+        files: [{ uri: "skill:review", name: "review", source: mention }],
+        agents: [{ name: "review", source: mention }],
+      },
+    })
+    expect(admitted).toEqual(
+      expect.objectContaining({
+        admittedSeq: 1,
+        id: "msg_1",
+        sessionID: "ses_1",
+        timeCreated: 1,
+        prompt: { text: "hello" },
+        delivery: "steer",
+      }),
+    )
+  })
+
+  test("preserves queued V2 prompt and command snapshots without adding overrides", async () => {
+    const { api, requests } = setup("v2")
+    const selection = { inheritActive: false, model: { providerID: "p", modelID: "m" }, variant: "" }
+    await api.session.prompt({
+      sessionID: "ses_1",
+      text: "queued",
+      selection,
+      delivery: "queue",
+      resume: false,
+    })
+    expect(await requests[0]!.json()).toEqual({
+      prompt: { text: "queued", selection },
+      delivery: "queue",
+      resume: false,
+    })
+    await api.session.command({
+      sessionID: "ses_1",
+      id: "msg_2",
+      command: "review",
+      arguments: " x",
+      agent: "build",
+      model: { providerID: "p", id: "m", variant: "high" },
+      selection,
+      files: [{ uri: "skill:review", name: "review" }],
+      agents: [{ name: "review", mention: { text: "@review", start: 0, end: 7 } }],
+      delivery: "queue",
+      resume: false,
+    })
+    expect(new URL(requests[1]!.url).pathname).toBe("/api/session/ses_1/command")
+    expect(await requests[1]!.json()).toEqual({
+      id: "msg_2",
+      command: "review",
+      arguments: " x",
+      agent: "build",
+      model: { providerID: "p", id: "m", variant: "high" },
+      selection,
+      files: [{ uri: "skill:review", name: "review" }],
+      agents: [{ name: "review", source: { text: "@review", start: 0, end: 7 } }],
+      delivery: "queue",
+      resume: false,
+    })
+    await api.session.command({ sessionID: "ses_1", command: "review" })
+    expect(await requests[2]!.json()).toEqual({ command: "review" })
+  })
+
+  test("forwards configured V2 authentication and request options without directory headers", async () => {
+    const { apiForDirectory, requests } = setup("v2", {
+      server: { url: "http://localhost:4096", username: "kit", password: "secret" },
+    })
+    const controller = new AbortController()
+    const api = apiForDirectory("/other")
+    await api.session.prompt(
+      { sessionID: "ses_1", text: "hello" },
+      {
+        signal: controller.signal,
+        headers: { "x-test": "prompt" },
+      },
+    )
+    await api.session.command(
+      { sessionID: "ses_1", command: "review" },
+      {
+        signal: controller.signal,
+        headers: { "x-test": "command" },
+      },
+    )
+    for (const request of requests) {
+      expect(request.headers.get("authorization")).toBe(`Basic ${btoa("kit:secret")}`)
+      expect(request.headers.get("content-type")).toBe("application/json")
+      expect(request.headers.get("x-opencode-directory")).toBeNull()
+      expect(new URL(request.url).search).toBe("")
+      expect(request.signal.aborted).toBe(false)
+    }
+    expect(requests.map((request) => request.headers.get("x-test"))).toEqual(["prompt", "command"])
+    controller.abort()
+    expect(requests.every((request) => request.signal.aborted)).toBe(true)
+  })
+
+  test("retains declared V2 errors and normal client response errors", async () => {
+    const error = { _tag: "ConflictError", message: "conflicting retry" }
+    const conflict = setup("v2", { response: Response.json(error, { status: 409 }) })
+    await expect(conflict.api.session.prompt({ sessionID: "ses_1", text: "hello" })).rejects.toEqual(error)
+    await expect(conflict.api.session.command({ sessionID: "ses_1", command: "review" })).rejects.toEqual(error)
+    const malformed = setup("v2", { response: new Response("{", { headers: { "content-type": "application/json" } }) })
+    await expect(malformed.api.session.prompt({ sessionID: "ses_1", text: "hello" })).rejects.toBeInstanceOf(
+      ClientError,
+    )
+    await expect(malformed.api.session.command({ sessionID: "ses_1", command: "review" })).rejects.toMatchObject({
+      reason: "MalformedResponse",
+    })
+    const unexpected = setup("v2", { response: new Response(null, { status: 502 }) })
+    await expect(unexpected.api.session.prompt({ sessionID: "ses_1", text: "hello" })).rejects.toMatchObject({
+      reason: "UnexpectedStatus",
+      cause: { status: 502 },
+    })
+    const cause = new Error("connection refused")
+    const transport = setup("v2", { error: cause })
+    await expect(transport.api.session.prompt({ sessionID: "ses_1", text: "hello" })).rejects.toMatchObject({
+      reason: "Transport",
+      cause,
+    })
+    await expect(transport.api.session.command({ sessionID: "ses_1", command: "review" })).rejects.toMatchObject({
+      reason: "Transport",
+      cause,
+    })
   })
 
   test("resolves protocol detection once across implementation methods", async () => {

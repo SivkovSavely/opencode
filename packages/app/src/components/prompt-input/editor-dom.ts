@@ -1,5 +1,34 @@
 const MAX_BREAKS = 200
 
+export function editorPlainText(node: Node): string {
+  if (node.nodeType === Node.TEXT_NODE) return (node.textContent ?? "").replace(/\u200B/g, "")
+  if (node.nodeType === Node.ELEMENT_NODE && (node as HTMLElement).tagName === "BR") return "\n"
+  return Array.from(node.childNodes)
+    .map((child, index, children) => {
+      const block = child.nodeType === Node.ELEMENT_NODE && ["DIV", "P"].includes((child as HTMLElement).tagName)
+      return editorPlainText(child) + (block && index < children.length - 1 ? "\n" : "")
+    })
+    .join("")
+}
+
+export function copyEditorSelection(
+  editor: HTMLElement,
+  event: Pick<ClipboardEvent, "clipboardData" | "preventDefault">,
+  cut = false,
+) {
+  const selection = window.getSelection()
+  if (!selection?.rangeCount || selection.isCollapsed || !event.clipboardData) return false
+  const range = selection.getRangeAt(0)
+  if (!editor.contains(range.startContainer) || !editor.contains(range.endContainer)) return false
+  const root = document.createElement("div")
+  root.append(range.cloneContents())
+  event.clipboardData.setData("text/plain", editorPlainText(root))
+  event.clipboardData.setData("application/x-opencode-prompt", root.innerHTML)
+  event.preventDefault()
+  if (cut) range.deleteContents()
+  return true
+}
+
 export function createTextFragment(content: string): DocumentFragment {
   const fragment = document.createDocumentFragment()
   let breaks = 0
@@ -61,7 +90,7 @@ export function setCursorPosition(parent: HTMLElement, position: number) {
     const isText = node.nodeType === Node.TEXT_NODE
     const isPill =
       node.nodeType === Node.ELEMENT_NODE &&
-      ((node as HTMLElement).dataset.type === "file" || (node as HTMLElement).dataset.type === "agent")
+      ["file", "agent", "model", "variant", "skill"].includes((node as HTMLElement).dataset.type ?? "")
     const isBreak = node.nodeType === Node.ELEMENT_NODE && (node as HTMLElement).tagName === "BR"
 
     if (isText && remaining <= length) {
@@ -126,7 +155,7 @@ export function setRangeEdge(parent: HTMLElement, range: Range, edge: "start" | 
     const isText = node.nodeType === Node.TEXT_NODE
     const isPill =
       node.nodeType === Node.ELEMENT_NODE &&
-      ((node as HTMLElement).dataset.type === "file" || (node as HTMLElement).dataset.type === "agent")
+      ["file", "agent", "model", "variant", "skill"].includes((node as HTMLElement).dataset.type ?? "")
     const isBreak = node.nodeType === Node.ELEMENT_NODE && (node as HTMLElement).tagName === "BR"
 
     if (isText && remaining <= length) {

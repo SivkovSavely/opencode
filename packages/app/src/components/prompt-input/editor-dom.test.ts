@@ -1,7 +1,83 @@
 import { describe, expect, test } from "bun:test"
-import { createTextFragment, getCursorPosition, getNodeLength, getTextLength, setCursorPosition } from "./editor-dom"
+import {
+  copyEditorSelection,
+  createTextFragment,
+  editorPlainText,
+  getCursorPosition,
+  getNodeLength,
+  getTextLength,
+  setCursorPosition,
+} from "./editor-dom"
 
 describe("prompt-input editor dom", () => {
+  test.each([false, true])("copy/cut preserves consecutive and terminal newlines (cut=%s)", (cut) => {
+    const editor = document.createElement("div")
+    editor.append(createTextFragment("one\n\ntwo\n"), document.createTextNode("\u200B"))
+    document.body.append(editor)
+    const range = document.createRange()
+    range.selectNodeContents(editor)
+    window.getSelection()!.removeAllRanges()
+    window.getSelection()!.addRange(range)
+    const clipboardData = new DataTransfer()
+    let prevented = false
+    expect(
+      copyEditorSelection(
+        editor,
+        {
+          clipboardData,
+          preventDefault: () => {
+            prevented = true
+          },
+        },
+        cut,
+      ),
+    ).toBe(true)
+    expect(prevented).toBe(true)
+    expect(clipboardData.getData("text/plain")).toBe("one\n\ntwo\n")
+    expect(clipboardData.getData("application/x-opencode-prompt")).toContain("one<br><br>two<br>")
+    expect(editorPlainText(editor)).toBe(cut ? "" : "one\n\ntwo\n")
+    editor.remove()
+  })
+
+  test.each([false, true])("partial copy/cut serializes only the selected text and breaks (cut=%s)", (cut) => {
+    const editor = document.createElement("div")
+    editor.append(createTextFragment("one\n\ntwo\n"))
+    document.body.append(editor)
+    const range = document.createRange()
+    range.setStart(editor.childNodes[0]!, 1)
+    range.setEnd(editor.childNodes[3]!, 2)
+    window.getSelection()!.removeAllRanges()
+    window.getSelection()!.addRange(range)
+    const clipboardData = new DataTransfer()
+    expect(copyEditorSelection(editor, { clipboardData, preventDefault: () => {} }, cut)).toBe(true)
+    expect(clipboardData.getData("text/plain")).toBe("ne\n\ntw")
+    expect(clipboardData.getData("application/x-opencode-prompt")).toBe("ne<br><br>tw")
+    expect(editorPlainText(editor)).toBe(cut ? "oo\n" : "one\n\ntwo\n")
+    editor.remove()
+  })
+
+  test("clipboard keeps structured chip attributes alongside newline-preserving plain text", () => {
+    const editor = document.createElement("div")
+    const chip = document.createElement("span")
+    chip.dataset.type = "model"
+    chip.dataset.providerId = "p"
+    chip.dataset.modelId = "canonical"
+    chip.textContent = "@model:Friendly Name"
+    editor.append(createTextFragment("one\n\n"), chip, createTextFragment("\ntwo\n"))
+    document.body.append(editor)
+    const range = document.createRange()
+    range.selectNodeContents(editor)
+    window.getSelection()!.removeAllRanges()
+    window.getSelection()!.addRange(range)
+    const clipboardData = new DataTransfer()
+    expect(copyEditorSelection(editor, { clipboardData, preventDefault: () => {} })).toBe(true)
+    expect(clipboardData.getData("text/plain")).toBe("one\n\n@model:Friendly Name\ntwo\n")
+    const template = document.createElement("template")
+    template.innerHTML = clipboardData.getData("application/x-opencode-prompt")
+    expect(template.content.querySelector("[data-type=model]")?.getAttribute("data-model-id")).toBe("canonical")
+    expect(editorPlainText(template.content)).toBe(clipboardData.getData("text/plain"))
+    editor.remove()
+  })
   test("createTextFragment preserves newlines with consecutive br nodes", () => {
     const fragment = createTextFragment("foo\n\nbar")
     const container = document.createElement("div")

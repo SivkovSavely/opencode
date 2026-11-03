@@ -40,6 +40,8 @@ import { ToolRegistry } from "@opencode-ai/core/tool/registry"
 import { ApplicationTools } from "@opencode-ai/core/tool/application-tools"
 import { AgentV2 } from "@opencode-ai/core/agent"
 import { Config } from "@opencode-ai/core/config"
+import { Catalog } from "@opencode-ai/core/catalog"
+import { LocationServiceMap } from "@opencode-ai/core/location-service-map"
 import { ConfigCompaction } from "@opencode-ai/core/config/compaction"
 import { Tool } from "@opencode-ai/core/tool/tool"
 import {
@@ -231,7 +233,7 @@ const runnerLayer = AppNodeBuilder.build(SessionRunnerLLM.node, [
   [LayerNodePlatform.llmClient, client],
   [SessionRunnerModel.node, models],
   [SystemContextRegistry.node, systemContext],
-  [Location.node, Location.boundNode({ directory: AbsolutePath.make("/project") })],
+  [Location.node, Location.boundNode({ directory: AbsolutePath.make(import.meta.dir) })],
   [SkillGuidance.node, skillGuidance],
   [ReferenceGuidance.node, referenceGuidance],
   [PermissionV2.node, permission],
@@ -274,13 +276,14 @@ const it = testEffect(
       SessionRunnerLLM.node,
       SessionExecution.node,
       SessionV2.node,
+      LocationServiceMap.node,
     ]),
     [
       [LayerNodePlatform.llmClient, client],
       [PermissionV2.node, permission],
       [SessionRunnerModel.node, models],
       [SystemContextRegistry.node, systemContext],
-      [Location.node, Location.boundNode({ directory: AbsolutePath.make("/project") })],
+      [Location.node, Location.boundNode({ directory: AbsolutePath.make(import.meta.dir) })],
       [SkillGuidance.node, skillGuidance],
       [ReferenceGuidance.node, referenceGuidance],
       [Snapshot.node, Snapshot.noopLayer],
@@ -301,7 +304,7 @@ const insertSession = (id: SessionV2.ID) =>
         id,
         project_id: Project.ID.global,
         slug: id,
-        directory: "/project",
+        directory: import.meta.dir,
         title: "test",
         version: "test",
       })
@@ -332,11 +335,27 @@ const setup = Effect.gen(function* () {
   maxActiveToolExecutions = 0
   yield* db
     .insert(ProjectTable)
-    .values({ id: Project.ID.global, worktree: AbsolutePath.make("/project"), sandboxes: [] })
+    .values({ id: Project.ID.global, worktree: AbsolutePath.make(import.meta.dir), sandboxes: [] })
     .onConflictDoNothing()
     .run()
     .pipe(Effect.orDie)
   yield* insertSession(sessionID)
+})
+
+const prepareAdmissionCatalog = Effect.gen(function* () {
+  const sessions = yield* SessionV2.Service
+  const locations = yield* LocationServiceMap.Service
+  yield* Catalog.Service.use((catalog) =>
+    catalog.transform((draft) => {
+      const providerID = ProviderV2.ID.make("fake")
+      draft.provider.update(providerID, (provider) => {
+        provider.api = { type: "aisdk", package: "@ai-sdk/openai", settings: {} }
+      })
+      draft.model.update(providerID, ModelV2.ID.make("replacement"), (model) => {
+        model.api = { type: "aisdk", package: "@ai-sdk/openai", id: ModelV2.ID.make("replacement"), settings: {} }
+      })
+    }),
+  ).pipe(Effect.provide(locations.get((yield* sessions.get(sessionID)).location)))
 })
 
 describe("retired V2 execution", () => {
@@ -640,12 +659,18 @@ describe("SessionRunnerLLM", () => {
       const previous = process.env.OPENCODE_MANAGED_PROFILE
       yield* Effect.gen(function* () {
         process.env.OPENCODE_MANAGED_PROFILE = "1"
-        expect((yield* runner.run({ sessionID, force: true }).pipe(Effect.flip))._tag).toBe("SessionInput.ManagedProfile")
+        expect((yield* runner.run({ sessionID, force: true }).pipe(Effect.flip))._tag).toBe(
+          "SessionInput.ManagedProfile",
+        )
         expect(yield* session.messages({ sessionID })).toEqual([])
-      }).pipe(Effect.ensuring(Effect.sync(() => {
-        if (previous === undefined) delete process.env.OPENCODE_MANAGED_PROFILE
-        else process.env.OPENCODE_MANAGED_PROFILE = previous
-      })))
+      }).pipe(
+        Effect.ensuring(
+          Effect.sync(() => {
+            if (previous === undefined) delete process.env.OPENCODE_MANAGED_PROFILE
+            else process.env.OPENCODE_MANAGED_PROFILE = previous
+          }),
+        ),
+      )
     }),
   )
   it.effect("advertises and executes a globally attached application tool", () =>
@@ -710,16 +735,20 @@ describe("SessionRunnerLLM", () => {
       const session = yield* SessionV2.Service
       requests.length = 0
       responses = undefined
-      streamGate = undefined
-      streamStarted = undefined
+      streamGate = yield* Deferred.make<void>()
+      streamStarted = yield* Deferred.make<void>()
       response = []
 
       const message = yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Run automatically" }) })
+      yield* Deferred.await(streamStarted)
 
       expect(requests).toHaveLength(1)
       expect(yield* session.messages({ sessionID })).toMatchObject([
         { id: message.id, type: "user", text: "Run automatically" },
       ])
+      const completion = yield* session.resume(sessionID).pipe(Effect.forkChild)
+      yield* Deferred.succeed(streamGate, undefined)
+      yield* Fiber.join(completion)
     }),
   )
 
@@ -773,10 +802,16 @@ describe("SessionRunnerLLM", () => {
       ).toBeUndefined()
 
       systemUnavailable = false
+      streamGate = yield* Deferred.make<void>()
+      streamStarted = yield* Deferred.make<void>()
       yield* session.prompt({ id: messageID, sessionID, prompt: Prompt.make({ text: "First" }) })
+      yield* Deferred.await(streamStarted)
 
       expect(requests).toHaveLength(1)
       expect(requests[0]?.messages.map((message) => message.role)).toEqual(["user"])
+      const completion = yield* session.resume(sessionID).pipe(Effect.forkChild)
+      yield* Deferred.succeed(streamGate, undefined)
+      yield* Fiber.join(completion)
     }),
   )
 
@@ -1055,6 +1090,7 @@ describe("SessionRunnerLLM", () => {
   it.effect("keeps the baseline and chronological System updates after a model switch", () =>
     Effect.gen(function* () {
       yield* setup
+      yield* prepareAdmissionCatalog
       const session = yield* SessionV2.Service
       const events = yield* EventV2.Service
       yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "First" }), resume: false })
@@ -1100,6 +1136,7 @@ describe("SessionRunnerLLM", () => {
   it.effect("preserves the baseline while context is temporarily unavailable", () =>
     Effect.gen(function* () {
       yield* setup
+      yield* prepareAdmissionCatalog
       const session = yield* SessionV2.Service
       const events = yield* EventV2.Service
       yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "First" }), resume: false })
@@ -2595,8 +2632,9 @@ describe("SessionRunnerLLM", () => {
 
       const first = yield* session.resume(sessionID).pipe(Effect.forkChild)
       yield* Deferred.await(streamStarted)
+      streamStarted = yield* Deferred.make<void>()
       const second = yield* session.resume(otherSessionID).pipe(Effect.forkChild)
-      yield* Effect.yieldNow
+      yield* Deferred.await(streamStarted)
 
       expect(requests).toHaveLength(2)
       expect(requests.map((request) => request.providerOptions?.openai?.promptCacheKey)).toEqual([

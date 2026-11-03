@@ -105,7 +105,7 @@ const withVariant = (
   model: ModelV2.Info,
   variantID: ModelV2.VariantID | undefined,
 ): Effect.Effect<ModelV2.Info, VariantUnavailableError> => {
-  const id = variantID === "default" || variantID === undefined ? model.request.variant : variantID
+  const id = variantID === "default" ? undefined : (variantID ?? model.request.variant)
   const variant = model.variants.find((item) => item.id === id)
   if (!variant && variantID !== undefined && variantID !== "default")
     return Effect.fail(
@@ -178,6 +178,11 @@ export const supported = (model: ModelV2.Info) =>
     model.api.package === "@ai-sdk/anthropic" ||
     (model.api.package === "@ai-sdk/openai-compatible" && model.api.url !== undefined))
 
+export const defaultModel = Effect.fn("SessionRunnerModel.defaultModel")(function* (catalog: Catalog.Interface) {
+  const model = yield* catalog.model.default()
+  return model && supported(model) ? model : (yield* catalog.model.available()).find(supported)
+})
+
 /** Resolves models from the catalog belonging to the current Location runtime. */
 export const locationLayer = Layer.effect(
   Service,
@@ -187,14 +192,11 @@ export const locationLayer = Layer.effect(
     return Service.of({
       resolve: Effect.fn("SessionRunnerModel.resolve")(function* (session) {
         // Location plugins populate and filter the catalog asynchronously during layer startup.
-        const defaultModel = session.model ? undefined : yield* catalog.model.default()
         const selected = session.model
           ? (yield* catalog.model.available()).find(
               (model) => model.providerID === session.model?.providerID && model.id === session.model.id,
             )
-          : defaultModel && supported(defaultModel)
-            ? defaultModel
-            : (yield* catalog.model.available()).find(supported)
+          : yield* defaultModel(catalog)
         if (!selected && session.model)
           return yield* new ModelUnavailableError({
             providerID: session.model.providerID,

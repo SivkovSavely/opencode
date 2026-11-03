@@ -7,7 +7,7 @@ import { Icon } from "@opencode-ai/ui/v2/icon"
 import { KeybindV2 } from "@opencode-ai/ui/v2/keybind-v2"
 import { TooltipV2 } from "@opencode-ai/ui/v2/tooltip-v2"
 import type { ReferenceInfo } from "@opencode-ai/sdk/v2/client"
-import { createEffect, createMemo, on, Show } from "solid-js"
+import { createEffect, createMemo, createResource, on, Show } from "solid-js"
 import { createStore } from "solid-js/store"
 import { ModelSelectorPopoverV2 } from "@/components/dialog-select-model"
 import { DialogSelectModelUnpaidV2 } from "@/components/dialog-select-model-unpaid-v2"
@@ -16,6 +16,13 @@ import { normalizePromptHistoryEntry, promptLength, type PromptHistoryComment } 
 import { createPersistedPromptInputHistory } from "@/components/prompt-input/history-store"
 import { promptDesignPlaceholder, promptPlaceholder } from "@/components/prompt-input/placeholder"
 import { createPromptSubmit } from "@/components/prompt-input/submit"
+import {
+  activePromptSelection,
+  contemplatedPromptSelection,
+  materializePrompt,
+  resolvePromptSelection,
+} from "@/components/prompt-input/controls"
+import { resolveServerProtocol } from "@/utils/server-protocol"
 import { selectionFromLines, type SelectedLineRange, useFile } from "@/context/file"
 import { useComments } from "@/context/comments"
 import { useCommand } from "@/context/command"
@@ -45,6 +52,7 @@ export type PromptInputV2ComposerProps = {
 export type PromptInputV2ControllerProps = Omit<PromptInputProps, "class" | "submission">
 export type PromptInputV2ComposerController = PromptInputV2Interaction & {
   readonly model: PromptInputProps["controls"]["model"]
+  readonly effectiveSelection: string | undefined
 }
 
 export function PromptInputV2Composer(props: PromptInputV2ComposerProps) {
@@ -67,10 +75,12 @@ export function PromptInputV2Composer(props: PromptInputV2ComposerProps) {
           <PromptInputV2ModelControl
             loading={props.controller.model.loading}
             paid={props.controller.model.paid}
-            title={language.t("command.model.choose")}
+            title={language.t("prompt.controls.savedModel", {
+              model: props.controller.model.selection.current()?.name ?? language.t("dialog.model.select.title"),
+            })}
             keybind={command.keybindParts("model.choose")}
             model={props.controller.model.selection}
-            providerID={props.controller.model.selection.current()?.provider?.id}
+            providerID={props.controller.model.selection.current()?.provider.id}
             modelName={props.controller.model.selection.current()?.name ?? language.t("dialog.model.select.title")}
             onClose={props.controller.restoreFocus}
             onUnpaidClick={() =>
@@ -79,6 +89,9 @@ export function PromptInputV2Composer(props: PromptInputV2ComposerProps) {
           />
         }
       />
+      <Show when={props.controller.effectiveSelection}>
+        {(label) => <div class="px-3 text-12-regular text-text-weak">{label()}</div>}
+      </Show>
     </div>
   )
 }
@@ -96,6 +109,21 @@ export function usePromptInputV2Controller(props: PromptInputV2ControllerProps):
   const language = useLanguage()
   const platform = usePlatform()
   const prompt = props.state ?? usePrompt()
+  const [skills] = createResource(sdk, (source) =>
+    (async () => {
+      if ((await resolveServerProtocol(source.protocol)) === "v1") {
+        return (await source.client.app.skills()).data ?? []
+      }
+      return (await source.api.skill.list({ location: { directory: source.directory } })).data
+    })().catch((error: unknown) => {
+      showToast({
+        variant: "error",
+        title: language.t("common.requestFailed"),
+        description: error instanceof Error ? error.message : String(error),
+      })
+      return []
+    }),
+  )
   const [submitState, setSubmitState] = createStore({ preparing: false })
   let editor: HTMLDivElement | undefined
 
@@ -130,13 +158,10 @@ export function usePromptInputV2Controller(props: PromptInputV2ControllerProps):
     return prompt.context.items().filter((item) => !!item.comment?.trim()).length
   })
   const blank = createMemo(() => {
-    const text = prompt
-      .current()
-      .map((part) => ("content" in part ? part.content : ""))
-      .join("")
+    const clean = materializePrompt(prompt.current())
     return (
-      text.trim().length === 0 &&
-      !prompt.current().some((part) => part.type !== "text") &&
+      clean.text.trim().length === 0 &&
+      !clean.prompt.some((part) => part.type !== "text") &&
       prompt.context.items().length === 0
     )
   })
@@ -235,6 +260,7 @@ export function usePromptInputV2Controller(props: PromptInputV2ControllerProps):
       props.onPreparing?.(value)
     },
     model: props.controls.model.selection,
+    skills: () => (skills() ?? []).map((skill) => skill.name),
   })
 
   const referenceDescription = (reference: ReferenceInfo) =>
@@ -285,7 +311,66 @@ export function usePromptInputV2Controller(props: PromptInputV2ControllerProps):
       resource,
     })),
   )
+  const baseSelection = createMemo(() => {
+    const id = props.controls.session.id
+    const model = props.controls.model.selection.current()
+    if (!model) return
+    const clean = materializePrompt(prompt.current())
+    return contemplatedPromptSelection({
+      text: clean.text,
+      base: {
+        providerID: model.provider.id,
+        modelID: model.id,
+        variant: props.controls.model.selection.variant.current(),
+      },
+      selection: clean.selection,
+      active: id
+        ? activePromptSelection(
+            sync().data.message[id] ?? [],
+            sync().data.session_working(id),
+            id,
+            sync().data.session_message[id] ?? [],
+          )
+        : undefined,
+      commands: mode() === "normal" ? sync().data.command : [],
+      agents: sync().data.agent,
+    })
+  })
+  const effectiveModel = createMemo(() => {
+    const pair = baseSelection()
+    return props.controls.model.selection
+      .list()
+      .find((model) => model.id === pair?.modelID && model.provider.id === pair.providerID)
+  })
+  const variants = createMemo(() => ["default", ...Object.keys(effectiveModel()?.variants ?? {})])
   const context = createMemo<PromptInputV2Suggestion[]>(() => [
+    ...props.controls.model.selection.list().map((model) => ({
+      id: `model:${model.provider.id}/${model.id}`,
+      kind: "model" as const,
+      label: model.name,
+      description: `${model.provider.name} (${model.provider.id}/${model.id})`,
+      mention: {
+        type: "model" as const,
+        providerID: model.provider.id,
+        modelID: model.id,
+        content: `@model:${model.name}`,
+        start: 0,
+        end: 0,
+      },
+    })),
+    ...variants().map((variant) => ({
+      id: `variant:${variant}`,
+      kind: "variant" as const,
+      label: variant,
+      mention: { type: "variant" as const, variant, content: `@variant:${variant}`, start: 0, end: 0 },
+    })),
+    ...(skills() ?? []).map((skill) => ({
+      id: `skill:${skill.name}`,
+      kind: "skill" as const,
+      label: `$${skill.name}`,
+      description: skill.description,
+      mention: { type: "skill" as const, name: skill.name, content: `$${skill.name}`, start: 0, end: 0 },
+    })),
     ...references(),
     ...props.controls.agents.available
       .filter((agent) => !agent.hidden && agent.mode !== "primary")
@@ -306,13 +391,15 @@ export function usePromptInputV2Controller(props: PromptInputV2ControllerProps):
     })),
   ])
   const slashCommands = createMemo(() => [
-    ...sync().data.command.map((item) => ({
-      id: `custom.${item.name}`,
-      trigger: item.name,
-      title: item.name,
-      description: item.description,
-      type: "custom" as const,
-    })),
+    ...sync()
+      .data.command.filter((item) => item.source !== "skill")
+      .map((item) => ({
+        id: `custom.${item.name}`,
+        trigger: item.name,
+        title: item.name,
+        description: item.description,
+        type: "custom" as const,
+      })),
     ...command.options
       .filter((item) => !item.disabled && !item.id.startsWith("suggested.") && item.slash)
       .map((item) => ({
@@ -334,7 +421,6 @@ export function usePromptInputV2Controller(props: PromptInputV2ControllerProps):
       keybind: command.keybindParts(item.id),
     })),
   )
-  const variants = createMemo(() => ["default", ...props.controls.model.selection.variant.list()])
   const controller = createPromptInputV2Controller({
     store: () => prompt.capture().store,
     state: interaction,
@@ -411,7 +497,8 @@ export function usePromptInputV2Controller(props: PromptInputV2ControllerProps):
           : undefined
       },
       variant: {
-        options: () => variants().map((value) => ({ id: value, label: value })),
+        options: () =>
+          ["default", ...props.controls.model.selection.variant.list()].map((value) => ({ id: value, label: value })),
         current: () => props.controls.model.selection.variant.current() ?? "default",
         onSelect: (value) => props.controls.model.selection.variant.set(value === "default" ? undefined : value),
         keybind: () => command.keybindParts("model.variant.cycle"),
@@ -433,15 +520,7 @@ export function usePromptInputV2Controller(props: PromptInputV2ControllerProps):
           event.shiftKey !== settings.general.enterNewline()
         )
           return
-        if (
-          !QueueCommand.parse(
-            prompt
-              .current()
-              .map((part) => ("content" in part ? part.content : ""))
-              .join(""),
-          )
-        )
-          return
+        if (!QueueCommand.parse(materializePrompt(prompt.current()).text)) return
         event.preventDefault()
         controller.dispatch({ type: "popover.close" })
         if (!event.repeat) void submission.handleSubmit(event)
@@ -449,6 +528,34 @@ export function usePromptInputV2Controller(props: PromptInputV2ControllerProps):
     },
   })
   Object.defineProperty(controller, "model", { get: () => props.controls.model })
+  Object.defineProperty(controller, "effectiveSelection", {
+    get: () => {
+      const base = baseSelection()
+      if (!base) return
+      const pair = resolvePromptSelection(
+        base,
+        materializePrompt(prompt.current()).selection,
+        props.controls.model.selection.list().map((model) => ({
+          providerID: model.provider.id,
+          modelID: model.id,
+          variants: Object.keys(model.variants ?? {}),
+        })),
+      )
+      if (pair.error) return language.t(pair.error)
+      const saved = props.controls.model.selection.current()
+      const variant = pair.variant ?? "default"
+      if (
+        saved?.provider.id === pair.model.providerID &&
+        saved.id === pair.model.modelID &&
+        variant === (props.controls.model.selection.variant.current() ?? "default")
+      )
+        return
+      return language.t("prompt.controls.effectiveSelection", {
+        model: effectiveModel()?.name ?? `${pair.model.providerID}/${pair.model.modelID}`,
+        variant,
+      })
+    },
+  })
 
   command.register("prompt-input", () => [
     {

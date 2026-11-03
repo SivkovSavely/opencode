@@ -14,10 +14,11 @@ const decodeCommand = Schema.decodeUnknownOption(ConfigCommand.Info)
 
 export const Plugin = define({
   id: "config-command",
-  effect: Effect.fn(function* (ctx) {
+  effect: Effect.fn(function* () {
     const config = yield* Config.Service
     const fs = yield* FSUtil.Service
-    yield* ctx.command.transform(
+    const commands = yield* CommandV2.Service
+    yield* commands.transform(
       Effect.fn(function* (draft) {
         const documents = yield* Effect.forEach(yield* config.entries(), (entry) => {
           if (entry.type === "document") return Effect.succeed([{ commands: entry.info.commands }])
@@ -37,8 +38,10 @@ export const Plugin = define({
                 const model = ModelV2.parse(command.model)
                 item.model = { id: model.modelID, providerID: model.providerID, variant: item.model?.variant }
               }
-              if (command.variant !== undefined && item.model !== undefined) {
-                item.model.variant = ModelV2.VariantID.make(command.variant)
+              if (command.variant !== undefined) {
+                const variant = ModelV2.VariantID.make(command.variant)
+                item.variant = item.model ? undefined : variant
+                if (item.model) item.model.variant = variant
               }
               if (command.subtask !== undefined) item.subtask = command.subtask
             })

@@ -171,7 +171,7 @@ const layer = Layer.effect(
 
     const get = Effect.fn("Command.get")(function* (name: string, activated?: readonly string[]) {
       const s = yield* InstanceState.get(state)
-      if (s.commands[name]) return s.commands[name]
+      if (s.commands[name] && s.commands[name].source !== "skill") return s.commands[name]
       return (yield* promptCommands(s.bridge, activated))[name]
     })
 

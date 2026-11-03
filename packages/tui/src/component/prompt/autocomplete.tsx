@@ -14,6 +14,9 @@ import { getScrollAcceleration } from "../../util/scroll"
 import { useTuiPaths } from "../../context/runtime"
 import { useTuiConfig } from "../../config"
 import { useLocation } from "../../context/location"
+import { useLocal } from "../../context/local"
+import { materializePrompt } from "../../prompt/materialize"
+import { contemplatedPromptModel } from "../../prompt/selection"
 import { useTheme, selectedForeground } from "../../context/theme"
 import { SplitBorder } from "../../ui/border"
 import { useTerminalDimensions } from "@opentui/solid"
@@ -21,7 +24,8 @@ import { Locale } from "../../util/locale"
 import type { PromptInfo } from "../../prompt/history"
 import { useFrecency } from "../../prompt/frecency"
 import { useBindings, useCommandSlashes, useOpencodeModeStack } from "../../keymap"
-import { displayCharAt, mentionTriggerIndex } from "../../prompt/display"
+import { displaySlice, promptOffsetWidth } from "../../prompt/display"
+import { mentionNamespaces, promptTrigger } from "../../prompt/trigger"
 import type { FileSystemEntry } from "@opencode-ai/sdk/v2"
 
 function removeLineRange(input: string) {
@@ -58,7 +62,7 @@ function extractLineRange(input: string) {
 
 export type AutocompleteRef = {
   onInput: (value: string) => void
-  visible: false | "@" | "/"
+  visible: false | "@" | "/" | "$"
 }
 
 export type AutocompleteOption = {
@@ -70,10 +74,14 @@ export type AutocompleteOption = {
   isDirectory?: boolean
   onSelect?: () => void
   path?: string
+  namespace?: boolean
 }
 
 export function Autocomplete(props: {
   value: string
+  prompt: PromptInfo
+  activeModel?: { providerID: string; modelID: string; variant?: string }
+  disabled?: boolean
   sessionID?: string
   setPrompt: (input: (prompt: PromptInfo) => void) => void
   setExtmark: (partIndex: number, extmarkId: number) => void
@@ -97,6 +105,7 @@ export function Autocomplete(props: {
   const tuiConfig = useTuiConfig()
   const paths = useTuiPaths()
   const location = useLocation()
+  const local = useLocal()
   const [store, setStore] = createStore({
     index: 0,
     selected: 0,
@@ -105,6 +114,9 @@ export function Autocomplete(props: {
   })
 
   const [positionTick, setPositionTick] = createSignal(0)
+  let editing = false
+  // Completion inserts no space, so ignore delayed cursor events for the accepted token.
+  let dismissed: { value: string; offset: number } | undefined
 
   createEffect(() => {
     if (!store.visible) return
@@ -148,7 +160,10 @@ export function Autocomplete(props: {
     // Track props.value to make memo reactive to text changes
     props.value // <- there surely is a better way to do this, like making .input() reactive
 
-    return props.input().getTextRange(store.index + 1, props.input().cursorOffset)
+    const prompt = { ...props.prompt, input: props.input().plainText }
+    const start = materializePrompt(prompt, store.index).caret
+    const logical = materializePrompt(prompt, props.input().cursorOffset)
+    return displaySlice(logical.input, start + 1, logical.caret)
   })
 
   // filter() reads reactive props.value plus non-reactive cursor/text state.
@@ -156,6 +171,8 @@ export function Autocomplete(props: {
   // Copy it into search in an effect because effects run after reactive updates have been rendered and painted
   // so the input has settled and all consumers read the same stable value.
   const [search, setSearch] = createSignal("")
+  const namespace = createMemo(() => (store.visible === "@" ? search().split(":")[0] : ""))
+  const query = createMemo(() => (store.visible === "@" ? search().slice(search().indexOf(":") + 1) : search()))
   createEffect(() => {
     const next = filter()
     setSearch(next ? next : "")
@@ -170,26 +187,36 @@ export function Autocomplete(props: {
   })
 
   function insertPart(text: string, part: PromptInfo["parts"][number]) {
+    editing = true
     const input = props.input()
-    const currentCursorOffset = input.cursorOffset
+    const prefix = store.visible === "$" || text.startsWith("$") ? "" : "@"
+    const label = text.startsWith("$") ? text : search().includes(":") ? `${namespace()}:${text}` : text
+    const append = prefix + label
+    if (part.type === "control") {
+      const previous = props.prompt.parts
+        .filter((item) => item.type === "control")
+        .filter((item) => item.kind === part.kind)
+        .sort((a, b) => b.source.start - a.source.start)
+      for (const item of previous) {
+        const cursor = input.cursorOffset
+        input.cursorOffset = item.source.end
+        const end = input.logicalCursor
+        input.cursorOffset = item.source.start
+        const start = input.logicalCursor
+        input.deleteRange(start.row, start.col, end.row, end.col)
+        const width = item.source.end - item.source.start
+        if (item.source.end <= store.index) setStore("index", store.index - width)
+        input.cursorOffset = cursor - (item.source.end <= cursor ? width : 0)
+      }
+    }
+    replaceQuery(append)
+    editing = true
 
-    const charAfterCursor = displayCharAt(props.value, currentCursorOffset)
-    const needsSpace = charAfterCursor !== " "
-    const append = "@" + text + (needsSpace ? " " : "")
-
-    input.cursorOffset = store.index
-    const startCursor = input.logicalCursor
-    input.cursorOffset = currentCursorOffset
-    const endCursor = input.logicalCursor
-
-    input.deleteRange(startCursor.row, startCursor.col, endCursor.row, endCursor.col)
-    input.insertText(append)
-
-    const virtualText = "@" + text
+    const virtualText = append
     const extmarkStart = store.index
-    const extmarkEnd = extmarkStart + Bun.stringWidth(virtualText)
+    const extmarkEnd = extmarkStart + promptOffsetWidth(virtualText)
 
-    const styleId = part.type === "file" ? props.fileStyleId : part.type === "agent" ? props.agentStyleId : undefined
+    const styleId = part.type === "file" || part.type === "skill" ? props.fileStyleId : props.agentStyleId
 
     const extmarkId = input.extmarks.create({
       start: extmarkStart,
@@ -200,31 +227,11 @@ export function Autocomplete(props: {
     })
 
     props.setPrompt((draft) => {
-      if (part.type === "file") {
-        const existingIndex = draft.parts.findIndex((p) => p.type === "file" && "url" in p && p.url === part.url)
-        if (existingIndex !== -1) {
-          const existing = draft.parts[existingIndex]
-          if (
-            part.source?.text &&
-            existing &&
-            "source" in existing &&
-            existing.source &&
-            "text" in existing.source &&
-            existing.source.text
-          ) {
-            existing.source.text.start = extmarkStart
-            existing.source.text.end = extmarkEnd
-            existing.source.text.value = virtualText
-          }
-          return
-        }
-      }
-
       if (part.type === "file" && part.source?.text) {
         part.source.text.start = extmarkStart
         part.source.text.end = extmarkEnd
         part.source.text.value = virtualText
-      } else if (part.type === "agent" && part.source) {
+      } else if ((part.type === "agent" || part.type === "control" || part.type === "skill") && part.source) {
         part.source.start = extmarkStart
         part.source.end = extmarkEnd
         part.source.value = virtualText
@@ -237,6 +244,7 @@ export function Autocomplete(props: {
     if (part.type === "file" && part.source && part.source.type === "file") {
       frecency.updateFrecency(part.source.path)
     }
+    editing = false
   }
 
   function createFilePart(
@@ -281,7 +289,8 @@ export function Autocomplete(props: {
 
   const referenceMatch = createMemo(() => {
     if (!store.visible || store.visible === "/") return
-    const { baseQuery } = extractLineRange(search())
+    if (namespace() !== "reference") return
+    const { baseQuery } = extractLineRange(query())
     const slash = baseQuery.indexOf("/")
     const alias = slash === -1 ? baseQuery : baseQuery.slice(0, slash)
     return references().find((item) => !item.hidden && item.name === alias)
@@ -314,9 +323,10 @@ export function Autocomplete(props: {
   }
 
   const [files] = createResource(
-    () => ({ query: search(), location: location() }),
+    () => ({ query: query(), namespace: namespace(), location: location() }),
     async (input) => {
-      if (!store.visible || store.visible === "/") return []
+      if (store.visible !== "@" || !["file", "reference"].includes(input.namespace) || !search().includes(":"))
+        return []
       if (referenceMatch()) return []
       const { lineRange, baseQuery } = extractLineRange(input.query ?? "")
 
@@ -445,7 +455,13 @@ export function Autocomplete(props: {
   )
 
   const commands = createMemo((): AutocompleteOption[] => {
-    const results: AutocompleteOption[] = [...slashes()]
+    const results: AutocompleteOption[] = slashes().map((item) => ({
+      ...item,
+      onSelect: () => {
+        replaceQuery("")
+        item.onSelect?.()
+      },
+    }))
 
     for (const serverCommand of sync.data.command) {
       if (serverCommand.source === "skill") continue
@@ -454,11 +470,7 @@ export function Autocomplete(props: {
         display: "/" + serverCommand.name + label,
         description: serverCommand.description,
         onSelect: () => {
-          const newText = "/" + serverCommand.name + " "
-          const cursor = props.input().logicalCursor
-          props.input().deleteRange(0, 0, cursor.row, cursor.col)
-          props.input().insertText(newText)
-          props.input().cursorOffset = Bun.stringWidth(newText)
+          replaceQuery("/" + serverCommand.name)
         },
       })
     }
@@ -473,13 +485,105 @@ export function Autocomplete(props: {
     }))
   })
 
+  function replaceQuery(text: string) {
+    editing = true
+    const input = props.input()
+    const end = input.cursorOffset
+    const controls = props.prompt.parts
+      .filter((part) => part.type === "control")
+      .filter((part) => part.source.start >= store.index && part.source.end <= end)
+      .sort((a, b) => a.source.start - b.source.start)
+    const boundaries = [store.index, ...controls.flatMap((part) => [part.source.start, part.source.end]), end]
+    for (let index = boundaries.length - 2; index >= 0; index -= 2) {
+      input.cursorOffset = boundaries[index + 1]
+      const finish = input.logicalCursor
+      input.cursorOffset = boundaries[index]
+      const start = input.logicalCursor
+      input.deleteRange(start.row, start.col, finish.row, finish.col)
+    }
+    input.cursorOffset = store.index
+    input.insertText(text)
+    editing = false
+  }
+
+  const [skills] = createResource(() =>
+    sdk.client.app
+      .skills({})
+      .then((result) => result.data ?? [])
+      .catch(() => []),
+  )
+  const skillOptions = createMemo(() =>
+    (skills() ?? []).map(
+      (skill): AutocompleteOption => ({
+        display: "$" + skill.name,
+        description: skill.description,
+        onSelect: () =>
+          insertPart("$" + skill.name, {
+            type: "skill",
+            name: skill.name,
+            source: { start: 0, end: 0, value: "" },
+          }),
+      }),
+    ),
+  )
+
+  const controls = createMemo((): AutocompleteOption[] => {
+    if (namespace() === "model")
+      return sync.data.provider.flatMap((provider) =>
+        Object.values(provider.models).map((model) => ({
+          display: `${model.name} (${provider.name})`,
+          description: `${provider.id}/${model.id}`,
+          value: `${provider.id}/${model.id}`,
+          aliases: [model.name, model.id, provider.name],
+          onSelect: () =>
+            insertPart(model.name, {
+              type: "control",
+              kind: "model",
+              model: { providerID: provider.id, modelID: model.id },
+              source: { start: 0, end: 0, value: "" },
+            }),
+        })),
+      )
+    const logical = materializePrompt(props.prompt)
+    const model = contemplatedPromptModel({
+      text: logical.input,
+      explicit: logical.selection.model,
+      active: props.activeModel,
+      persistent: local.model.current(),
+      commands: sync.data.command,
+      agents: sync.data.agent,
+    })
+    const info = sync.data.provider.find((provider) => provider.id === model?.providerID)?.models[model?.modelID ?? ""]
+    return ["default", ...Object.keys(info?.variants ?? {})].map((variant) => ({
+      display: variant,
+      description: `${model?.providerID ?? ""}/${model?.modelID ?? ""}`,
+      onSelect: () =>
+        insertPart(variant, { type: "control", kind: "variant", variant, source: { start: 0, end: 0, value: "" } }),
+    }))
+  })
+
   const options = createMemo((prev: AutocompleteOption[] | undefined) => {
     const filesValue = files()
     const referenceMatchValue = referenceMatch()
     const agentsValue = agents()
     const referenceAliasesValue = referenceAliases()
     const commandsValue = commands()
-    const searchValue = search()
+    const searchValue = query()
+
+    if (store.visible === "@" && !search().includes(":")) {
+      const namespaces = mentionNamespaces.map(
+        (name): AutocompleteOption => ({
+          display: "@" + name,
+          value: name,
+          namespace: true,
+          onSelect: () => {
+            replaceQuery("@" + name + ":")
+            setSearch(name + ":")
+          },
+        }),
+      )
+      return search() ? fuzzysort.go(search(), namespaces, { key: "value" }).map((item) => item.obj) : namespaces
+    }
 
     if (store.visible === "@" && referenceMatchValue) {
       return referenceAliasesValue.filter((item) => item.display === `@${referenceMatchValue.name}`)
@@ -487,15 +591,28 @@ export function Autocomplete(props: {
 
     // Files come from fff already fuzzy ranked and filtered
     // it shouldn't be additionally sorted by fuzzysort as it will loose the results
-    const fileOptions: AutocompleteOption[] = store.visible === "@" ? filesValue || [] : []
+    const fileOptions: AutocompleteOption[] =
+      store.visible === "@" && ["file", "reference"].includes(namespace()) ? filesValue || [] : []
     const nonFileOptions: AutocompleteOption[] =
-      store.visible === "@" ? [...referenceAliasesValue, ...agentsValue, ...mcpResources()] : [...commandsValue]
+      store.visible === "$"
+        ? skillOptions()
+        : store.visible === "@"
+          ? namespace() === "reference"
+            ? referenceAliasesValue
+            : namespace() === "agent"
+              ? agentsValue
+              : namespace() === "resource"
+                ? mcpResources()
+                : ["model", "variant"].includes(namespace())
+                  ? controls()
+                  : []
+          : [...commandsValue]
 
     if (!searchValue) {
       return [...nonFileOptions, ...fileOptions]
     }
 
-    if (files.loading && prev && prev.length > 0) {
+    if (fileOptions.length && files.loading && prev && prev.length > 0) {
       return prev
     }
 
@@ -553,27 +670,18 @@ export function Autocomplete(props: {
   function select() {
     const selected = options()[store.selected]
     if (!selected) return
-    hide()
     selected.onSelect?.()
+    if (!selected.namespace) hide()
   }
 
   function expandDirectory() {
     const selected = options()[store.selected]
     if (!selected) return
 
-    const input = props.input()
-    const currentCursorOffset = input.cursorOffset
-
     const displayText = (selected.value ?? selected.display).trimEnd()
     const path = displayText.startsWith("@") ? displayText.slice(1) : displayText
 
-    input.cursorOffset = store.index
-    const startCursor = input.logicalCursor
-    input.cursorOffset = currentCursorOffset
-    const endCursor = input.logicalCursor
-
-    input.deleteRange(startCursor.row, startCursor.col, endCursor.row, endCursor.col)
-    input.insertText("@" + path + "/")
+    replaceQuery("@" + namespace() + ":" + path + "/")
 
     setStore("selected", 0)
   }
@@ -640,7 +748,7 @@ export function Autocomplete(props: {
     ]),
   }))
 
-  function show(mode: "@" | "/") {
+  function show(mode: "@" | "/" | "$") {
     setStore({
       visible: mode,
       index: props.input().cursorOffset,
@@ -648,15 +756,7 @@ export function Autocomplete(props: {
   }
 
   function hide() {
-    const text = props.input().plainText
-    if (store.visible === "/" && !text.endsWith(" ") && text.startsWith("/")) {
-      const cursor = props.input().logicalCursor
-      props.input().deleteRange(0, 0, cursor.row, cursor.col)
-      // Sync the prompt store immediately since onContentChange is async
-      props.setPrompt((draft) => {
-        draft.input = props.input().plainText
-      })
-    }
+    dismissed = { value: props.input().plainText, offset: props.input().cursorOffset }
     setStore("visible", false)
   }
 
@@ -674,37 +774,14 @@ export function Autocomplete(props: {
         return store.visible
       },
       onInput(value) {
-        if (store.visible) {
-          if (
-            // Typed text before the trigger
-            props.input().cursorOffset <= store.index ||
-            // There is a space between the trigger and the cursor
-            props.input().getTextRange(store.index, props.input().cursorOffset).match(/\s/) ||
-            // "/<command>" is not the sole content
-            (store.visible === "/" && value.match(/^\S+\s+\S+\s*$/))
-          ) {
-            hide()
-          }
-          return
-        }
-
-        // Check if autocomplete should reopen (e.g., after backspace deleted a space)
+        if (editing) return
         const offset = props.input().cursorOffset
-        if (offset === 0) return
-
-        // Check for "/" at position 0 - reopen slash commands
-        if (value.startsWith("/") && !value.slice(0, offset).match(/\s/)) {
-          show("/")
-          setStore("index", 0)
-          return
-        }
-
-        // Check for "@" trigger - find the nearest "@" before cursor with no whitespace between
-        const idx = mentionTriggerIndex(value, offset)
-        if (idx !== undefined) {
-          show("@")
-          setStore("index", idx)
-        }
+        if (dismissed?.value === value && dismissed.offset === offset) return
+        dismissed = undefined
+        const trigger = !props.disabled && promptTrigger({ ...props.prompt, input: value }, offset)
+        if (!trigger) return hide()
+        show(trigger.mode)
+        setStore("index", trigger.index)
       },
     })
   })

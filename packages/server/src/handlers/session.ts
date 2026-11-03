@@ -6,6 +6,7 @@ import { SessionsCursor } from "@opencode-ai/protocol/groups/session"
 import {
   ConflictError,
   InvalidCursorError,
+  InvalidRequestError,
   MessageNotFoundError,
   ServiceUnavailableError,
   SessionNotFoundError,
@@ -149,6 +150,10 @@ export const SessionHandler = HttpApiBuilder.group(Api, "server.session", (handl
                 resume: ctx.payload.resume,
               })
               .pipe(
+                Effect.catchTag(
+                  "Session.InvalidModelError",
+                  (error) => new InvalidRequestError({ message: error.message, field: "model" }),
+                ),
                 Effect.catchTag("Session.NotFoundError", (error) =>
                   Effect.fail(
                     new SessionNotFoundError({
@@ -171,9 +176,75 @@ export const SessionHandler = HttpApiBuilder.group(Api, "server.session", (handl
                   ),
                 ),
                 Effect.catchTag("SessionInput.ManagedProfile", () =>
-                  Effect.fail(new ConflictError({ message: "V2 session execution is unavailable in managed profile", resource: ctx.params.sessionID })),
+                  Effect.fail(
+                    new ConflictError({
+                      message: "V2 session execution is unavailable in managed profile",
+                      resource: ctx.params.sessionID,
+                    }),
+                  ),
                 ),
               ),
+          }
+        }),
+      )
+      .handle(
+        "session.command",
+        Effect.fn(function* (ctx) {
+          return {
+            data: yield* session.command({ ...ctx.payload, sessionID: ctx.params.sessionID }).pipe(
+              Effect.catchTag(
+                "Session.InvalidModelError",
+                (error) => new InvalidRequestError({ message: error.message, field: "model" }),
+              ),
+              Effect.catchTag(
+                "Session.NotFoundError",
+                (error) =>
+                  new SessionNotFoundError({
+                    sessionID: error.sessionID,
+                    message: `Session not found: ${error.sessionID}`,
+                  }),
+              ),
+              Effect.catchTag(
+                "Session.CommandNotFoundError",
+                (error) =>
+                  new InvalidRequestError({
+                    message: `Command not found: ${error.command}`,
+                    field: "command",
+                  }),
+              ),
+              Effect.catchTag(
+                "Session.OperationUnavailableError",
+                (error) =>
+                  new ServiceUnavailableError({
+                    message: `Session ${error.operation} is not available yet`,
+                    service: `session.${error.operation}`,
+                  }),
+              ),
+              Effect.catchTag(
+                "Session.PromptConflictError",
+                (error) =>
+                  new ConflictError({
+                    message: `Prompt message ID conflicts with an existing durable record: ${error.messageID}`,
+                    resource: error.messageID,
+                  }),
+              ),
+              Effect.catchTag(
+                "SessionInput.Retired",
+                (error) =>
+                  new ConflictError({
+                    message: `Session is retired: ${error.sessionID}`,
+                    resource: error.sessionID,
+                  }),
+              ),
+              Effect.catchTag(
+                "SessionInput.ManagedProfile",
+                () =>
+                  new ConflictError({
+                    message: "V2 session execution is unavailable in managed profile",
+                    resource: ctx.params.sessionID,
+                  }),
+              ),
+            ),
           }
         }),
       )

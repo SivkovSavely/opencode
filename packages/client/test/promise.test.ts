@@ -54,6 +54,48 @@ test("sessions.get returns the wire projection", async () => {
   expect(result.time.created).toBe(1_717_171_717_000)
 })
 
+test("current prompt and command transports preserve one-message controls and skill references", async () => {
+  const requests: unknown[] = []
+  const client = OpenCode.make({
+    baseUrl: "http://localhost:3000",
+    headers: { Authorization: "Basic configured" },
+    fetch: async (_input, init) => {
+      expect(new Headers(init?.headers).get("authorization")).toBe("Basic configured")
+      requests.push(JSON.parse(String(init?.body)))
+      return Response.json(admission)
+    },
+  })
+  const prompt = {
+    text: "hello $review",
+    files: [{ uri: "skill:review", name: "review" }],
+    model: { id: "base", providerID: "fake", variant: "low" },
+    selection: { inheritActive: true, model: { modelID: "override", providerID: "fake" }, variant: "high" },
+  }
+  await client.sessions.prompt({ sessionID: "ses_test", prompt, resume: false })
+  await client.sessions.command({
+    sessionID: "ses_test",
+    command: "review",
+    arguments: "branch",
+    model: prompt.model,
+    selection: prompt.selection,
+    files: prompt.files,
+    delivery: "queue",
+    resume: false,
+  })
+  expect(requests).toEqual([
+    { prompt, resume: false },
+    {
+      command: "review",
+      arguments: "branch",
+      model: prompt.model,
+      selection: prompt.selection,
+      files: prompt.files,
+      delivery: "queue",
+      resume: false,
+    },
+  ])
+})
+
 test("events.subscribe exposes the Promise event stream wire projection", async () => {
   const client = OpenCode.make({
     baseUrl: "http://localhost:3000",

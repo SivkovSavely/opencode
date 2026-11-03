@@ -1,5 +1,5 @@
 import { useFilteredList } from "@opencode-ai/ui/hooks"
-import { QueueCommand } from "@opencode-ai/schema/queue-command"
+import fuzzysort from "fuzzysort"
 import { useSpring } from "@opencode-ai/ui/motion-spring"
 import {
   createEffect,
@@ -53,7 +53,12 @@ import { useLanguage } from "@/context/language"
 import { usePlatform } from "@/context/platform"
 import { useSettings } from "@/context/settings"
 import { createSessionTabs } from "@/pages/session/helpers"
-import { createTextFragment, getCursorPosition, setCursorPosition, setRangeEdge } from "./prompt-input/editor-dom"
+import {
+  copyEditorSelection,
+  createTextFragment,
+  getCursorPosition,
+  setCursorPosition,
+} from "./prompt-input/editor-dom"
 import { createPromptAttachments } from "./prompt-input/attachments"
 import { ACCEPTED_FILE_TYPES, pickAttachmentFiles } from "./prompt-input/files"
 import {
@@ -75,6 +80,14 @@ import {
   type PromptInputSubmission,
 } from "./prompt-input/contracts"
 import { createPromptSubmit } from "./prompt-input/submit"
+import {
+  activePromptSelection,
+  materializePrompt,
+  parseQueueCommand,
+  promptTrigger,
+  replacePromptTrigger,
+  contemplatedPromptSelection,
+} from "./prompt-input/controls"
 import { PromptPopover, type AtOption, type SlashCommand } from "./prompt-input/slash-popover"
 import { PromptContextItems } from "./prompt-input/context-items"
 import { PromptImageAttachments } from "./prompt-input/image-attachments"
@@ -84,6 +97,7 @@ import { createPromptInputTransientState } from "./prompt-input/transient-state"
 import { showToast } from "@/utils/toast"
 import { ImagePreview } from "@opencode-ai/ui/image-preview"
 import type { ReferenceInfo } from "@opencode-ai/sdk/v2/client"
+import { resolveServerProtocol } from "@/utils/server-protocol"
 
 export { createPromptInputHistory }
 export type { PromptInputControls, PromptInputHistory, PromptInputProps, PromptInputState, PromptInputSubmission }
@@ -280,14 +294,57 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
     return prompt.context.items().filter((item) => !!item.comment?.trim()).length
   })
   const blank = createMemo(() => {
-    const text = prompt
-      .current()
-      .map((part) => ("content" in part ? part.content : ""))
-      .join("")
+    const clean = materializePrompt(prompt.current())
+    const text = clean.text
     return (
       text.trim().length === 0 &&
-      !prompt.current().some((part) => part.type !== "text") &&
+      !clean.prompt.some((part) => part.type !== "text") &&
       prompt.context.items().length === 0
+    )
+  })
+  const resolveExecutionSelection = (parts: Prompt) => {
+    const id = props.controls.session.id
+    const active = id
+      ? activePromptSelection(
+          sync().data.message[id] ?? [],
+          sync().data.session_working(id),
+          id,
+          sync().data.session_message?.[id] ?? [],
+        )
+      : undefined
+    const clean = materializePrompt(parts)
+    const base = props.controls.model.selection.current()
+    const pair = base
+      ? contemplatedPromptSelection({
+          text: clean.text,
+          selection: clean.selection,
+          base: {
+            providerID: base.provider.id,
+            modelID: base.id,
+            variant: props.controls.model.selection.variant.current(),
+          },
+          active,
+          commands: sync().data.command,
+          agents: sync().data.agent,
+        })
+      : undefined
+    const model = pair
+      ? props.controls.model.selection
+          .list()
+          .find((item) => item.provider.id === pair.providerID && item.id === pair.modelID)
+      : undefined
+    const variant = pair?.variant
+    return { model, variant: variant === "default" || !model?.variants?.[variant ?? ""] ? undefined : variant }
+  }
+  const executionSelection = createMemo(() => resolveExecutionSelection(prompt.current()))
+  const executionDiffers = createMemo(() => {
+    const effective = executionSelection()
+    const saved = props.controls.model.selection.current()
+    return (
+      effective.model &&
+      (effective.model.id !== saved?.id ||
+        effective.model.provider.id !== saved?.provider.id ||
+        effective.variant !== props.controls.model.selection.variant.current())
     )
   })
   const stopping = createMemo(() => store.preparing || (working() && blank()))
@@ -612,17 +669,55 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
     ),
   )
 
+  const [skills] = createResource(sdk, (source) =>
+    (async () => {
+      if ((await resolveServerProtocol(source.protocol)) === "v1") return (await source.client.app.skills()).data ?? []
+      return (await source.api.skill.list({ location: { directory: source.directory } })).data
+    })().catch((error: unknown) => {
+      showToast({
+        title: language.t("common.requestFailed"),
+        description: error instanceof Error ? error.message : String(error),
+        variant: "error",
+      })
+      return []
+    }),
+  )
+
   const handleAtSelect = (option: AtOption | undefined) => {
     if (!option) return
+    if (option.type === "namespace") {
+      addPart({ type: "text", content: `@${option.name}:`, start: 0, end: 0 }, false, true)
+      handleInput()
+      return
+    }
+    if (option.type === "model") {
+      addPart({
+        type: "model",
+        providerID: option.providerID,
+        modelID: option.modelID,
+        content: `@model:${option.name}`,
+        start: 0,
+        end: 0,
+      })
+      return
+    }
+    if (option.type === "variant") {
+      addPart({ type: "variant", variant: option.variant, content: `@variant:${option.variant}`, start: 0, end: 0 })
+      return
+    }
+    if (option.type === "skill") {
+      addPart({ type: "skill", name: option.name, content: `$${option.name}`, start: 0, end: 0 })
+      return
+    }
     if (option.type === "agent") {
-      addPart({ type: "agent", name: option.name, content: "@" + option.name, start: 0, end: 0 })
+      addPart({ type: "agent", name: option.name, content: "@agent:" + option.name, start: 0, end: 0 })
       return
     }
     if (option.type === "reference") {
       addPart({
         type: "file",
         path: option.path,
-        content: "@" + option.name,
+        content: "@reference:" + option.name,
         start: 0,
         end: 0,
         mime: "application/x-directory",
@@ -634,7 +729,7 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
       addPart({
         type: "file",
         path: option.uri,
-        content: "@" + option.name,
+        content: "@resource:" + option.name,
         start: 0,
         end: 0,
         mime: option.mime ?? "text/plain",
@@ -642,18 +737,21 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
         url: option.uri,
         source: {
           type: "resource",
-          text: { value: "@" + option.name, start: 0, end: 0 },
+          text: { value: "@resource:" + option.name, start: 0, end: 0 },
           clientName: option.client,
           uri: option.uri,
         },
       })
       return
     }
-    addPart({ type: "file", path: option.path, content: "@" + option.path, start: 0, end: 0 })
+    addPart({ type: "file", path: option.path, content: "@file:" + option.path, start: 0, end: 0 })
   }
 
   const atKey = (x: AtOption | undefined) => {
     if (!x) return ""
+    if (x.type === "namespace" || x.type === "skill") return `${x.type}:${x.name}`
+    if (x.type === "model") return `model:${x.providerID}/${x.modelID}`
+    if (x.type === "variant") return `variant:${x.variant}`
     if (x.type === "agent") return `agent:${x.name}`
     if (x.type === "reference") return `reference:${x.name}`
     if (x.type === "resource") return `resource:${x.client}:${x.uri}`
@@ -668,27 +766,69 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
     onKeyDown: atOnKeyDown,
   } = useFilteredList<AtOption>({
     items: async (query) => {
+      const trigger = editorRef && promptTrigger(parseFromDOM(), getCursorPosition(editorRef))
+      if (trigger?.type === "skill") {
+        const available = skills() ?? []
+        return (query ? fuzzysort.go(query, available, { key: "name" }).map((item) => item.obj) : available).map(
+          (item): AtOption => ({ type: "skill", name: item.name, display: item.name }),
+        )
+      }
+      const namespaces = ["file", "agent", "model", "variant", "reference", "resource"]
+      const colon = query.indexOf(":")
+      if (colon === -1)
+        return (query ? fuzzysort.go(query, namespaces).map((item) => item.target) : namespaces).map(
+          (name): AtOption => ({ type: "namespace", name, display: `@${name}:` }),
+        )
+      const namespace = query.slice(0, colon)
+      const search = query.slice(colon + 1)
+      const filter = (items: AtOption[]) =>
+        search ? fuzzysort.go(search, items, { key: "display" }).map((item) => item.obj) : items
+      if (namespace === "model")
+        return filter(
+          props.controls.model.selection.list().map(
+            (item): AtOption => ({
+              type: "model",
+              providerID: item.provider.id,
+              modelID: item.id,
+              name: item.name,
+              display: `${item.name} (${item.provider.id}/${item.id})`,
+            }),
+          ),
+        )
+      if (namespace === "variant") {
+        // Completion can run before handleInput persists the current DOM prompt.
+        const model = resolveExecutionSelection(editorRef ? parseFromDOM() : prompt.current()).model
+        return filter(
+          ["default", ...Object.keys(model?.variants ?? {})].map(
+            (variant): AtOption => ({ type: "variant", variant, display: variant }),
+          ),
+        )
+      }
       const references = referenceList()
       const agents = agentList()
       const mcpResources = mcpResourceList()
       const open = recent()
       const seen = new Set(open)
       const pinned: AtOption[] = open.map((path) => ({ type: "file", path, display: path, recent: true }))
-      if (!query.trim()) return [...references, ...agents, ...mcpResources, ...pinned]
-      const paths = await files.searchFilesAndDirectories(query)
+      if (namespace === "agent") return filter(agents)
+      if (namespace === "reference") return filter(references)
+      if (namespace === "resource") return filter(mcpResources)
+      if (namespace !== "file") return []
+      if (!search.trim()) return pinned
+      const paths = await files.searchFilesAndDirectories(search)
       const fileOptions: AtOption[] = paths
         .filter((path) => !seen.has(path))
         .map((path) => ({ type: "file", path, display: path }))
-      return [...references, ...agents, ...mcpResources, ...pinned, ...fileOptions]
+      return [...filter(pinned), ...fileOptions]
     },
     key: atKey,
     filterKeys: ["display"],
-    skipFilter: (item) => item.type === "file" && !item.recent,
+    skipFilter: () => true,
     groupBy: (item) => {
       if (item.type === "reference") return "reference"
       if (item.type === "agent") return "agent"
       if (item.type === "resource") return "resource"
-      if (item.recent) return "recent"
+      if (item.type === "file" && item.recent) return "recent"
       return "file"
     },
     sortGroupsBy: (a, b) => {
@@ -716,14 +856,16 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
         type: "builtin" as const,
       }))
 
-    const custom = sync().data.command.map((cmd) => ({
-      id: `custom.${cmd.name}`,
-      trigger: cmd.name,
-      title: cmd.name,
-      description: cmd.description,
-      type: "custom" as const,
-      // source: cmd.source,
-    }))
+    const custom = sync()
+      .data.command.filter((cmd) => cmd.source !== "skill")
+      .map((cmd) => ({
+        id: `custom.${cmd.name}`,
+        trigger: cmd.name,
+        title: cmd.name,
+        description: cmd.description,
+        type: "custom" as const,
+        // source: cmd.source,
+      }))
 
     return [...custom, ...builtin]
   })
@@ -743,9 +885,7 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
         focusEditorEnd()
         return
       }
-      setEditorText(text)
-      prompt.set([{ type: "text", content: text, start: 0, end: text.length }, ...images], text.length)
-      focusEditorEnd()
+      addPart({ type: "text", content: text, start: 0, end: text.length }, false, true)
       return
     }
 
@@ -772,7 +912,7 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
     onSelect: handleSlashSelect,
   })
 
-  const createPill = (part: FileAttachmentPart | AgentPart) => {
+  const createPill = (part: Exclude<ContentPart, ImageAttachmentPart | { type: "text" }>) => {
     const pill = document.createElement("span")
     pill.textContent = part.content
     pill.setAttribute("data-type", part.type)
@@ -788,6 +928,12 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
       }
     }
     if (part.type === "agent") pill.setAttribute("data-name", part.name)
+    if (part.type === "skill") pill.setAttribute("data-name", part.name)
+    if (part.type === "model") {
+      pill.dataset.providerId = part.providerID
+      pill.dataset.modelId = part.modelID
+    }
+    if (part.type === "variant") pill.dataset.variant = part.variant
     pill.setAttribute("contenteditable", "false")
     pill.style.userSelect = "text"
     pill.style.cursor = "default"
@@ -810,6 +956,7 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
       const el = node as HTMLElement
       if (el.dataset.type === "file") return true
       if (el.dataset.type === "agent") return true
+      if (["model", "variant", "skill"].includes(el.dataset.type ?? "")) return true
       return el.tagName === "BR"
     })
 
@@ -820,7 +967,7 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
         editorRef.appendChild(createTextFragment(part.content))
         continue
       }
-      if (part.type === "file" || part.type === "agent") {
+      if (part.type !== "image") {
         editorRef.appendChild(createPill(part))
       }
     }
@@ -884,7 +1031,7 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
     ),
   )
 
-  const parseFromDOM = (): Prompt => {
+  const parseFromDOM = (root: ParentNode = editorRef): Prompt => {
     const parts: Prompt = []
     let position = 0
     let buffer = ""
@@ -948,6 +1095,17 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
       if (node.nodeType !== Node.ELEMENT_NODE) return
 
       const el = node as HTMLElement
+      if (el.dataset.type === "model" || el.dataset.type === "variant" || el.dataset.type === "skill") {
+        flushText()
+        const content = el.textContent ?? ""
+        const base = { content, start: position, end: position + content.length }
+        if (el.dataset.type === "model")
+          parts.push({ ...base, type: "model", providerID: el.dataset.providerId!, modelID: el.dataset.modelId! })
+        if (el.dataset.type === "variant") parts.push({ ...base, type: "variant", variant: el.dataset.variant! })
+        if (el.dataset.type === "skill") parts.push({ ...base, type: "skill", name: el.dataset.name! })
+        position += content.length
+        return
+      }
       if (el.dataset.type === "file") {
         flushText()
         pushFile(el)
@@ -968,7 +1126,7 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
       }
     }
 
-    const children = Array.from(editorRef.childNodes)
+    const children = Array.from(root.childNodes)
     children.forEach((child, index) => {
       const isBlock = child.nodeType === Node.ELEMENT_NODE && ["DIV", "P"].includes((child as HTMLElement).tagName)
       visit(child)
@@ -1010,14 +1168,14 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
     const shellMode = store.mode === "shell"
 
     if (!shellMode) {
-      const atMatch = rawText.substring(0, cursorPosition).match(/@(\S*)$/)
-      const slashMatch = rawText.match(/^\/(\S*)$/)
+      const trigger = promptTrigger(rawParts, cursorPosition)
 
-      if (atMatch) {
-        atOnInput(atMatch[1])
+      if (trigger?.type === "at" || trigger?.type === "skill") {
+        const query = trigger.query
+        atOnInput(query)
         setStore({ popover: "at", slashMenu: false, slashMenuQuery: "" })
-      } else if (slashMatch) {
-        slashOnInput(slashMatch[1])
+      } else if (trigger?.type === "slash") {
+        slashOnInput(trigger.query)
         setStore({ popover: "slash", slashMenu: false, slashMenuQuery: "" })
       } else {
         closePopover()
@@ -1033,7 +1191,7 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
     queueScroll()
   }
 
-  const addPart = (part: ContentPart) => {
+  const addPart = (part: ContentPart, literal = false, replaceTrigger = false) => {
     if (part.type === "image") return false
 
     const selection = window.getSelection()
@@ -1049,22 +1207,25 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
     const range = selection.getRangeAt(0)
     if (!editorRef.contains(range.startContainer)) return false
 
-    if (part.type === "file" || part.type === "agent") {
-      const cursorPosition = getCursorPosition(editorRef)
-      const rawText = prompt
-        .current()
-        .map((p) => ("content" in p ? p.content : ""))
-        .join("")
-      const textBeforeCursor = rawText.substring(0, cursorPosition)
-      const atMatch = textBeforeCursor.match(/@(\S*)$/)
-      const pill = createPill(part)
-      const gap = document.createTextNode(" ")
-
-      if (atMatch) {
-        const start = atMatch.index ?? cursorPosition - atMatch[0].length
-        setRangeEdge(editorRef, range, "start", start)
-        setRangeEdge(editorRef, range, "end", cursorPosition)
+    if (!literal && (part.type !== "text" || replaceTrigger)) {
+      const next = replacePromptTrigger(
+        parseFromDOM(),
+        getCursorPosition(editorRef),
+        part,
+        part.type === "file" || part.type === "agent",
+      )
+      if (next) {
+        renderEditor(next.prompt)
+        setCursorPosition(editorRef, next.cursor)
+        handleInput()
+        closePopover()
+        return true
       }
+    }
+
+    if (part.type !== "text") {
+      const pill = createPill(part)
+      const gap = document.createTextNode(!literal && (part.type === "file" || part.type === "agent") ? " " : "")
 
       range.deleteContents()
       range.insertNode(gap)
@@ -1073,6 +1234,11 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
       range.collapse(true)
       selection.removeAllRanges()
       selection.addRange(range)
+      if (part.type === "model" || part.type === "variant") {
+        editorRef.querySelectorAll(`[data-type="${part.type}"]`).forEach((node) => {
+          if (node !== pill) node.remove()
+        })
+      }
     }
 
     if (part.type === "text") {
@@ -1116,6 +1282,21 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
 
   const addToHistory = (prompt: Prompt, mode: "normal" | "shell") => {
     history.add(prompt, mode, mode === "shell" ? [] : historyComments())
+  }
+
+  const copyPrompt = (event: ClipboardEvent, cut = false) => {
+    if (copyEditorSelection(editorRef, event, cut) && cut) handleInput()
+  }
+
+  const pastePrompt = (event: ClipboardEvent) => {
+    const html = event.clipboardData?.getData("application/x-opencode-prompt")
+    if (!html) return handlePaste(event)
+    event.preventDefault()
+    const root = document.createElement("template")
+    // Template contents stay inert and only known prompt fields enter the live editor.
+    root.innerHTML = html
+    const parts = parseFromDOM(root.content)
+    parts.forEach((part) => addPart(part, true))
   }
 
   createEffect(
@@ -1243,6 +1424,7 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
         props.onPreparing?.(value)
       },
       model: props.controls.model.selection,
+      skills: () => (skills() ?? []).map((skill) => skill.name),
     })
 
   const handleKeyDown = (event: KeyboardEvent) => {
@@ -1335,12 +1517,7 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
     if (
       store.mode === "normal" &&
       event.key === "Enter" &&
-      QueueCommand.parse(
-        prompt
-          .current()
-          .map((part) => ("content" in part ? part.content : ""))
-          .join(""),
-      )
+      parseQueueCommand(materializePrompt(prompt.current()).text)
     ) {
       event.preventDefault()
       if (!event.repeat) void handleSubmit(event)
@@ -1546,7 +1723,9 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
               // @ts-expect-error
               autocomplete="off"
               onInput={handleInput}
-              onPaste={handlePaste}
+              onCopy={(event) => copyPrompt(event)}
+              onCut={(event) => copyPrompt(event, true)}
+              onPaste={pastePrompt}
               onCompositionStart={handleCompositionStart}
               onCompositionEnd={handleCompositionEnd}
               onFocus={handleFocus}
@@ -1557,6 +1736,7 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
                 "w-full pl-3 pr-2 pt-2 text-14-regular text-text-strong focus:outline-none whitespace-pre-wrap": true,
                 "[&_[data-type=file]]:text-syntax-property": true,
                 "[&_[data-type=agent]]:text-syntax-type": true,
+                "[&_[data-type=model]]:text-syntax-type [&_[data-type=variant]]:text-syntax-type [&_[data-type=skill]]:text-syntax-property": true,
                 "font-mono!": store.mode === "shell",
               }}
               style={{ "padding-bottom": space }}
@@ -1748,8 +1928,11 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
                                 />
                               </Show>
                               <span class="truncate">
-                                {props.controls.model.selection.current()?.name ??
-                                  language.t("dialog.model.select.title")}
+                                {language.t("prompt.controls.savedModel", {
+                                  model:
+                                    props.controls.model.selection.current()?.name ??
+                                    language.t("dialog.model.select.title"),
+                                })}
                               </span>
                               <Icon name="chevron-down" size="small" class="shrink-0" />
                             </Button>
@@ -1781,8 +1964,11 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
                                   />
                                 </Show>
                                 <span class="truncate">
-                                  {props.controls.model.selection.current()?.name ??
-                                    language.t("dialog.model.select.title")}
+                                  {language.t("prompt.controls.savedModel", {
+                                    model:
+                                      props.controls.model.selection.current()?.name ??
+                                      language.t("dialog.model.select.title"),
+                                  })}
                                 </span>
                                 <Icon name="chevron-down" size="small" class="shrink-0" />
                               </Button>
@@ -1807,7 +1993,11 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
                             size="normal"
                             options={variants()}
                             current={props.controls.model.selection.variant.current() ?? "default"}
-                            label={(x) => (x === "default" ? language.t("common.default") : x)}
+                            label={(x) =>
+                              language.t("prompt.controls.savedVariant", {
+                                variant: x === "default" ? language.t("common.default") : x,
+                              })
+                            }
                             onSelect={(value) => {
                               props.controls.model.selection.variant.set(value === "default" ? undefined : value)
                               restoreFocus()
@@ -1820,6 +2010,21 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
                           />
                         </TooltipKeybind>
                       </div>
+                    </Show>
+                    <Show when={executionDiffers()}>
+                      <span
+                        data-component="prompt-effective-selection"
+                        class="min-w-0 max-w-[320px] truncate text-12-regular text-text-weak"
+                        title={language.t("prompt.controls.effectiveSelection", {
+                          model: `${executionSelection().model?.name} (${executionSelection().model?.provider.id})`,
+                          variant: executionSelection().variant ?? language.t("common.default"),
+                        })}
+                      >
+                        {language.t("prompt.controls.effectiveSelection", {
+                          model: `${executionSelection().model?.name} (${executionSelection().model?.provider.id})`,
+                          variant: executionSelection().variant ?? language.t("common.default"),
+                        })}
+                      </span>
                     </Show>
                   </Show>
                 </Show>

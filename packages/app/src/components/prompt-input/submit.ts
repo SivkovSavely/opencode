@@ -1,9 +1,10 @@
-import type { Message, Session } from "@opencode-ai/sdk/v2/client"
+import type { Message, Session, SessionQueueV1Payload } from "@opencode-ai/sdk/v2/client"
 import { showToast } from "@/utils/toast"
 import { base64Encode } from "@opencode-ai/core/util/encode"
 import { Binary } from "@opencode-ai/core/util/binary"
 import { useLocation, useNavigate, useParams, useSearchParams } from "@solidjs/router"
 import { batch, startTransition, type Accessor } from "solid-js"
+import { unwrap } from "solid-js/store"
 import { useTabs } from "@/context/tabs"
 import { useServerSync, type ServerSync } from "@/context/server-sync"
 import { useLanguage } from "@/context/language"
@@ -22,11 +23,19 @@ import { createPromptSubmissionState } from "./submission-state"
 import { normalizeSessionInfo } from "@/utils/session"
 import { Event } from "@opencode-ai/schema/event"
 import { blobDataUrl } from "@/utils/draft-store"
-import { QueueCommand } from "@opencode-ai/schema/queue-command"
 import { queuePayload, QueuePayloadError } from "./queue-payload"
 import { Schema } from "effect"
 import { SessionQueueV1 } from "@opencode-ai/schema/v1/session-queue"
 import { queuePreview } from "@/utils/session-queue"
+import {
+  materializePrompt,
+  commandBody,
+  resolvePromptSelection,
+  activePromptSelection,
+  parseQueueCommand,
+  contemplatedPromptSelection,
+  type PromptSelection,
+} from "./controls"
 
 type PendingPrompt = {
   abort: AbortController
@@ -49,6 +58,7 @@ type PendingNewSession = {
 const pending = new Map<string, PendingPrompt>()
 
 export type FollowupDraft = {
+  selection?: PromptSelection
   sessionID: string
   sessionDirectory: string
   prompt: Prompt
@@ -75,9 +85,46 @@ const draftText = (prompt: Prompt) => prompt.map((part) => ("content" in part ? 
 
 const draftImages = (prompt: Prompt) => prompt.filter((part): part is ImageAttachmentPart => part.type === "image")
 
+async function commandFiles(draft: FollowupDraft) {
+  const clean = materializePrompt(draft.prompt)
+  const images = await Promise.all(
+    draftImages(clean.prompt).map(async (part) => ({ ...part, dataUrl: await blobDataUrl(part.blob, part.mime) })),
+  )
+  return buildRequestParts({
+    prompt: clean.prompt,
+    context: draft.context,
+    images,
+    text: clean.text,
+    sessionID: draft.sessionID,
+    messageID: "",
+    sessionDirectory: draft.sessionDirectory,
+  }).requestParts.flatMap((part) => (part.type === "file" ? [{ uri: part.url, name: part.filename }] : []))
+}
+
 export async function sendFollowupDraft(input: FollowupSendInput) {
+  input = { ...input, draft: structuredClone(unwrap(input.draft)) }
+  const clean = materializePrompt(
+    input.draft.prompt,
+    input.sync.data.command.filter((item) => item.source === "skill").map((item) => item.name),
+  )
+  const selection = { inheritActive: true, ...clean.selection, ...input.draft.selection }
+  const activeSelection = activePromptSelection(
+    input.sync.data.message?.[input.draft.sessionID] ?? [],
+    input.sync.data.session_working(input.draft.sessionID),
+    input.draft.sessionID,
+    input.sync.data.session_message?.[input.draft.sessionID] ?? [],
+  )
   const variant = input.forceDefaultVariant ? "default" : input.draft.variant
-  const text = draftText(input.draft.prompt)
+  const execution = contemplatedPromptSelection({
+    text: clean.text,
+    selection,
+    base: { ...input.draft.model, variant },
+    active: activeSelection,
+    commands: input.sync.data.command,
+    agents: input.sync.data.agent,
+  })
+  const text = clean.text
+  if (!text.trim() && !clean.prompt.some((part) => part.type !== "text") && !input.draft.context.length) return false
   const images = draftImages(input.draft.prompt)
   const setBusy = () => {
     if (!input.optimisticBusy) return
@@ -96,9 +143,9 @@ export async function sendFollowupDraft(input: FollowupSendInput) {
     return true
   }
 
-  const [head, ...tail] = text.split(" ")
-  const cmd = head?.startsWith("/") ? head.slice(1) : undefined
-  if (cmd && input.sync.data.command.find((item) => item.name === cmd)) {
+  const command = commandBody(text)
+  const cmd = command?.name
+  if (cmd && input.sync.data.command.find((item) => item.name === cmd && item.source !== "skill")) {
     setBusy()
     try {
       if (!(await wait())) {
@@ -106,12 +153,7 @@ export async function sendFollowupDraft(input: FollowupSendInput) {
         return false
       }
 
-      const files = await Promise.all(
-        images.map(async (attachment) => ({
-          uri: await blobDataUrl(attachment.blob, attachment.mime),
-          name: attachment.filename,
-        })),
-      )
+      const files = await commandFiles({ ...input.draft, prompt: clean.prompt })
       if (input.signal?.aborted) {
         setIdle()
         return false
@@ -122,7 +164,8 @@ export async function sendFollowupDraft(input: FollowupSendInput) {
         sessionID: input.draft.sessionID,
         id: messageID,
         command: cmd,
-        arguments: tail.join(" "),
+        arguments: command!.arguments,
+        selection,
         agent: input.draft.agent,
         model: {
           id: input.draft.model.modelID,
@@ -147,7 +190,7 @@ export async function sendFollowupDraft(input: FollowupSendInput) {
   )
   if (input.signal?.aborted) return false
   const { requestParts, optimisticParts } = buildRequestParts({
-    prompt: input.draft.prompt,
+    prompt: clean.prompt,
     context: input.draft.context,
     images: encodedImages,
     text,
@@ -162,7 +205,11 @@ export async function sendFollowupDraft(input: FollowupSendInput) {
     role: "user",
     time: { created: Date.now() },
     agent: input.draft.agent,
-    model: { ...input.draft.model, variant: input.draft.variant },
+    model: {
+      providerID: execution.providerID,
+      modelID: execution.modelID,
+      variant: execution.variant === "default" ? undefined : execution.variant,
+    },
   }
 
   const add = () =>
@@ -200,6 +247,7 @@ export async function sendFollowupDraft(input: FollowupSendInput) {
       agent: input.draft.agent,
       model: input.draft.model,
       variant,
+      selection,
       legacyParts: requestParts,
       text: requestParts.flatMap((part) => (part.type === "text" ? [part.text] : [])).join("\n"),
       files: requestParts.flatMap((part) => {
@@ -261,6 +309,7 @@ type PromptSubmitInput = {
   onPreparing?: (value: boolean) => void
   worktreeReadyTimeoutMs?: number
   model?: ModelSelection
+  skills?: Accessor<string[]>
 }
 
 export function createPromptSubmit(input: PromptSubmitInput) {
@@ -281,7 +330,10 @@ export function createPromptSubmit(input: PromptSubmitInput) {
   const submitting = new Set<string>()
   const activeSubmissions = new Map<string, ActiveSubmission>()
   const pendingNewSessions = new Map<string, PendingNewSession>()
-  const queueRetries = new Map<string, { id: string; signature: string }>()
+  const queueRetries = new Map<
+    string,
+    { id: string; source: string; signature: string; payload: SessionQueueV1Payload }
+  >()
   const destinationKey = () => JSON.stringify([location.pathname, search.draftId])
 
   const errorMessage = (err: unknown) => {
@@ -412,12 +464,18 @@ export function createPromptSubmit(input: PromptSubmitInput) {
     })
     const currentPrompt = submission.prompt
     const context = submission.context
-    const text = currentPrompt.map((part) => ("content" in part ? part.content : "")).join("")
-    const images = input.imageAttachments().slice()
+    const clean = materializePrompt(
+      currentPrompt,
+      input.skills?.() ??
+        sync()
+          .data.command.filter((item) => item.source === "skill")
+          .map((item) => item.name),
+    )
+    const text = input.mode() === "shell" ? draftText(currentPrompt) : clean.text
     const mode = input.mode()
     const queueCommand =
       mode === "normal"
-        ? QueueCommand.parse(text, currentPrompt.some((part) => part.type !== "text") || context.length > 0)
+        ? parseQueueCommand(text, clean.prompt.some((part) => part.type !== "text") || context.length > 0)
         : undefined
 
     if (queueCommand && queueCommand.type !== "enqueue") {
@@ -518,7 +576,8 @@ export function createPromptSubmit(input: PromptSubmitInput) {
       return
     }
 
-    if (text.trim().length === 0 && !currentPrompt.some((part) => part.type !== "text") && context.length === 0) {
+    if (text.trim().length === 0 && !clean.prompt.some((part) => part.type !== "text") && context.length === 0) {
+      if (currentPrompt.some((part) => part.type === "model" || part.type === "variant")) return
       if (input.working()) void abort()
       return
     }
@@ -536,8 +595,56 @@ export function createPromptSubmit(input: PromptSubmitInput) {
     }
     const model = { modelID: currentModel.id, providerID: currentModel.provider.id }
     const agent = currentAgent.name
-
+    const selection = mode === "normal" ? clean.selection : {}
+    const available = local.model.list()
+    const activeSelection = params.id
+      ? activePromptSelection(
+          sync().data.message?.[params.id] ?? [],
+          sync().data.session_working(params.id),
+          params.id,
+          sync().data.session_message?.[params.id] ?? [],
+        )
+      : undefined
     const enqueue = delivery === "queue" || queueCommand?.type === "enqueue"
+    const queueSignature = JSON.stringify([
+      currentPrompt,
+      context,
+      agent,
+      mode,
+      queueCommand?.type === "enqueue" ? queueCommand.front : undefined,
+    ])
+    const retry = enqueue
+      ? Array.from(queueRetries.values()).find(
+          (item) => item.source === initialKey && item.signature === queueSignature,
+        )
+      : undefined
+    const queuedCommand = commandBody(queueCommand?.type === "enqueue" ? queueCommand.body : text)
+    const commands = sync().data.command.slice()
+    const executionBase = contemplatedPromptSelection({
+      text,
+      selection,
+      base: { ...model, variant },
+      active: activeSelection,
+      queue: enqueue,
+      commands: mode === "normal" ? commands : [],
+      agents: sync().data.agent,
+    })
+    const resolved = retry
+      ? { model: retry.payload.model ?? model, variant: retry.payload.variant }
+      : resolvePromptSelection(
+          executionBase,
+          selection,
+          available.map((item) => ({
+            providerID: item.provider.id,
+            modelID: item.id,
+            variants: Object.keys(item.variants ?? {}),
+          })),
+        )
+    if ("error" in resolved) {
+      showToast({ title: language.t("common.requestFailed"), description: language.t(resolved.error!) })
+      return
+    }
+
     const steering = !enqueue && input.working()
     if (!enqueue) input.onPreparing?.(true)
 
@@ -718,11 +825,12 @@ export function createPromptSubmit(input: PromptSubmitInput) {
     const draft: FollowupDraft = {
       sessionID: session.id,
       sessionDirectory,
-      prompt: currentPrompt,
+      prompt: clean.prompt,
       context,
       agent,
       model,
       variant: forceDefaultVariant ? "default" : variant,
+      selection,
     }
 
     const clearInput = (preserveChanges = false) => {
@@ -786,24 +894,39 @@ export function createPromptSubmit(input: PromptSubmitInput) {
 
     if (enqueue) {
       try {
-        const [head] = text.split(" ")
-        const payload = await queuePayload(draft, {
-          mode,
-          command: queueCommand?.type === "enqueue" ? queueCommand : undefined,
-          custom: text.startsWith("/") && sync().data.command.some((item) => item.name === head?.slice(1)),
-        })
         const key = ScopedKey.from(sourceSDK.scope, sessionDirectory, session.id, initialKey)
         const front = queueCommand?.type === "enqueue" ? queueCommand.front : undefined
-        const signature = JSON.stringify([payload, front])
+        const signature = queueSignature
         const previous = queueRetries.get(key)
         const admission =
-          previous?.signature === signature ? previous : { id: Identifier.ascending("message"), signature }
+          previous?.signature === signature
+            ? previous
+            : {
+                id: Identifier.ascending("message"),
+                source: initialKey,
+                signature,
+                payload: await queuePayload(
+                  {
+                    ...draft,
+                    model: resolved.model!,
+                    variant: resolved.variant ?? (forceDefaultVariant ? "default" : undefined),
+                  },
+                  {
+                    mode,
+                    command: queueCommand?.type === "enqueue" ? queueCommand : undefined,
+                    custom:
+                      !!queuedCommand &&
+                      commands.some((item) => item.name === queuedCommand.name && item.source !== "skill"),
+                    commands: commands.map((item) => ({ name: item.name, source: item.source })),
+                  },
+                ),
+              }
         queueRetries.set(key, admission)
         const result = await sourceSDK.client.session.queueSubmit({
           sessionID: session.id,
           directory: sessionDirectory,
           id: admission.id,
-          payload,
+          payload: admission.payload,
           front,
         })
         Schema.decodeUnknownSync(SessionQueueV1.Snapshot)(result.data)
@@ -848,27 +971,23 @@ export function createPromptSubmit(input: PromptSubmitInput) {
       return
     }
 
-    if (text.startsWith("/")) {
-      const [cmdName, ...args] = text.split(" ")
-      const commandName = cmdName.slice(1)
-      const customCommand = sync().data.command.find((c) => c.name === commandName)
+    if (commandBody(text)) {
+      const command = commandBody(text)
+      const commandName = command?.name
+      const customCommand = commands.find((c) => c.name === commandName && c.source !== "skill")
       if (customCommand) {
         const messageID = Identifier.ascending("message")
         if (!steering) serverSync().session.set("session_status", session.id, { type: "busy" })
         if (isNewSession) active.session = { sessionID: session.id, api: sessionApi }
         try {
-          const files = await Promise.all(
-            images.map(async (attachment) => ({
-              uri: await blobDataUrl(attachment.blob, attachment.mime),
-              name: attachment.filename,
-            })),
-          )
+          const files = await commandFiles(draft)
           if (active.abort?.signal.aborted) return
           await sessionApi.command({
             sessionID: session.id,
             id: messageID,
-            command: commandName,
-            arguments: args.join(" "),
+            command: customCommand.name,
+            arguments: command!.arguments,
+            selection: { inheritActive: true, ...selection },
             agent,
             model: {
               id: model.modelID,

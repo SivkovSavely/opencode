@@ -3,8 +3,12 @@ import { Cause, Deferred, Effect, Exit, Fiber, Latch, Schema, Scope, Synchronize
 export interface Runner<A, E = never> {
   readonly state: State<A, E>
   readonly busy: boolean
+  readonly admit: <B, E2>(prepare: (active: boolean) => Effect.Effect<B, E2>) => Effect.Effect<B, E2>
   readonly ensureRunning: (work: Effect.Effect<A, E>) => Effect.Effect<A, E>
-  readonly enqueue: (work: Effect.Effect<A, E>) => Effect.Effect<A, E>
+  readonly enqueue: <E2 = never>(
+    work: Effect.Effect<A, E>,
+    prepare?: (active: boolean) => Effect.Effect<void, E2>,
+  ) => Effect.Effect<A, E | E2>
   readonly startIfIdle: (
     work: Effect.Effect<A, E, Scope.Scope>,
     prepare: Effect.Effect<boolean, never, Scope.Scope>,
@@ -250,10 +254,11 @@ export const make = <A, E = never>(
       }),
     ).pipe(Effect.flatten)
 
-  const enqueue = (work: Effect.Effect<A, E>) =>
+  const enqueue = <E2 = never>(work: Effect.Effect<A, E>, prepare?: (active: boolean) => Effect.Effect<void, E2>) =>
     SynchronizedRef.modifyEffect(
       ref,
       Effect.fnUntraced(function* (st) {
+        if (prepare) yield* prepare(st._tag === "Running" || st._tag === "RunningQueued")
         const pending = {
           id: next(),
           done: yield* Deferred.make<A, E | Cancelled | Interrupted>(),
@@ -272,6 +277,11 @@ export const make = <A, E = never>(
         return [awaitDone(pending.done), { ...st, queue: [...st.queue, pending] }] as const
       }),
     ).pipe(Effect.flatten)
+
+  const admit = <B, E2>(prepare: (active: boolean) => Effect.Effect<B, E2>) =>
+    SynchronizedRef.modifyEffect(ref, (st) =>
+      prepare(st._tag === "Running" || st._tag === "RunningQueued").pipe(Effect.map((value) => [value, st] as const)),
+    )
 
   const startIfIdle = (work: Effect.Effect<A, E, Scope.Scope>, prepare: Effect.Effect<boolean, never, Scope.Scope>) =>
     SynchronizedRef.modifyEffect(
@@ -425,6 +435,7 @@ export const make = <A, E = never>(
       return state()._tag !== "Idle"
     },
     ensureRunning,
+    admit,
     enqueue,
     startIfIdle,
     startShell,

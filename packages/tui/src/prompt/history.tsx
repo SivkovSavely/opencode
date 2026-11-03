@@ -10,6 +10,14 @@ export type PromptInfo = {
   input: string
   mode?: "normal" | "shell"
   parts: (
+    | { type: "skill"; name: string; source: { start: number; end: number; value: string } }
+    | {
+        type: "control"
+        kind: "model"
+        model: { providerID: string; modelID: string }
+        source: { start: number; end: number; value: string }
+      }
+    | { type: "control"; kind: "variant"; variant: string; source: { start: number; end: number; value: string } }
     | Omit<FilePart, "id" | "messageID" | "sessionID">
     | Omit<AgentPart, "id" | "messageID" | "sessionID">
     | (Omit<TextPart, "id" | "messageID" | "sessionID"> & {

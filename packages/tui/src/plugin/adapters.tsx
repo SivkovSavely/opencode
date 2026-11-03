@@ -12,7 +12,7 @@ import { DialogAlert } from "../ui/dialog-alert"
 import { DialogConfirm } from "../ui/dialog-confirm"
 import { DialogPrompt } from "../ui/dialog-prompt"
 import { DialogSelect, type DialogSelectOption as SelectOption } from "../ui/dialog-select"
-import { Prompt } from "../component/prompt"
+import { Prompt, type PromptRef } from "../component/prompt"
 import type { useToast } from "../ui/toast"
 import * as Keymap from "../keymap"
 import { createCommandShim } from "./command-shim"
@@ -246,7 +246,8 @@ export function createTuiApiAdapters(input: Input): Omit<TuiPluginApi, "lifecycl
             visible={props.visible}
             disabled={props.disabled}
             onSubmit={props.onSubmit}
-            ref={props.ref}
+            // Preserve opaque local parts through plugin draft round trips.
+            ref={props.ref as ((ref: PromptRef | undefined) => void) | undefined}
             hint={props.hint}
             right={props.right}
             showPlaceholder={props.showPlaceholder}

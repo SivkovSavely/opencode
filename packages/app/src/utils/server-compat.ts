@@ -1,4 +1,5 @@
 import type { ServerApi } from "./server"
+import type { PromptSelection } from "@/components/prompt-input/controls"
 import { resolveServerProtocol, type ServerProtocolSource } from "./server-protocol"
 import type { AgentPartInput, FilePartInput, OpencodeClient, Session, TextPartInput } from "@opencode-ai/sdk/v2/client"
 import type {
@@ -22,8 +23,14 @@ type CompatibleSessionApi = Omit<
   SessionApi,
   "prompt" | "command" | "shell" | "compact" | "rename" | "archive" | "remove"
 > & {
-  prompt: (input: SessionPromptInput & LegacyPrompt) => Promise<SessionPromptOutput>
-  command: (input: SessionCommandInput) => Promise<SessionCommandOutput>
+  prompt: (
+    input: SessionPromptInput & LegacyPrompt,
+    options?: Parameters<SessionApi["prompt"]>[1],
+  ) => Promise<SessionPromptOutput>
+  command: (
+    input: SessionCommandInput & { selection?: PromptSelection },
+    options?: Parameters<SessionApi["command"]>[1],
+  ) => Promise<SessionCommandOutput>
   shell: (input: SessionShellInput & LegacyPrompt) => Promise<SessionShellOutput>
   compact: (input: SessionCompactInput & { model?: LegacyPrompt["model"] }) => Promise<SessionCompactOutput>
   rename: (input: Parameters<SessionApi["rename"]>[0] & LegacyLocation) => ReturnType<SessionApi["rename"]>
@@ -40,6 +47,7 @@ export type CompatibleApi = Omit<ServerApi, "session" | "permission"> & {
   readonly permission: CompatiblePermissionApi
 }
 type LegacyPrompt = {
+  selection?: PromptSelection
   agent?: string
   model?: { providerID: string; modelID: string }
   variant?: string
@@ -54,6 +62,7 @@ type CompatibleInput = {
 }
 
 function mime(uri: string) {
+  if (uri.startsWith("skill:")) return "application/x-opencode-skill"
   const match = /^data:([^;,]+)/.exec(uri)
   return match?.[1] ?? "application/octet-stream"
 }
@@ -210,6 +219,7 @@ function createV1Api(input: CompatibleInput): CompatibleApi {
           agent: value.agent,
           model: value.model,
           variant: value.variant,
+          ...("selection" in value ? { selection: value.selection } : {}),
           parts: value.legacyParts ?? [
             { type: "text", text: value.text },
             ...(value.files ?? []).map((file) => ({
@@ -244,7 +254,7 @@ function createV1Api(input: CompatibleInput): CompatibleApi {
           delivery: value.delivery ?? "steer",
         }
       },
-      async command(value: SessionCommandInput) {
+      async command(value: SessionCommandInput & { selection?: PromptSelection }) {
         await legacy().session.command({
           sessionID: value.sessionID,
           messageID: value.id ?? undefined,
@@ -253,6 +263,7 @@ function createV1Api(input: CompatibleInput): CompatibleApi {
           agent: value.agent ?? undefined,
           model: value.model ? `${value.model.providerID}/${value.model.id}` : undefined,
           variant: value.model?.variant,
+          ...("selection" in value ? { selection: value.selection } : {}),
           parts: value.files?.map((file) => ({
             type: "file" as const,
             mime: mime(file.uri),

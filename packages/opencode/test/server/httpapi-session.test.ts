@@ -423,6 +423,41 @@ describe("session HttpApi", () => {
     { git: true, config: { formatter: false, lsp: false } },
   )
 
+  it.live("rejects invalid composer variants with visible API errors before admission", () =>
+    Effect.gen(function* () {
+      const llm = yield* TestLLMServer
+      const directory = yield* tmpdirScoped({
+        git: true,
+        config: { ...testProviderConfig(llm.url), command: { probe: { template: "probe" } } },
+      })
+      const session = yield* createSession({ title: "selection validation" }).pipe(provideInstanceEffect(directory))
+      for (const route of [SessionPaths.prompt, SessionPaths.promptAsync, SessionPaths.command]) {
+        const response = yield* request(
+          `${pathFor(route, { sessionID: session.id })}?directory=${encodeURIComponent(directory)}`,
+          {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({
+              ...(route === SessionPaths.command
+                ? { command: "probe", arguments: "", model: "test/test-model" }
+                : {
+                    model: { providerID: "test", modelID: "test-model" },
+                    parts: [{ type: "text", text: "invalid variant" }],
+                  }),
+              selection: { inheritActive: true, variant: "unsupported-composer-variant" },
+            }),
+          },
+        )
+        expect(response.status).toBe(400)
+        expect(yield* responseJson(response)).toMatchObject({ message: expect.stringContaining("Variant not found") })
+      }
+      expect(
+        yield* Session.use.messages({ sessionID: session.id }).pipe(provideInstanceEffect(directory)),
+      ).toHaveLength(0)
+      expect(yield* llm.calls).toBe(0)
+    }).pipe(Effect.provide(TestLLMServer.layer), Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node))),
+  )
+
   it.live("uses the persisted session directory for prompt requests", () =>
     Effect.gen(function* () {
       const llm = yield* TestLLMServer
@@ -738,13 +773,22 @@ describe("session HttpApi", () => {
             resource: session.id,
           })
           const admitted = yield* Database.Service.use(({ db }) =>
-            db.select().from(SessionInputTable).where(eq(SessionInputTable.id, SessionMessage.ID.make("msg_managed_http"))).get().pipe(Effect.orDie),
+            db
+              .select()
+              .from(SessionInputTable)
+              .where(eq(SessionInputTable.id, SessionMessage.ID.make("msg_managed_http")))
+              .get()
+              .pipe(Effect.orDie),
           )
           expect(admitted).toBeUndefined()
-        }).pipe(Effect.ensuring(Effect.sync(() => {
-          if (previous === undefined) delete process.env.OPENCODE_MANAGED_PROFILE
-          else process.env.OPENCODE_MANAGED_PROFILE = previous
-        })))
+        }).pipe(
+          Effect.ensuring(
+            Effect.sync(() => {
+              if (previous === undefined) delete process.env.OPENCODE_MANAGED_PROFILE
+              else process.env.OPENCODE_MANAGED_PROFILE = previous
+            }),
+          ),
+        )
       }),
     { git: true, config: { formatter: false, lsp: false } },
   )

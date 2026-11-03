@@ -10,6 +10,11 @@ import { SessionStatus } from "./status"
 import { RuntimeLifecycle } from "@/server/runtime-lifecycle"
 
 export interface Interface {
+  readonly admit: <E>(
+    sessionID: SessionID,
+    prepare: (active?: SessionV1.User["model"]) => Effect.Effect<SessionV1.User, E>,
+  ) => Effect.Effect<void, E>
+  readonly observe: (sessionID: SessionID, parent: SessionV1.User, visible: ReadonlySet<string>) => Effect.Effect<void>
   readonly assertNotBusy: (sessionID: SessionID) => Effect.Effect<void, Session.BusyError>
   readonly cancel: (sessionID: SessionID) => Effect.Effect<void>
   readonly ensureRunning: (
@@ -17,11 +22,12 @@ export interface Interface {
     onInterrupt: Effect.Effect<SessionV1.WithParts>,
     work: Effect.Effect<SessionV1.WithParts>,
   ) => Effect.Effect<SessionV1.WithParts>
-  readonly enqueue: (
+  readonly enqueue: <E = never>(
     sessionID: SessionID,
     onInterrupt: Effect.Effect<SessionV1.WithParts>,
     work: Effect.Effect<SessionV1.WithParts>,
-  ) => Effect.Effect<SessionV1.WithParts>
+    prepare?: (active?: SessionV1.User["model"]) => Effect.Effect<SessionV1.User, E>,
+  ) => Effect.Effect<SessionV1.WithParts, E>
   readonly startIfIdle: (
     sessionID: SessionID,
     onInterrupt: Effect.Effect<SessionV1.WithParts>,
@@ -53,6 +59,7 @@ const layer = Layer.effect(
       Effect.fn("SessionRunState.state")(function* () {
         const scope = yield* Scope.Scope
         const runners = new Map<SessionID, Runner.Runner<SessionV1.WithParts>>()
+        const selections = new Map<SessionID, SessionV1.User>()
         yield* Effect.addFinalizer(
           Effect.fnUntraced(function* () {
             yield* Effect.forEach(runners.values(), (runner) => runner.cancelWithReason("scope"), {
@@ -62,7 +69,7 @@ const layer = Layer.effect(
             runners.clear()
           }),
         )
-        return { runners, scope }
+        return { runners, selections, scope }
       }),
     )
 
@@ -72,7 +79,9 @@ const layer = Layer.effect(
       if (existing) return existing
       const next = Runner.make<SessionV1.WithParts>(data.scope, {
         onIdle: Effect.gen(function* () {
+          if (next.busy) return
           data.runners.delete(sessionID)
+          data.selections.delete(sessionID)
           if (yield* runtime.isParked(sessionID)) {
             yield* status.set(sessionID, { type: "busy" })
             return
@@ -127,12 +136,80 @@ const layer = Layer.effect(
       return yield* onCancellation((yield* runner(sessionID)).ensureRunning(work), onInterrupt)
     })
 
-    const enqueue = Effect.fn("SessionRunState.enqueue")(function* (
+    const activeModel = Effect.fn("SessionRunState.activeModel")(function* (sessionID: SessionID, active: boolean) {
+      if (!active) return
+      const data = yield* InstanceState.get(state)
+      const parent = data.selections.get(sessionID)
+      if (!parent) return
+      const response = yield* sessions
+        .findMessage(sessionID, (message) => message.info.role === "assistant" && message.info.parentID === parent.id)
+        .pipe(Effect.orDie)
+      if (Option.isSome(response) && response.value.info.role === "assistant") {
+        const assistant = response.value.info
+        // Runner cleanup can lag the durable terminal response. Tool steps still own the turn.
+        if (
+          assistant.time.completed &&
+          (assistant.error ||
+            (assistant.finish &&
+              !["tool-calls", "unknown"].includes(assistant.finish) &&
+              !response.value.parts.some((part) => part.type === "tool")))
+        )
+          return
+      }
+      return parent.model
+    })
+
+    const enqueue = Effect.fn("SessionRunState.enqueue")(function* <E = never>(
       sessionID: SessionID,
       onInterrupt: Effect.Effect<SessionV1.WithParts>,
       work: Effect.Effect<SessionV1.WithParts>,
+      prepare?: (active?: SessionV1.User["model"]) => Effect.Effect<SessionV1.User, E>,
     ) {
-      return yield* onCancellation((yield* runner(sessionID)).enqueue(work), onInterrupt)
+      const data = yield* InstanceState.get(state)
+      return yield* onCancellation(
+        (yield* runner(sessionID)).enqueue(
+          work,
+          prepare
+            ? (active) =>
+                activeModel(sessionID, active).pipe(
+                  Effect.flatMap(prepare),
+                  Effect.tap((parent) => Effect.sync(() => data.selections.set(sessionID, parent))),
+                  Effect.asVoid,
+                )
+            : undefined,
+        ),
+        onInterrupt,
+      )
+    })
+
+    const admit = Effect.fn("SessionRunState.admit")(function* <E>(
+      sessionID: SessionID,
+      prepare: (active?: SessionV1.User["model"]) => Effect.Effect<SessionV1.User, E>,
+    ) {
+      const data = yield* InstanceState.get(state)
+      const current = yield* runner(sessionID)
+      yield* current.admit((active) =>
+        activeModel(sessionID, active).pipe(
+          Effect.flatMap(prepare),
+          Effect.tap((parent) => Effect.sync(() => data.selections.set(sessionID, parent))),
+        ),
+      )
+    })
+
+    const observe = Effect.fn("SessionRunState.observe")(function* (
+      sessionID: SessionID,
+      parent: SessionV1.User,
+      visible: ReadonlySet<string>,
+    ) {
+      const data = yield* InstanceState.get(state)
+      const current = yield* runner(sessionID)
+      yield* current.admit(() =>
+        Effect.sync(() => {
+          const admitted = data.selections.get(sessionID)
+          // Never replace a steer admitted after this history snapshot was read.
+          if (!admitted || visible.has(admitted.id)) data.selections.set(sessionID, parent)
+        }),
+      )
     })
 
     const startShell = Effect.fn("SessionRunState.startShell")(function* (
@@ -155,7 +232,7 @@ const layer = Layer.effect(
       return yield* (yield* runner(sessionID)).startIfIdle(work, prepare)
     })
 
-    return Service.of({ assertNotBusy, cancel, ensureRunning, enqueue, startShell, startIfIdle })
+    return Service.of({ admit, observe, assertNotBusy, cancel, ensureRunning, enqueue, startShell, startIfIdle })
   }),
 )
 

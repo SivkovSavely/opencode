@@ -2,6 +2,7 @@ import { createOpencodeClient } from "@opencode-ai/sdk/v2/client"
 import { OpenCode, type OpenCodeClient } from "@opencode-ai/client/promise"
 import type { ServerConnection } from "@/context/server"
 import { decode64 } from "@/utils/base64"
+import type { CompatibleApi } from "./server-compat"
 
 export function authTokenFromCredentials(input: { username?: string; password: string }) {
   return btoa(`${input.username ?? "opencode"}:${input.password}`)
@@ -45,7 +46,7 @@ export function createApiForServer(input: {
   server: ServerConnection.HttpBase
   fetch?: typeof globalThis.fetch
 }): OpenCodeClient {
-  return OpenCode.make({
+  const options = {
     baseUrl: input.server.url,
     fetch: input.fetch,
     headers: input.server.password
@@ -56,7 +57,51 @@ export function createApiForServer(input: {
           })}`,
         }
       : undefined,
-  })
+  }
+  const client = OpenCode.make(options)
+  const fetch = input.fetch ?? globalThis.fetch
+  // Keep the pinned client's auth, request options, and response/error handling,
+  // but bypass its outdated body whitelist for these two V2 endpoints.
+  const session = (body: unknown) =>
+    OpenCode.make({
+      ...options,
+      fetch: Object.assign(
+        (url: string | URL | Request, init?: RequestInit) => fetch(url, { ...init, body: JSON.stringify(body) }),
+        { preconnect: fetch.preconnect },
+      ),
+    }).session
+  const prompt: CompatibleApi["session"]["prompt"] = (value, requestOptions) =>
+    session({
+      id: value.id ?? undefined,
+      prompt: {
+        text: value.text,
+        files: value.files?.map(({ mention, ...file }) => ({ ...file, source: mention })),
+        agents: value.agents?.map(({ mention, ...agent }) => ({ ...agent, source: mention })),
+        agent: value.agent,
+        model: value.model && {
+          providerID: value.model.providerID,
+          id: value.model.modelID,
+          variant: value.variant,
+        },
+        selection: value.selection,
+      },
+      delivery: value.delivery ?? undefined,
+      resume: value.resume ?? undefined,
+    }).prompt(value, requestOptions)
+  const command: CompatibleApi["session"]["command"] = (value, requestOptions) =>
+    session({
+      id: value.id ?? undefined,
+      command: value.command,
+      arguments: value.arguments ?? undefined,
+      agent: value.agent ?? undefined,
+      model: value.model ?? undefined,
+      selection: value.selection,
+      files: value.files?.map(({ mention, ...file }) => ({ ...file, source: mention })),
+      agents: value.agents?.map(({ mention, ...agent }) => ({ ...agent, source: mention })),
+      delivery: value.delivery ?? undefined,
+      resume: value.resume ?? undefined,
+    }).command(value, requestOptions)
+  return { ...client, session: { ...client.session, prompt, command } }
 }
 
 export type ServerApi = OpenCodeClient

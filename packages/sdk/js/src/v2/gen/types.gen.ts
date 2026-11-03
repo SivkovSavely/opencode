@@ -3947,6 +3947,14 @@ export type SessionQueueV1Payload =
         modelID: string
       }
       variant?: string
+      selection?: {
+        inheritActive?: boolean
+        model?: {
+          providerID: string
+          modelID: string
+        }
+        variant?: string
+      }
       parts: Array<TextPartInput | FilePartInput | AgentPartInput | SubtaskPartInput>
       system?: string
       format?: OutputFormat
@@ -3962,6 +3970,14 @@ export type SessionQueueV1Payload =
         modelID: string
       }
       variant?: string
+      selection?: {
+        inheritActive?: boolean
+        model?: {
+          providerID: string
+          modelID: string
+        }
+        variant?: string
+      }
       command: string
       arguments: string
       parts?: Array<FilePartInput>
@@ -3974,6 +3990,14 @@ export type SessionQueueV1Payload =
         modelID: string
       }
       variant?: string
+      selection?: {
+        inheritActive?: boolean
+        model?: {
+          providerID: string
+          modelID: string
+        }
+        variant?: string
+      }
       command: string
     }
   | {
@@ -3984,6 +4008,14 @@ export type SessionQueueV1Payload =
         modelID: string
       }
       variant?: string
+      selection?: {
+        inheritActive?: boolean
+        model?: {
+          providerID: string
+          modelID: string
+        }
+        variant?: string
+      }
     }
 
 export type SessionQueueV1Entry = {
@@ -10579,6 +10611,14 @@ export type SessionPromptData = {
     format?: OutputFormat
     system?: string
     variant?: string
+    selection?: {
+      inheritActive?: boolean
+      model?: {
+        providerID: string
+        modelID: string
+      }
+      variant?: string
+    }
     parts: Array<TextPartInput | FilePartInput | AgentPartInput | SubtaskPartInput>
   }
   path: {
@@ -11023,6 +11063,14 @@ export type SessionPromptAsyncData = {
     format?: OutputFormat
     system?: string
     variant?: string
+    selection?: {
+      inheritActive?: boolean
+      model?: {
+        providerID: string
+        modelID: string
+      }
+      variant?: string
+    }
     parts: Array<TextPartInput | FilePartInput | AgentPartInput | SubtaskPartInput>
   }
   path: {
@@ -11244,6 +11292,14 @@ export type SessionCommandData = {
     arguments: string
     command: string
     variant?: string
+    selection?: {
+      inheritActive?: boolean
+      model?: {
+        providerID: string
+        modelID: string
+      }
+      variant?: string
+    }
     parts?: Array<{
       id?: string
       type: "file"

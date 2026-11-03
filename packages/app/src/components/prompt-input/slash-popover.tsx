@@ -6,6 +6,10 @@ import { KeybindV2 } from "@opencode-ai/ui/v2/keybind-v2"
 import { getDirectory, getFilename } from "@opencode-ai/core/util/path"
 
 export type AtOption =
+  | { type: "namespace"; name: string; display: string }
+  | { type: "model"; providerID: string; modelID: string; name: string; display: string }
+  | { type: "variant"; variant: string; display: string }
+  | { type: "skill"; name: string; display: string }
   | { type: "agent"; name: string; display: string }
   | {
       type: "resource"
@@ -86,6 +90,24 @@ export const PromptPopover: Component<PromptPopoverProps> = (props) => {
               <For each={props.atFlat.slice(0, 10)}>
                 {(item) => {
                   const key = props.atKey(item)
+
+                  if (
+                    item.type === "namespace" ||
+                    item.type === "model" ||
+                    item.type === "variant" ||
+                    item.type === "skill"
+                  ) {
+                    return (
+                      <button
+                        class="w-full flex items-center gap-x-2 px-2 py-1 text-left rounded-md"
+                        classList={{ "bg-surface-raised-base-hover": props.atActive === key }}
+                        onClick={() => props.onAtSelect(item)}
+                        onPointerMove={() => props.setAtActive(key)}
+                      >
+                        <span>{item.display}</span>
+                      </button>
+                    )
+                  }
 
                   if (item.type === "agent") {
                     return (

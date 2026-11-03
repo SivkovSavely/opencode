@@ -79,6 +79,32 @@ export const load = Effect.fn("SessionHistory.load")(function* (db: DatabaseServ
   return yield* Effect.forEach(yield* messageRows(db, sessionID, compaction, epoch?.baselineSeq), decodeMessageRow)
 })
 
+/** Selection survives context compaction without mutating the Session's defaults. */
+export const selection = Effect.fn("SessionHistory.selection")(function* (
+  db: DatabaseService,
+  sessionID: SessionSchema.ID,
+) {
+  const [user, model, agent] = yield* Effect.all(
+    (["user", "model-switched", "agent-switched"] as const).map((type) =>
+      db
+        .select()
+        .from(SessionMessageTable)
+        .where(and(eq(SessionMessageTable.session_id, sessionID), eq(SessionMessageTable.type, type)))
+        .orderBy(desc(SessionMessageTable.seq))
+        .limit(1)
+        .get()
+        .pipe(Effect.orDie),
+    ),
+  )
+  if (!user) return {}
+  const message = yield* decodeMessageRow(user)
+  if (message.type !== "user") return {}
+  return {
+    model: !model || model.seq < user.seq ? message.model : undefined,
+    agent: !agent || agent.seq < user.seq ? message.agent : undefined,
+  }
+})
+
 export const loadForRunner = Effect.fn("SessionHistory.loadForRunner")(function* (
   db: DatabaseService,
   sessionID: SessionSchema.ID,

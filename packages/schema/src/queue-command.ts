@@ -35,7 +35,7 @@ export function parse(text: string, attachments = false): Result | undefined {
   }
 
   // Prefix syntax wins when both forms are present, matching the queue plugin.
-  const prefix = text.match(/^\/queue(?:\s+([\s\S]*))?$/)
+  const prefix = text.match(/^\s*\/queue(?:\s+([\s\S]*))?$/)
   const suffix = prefix ? undefined : text.match(/^([\s\S]*?)\s+\/queue(?:\s+(front))?\s*$/)
   const standalone = text.trim()
   if (!prefix && !suffix && standalone !== "/queue" && standalone !== "/queue front") return undefined

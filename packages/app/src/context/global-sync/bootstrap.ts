@@ -277,7 +277,7 @@ export const loadCommands = (
   api: CommandListApi,
   legacy?: OpencodeClient,
   protocol?: ServerProtocolSource,
-): Promise<CommandInfo[]> =>
+): Promise<(CommandInfo & { source?: "command" | "mcp" | "skill" })[]> =>
   retry(async () => {
     if ((await resolveServerProtocol(protocol)) === "v1" && legacy) {
       return ((await legacy.command.list()).data ?? []).map((command) => {
@@ -289,7 +289,7 @@ export const loadCommands = (
           agent: command.agent,
           model: providerID && id ? { providerID, id } : undefined,
           subtask: command.subtask,
-          // source: command.source === "skill" ? undefined : command.source,
+          source: command.source,
         }
       })
     }

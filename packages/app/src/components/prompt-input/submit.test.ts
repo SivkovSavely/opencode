@@ -4,6 +4,7 @@ import type { ContextItem, ImageAttachmentPart, Prompt, PromptScope, PromptStore
 import type { ModelSelection } from "@/context/local"
 import { ServerScope } from "@/utils/server-scope"
 import { Worktree as WorktreeState } from "@/utils/worktree"
+import type { Message } from "@opencode-ai/sdk/v2/client"
 
 let createPromptSubmit: typeof import("./submit").createPromptSubmit
 
@@ -49,8 +50,20 @@ let queueError: Error | undefined
 let invalidQueueResponse = false
 let queueStarted = () => {}
 const interrupted: string[] = []
-const commands: Array<{ name: string }> = []
+const commands: Array<{
+  name: string
+  source?: "command" | "mcp" | "skill"
+  model?: { providerID: string; id: string; variant?: string }
+  agent?: string
+  subtask?: boolean
+}> = []
 let serverSessionSyncs = 0
+let runtimeWorking = false
+let projectedMessages: Message[] = []
+let projectedAdmissions: { id: string; type: string }[] = []
+let availableAgents: { name: string; mode: "primary" | "subagent"; model?: { providerID: string; modelID: string } }[] =
+  []
+let availableModels: { id: string; provider: { id: string }; variants: Record<string, object> }[] = []
 
 let params: { id?: string } = {}
 let search: { draftId?: string } = {}
@@ -293,6 +306,7 @@ beforeAll(async () => {
     useLocal: () => ({
       model: {
         current: () => ({ id: "model", provider: { id: "provider" } }),
+        list: () => availableModels,
         variant: { current: () => variant },
       },
       agent: {
@@ -359,7 +373,13 @@ beforeAll(async () => {
 
   mock.module("@/context/sync", () => ({
     useSync: () => () => ({
-      data: { command: commands },
+      data: {
+        command: commands,
+        agent: availableAgents,
+        session_working: () => runtimeWorking,
+        message: { [params.id ?? ""]: projectedMessages },
+        session_message: { [params.id ?? ""]: projectedAdmissions },
+      },
       session: {
         get: () => (parentID ? { parentID } : undefined),
         optimistic: {
@@ -432,6 +452,15 @@ beforeAll(async () => {
 })
 
 beforeEach(() => {
+  runtimeWorking = false
+  projectedMessages = []
+  projectedAdmissions = []
+  availableAgents = []
+  availableModels = [
+    { id: "model", provider: { id: "provider" }, variants: { high: {}, low: {}, captured: {} } },
+    { id: "chosen", provider: { id: "override" }, variants: { high: {}, low: {} } },
+    { id: "draft-model", provider: { id: "draft-provider" }, variants: { "draft-variant": {} } },
+  ]
   queuedInputs.length = 0
   queueMutations.length = 0
   queueItems.length = 0
@@ -513,6 +542,290 @@ const createSubmit = (options: Partial<Parameters<typeof createPromptSubmit>[0]>
     onSubmit: () => undefined,
     ...options,
   })
+
+const model = {
+  type: "model" as const,
+  providerID: "override",
+  modelID: "chosen",
+  content: "@model:override/chosen",
+  start: 0,
+  end: 22,
+}
+const control = { type: "variant" as const, variant: "low", content: "@variant:low", start: 0, end: 12 }
+const text = (content: string) => ({ type: "text" as const, content, start: 0, end: content.length })
+
+describe("structured prompt controls", () => {
+  test("a confirmed newer steer supplies variant validation and optimistic metadata while the old assistant streams", async () => {
+    params.id = "ses_controls"
+    runtimeWorking = true
+    availableModels.push({ id: "steer", provider: { id: "next" }, variants: { "steer-only": {} } })
+    const parent = {
+      id: "a",
+      sessionID: params.id,
+      role: "user",
+      model: { providerID: "provider", modelID: "model", variant: "low" },
+    } as Extract<Message, { role: "user" }>
+    projectedMessages = [
+      parent,
+      {
+        id: "assistant-a",
+        sessionID: params.id,
+        role: "assistant",
+        parentID: "a",
+        providerID: "provider",
+        modelID: "model",
+        time: { created: 2 },
+      } as Message,
+      { ...parent, id: "b", model: { providerID: "next", modelID: "steer", variant: "steer-only" } },
+      { ...parent, id: "optimistic", model: { providerID: "wrong", modelID: "wrong" } },
+    ]
+    projectedAdmissions = [
+      { id: "a", type: "user" },
+      { id: "b", type: "user" },
+    ]
+    promptValue = [{ ...control, variant: "steer-only" }, text("continue")]
+    await createSubmit({ working: () => true }).handleSubmit(new Event("submit"))
+    expect(promptInputs[0]).toMatchObject({
+      model: { providerID: "provider", modelID: "model" },
+      selection: { inheritActive: true, variant: "steer-only" },
+    })
+    expect(optimistic[0]).toMatchObject({
+      message: { model: { providerID: "next", modelID: "steer", variant: "steer-only" } },
+    })
+  })
+
+  test("direct command submissions validate explicit variants against command model defaults", async () => {
+    params.id = "ses_controls"
+    availableModels.push({ id: "cmd", provider: { id: "command" }, variants: { "command-only": {} } })
+    commands.push({ name: "review", model: { providerID: "command", id: "cmd" } })
+    promptValue = [{ ...control, variant: "command-only" }, text("/review  changes")]
+    await createSubmit().handleSubmit(new Event("submit"))
+    expect(sentCommands[0]).toMatchObject({
+      command: "review",
+      arguments: " changes",
+      model: { providerID: "provider", id: "model" },
+      selection: { inheritActive: true, variant: "command-only" },
+    })
+    expect(toasts).toHaveLength(0)
+  })
+
+  test("direct command submissions validate against configured command-agent model defaults", async () => {
+    params.id = "ses_controls"
+    availableModels.push({ id: "cmd", provider: { id: "command" }, variants: { "command-only": {} } })
+    availableAgents = [{ name: "reviewer", mode: "primary", model: { providerID: "command", modelID: "cmd" } }]
+    commands.push({ name: "review", agent: "reviewer" })
+    promptValue = [text("/review changes"), { ...control, variant: "command-only" }]
+    await createSubmit().handleSubmit(new Event("submit"))
+    expect(sentCommands[0]).toMatchObject({
+      command: "review",
+      selection: { inheritActive: true, variant: "command-only" },
+    })
+    expect(toasts).toHaveLength(0)
+  })
+
+  test("queue command snapshots use command defaults and persistent fallback rather than a running steer", async () => {
+    params.id = "ses_controls"
+    runtimeWorking = true
+    variant = "high"
+    availableModels.push({ id: "cmd", provider: { id: "command" }, variants: { high: {} } })
+    commands.push({ name: "review", model: { providerID: "command", id: "cmd" } })
+    projectedMessages = [
+      {
+        id: "a",
+        sessionID: params.id,
+        role: "user",
+        model: { providerID: "override", modelID: "chosen", variant: "low" },
+      } as Message,
+      {
+        id: "assistant-a",
+        sessionID: params.id,
+        role: "assistant",
+        parentID: "a",
+        providerID: "override",
+        modelID: "chosen",
+        time: { created: 2 },
+      } as Message,
+    ]
+    promptValue = [text("/queue /review changes")]
+    await createSubmit({ working: () => true }).handleSubmit(new Event("submit"))
+    expect(queuedInputs[0]).toMatchObject({
+      payload: { model: { providerID: "command", modelID: "cmd" }, variant: "high", selection: {} },
+    })
+    expect(toasts).toContainEqual(expect.objectContaining({ variant: "success" }))
+  })
+
+  test("normal sends inherit active with explicit chips while session creation retains persistent base", async () => {
+    promptValue = [text("he"), model, text("llo"), control]
+    await createSubmit().handleSubmit(new Event("submit"))
+    expect(sessionCreateInputs[0]?.model).toMatchObject({ id: "model", providerID: "provider" })
+    expect(promptInputs[0]).toMatchObject({
+      text: "hello",
+      model: { modelID: "model", providerID: "provider" },
+      selection: { inheritActive: true, model: { providerID: "override", modelID: "chosen" }, variant: "low" },
+    })
+    expect(promptInputs[0]).toMatchObject({ legacyParts: [{ type: "text", text: "hello" }] })
+  })
+
+  test("controls anywhere leave command arguments byte-exact and skills become files", async () => {
+    params.id = "ses_controls"
+    commands.push({ name: "review" }, { name: "one", source: "skill" }, { name: "two", source: "skill" })
+    promptValue = [model, text("/rev"), control, text("iew  a\n b $one $two")]
+    await createSubmit().handleSubmit(new Event("submit"))
+    expect(sentCommands[0]).toMatchObject({
+      command: "review",
+      arguments: " a\n b $one $two",
+      selection: { inheritActive: true, model: { providerID: "override", modelID: "chosen" }, variant: "low" },
+      files: [
+        { uri: "skill:one", name: "one" },
+        { uri: "skill:two", name: "two" },
+      ],
+    })
+  })
+
+  test("manually typed slash skills stay ordinary prompts", async () => {
+    params.id = "ses_controls"
+    commands.push({ name: "one", source: "skill" })
+    promptValue = [model, text("/one arg")]
+    await createSubmit().handleSubmit(new Event("submit"))
+    expect(sentCommands).toHaveLength(0)
+    expect(promptInputs[0]).toMatchObject({ text: "/one arg", selection: { inheritActive: true } })
+  })
+
+  test("leading authored whitespace after controls still routes a command with exact arguments", async () => {
+    params.id = "ses_controls"
+    commands.push({ name: "review" })
+    promptValue = [model, text(" \n /rev"), control, text("iew  a\n b ")]
+    await createSubmit().handleSubmit(new Event("submit"))
+    expect(sentCommands[0]).toMatchObject({ command: "review", arguments: " a\n b " })
+    expect(promptInputs).toHaveLength(0)
+  })
+
+  test("leading authored whitespace after controls still routes queue syntax and preserves its established delimiter handling", async () => {
+    params.id = "ses_controls"
+    commands.push({ name: "review" })
+    promptValue = [model, text(" \n /qu"), control, text("eue /review   a\n b ")]
+    await createSubmit().handleSubmit(new Event("submit"))
+    expect(queuedInputs[0]).toMatchObject({ payload: { kind: "command", command: "review", arguments: "a\n b" } })
+    expect(sentCommands).toHaveLength(0)
+    expect(promptInputs).toHaveLength(0)
+  })
+
+  test("logical skill text split by control chips activates in both sends and queue payloads", async () => {
+    params.id = "ses_controls"
+    commands.push({ name: "my-skill", source: "skill" })
+    promptValue = [text("$my"), model, text("-skill"), control]
+    await createSubmit().handleSubmit(new Event("submit"))
+    expect(promptInputs[0]).toMatchObject({ text: "$my-skill", files: [{ uri: "skill:my-skill", name: "my-skill" }] })
+    promptValue = [text("$my"), model, text("-skill"), control]
+    await createSubmit().handleSubmit(new Event("submit"), "queue")
+    expect(queuedInputs[0]).toMatchObject({
+      payload: {
+        kind: "prompt",
+        parts: [
+          { type: "text", text: "$my-skill" },
+          { type: "file", mime: "application/x-opencode-skill", url: "skill:my-skill" },
+        ],
+      },
+    })
+  })
+
+  test("ordinary prompt and suffix queue bodies retain authored leading and trailing whitespace", async () => {
+    params.id = "ses_controls"
+    promptValue = [model, text("  hello \n ")]
+    await createSubmit().handleSubmit(new Event("submit"))
+    expect(promptInputs[0]).toMatchObject({ text: "  hello \n " })
+    promptValue = [model, text("  hello   /queue")]
+    await createSubmit().handleSubmit(new Event("submit"))
+    expect(queuedInputs[0]).toMatchObject({ payload: { parts: [{ type: "text", text: "  hello" }] } })
+  })
+
+  test("control-only input neither sends nor interrupts", async () => {
+    params.id = "ses_controls"
+    promptValue = [model, control]
+    await createSubmit({ working: () => true }).handleSubmit(new Event("submit"))
+    expect(promptInputs).toHaveLength(0)
+    expect(interrupted).toHaveLength(0)
+  })
+
+  test("tool-call continuation uses the real running parent's selection without changing the persistent request fallback", async () => {
+    params.id = "ses_controls"
+    runtimeWorking = true
+    availableModels = [{ id: "chosen", provider: { id: "override" }, variants: { "active-only": {} } }]
+    projectedMessages = [
+      {
+        id: "user",
+        sessionID: params.id,
+        role: "user",
+        model: { providerID: "override", modelID: "chosen", variant: "active-only" },
+      } as Message,
+      {
+        id: "assistant",
+        sessionID: params.id,
+        role: "assistant",
+        parentID: "user",
+        providerID: "override",
+        modelID: "chosen",
+        finish: "tool-calls",
+        time: { created: 1, completed: 2 },
+      } as Message,
+    ]
+    promptValue = [{ ...control, variant: "active-only" }, text("continue")]
+    await createSubmit({ working: () => true }).handleSubmit(new Event("submit"))
+    expect(promptInputs[0]).toMatchObject({
+      model: { providerID: "provider", modelID: "model" },
+      selection: { inheritActive: true, variant: "active-only" },
+    })
+    expect(optimistic[0]).toMatchObject({
+      message: { model: { providerID: "override", modelID: "chosen", variant: "active-only" } },
+    })
+    runtimeWorking = false
+    availableModels.push({ id: "model", provider: { id: "provider" }, variants: { high: {} } })
+    promptValue = [{ ...control, variant: "active-only" }, text("continue")]
+    await createSubmit({ working: () => true }).handleSubmit(new Event("submit"))
+    expect(promptInputs).toHaveLength(1)
+    expect(toasts).toContainEqual(expect.objectContaining({ description: "prompt.controls.variantUnavailable" }))
+  })
+
+  test("queue removes controls and snapshots overrides without active inheritance", async () => {
+    params.id = "ses_controls"
+    commands.push({ name: "review", model: { providerID: "command", id: "default" } })
+    promptValue = [text("/rev"), model, text("iew  a"), control, text("\n b")]
+    await createSubmit().handleSubmit(new Event("submit"), "queue")
+    expect(queuedInputs[0]).toMatchObject({
+      payload: {
+        kind: "command",
+        command: "review",
+        arguments: " a\n b",
+        model: { providerID: "override", modelID: "chosen" },
+        variant: "low",
+        selection: { model: { providerID: "override", modelID: "chosen" }, variant: "low" },
+      },
+    })
+  })
+
+  test("failed queue retries reuse the captured selection rather than changed persistent defaults", async () => {
+    params.id = "ses_controls"
+    variant = "high"
+    queueError = new Error("offline")
+    const submit = createSubmit()
+    await submit.handleSubmit(new Event("submit"), "queue")
+    variant = "low"
+    availableModels = []
+    queueError = undefined
+    await submit.handleSubmit(new Event("submit"), "queue")
+    expect(queuedInputs).toHaveLength(2)
+    expect(queuedInputs[1]).toEqual(queuedInputs[0])
+    expect(queuedInputs[1]).toMatchObject({ payload: { variant: "high", selection: {} } })
+  })
+
+  test("queue slash-skill syntax remains literal prompt content", async () => {
+    params.id = "ses_controls"
+    commands.push({ name: "one", source: "skill" })
+    promptValue = [model, text("/queue /one arg")]
+    await createSubmit().handleSubmit(new Event("submit"))
+    expect(queuedInputs[0]).toMatchObject({ payload: { kind: "prompt", parts: [{ type: "text", text: "/one arg" }] } })
+  })
+})
 
 describe("native queue submission", () => {
   test("preserves an explicit default variant when queueing in a child session", async () => {
@@ -944,6 +1257,35 @@ describe("native queue submission", () => {
       expect(promptContextItems[0]?.comment).toBe("edited comment")
       expect(promptInputs[0]).toMatchObject({ text: expect.stringContaining("captured comment") })
     })
+  })
+
+  test("a model-only chip drops an unsupported base variant in the queued snapshot", async () => {
+    params.id = "ses_controls"
+    variant = "high"
+    availableModels = [{ id: "chosen", provider: { id: "override" }, variants: { low: {} } }]
+    promptValue = [model, text("hello")]
+    await createSubmit().handleSubmit(new Event("submit"), "queue")
+    expect(queuedInputs[0]).toMatchObject({ payload: { model: { providerID: "override", modelID: "chosen" } } })
+    expect((queuedInputs[0] as { payload: object }).payload).not.toHaveProperty("variant")
+  })
+
+  test("an explicit invalid variant visibly rejects without clearing the draft", async () => {
+    params.id = "ses_controls"
+    availableModels = [{ id: "chosen", provider: { id: "override" }, variants: { high: {} } }]
+    promptValue = [model, control, text("hello")]
+    await createSubmit().handleSubmit(new Event("submit"))
+    expect(promptInputs).toHaveLength(0)
+    expect(promptResets).toBe(0)
+    expect(toasts).toContainEqual(expect.objectContaining({ description: "prompt.controls.variantUnavailable" }))
+  })
+
+  test("a disconnected selected model visibly rejects", async () => {
+    params.id = "ses_controls"
+    promptValue = [model, text("hello")]
+    availableModels = []
+    await createSubmit().handleSubmit(new Event("submit"))
+    expect(promptInputs).toHaveLength(0)
+    expect(toasts).toContainEqual(expect.objectContaining({ description: "prompt.controls.modelUnavailable" }))
   })
 })
 
@@ -1716,6 +2058,7 @@ describe("prompt submit worktree selection", () => {
         id: expect.stringMatching(/^msg_/),
         command: "review",
         arguments: "staged changes",
+        selection: { inheritActive: true },
         agent: "agent",
         model: { id: "model", providerID: "provider", variant: "high" },
         files: [],

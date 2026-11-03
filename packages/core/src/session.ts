@@ -38,6 +38,10 @@ import { Revert } from "@opencode-ai/schema/revert"
 import { FSUtil } from "./fs-util"
 import { SessionDurable } from "@opencode-ai/schema/durable-event-manifest"
 import { ManagedCommand } from "./managed-command"
+import { SessionActiveSelection } from "./session/active-selection"
+import { CommandV2 } from "./command"
+import { Catalog } from "./catalog"
+import { SessionRunnerModel } from "./session/runner/model"
 
 export const RevertState = Revert.State
 export type RevertState = Revert.State
@@ -96,7 +100,7 @@ export class NotFoundError extends Schema.TaggedErrorClass<NotFoundError>()("Ses
 export class OperationUnavailableError extends Schema.TaggedErrorClass<OperationUnavailableError>()(
   "Session.OperationUnavailableError",
   {
-    operation: Schema.Literals(["move", "shell", "skill", "switchAgent", "compact", "wait"]),
+    operation: Schema.Literals(["move", "shell", "skill", "switchAgent", "compact", "wait", "subtask"]),
   },
 ) {}
 
@@ -105,6 +109,15 @@ export { ContextSnapshotDecodeError, MessageDecodeError } from "./session/error"
 export class PromptConflictError extends Schema.TaggedErrorClass<PromptConflictError>()("Session.PromptConflictError", {
   sessionID: SessionSchema.ID,
   messageID: SessionMessage.ID,
+}) {}
+export class CommandNotFoundError extends Schema.TaggedErrorClass<CommandNotFoundError>()(
+  "Session.CommandNotFoundError",
+  {
+    command: Schema.String,
+  },
+) {}
+export class InvalidModelError extends Schema.TaggedErrorClass<InvalidModelError>()("Session.InvalidModelError", {
+  message: Schema.String,
 }) {}
 export const MessageNotFoundError = SessionRevert.MessageNotFoundError
 export type MessageNotFoundError = SessionRevert.MessageNotFoundError
@@ -156,7 +169,32 @@ export interface Interface {
     prompt: PromptInput.Prompt
     delivery?: SessionInput.Delivery
     resume?: boolean
-  }) => Effect.Effect<SessionInput.Admitted, NotFoundError | PromptConflictError | SessionInput.Retired | SessionInput.ManagedProfile>
+  }) => Effect.Effect<
+    SessionInput.Admitted,
+    NotFoundError | PromptConflictError | InvalidModelError | SessionInput.Retired | SessionInput.ManagedProfile
+  >
+  readonly command: (input: {
+    id?: SessionMessage.ID
+    sessionID: SessionSchema.ID
+    command: string
+    arguments?: string
+    agent?: string
+    model?: ModelV2.Ref
+    selection?: PromptInput.Prompt["selection"]
+    files?: PromptInput.Prompt["files"]
+    agents?: PromptInput.Prompt["agents"]
+    delivery?: SessionInput.Delivery
+    resume?: boolean
+  }) => Effect.Effect<
+    SessionInput.Admitted,
+    | NotFoundError
+    | CommandNotFoundError
+    | InvalidModelError
+    | OperationUnavailableError
+    | PromptConflictError
+    | SessionInput.Retired
+    | SessionInput.ManagedProfile
+  >
   readonly shell: (input: {
     id?: EventV2.ID
     sessionID: SessionSchema.ID
@@ -197,6 +235,7 @@ const layer = Layer.effect(
     const execution = yield* SessionExecution.Service
     const store = yield* SessionStore.Service
     const locations = yield* LocationServiceMap.Service
+    const activeSelection = yield* SessionActiveSelection.Service
     const decodeMessage = Schema.decodeUnknownEffect(SessionMessage.Message)
     const isDurableSessionEvent = Schema.is(SessionEvent.Durable)
     const decode = (row: typeof SessionMessageTable.$inferSelect) =>
@@ -246,10 +285,14 @@ const layer = Layer.effect(
           time: { created: now, updated: now },
         })
         const projected = yield* events
-          .publish(SessionV1.Event.Created, { sessionID, info }, {
-            location: input.location,
-            commit: () => ManagedCommand.enrollCreatedRoot(database, sessionID),
-          })
+          .publish(
+            SessionV1.Event.Created,
+            { sessionID, info },
+            {
+              location: input.location,
+              commit: () => ManagedCommand.enrollCreatedRoot(database, sessionID),
+            },
+          )
           .pipe(
             Effect.as({ type: "created" } as const),
             Effect.catchDefect((defect) => {
@@ -368,33 +411,205 @@ const layer = Layer.effect(
         })
       }),
       prompt: Effect.fn("V2Session.prompt")((input) =>
-        Effect.uninterruptible(
-          Effect.gen(function* () {
-            yield* SessionInput.guardManagedProfile
-            yield* result.get(input.sessionID)
-            const prompt = resolvePrompt(input.prompt)
-            const messageID = input.id ?? SessionMessage.ID.create()
-            const delivery = input.delivery ?? "steer"
-            const expected = { sessionID: input.sessionID, messageID, prompt, delivery }
-            const admitted = yield* SessionInput.admit(db, events, {
-              id: messageID,
-              sessionID: input.sessionID,
-              prompt,
-              delivery,
-            }).pipe(
-              Effect.catchDefect((defect) =>
-                defect instanceof SessionInput.LifecycleConflict
-                  ? new PromptConflictError({ sessionID: input.sessionID, messageID })
-                  : Effect.die(defect),
-              ),
-            )
-            if (!SessionInput.equivalent(admitted, expected))
-              return yield* new PromptConflictError({ sessionID: input.sessionID, messageID })
-            if (input.resume !== false) yield* execution.wake(admitted.sessionID)
-            return admitted
-          }),
+        activeSelection.admission(
+          input.sessionID,
+          Effect.uninterruptible(
+            Effect.gen(function* () {
+              yield* SessionInput.guardManagedProfile
+              const session = yield* result.get(input.sessionID)
+              const messageID = input.id ?? SessionMessage.ID.create()
+              const delivery = input.delivery ?? "steer"
+              const existing = yield* SessionInput.find(db, messageID)
+              if (existing) {
+                if (
+                  !SessionInput.equivalent(existing, {
+                    sessionID: input.sessionID,
+                    delivery,
+                    prompt: resolvePrompt(input.prompt, existing.prompt.model),
+                  })
+                )
+                  return yield* new PromptConflictError({ sessionID: input.sessionID, messageID })
+                yield* SessionInput.admit(db, events, {
+                  id: messageID,
+                  sessionID: input.sessionID,
+                  delivery,
+                  prompt: existing.prompt,
+                })
+                if (input.resume !== false) yield* execution.wake(existing.sessionID)
+                return existing
+              }
+              while (true) {
+                const parent = activeSelection.parent(input.sessionID)
+                const inherited =
+                  input.prompt.selection?.inheritActive && input.delivery !== "queue" ? parent?.model : undefined
+                const selected = input.prompt.selection?.model
+                const fallback = inherited ?? input.prompt.model ?? session.model
+                const defaultModel =
+                  !fallback && !selected && input.prompt.selection
+                    ? yield* Catalog.Service.use((catalog) => SessionRunnerModel.defaultModel(catalog)).pipe(
+                        Effect.provide(locations.get(session.location)),
+                      )
+                    : undefined
+                const base =
+                  fallback ??
+                  (defaultModel && {
+                    id: defaultModel.id,
+                    providerID: defaultModel.providerID,
+                    variant: defaultModel.variants.find((variant) => variant.id === defaultModel.request.variant)?.id,
+                  })
+                const chosen = selected
+                  ? {
+                      id: selected.modelID,
+                      providerID: selected.providerID,
+                      variant: input.prompt.selection?.variant ?? base?.variant,
+                    }
+                  : base && { ...base, variant: input.prompt.selection?.variant ?? base.variant }
+                const catalogModel = chosen
+                  ? yield* Catalog.Service.use((catalog) =>
+                      Effect.gen(function* () {
+                        return (yield* catalog.model.available()).find(
+                          (model) => model.providerID === chosen.providerID && model.id === chosen.id,
+                        )
+                      }),
+                    ).pipe(Effect.provide(locations.get(session.location)))
+                  : undefined
+                // A terminal provider event may arrive while catalog/plugins are resolving.
+                if (activeSelection.parent(input.sessionID) !== parent) continue
+                if (chosen && !catalogModel)
+                  return yield* new InvalidModelError({
+                    message: `Model unavailable: ${chosen.providerID}/${chosen.id}`,
+                  })
+                if (catalogModel && !SessionRunnerModel.supported(catalogModel))
+                  return yield* new InvalidModelError({
+                    message: `Unsupported model API: ${catalogModel.providerID}/${catalogModel.id}`,
+                  })
+                const explicitVariant = input.prompt.selection
+                  ? input.prompt.selection.variant
+                  : input.prompt.model?.variant
+                if (
+                  catalogModel &&
+                  chosen?.variant &&
+                  chosen.variant !== "default" &&
+                  !catalogModel.variants.some((variant) => variant.id === chosen.variant)
+                ) {
+                  if (explicitVariant !== undefined && explicitVariant !== "default")
+                    return yield* new InvalidModelError({
+                      message: `Variant unavailable for ${chosen.providerID}/${chosen.id}: ${chosen.variant}`,
+                    })
+                  chosen.variant = undefined
+                }
+                const prompt = resolvePrompt(
+                  input.prompt,
+                  catalogModel && chosen && (chosen.variant === undefined || chosen.variant === "default")
+                    ? {
+                        ...chosen,
+                        variant:
+                          catalogModel.variants.find((variant) => variant.id === catalogModel.request.variant)?.id ??
+                          ModelV2.VariantID.make("default"),
+                      }
+                    : chosen,
+                )
+                const expected = { sessionID: input.sessionID, messageID, prompt, delivery }
+                const admitted = yield* activeSelection.transition(
+                  input.sessionID,
+                  Effect.gen(function* () {
+                    if (activeSelection.parent(input.sessionID) !== parent) return undefined
+                    const admitted = yield* SessionInput.admit(db, events, {
+                      id: messageID,
+                      sessionID: input.sessionID,
+                      prompt,
+                      delivery,
+                    }).pipe(
+                      Effect.catchDefect((defect) =>
+                        defect instanceof SessionInput.LifecycleConflict
+                          ? new PromptConflictError({ sessionID: input.sessionID, messageID })
+                          : Effect.die(defect),
+                      ),
+                    )
+                    if (!SessionInput.equivalent(admitted, expected))
+                      return yield* new PromptConflictError({ sessionID: input.sessionID, messageID })
+                    if (parent && delivery === "steer" && admitted.prompt.model)
+                      activeSelection.update(input.sessionID, parent, admitted.prompt.model)
+                    return admitted
+                  }),
+                )
+                if (!admitted) continue
+                if (input.resume !== false) yield* execution.wake(admitted.sessionID)
+                return admitted
+              }
+            }),
+          ),
         ),
       ),
+      command: Effect.fn("V2Session.command")(function* (input) {
+        yield* SessionInput.guardManagedProfile
+        const session = yield* result.get(input.sessionID)
+        const command = yield* CommandV2.Service.use((commands) => commands.get(input.command)).pipe(
+          Effect.provide(locations.get(session.location)),
+        )
+        if (!command) return yield* new CommandNotFoundError({ command: input.command })
+        if (command.subtask) return yield* new OperationUnavailableError({ operation: "subtask" })
+        const args =
+          (input.arguments ?? "")
+            .match(/(?:[^\s"']+|"[^"]*"|'[^']*')+/g)
+            ?.map((arg) => arg.replace(/^['"]|['"]$/g, "")) ?? []
+        const positions = Array.from(command.template.matchAll(/\$(\d+)/g), (match) => Number(match[1]))
+        const last = Math.max(0, ...positions)
+        const text =
+          command.template.replace(/\$(\d+)|\$ARGUMENTS/g, (_, index) => {
+            if (index === undefined) return input.arguments ?? ""
+            const position = Number(index)
+            return position === last ? args.slice(position - 1).join(" ") : (args[position - 1] ?? "")
+          }) +
+          (positions.length === 0 && !command.template.includes("$ARGUMENTS") && input.arguments?.trim()
+            ? `\n\n${input.arguments}`
+            : "")
+        if (text.includes("!`")) return yield* new OperationUnavailableError({ operation: "shell" })
+        const agent = yield* AgentV2.Service.use((agents) => agents.resolve(command.agent ?? input.agent)).pipe(
+          Effect.provide(locations.get(session.location)),
+        )
+        const commandModel = command.model ?? (command.agent ? agent?.model : undefined)
+        const variant = command.variant ?? commandModel?.variant ?? (commandModel && ModelV2.VariantID.make("default"))
+        const explicitModel = input.selection?.model
+        const commandVariant =
+          explicitModel &&
+          variant !== undefined &&
+          variant !== "default" &&
+          (commandModel?.id !== explicitModel.modelID || commandModel.providerID !== explicitModel.providerID)
+            ? yield* Catalog.Service.use((catalog) =>
+                catalog.model.get(explicitModel.providerID, explicitModel.modelID),
+              ).pipe(
+                Effect.map((model) => (model?.variants.some((item) => item.id === variant) ? variant : undefined)),
+                Effect.provide(locations.get(session.location)),
+              )
+            : variant
+        return yield* result.prompt({
+          id: input.id,
+          sessionID: input.sessionID,
+          delivery: input.delivery,
+          resume: input.resume,
+          prompt: {
+            text: text.trim(),
+            files: input.files,
+            agents: input.agents,
+            agent: command.agent ?? input.agent,
+            model: commandModel ?? input.model,
+            selection:
+              input.selection || commandVariant !== undefined || commandModel
+                ? {
+                    ...input.selection,
+                    model:
+                      input.selection?.model ??
+                      (commandModel && {
+                        providerID: commandModel.providerID,
+                        modelID: commandModel.id,
+                      }),
+                    variant: input.selection?.variant ?? commandVariant,
+                  }
+                : undefined,
+          },
+        })
+      }),
       shell: Effect.fn("V2Session.shell")(function* () {
         return yield* new OperationUnavailableError({ operation: "shell" })
       }),
@@ -469,16 +684,22 @@ const layer = Layer.effect(
   }),
 )
 
-const resolvePrompt = (input: PromptInput.Prompt) =>
+const resolvePrompt = (input: PromptInput.Prompt, model?: ModelV2.Ref) =>
   Prompt.make({
     text: input.text,
     agents: input.agents,
+    agent: input.agent,
+    model,
+    requestedModel: input.model,
+    selection: input.selection,
     files: input.files?.map((file) => {
       const dataMime = file.uri.match(/^data:([^;,]+)[;,]/i)?.[1]
       const target = URL.canParse(file.uri) ? new URL(file.uri).pathname : (file.name ?? file.uri)
       return {
         ...file,
-        mime: dataMime ?? (target.endsWith("/") ? "application/x-directory" : FSUtil.mimeType(target)),
+        mime: file.uri.startsWith("skill:")
+          ? "application/x-opencode-skill"
+          : (dataMime ?? (target.endsWith("/") ? "application/x-directory" : FSUtil.mimeType(target))),
       }
     }),
   })
@@ -494,5 +715,6 @@ export const node = makeGlobalNode({
     SessionStore.node,
     LocationServiceMap.node,
     SessionProjector.node,
+    SessionActiveSelection.node,
   ],
 })

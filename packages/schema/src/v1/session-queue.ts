@@ -6,10 +6,17 @@ import { NonNegativeInt, optional } from "../schema"
 import { SessionID } from "../session-id"
 import { SessionV1 } from "./session"
 
+export const Selection = Schema.Struct({
+  inheritActive: optional(Schema.Boolean),
+  model: optional(Schema.Struct({ providerID: Schema.String, modelID: Schema.String })),
+  variant: optional(Schema.String),
+})
+
 const common = {
   agent: Schema.String,
   model: Schema.Struct({ providerID: Schema.String, modelID: Schema.String }),
   variant: optional(Schema.String),
+  selection: optional(Selection),
 }
 
 export const Payload = Schema.Union([

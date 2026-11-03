@@ -64,6 +64,9 @@ import { SessionQueueTable } from "@opencode-ai/core/session/queue.sql"
 import { requireUnmanagedShell } from "@/util/managed-shell"
 import { ManagedCommand } from "@opencode-ai/core/managed-command"
 import { ManagedWorkspace } from "@/server/managed-workspace"
+import { SkillTool } from "@/tool/skill"
+import { Skill } from "@/skill"
+import { Ripgrep } from "@opencode-ai/core/ripgrep"
 
 // @ts-ignore
 globalThis.AI_SDK_LOG_WARNINGS = false
@@ -133,12 +136,16 @@ function isOrphanedInterruptedTool(part: SessionV1.ToolPart) {
   )
 }
 
+export class InputError extends Schema.TaggedErrorClass<InputError>()("PromptInputError", {
+  message: Schema.String,
+}) {}
+
 export interface Interface {
   readonly cancel: (sessionID: SessionID) => Effect.Effect<void>
   readonly prompt: (
     input: PromptInput,
     task?: TaskAdmission,
-  ) => Effect.Effect<SessionV1.WithParts, Image.Error | RuntimeLifecycle.RuntimeDrainingError>
+  ) => Effect.Effect<SessionV1.WithParts, Image.Error | InputError | RuntimeLifecycle.RuntimeDrainingError>
   readonly loop: (input: LoopInput) => Effect.Effect<SessionV1.WithParts>
   readonly recover: (
     sessionID: SessionID,
@@ -150,7 +157,7 @@ export interface Interface {
   ) => Effect.Effect<SessionV1.WithParts, Session.BusyError | RuntimeLifecycle.RuntimeDrainingError>
   readonly command: (
     input: CommandInput,
-  ) => Effect.Effect<SessionV1.WithParts, Image.Error | RuntimeLifecycle.RuntimeDrainingError>
+  ) => Effect.Effect<SessionV1.WithParts, Image.Error | InputError | RuntimeLifecycle.RuntimeDrainingError>
   readonly resolvePromptParts: (template: string) => Effect.Effect<PromptInput["parts"]>
   readonly queueSubmit: (
     sessionID: SessionID,
@@ -164,7 +171,7 @@ export interface Interface {
   readonly queueUpdate: (
     sessionID: SessionID,
     input: SessionQueueV1.Update,
-  ) => Effect.Effect<SessionQueueV1.Snapshot, SessionQueue.QueueError | Image.Error>
+  ) => Effect.Effect<SessionQueueV1.Snapshot, SessionQueue.QueueError | Image.Error | InputError>
   readonly queueFlush: (sessionID: SessionID) => Effect.Effect<SessionQueueV1.Snapshot, SessionQueue.QueueError>
   readonly queueResume: (sessionID: SessionID) => Effect.Effect<SessionQueueV1.Snapshot, SessionQueue.QueueError>
 }
@@ -176,7 +183,7 @@ type TaskAdmission = {
   parentMode?: "foreground" | "background"
   notification?: boolean
   recoveryFence?: number
-  admission?: Deferred.Deferred<void, RuntimeLifecycle.RuntimeDrainingError>
+  admission?: Deferred.Deferred<void, RuntimeLifecycle.RuntimeDrainingError | InputError>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/SessionPrompt") {}
@@ -212,6 +219,7 @@ const layer = Layer.effect(
     const flags = yield* RuntimeFlags.Service
     const database = yield* Database.Service
     const queue = yield* SessionQueue.Service
+    const skillTool = yield* SkillTool
     const queueState = yield* InstanceState.make(() => Effect.sync(() => new Map<SessionID, Set<string>>()))
     const runtime = Option.getOrElse(
       yield* Effect.serviceOption(RuntimeLifecycle.Service),
@@ -1073,7 +1081,9 @@ const layer = Layer.effect(
               .pipe(Effect.catchIf(Provider.ModelNotFoundError.isInstance, () => Effect.succeed(undefined)))
           : undefined
       const variant =
-        input.variant ?? (!resolved && ag.variant && full?.variants?.[ag.variant] ? ag.variant : undefined)
+        input.variant ??
+        (input.selection && "variant" in model && typeof model.variant === "string" ? model.variant : undefined) ??
+        (!resolved && ag.variant && full?.variants?.[ag.variant] ? ag.variant : undefined)
 
       const info: SessionV1.User = {
         id: input.messageID ?? MessageID.ascending(),
@@ -1100,306 +1110,354 @@ const layer = Layer.effect(
         id: part.id ? PartID.make(part.id) : PartID.ascending(),
       })
 
-      const resolvePart: (part: PromptInput["parts"][number]) => Effect.Effect<Draft<SessionV1.Part>[]> = Effect.fn(
-        "SessionPrompt.resolveUserPart",
-      )(function* (part) {
-        if (part.type === "file") {
-          if (part.source?.type === "resource") {
-            if (process.env.OPENCODE_MANAGED_PROFILE === "1")
-              throw new Error("MCP resources are unavailable in the managed profile")
-            const { clientName, uri } = part.source
-            yield* Effect.logInfo("mcp resource", { clientName, uri, mime: part.mime })
-            const pieces: Draft<SessionV1.Part>[] = [
-              {
-                messageID: info.id,
-                sessionID: input.sessionID,
-                type: "text",
-                synthetic: true,
-                text: `Reading MCP resource: ${part.filename} (${uri})`,
-              },
-            ]
-            const current = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
-            const exit = yield* mcp
-              .readResource(clientName, uri, McpActivation.names(current.metadata))
-              .pipe(Effect.exit)
-            if (Exit.isSuccess(exit)) {
-              const content = exit.value
-              if (!content) throw new Error(`Resource not found: ${clientName}/${uri}`)
-              const items = Array.isArray(content.contents) ? content.contents : [content.contents]
-              for (const c of items) {
-                if (!c || typeof c !== "object") continue
-                if ("text" in c && typeof c.text === "string" && c.text) {
-                  pieces.push({
-                    messageID: info.id,
-                    sessionID: input.sessionID,
-                    type: "text",
-                    synthetic: true,
-                    text: c.text,
-                  })
-                } else if ("blob" in c && typeof c.blob === "string" && c.blob) {
-                  const mime = "mimeType" in c && typeof c.mimeType === "string" ? c.mimeType : part.mime
-                  const filename = "uri" in c && typeof c.uri === "string" ? c.uri : part.filename
-                  const size = mcpResourceBase64Size(c.blob)
-                  if (!SUPPORTED_MCP_RESOURCE_ATTACHMENT_MIMES.has(mime)) {
-                    pieces.push({
-                      messageID: info.id,
-                      sessionID: input.sessionID,
-                      type: "text",
-                      synthetic: true,
-                      text: `[Binary MCP resource omitted: ${filename ?? uri} (${mime}, ${formatMcpResourceBytes(size)}) is not a supported attachment type]`,
-                    })
-                    continue
-                  }
-                  if (size > MAX_MCP_RESOURCE_BLOB_BYTES) {
-                    pieces.push({
-                      messageID: info.id,
-                      sessionID: input.sessionID,
-                      type: "text",
-                      synthetic: true,
-                      text: `[Binary MCP resource omitted: ${filename ?? uri} (${mime}, ${formatMcpResourceBytes(size)}) exceeds ${formatMcpResourceBytes(MAX_MCP_RESOURCE_BLOB_BYTES)}]`,
-                    })
-                    continue
-                  }
-                  pieces.push({
-                    messageID: info.id,
-                    sessionID: input.sessionID,
-                    type: "text",
-                    synthetic: true,
-                    text: `[Binary MCP resource attached: ${filename ?? uri} (${mime})]`,
-                  })
-                  pieces.push({
-                    messageID: info.id,
-                    sessionID: input.sessionID,
-                    type: "file",
-                    mime,
-                    filename,
-                    url: `data:${mime};base64,${c.blob}`,
-                  })
-                }
-              }
-            } else {
-              const error = Cause.squash(exit.cause)
-              yield* Effect.logError("failed to read MCP resource", { error, clientName, uri })
-              const message = error instanceof Error ? error.message : String(error)
-              pieces.push({
-                messageID: info.id,
-                sessionID: input.sessionID,
-                type: "text",
-                synthetic: true,
-                text: `Failed to read MCP resource ${part.filename}: ${message}`,
+      const resolvePart: (part: PromptInput["parts"][number]) => Effect.Effect<Draft<SessionV1.Part>[], InputError> =
+        Effect.fn("SessionPrompt.resolveUserPart")(function* (part) {
+          if (part.type === "file") {
+            if (part.mime === "application/x-opencode-skill") {
+              if (!part.url.startsWith("skill:"))
+                return yield* new InputError({ message: "Invalid skill attachment URL" })
+              const name = yield* Effect.try({
+                try: () => decodeURIComponent(part.url.slice("skill:".length)),
+                catch: () => new InputError({ message: "Invalid skill attachment name" }),
               })
-            }
-            return pieces
-          }
-          const url = new URL(part.url)
-          switch (url.protocol) {
-            case "data:":
-              if (part.mime === "text/plain") {
-                return [
+              if (!name || (part.filename && part.filename !== name))
+                return yield* new InputError({ message: "Invalid skill attachment name" })
+              const skill = yield* skillTool.init()
+              const current = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
+              const controller = new AbortController()
+              const loaded = yield* skill
+                .execute(
+                  { name },
                   {
+                    sessionID: input.sessionID,
                     messageID: info.id,
-                    sessionID: input.sessionID,
-                    type: "text",
-                    synthetic: true,
-                    text: `Called the Read tool with the following input: ${JSON.stringify({ filePath: part.filename })}`,
-                  },
-                  {
-                    messageID: info.id,
-                    sessionID: input.sessionID,
-                    type: "text",
-                    synthetic: true,
-                    text: decodeDataUrl(part.url),
-                  },
-                  { ...part, messageID: info.id, sessionID: input.sessionID },
-                ]
-              }
-              break
-            case "file:": {
-              yield* Effect.logInfo("file", { mime: part.mime })
-              const filepath = fileURLToPath(part.url)
-              const mime = (yield* fsys.isDir(filepath)) ? "application/x-directory" : part.mime
-
-              const { read } = yield* registry.named()
-              const execRead = (args: Parameters<typeof read.execute>[0], extra?: Tool.Context["extra"]) => {
-                const controller = new AbortController()
-                return read
-                  .execute(args, {
-                    sessionID: input.sessionID,
+                    agent: ag.name,
                     abort: controller.signal,
-                    agent: input.agent!,
-                    messageID: info.id,
-                    extra: { bypassCwdCheck: true, ...extra },
                     messages: [],
                     metadata: () => Effect.void,
-                    ask: () => Effect.void,
-                  })
-                  .pipe(Effect.onInterrupt(() => Effect.sync(() => controller.abort())))
-              }
-
-              if (mime === "text/plain") {
-                let offset: number | undefined
-                let limit: number | undefined
-                const range = { start: url.searchParams.get("start"), end: url.searchParams.get("end") }
-                if (range.start != null) {
-                  const filePathURI = part.url.split("?")[0]
-                  let start = parseInt(range.start)
-                  let end = range.end ? parseInt(range.end) : undefined
-                  if (start === end) {
-                    const symbols = yield* lsp.documentSymbol(filePathURI).pipe(Effect.catch(() => Effect.succeed([])))
-                    for (const symbol of symbols) {
-                      let r: LSP.Range | undefined
-                      if ("range" in symbol) r = symbol.range
-                      else if ("location" in symbol) r = symbol.location.range
-                      if (r?.start?.line && r?.start?.line === start) {
-                        start = r.start.line
-                        end = r?.end?.line ?? start
-                        break
-                      }
-                    }
-                  }
-                  offset = Math.max(start, 1)
-                  if (end) limit = end - (offset - 1)
-                }
-                const args = { filePath: filepath, offset, limit }
-                const pieces: Draft<SessionV1.Part>[] = [
-                  {
-                    messageID: info.id,
-                    sessionID: input.sessionID,
-                    type: "text",
-                    synthetic: true,
-                    text: `Called the Read tool with the following input: ${JSON.stringify(args)}`,
+                    ask: (request) =>
+                      permission
+                        .ask({
+                          ...request,
+                          sessionID: input.sessionID,
+                          ruleset: Permission.merge(ag.permission, current.permission ?? []),
+                        })
+                        .pipe(Effect.orDie),
                   },
-                ]
-                const exit = yield* provider.getModel(info.model.providerID, info.model.modelID).pipe(
-                  Effect.flatMap((mdl) => execRead(args, { model: mdl })),
-                  Effect.exit,
                 )
-                if (Exit.isSuccess(exit)) {
-                  const result = exit.value
-                  pieces.push({
-                    messageID: info.id,
-                    sessionID: input.sessionID,
-                    type: "text",
-                    synthetic: true,
-                    text: result.output,
-                  })
-                  if (result.attachments?.length) {
-                    pieces.push(
-                      ...result.attachments.map((a) => ({
-                        ...a,
-                        synthetic: true,
-                        filename: a.filename ?? part.filename,
+                .pipe(
+                  Effect.catchCause((cause) => {
+                    if (Cause.hasInterrupts(cause)) return Effect.failCause(cause)
+                    const error = Cause.squash(cause)
+                    return Effect.fail(
+                      new InputError({ message: error instanceof Error ? error.message : String(error) }),
+                    )
+                  }),
+                  Effect.ensuring(Effect.sync(() => controller.abort())),
+                )
+              return [
+                { ...part, messageID: info.id, sessionID: input.sessionID },
+                { type: "text", text: loaded.output, synthetic: true, messageID: info.id, sessionID: input.sessionID },
+              ]
+            }
+            if (part.source?.type === "resource") {
+              if (process.env.OPENCODE_MANAGED_PROFILE === "1")
+                throw new Error("MCP resources are unavailable in the managed profile")
+              const { clientName, uri } = part.source
+              yield* Effect.logInfo("mcp resource", { clientName, uri, mime: part.mime })
+              const pieces: Draft<SessionV1.Part>[] = [
+                {
+                  messageID: info.id,
+                  sessionID: input.sessionID,
+                  type: "text",
+                  synthetic: true,
+                  text: `Reading MCP resource: ${part.filename} (${uri})`,
+                },
+              ]
+              const current = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
+              const exit = yield* mcp
+                .readResource(clientName, uri, McpActivation.names(current.metadata))
+                .pipe(Effect.exit)
+              if (Exit.isSuccess(exit)) {
+                const content = exit.value
+                if (!content) throw new Error(`Resource not found: ${clientName}/${uri}`)
+                const items = Array.isArray(content.contents) ? content.contents : [content.contents]
+                for (const c of items) {
+                  if (!c || typeof c !== "object") continue
+                  if ("text" in c && typeof c.text === "string" && c.text) {
+                    pieces.push({
+                      messageID: info.id,
+                      sessionID: input.sessionID,
+                      type: "text",
+                      synthetic: true,
+                      text: c.text,
+                    })
+                  } else if ("blob" in c && typeof c.blob === "string" && c.blob) {
+                    const mime = "mimeType" in c && typeof c.mimeType === "string" ? c.mimeType : part.mime
+                    const filename = "uri" in c && typeof c.uri === "string" ? c.uri : part.filename
+                    const size = mcpResourceBase64Size(c.blob)
+                    if (!SUPPORTED_MCP_RESOURCE_ATTACHMENT_MIMES.has(mime)) {
+                      pieces.push({
                         messageID: info.id,
                         sessionID: input.sessionID,
-                      })),
-                    )
-                  } else {
-                    pieces.push({ ...part, mime, messageID: info.id, sessionID: input.sessionID })
+                        type: "text",
+                        synthetic: true,
+                        text: `[Binary MCP resource omitted: ${filename ?? uri} (${mime}, ${formatMcpResourceBytes(size)}) is not a supported attachment type]`,
+                      })
+                      continue
+                    }
+                    if (size > MAX_MCP_RESOURCE_BLOB_BYTES) {
+                      pieces.push({
+                        messageID: info.id,
+                        sessionID: input.sessionID,
+                        type: "text",
+                        synthetic: true,
+                        text: `[Binary MCP resource omitted: ${filename ?? uri} (${mime}, ${formatMcpResourceBytes(size)}) exceeds ${formatMcpResourceBytes(MAX_MCP_RESOURCE_BLOB_BYTES)}]`,
+                      })
+                      continue
+                    }
+                    pieces.push({
+                      messageID: info.id,
+                      sessionID: input.sessionID,
+                      type: "text",
+                      synthetic: true,
+                      text: `[Binary MCP resource attached: ${filename ?? uri} (${mime})]`,
+                    })
+                    pieces.push({
+                      messageID: info.id,
+                      sessionID: input.sessionID,
+                      type: "file",
+                      mime,
+                      filename,
+                      url: `data:${mime};base64,${c.blob}`,
+                    })
                   }
-                } else {
-                  const error = Cause.squash(exit.cause)
-                  yield* Effect.logError("failed to read file", { error, filepath })
-                  const message = error instanceof Error ? error.message : String(error)
-                  yield* events.publish(Session.Event.Error, {
-                    sessionID: input.sessionID,
-                    error: new NamedError.Unknown({ message }).toObject(),
-                  })
-                  pieces.push({
-                    messageID: info.id,
-                    sessionID: input.sessionID,
-                    type: "text",
-                    synthetic: true,
-                    text: `Read tool failed to read ${filepath} with the following error: ${message}`,
-                  })
                 }
-                return pieces
+              } else {
+                const error = Cause.squash(exit.cause)
+                yield* Effect.logError("failed to read MCP resource", { error, clientName, uri })
+                const message = error instanceof Error ? error.message : String(error)
+                pieces.push({
+                  messageID: info.id,
+                  sessionID: input.sessionID,
+                  type: "text",
+                  synthetic: true,
+                  text: `Failed to read MCP resource ${part.filename}: ${message}`,
+                })
               }
-
-              if (mime === "application/x-directory") {
-                const args = { filePath: filepath }
-                const exit = yield* execRead(args).pipe(Effect.exit)
-                if (Exit.isFailure(exit)) {
-                  const error = Cause.squash(exit.cause)
-                  yield* Effect.logError("failed to read directory", { error, filepath })
-                  const message = error instanceof Error ? error.message : String(error)
-                  yield* events.publish(Session.Event.Error, {
-                    sessionID: input.sessionID,
-                    error: new NamedError.Unknown({ message }).toObject(),
-                  })
+              return pieces
+            }
+            const url = new URL(part.url)
+            switch (url.protocol) {
+              case "data:":
+                if (part.mime === "text/plain") {
                   return [
                     {
                       messageID: info.id,
                       sessionID: input.sessionID,
                       type: "text",
                       synthetic: true,
-                      text: `Read tool failed to read ${filepath} with the following error: ${message}`,
+                      text: `Called the Read tool with the following input: ${JSON.stringify({ filePath: part.filename })}`,
                     },
+                    {
+                      messageID: info.id,
+                      sessionID: input.sessionID,
+                      type: "text",
+                      synthetic: true,
+                      text: decodeDataUrl(part.url),
+                    },
+                    { ...part, messageID: info.id, sessionID: input.sessionID },
                   ]
                 }
+                break
+              case "file:": {
+                yield* Effect.logInfo("file", { mime: part.mime })
+                const filepath = fileURLToPath(part.url)
+                const mime = (yield* fsys.isDir(filepath)) ? "application/x-directory" : part.mime
+
+                const { read } = yield* registry.named()
+                const execRead = (args: Parameters<typeof read.execute>[0], extra?: Tool.Context["extra"]) => {
+                  const controller = new AbortController()
+                  return read
+                    .execute(args, {
+                      sessionID: input.sessionID,
+                      abort: controller.signal,
+                      agent: input.agent!,
+                      messageID: info.id,
+                      extra: { bypassCwdCheck: true, ...extra },
+                      messages: [],
+                      metadata: () => Effect.void,
+                      ask: () => Effect.void,
+                    })
+                    .pipe(Effect.onInterrupt(() => Effect.sync(() => controller.abort())))
+                }
+
+                if (mime === "text/plain") {
+                  let offset: number | undefined
+                  let limit: number | undefined
+                  const range = { start: url.searchParams.get("start"), end: url.searchParams.get("end") }
+                  if (range.start != null) {
+                    const filePathURI = part.url.split("?")[0]
+                    let start = parseInt(range.start)
+                    let end = range.end ? parseInt(range.end) : undefined
+                    if (start === end) {
+                      const symbols = yield* lsp
+                        .documentSymbol(filePathURI)
+                        .pipe(Effect.catch(() => Effect.succeed([])))
+                      for (const symbol of symbols) {
+                        let r: LSP.Range | undefined
+                        if ("range" in symbol) r = symbol.range
+                        else if ("location" in symbol) r = symbol.location.range
+                        if (r?.start?.line && r?.start?.line === start) {
+                          start = r.start.line
+                          end = r?.end?.line ?? start
+                          break
+                        }
+                      }
+                    }
+                    offset = Math.max(start, 1)
+                    if (end) limit = end - (offset - 1)
+                  }
+                  const args = { filePath: filepath, offset, limit }
+                  const pieces: Draft<SessionV1.Part>[] = [
+                    {
+                      messageID: info.id,
+                      sessionID: input.sessionID,
+                      type: "text",
+                      synthetic: true,
+                      text: `Called the Read tool with the following input: ${JSON.stringify(args)}`,
+                    },
+                  ]
+                  const exit = yield* provider.getModel(info.model.providerID, info.model.modelID).pipe(
+                    Effect.flatMap((mdl) => execRead(args, { model: mdl })),
+                    Effect.exit,
+                  )
+                  if (Exit.isSuccess(exit)) {
+                    const result = exit.value
+                    pieces.push({
+                      messageID: info.id,
+                      sessionID: input.sessionID,
+                      type: "text",
+                      synthetic: true,
+                      text: result.output,
+                    })
+                    if (result.attachments?.length) {
+                      pieces.push(
+                        ...result.attachments.map((a) => ({
+                          ...a,
+                          synthetic: true,
+                          filename: a.filename ?? part.filename,
+                          messageID: info.id,
+                          sessionID: input.sessionID,
+                        })),
+                      )
+                    } else {
+                      pieces.push({ ...part, mime, messageID: info.id, sessionID: input.sessionID })
+                    }
+                  } else {
+                    const error = Cause.squash(exit.cause)
+                    yield* Effect.logError("failed to read file", { error, filepath })
+                    const message = error instanceof Error ? error.message : String(error)
+                    yield* events.publish(Session.Event.Error, {
+                      sessionID: input.sessionID,
+                      error: new NamedError.Unknown({ message }).toObject(),
+                    })
+                    pieces.push({
+                      messageID: info.id,
+                      sessionID: input.sessionID,
+                      type: "text",
+                      synthetic: true,
+                      text: `Read tool failed to read ${filepath} with the following error: ${message}`,
+                    })
+                  }
+                  return pieces
+                }
+
+                if (mime === "application/x-directory") {
+                  const args = { filePath: filepath }
+                  const exit = yield* execRead(args).pipe(Effect.exit)
+                  if (Exit.isFailure(exit)) {
+                    const error = Cause.squash(exit.cause)
+                    yield* Effect.logError("failed to read directory", { error, filepath })
+                    const message = error instanceof Error ? error.message : String(error)
+                    yield* events.publish(Session.Event.Error, {
+                      sessionID: input.sessionID,
+                      error: new NamedError.Unknown({ message }).toObject(),
+                    })
+                    return [
+                      {
+                        messageID: info.id,
+                        sessionID: input.sessionID,
+                        type: "text",
+                        synthetic: true,
+                        text: `Read tool failed to read ${filepath} with the following error: ${message}`,
+                      },
+                    ]
+                  }
+                  return [
+                    {
+                      messageID: info.id,
+                      sessionID: input.sessionID,
+                      type: "text",
+                      synthetic: true,
+                      text: `Called the Read tool with the following input: ${JSON.stringify(args)}`,
+                    },
+                    {
+                      messageID: info.id,
+                      sessionID: input.sessionID,
+                      type: "text",
+                      synthetic: true,
+                      text: exit.value.output,
+                    },
+                    { ...part, mime, messageID: info.id, sessionID: input.sessionID },
+                  ]
+                }
+
                 return [
                   {
                     messageID: info.id,
                     sessionID: input.sessionID,
                     type: "text",
                     synthetic: true,
-                    text: `Called the Read tool with the following input: ${JSON.stringify(args)}`,
+                    text: `Called the Read tool with the following input: {"filePath":"${filepath}"}`,
                   },
                   {
+                    id: part.id,
                     messageID: info.id,
                     sessionID: input.sessionID,
-                    type: "text",
-                    synthetic: true,
-                    text: exit.value.output,
+                    type: "file",
+                    url:
+                      `data:${mime};base64,` +
+                      Buffer.from(yield* fsys.readFile(filepath).pipe(Effect.catch(Effect.die))).toString("base64"),
+                    mime,
+                    filename: part.filename!,
+                    source: part.source,
                   },
-                  { ...part, mime, messageID: info.id, sessionID: input.sessionID },
                 ]
               }
-
-              return [
-                {
-                  messageID: info.id,
-                  sessionID: input.sessionID,
-                  type: "text",
-                  synthetic: true,
-                  text: `Called the Read tool with the following input: {"filePath":"${filepath}"}`,
-                },
-                {
-                  id: part.id,
-                  messageID: info.id,
-                  sessionID: input.sessionID,
-                  type: "file",
-                  url:
-                    `data:${mime};base64,` +
-                    Buffer.from(yield* fsys.readFile(filepath).pipe(Effect.catch(Effect.die))).toString("base64"),
-                  mime,
-                  filename: part.filename!,
-                  source: part.source,
-                },
-              ]
             }
           }
-        }
 
-        if (part.type === "agent") {
-          const perm = Permission.evaluate("task", part.name, ag.permission)
-          const hint = perm.action === "deny" ? " . Invoked by user; guaranteed to exist." : ""
-          return [
-            { ...part, messageID: info.id, sessionID: input.sessionID },
-            {
-              messageID: info.id,
-              sessionID: input.sessionID,
-              type: "text",
-              synthetic: true,
-              text:
-                " Use the above message and context to generate a prompt and call the task tool with subagent: " +
-                part.name +
-                hint,
-            },
-          ]
-        }
+          if (part.type === "agent") {
+            const perm = Permission.evaluate("task", part.name, ag.permission)
+            const hint = perm.action === "deny" ? " . Invoked by user; guaranteed to exist." : ""
+            return [
+              { ...part, messageID: info.id, sessionID: input.sessionID },
+              {
+                messageID: info.id,
+                sessionID: input.sessionID,
+                type: "text",
+                synthetic: true,
+                text:
+                  " Use the above message and context to generate a prompt and call the task tool with subagent: " +
+                  part.name +
+                  hint,
+              },
+            ]
+          }
 
-        return [{ ...part, messageID: info.id, sessionID: input.sessionID }]
-      })
+          return [{ ...part, messageID: info.id, sessionID: input.sessionID }]
+        })
 
       const resolvedParts = resolved
         ? input.parts.map((part) => assign({ ...part, messageID: info.id, sessionID: input.sessionID }))
@@ -1463,86 +1521,115 @@ const layer = Layer.effect(
         })
       }
 
-      const save = db
-        .transaction(
-          () =>
-            Effect.gen(function* () {
-              const retired = yield* db
-                .get<{
-                  session_id: string
-                }>(sql`SELECT session_id FROM runtime_retirement WHERE session_id = ${input.sessionID}`)
-                .pipe(Effect.orDie)
-              if (retired) return yield* Effect.interrupt
-              if (delivery && (delivery.delivery === "queue" || delivery.state === "claimed")) {
-                if (!(yield* ownsQueue(input.sessionID))) return yield* Effect.interrupt
-              }
-              if (delivery?.delivery === "steer" && delivery.state === "claimed") {
-                const stored = yield* queue.get(input.sessionID, delivery.id)
-                if (stored.state !== "claimed" || stored.messageID !== info.id) return yield* Effect.interrupt
-                const source = yield* sessions.findMessage(input.sessionID, (message) => message.info.id === info.id)
-                if (Option.isNone(source)) return yield* Effect.interrupt
-                info.time.created = source.value.info.time.created
-                for (const part of source.value.parts) {
-                  yield* sessions.removePart({ sessionID: input.sessionID, messageID: info.id, partID: part.id })
-                  if (part.type === "text" && part.metadata?.opencode_queue)
-                    parts.push({ ...part, text: "", synthetic: true, ignored: true })
-                }
-              } else if (delivery) yield* requireUnusedMessageID(info.id)
-              const current = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
-              if (
-                current.agent !== info.agent ||
-                current.model?.providerID !== info.model.providerID ||
-                current.model?.id !== info.model.modelID ||
-                (current.model?.variant === "default" ? undefined : current.model?.variant) !== info.model.variant
-              ) {
-                yield* sessions.setAgentModel({
-                  sessionID: input.sessionID,
-                  agent: info.agent,
-                  model: {
-                    id: info.model.modelID,
-                    providerID: info.model.providerID,
-                    variant: info.model.variant ?? "default",
-                  },
-                  time: info.time.created,
-                })
-              }
-              yield* sessions.updateMessage(info)
-              for (const part of parts) yield* sessions.updatePart(part)
-              if (delivery && (delivery.delivery === "queue" || delivery.state === "claimed")) {
-                yield* queue.delivered(input.sessionID, delivery.id, info.id)
-                return
-              }
-              if (delivery) {
-                yield* queue.attachSteer(input.sessionID, delivery.id, info.id)
-                return
-              }
-              yield* queue.registerSteer(
-                input.sessionID,
-                info.id,
-                {
-                  kind: "prompt",
-                  agent: info.agent,
-                  model: info.model,
-                  variant: info.model.variant,
-                  parts: parts
-                    .filter(
-                      (part) =>
-                        part.type === "text" ||
-                        part.type === "file" ||
-                        part.type === "agent" ||
-                        part.type === "subtask",
+      const save = (active?: SessionV1.User["model"]) =>
+        Effect.gen(function* () {
+          if (input.selection && !resolved) {
+            const inherited = input.selection.inheritActive ? active : undefined
+            const selected = input.selection.model ?? inherited ?? info.model
+            const full = yield* getModel(
+              ProviderV2.ID.make(selected.providerID),
+              ModelV2.ID.make(selected.modelID),
+              input.sessionID,
+            )
+            const variant = input.selection.variant ?? inherited?.variant ?? info.model.variant ?? "default"
+            const supported = variant === "default" || Object.hasOwn(full.variants ?? {}, variant)
+            if (input.selection.variant !== undefined && !supported)
+              return yield* new InputError({
+                message: `Variant not found: "${variant}" for ${selected.providerID}/${selected.modelID}`,
+              })
+            info.model = {
+              providerID: ProviderV2.ID.make(selected.providerID),
+              modelID: ModelV2.ID.make(selected.modelID),
+              variant: supported ? variant : "default",
+            }
+          }
+          yield* db
+            .transaction(
+              () =>
+                Effect.gen(function* () {
+                  const retired = yield* db
+                    .get<{
+                      session_id: string
+                    }>(sql`SELECT session_id FROM runtime_retirement WHERE session_id = ${input.sessionID}`)
+                    .pipe(Effect.orDie)
+                  if (retired) return yield* Effect.interrupt
+                  if (delivery && (delivery.delivery === "queue" || delivery.state === "claimed")) {
+                    if (!(yield* ownsQueue(input.sessionID))) return yield* Effect.interrupt
+                  }
+                  if (delivery?.delivery === "steer" && delivery.state === "claimed") {
+                    const stored = yield* queue.get(input.sessionID, delivery.id)
+                    if (stored.state !== "claimed" || stored.messageID !== info.id) return yield* Effect.interrupt
+                    const source = yield* sessions.findMessage(
+                      input.sessionID,
+                      (message) => message.info.id === info.id,
                     )
-                    .map(({ id, messageID, sessionID, ...part }) => part),
-                  system: info.system,
-                  format: info.format,
-                  tools: info.tools,
-                },
-                info.id,
-              )
-            }),
-          { behavior: "immediate" },
-        )
-        .pipe(Effect.orDie)
+                    if (Option.isNone(source)) return yield* Effect.interrupt
+                    info.time.created = source.value.info.time.created
+                    for (const part of source.value.parts) {
+                      yield* sessions.removePart({ sessionID: input.sessionID, messageID: info.id, partID: part.id })
+                      if (part.type === "text" && part.metadata?.opencode_queue)
+                        parts.push({ ...part, text: "", synthetic: true, ignored: true })
+                    }
+                  } else if (delivery) yield* requireUnusedMessageID(info.id)
+                  const current = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
+                  if (
+                    !input.selection &&
+                    (current.agent !== info.agent ||
+                      current.model?.providerID !== info.model.providerID ||
+                      current.model?.id !== info.model.modelID ||
+                      (current.model?.variant === "default" ? undefined : current.model?.variant) !==
+                        info.model.variant)
+                  ) {
+                    yield* sessions.setAgentModel({
+                      sessionID: input.sessionID,
+                      agent: info.agent,
+                      model: {
+                        id: info.model.modelID,
+                        providerID: info.model.providerID,
+                        variant: info.model.variant ?? "default",
+                      },
+                      time: info.time.created,
+                    })
+                  }
+                  yield* sessions.updateMessage(info)
+                  for (const part of parts) yield* sessions.updatePart(part)
+                  if (delivery && (delivery.delivery === "queue" || delivery.state === "claimed")) {
+                    yield* queue.delivered(input.sessionID, delivery.id, info.id)
+                    return
+                  }
+                  if (delivery) {
+                    yield* queue.attachSteer(input.sessionID, delivery.id, info.id)
+                    return
+                  }
+                  yield* queue.registerSteer(
+                    input.sessionID,
+                    info.id,
+                    {
+                      kind: "prompt",
+                      agent: info.agent,
+                      model: info.model,
+                      variant: info.model.variant,
+                      selection: input.selection ? {} : undefined,
+                      parts: parts
+                        .filter(
+                          (part) =>
+                            part.type === "text" ||
+                            part.type === "file" ||
+                            part.type === "agent" ||
+                            part.type === "subtask",
+                        )
+                        .map(({ id, messageID, sessionID, ...part }) => part),
+                      system: info.system,
+                      format: info.format,
+                      tools: info.tools,
+                    },
+                    info.id,
+                  )
+                }),
+              { behavior: "immediate" },
+            )
+            .pipe(Effect.orDie)
+        }).pipe(Effect.asVoid)
 
       return { message: { info, parts }, save }
     }, Effect.scoped)
@@ -1553,7 +1640,7 @@ const layer = Layer.effect(
       resolved = false,
     ) {
       const prepared = yield* prepareUserMessage(input, delivery, resolved)
-      yield* prepared.save
+      yield* prepared.save()
       yield* notifyQueue(input.sessionID).pipe(Effect.orDie)
       return prepared.message
     })
@@ -1563,107 +1650,151 @@ const layer = Layer.effect(
       task?: TaskAdmission,
       delivery?: SessionQueueV1.Entry,
       resolved?: boolean,
-    ) => Effect.Effect<SessionV1.WithParts, Image.Error | RuntimeLifecycle.RuntimeDrainingError> = Effect.fn(
-      "SessionPrompt.prompt",
-    )(function* (input: PromptInput, task?: TaskAdmission, delivery?: SessionQueueV1.Entry, resolved = false) {
-      rejectManagedInputParts(input.parts)
-      const session = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
-      const work = Effect.gen(function* () {
-        const existing =
-          input.idempotent && input.messageID
-            ? yield* sessions
-                .findMessage(input.sessionID, (item) => item.info.id === input.messageID)
-                .pipe(Effect.orDie)
-            : Option.none<SessionV1.WithParts>()
-        const complete =
-          Option.isSome(existing) &&
-          input.parts.every((part) => part.id && existing.value.parts.some((saved) => saved.id === part.id))
-        const message = complete
-          ? existing.value
-          : yield* Effect.gen(function* () {
-              yield* revert.cleanup(session)
-              return yield* createUserMessage(input, delivery, resolved)
-            })
-        yield* sessions.touch(input.sessionID)
+    ) => Effect.Effect<SessionV1.WithParts, Image.Error | InputError | RuntimeLifecycle.RuntimeDrainingError> =
+      Effect.fn("SessionPrompt.prompt")(function* (
+        input: PromptInput,
+        task?: TaskAdmission,
+        delivery?: SessionQueueV1.Entry,
+        resolved = false,
+      ) {
+        rejectManagedInputParts(input.parts)
+        const session = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
+        const work = Effect.gen(function* () {
+          const existing =
+            input.idempotent && input.messageID
+              ? yield* sessions
+                  .findMessage(input.sessionID, (item) => item.info.id === input.messageID)
+                  .pipe(Effect.orDie)
+              : Option.none<SessionV1.WithParts>()
+          const complete =
+            Option.isSome(existing) &&
+            input.parts.every((part) => part.id && existing.value.parts.some((saved) => saved.id === part.id))
+          const prepared = complete
+            ? { message: existing.value, save: () => Effect.void }
+            : yield* Effect.gen(function* () {
+                yield* revert.cleanup(session)
+                return yield* prepareUserMessage(input, delivery, resolved)
+              })
+          yield* sessions.touch(input.sessionID)
 
-        const permissions: PermissionV1.Rule[] = []
-        for (const [t, enabled] of Object.entries(input.tools ?? {})) {
-          permissions.push({ permission: t, action: enabled ? "allow" : "deny", pattern: "*" })
-        }
-        if (permissions.length > 0) {
-          session.permission = permissions
-          yield* sessions.setPermission({ sessionID: session.id, permission: permissions })
-        }
-        return message
-      })
+          const permissions: PermissionV1.Rule[] = []
+          for (const [t, enabled] of Object.entries(input.tools ?? {})) {
+            permissions.push({ permission: t, action: enabled ? "allow" : "deny", pattern: "*" })
+          }
+          if (permissions.length > 0) {
+            session.permission = permissions
+            yield* sessions.setPermission({ sessionID: session.id, permission: permissions })
+          }
+          return prepared
+        })
 
-      if (input.noReply === true && delivery) return yield* work
-      yield* Effect.logInfo("restart diagnostic runtime admission requested", {
-        sessionID: input.sessionID,
-        parentSessionID: session.parentID,
-      })
-      let interrupted = false
-      return yield* Effect.acquireUseRelease(
-        runtime
-          .admit({
-            sessionID: input.sessionID,
-            directory: session.directory,
-            parentSessionID: session.parentID,
-            managedChildAuthorization: task?.managedChildAuthorization?.prompt,
-            parentMessageID: task?.parentMessageID,
-            parentCallID: task?.parentCallID,
-            parentMode: task?.parentMode,
-            rejectCancelled: task?.notification || input.noReply,
-            rejectRecoveryNeeded: task?.notification,
-            recoveryFence: task?.recoveryFence,
-            manualRecovery: task === undefined || task.admission !== undefined,
-          })
-          .pipe(Effect.tapError((error) => (task?.admission ? Deferred.fail(task.admission, error) : Effect.void))),
-        (admission) =>
-          Effect.gen(function* () {
-            if (task?.admission) yield* Deferred.succeed(task.admission, undefined)
-            yield* Effect.logInfo("restart diagnostic runtime admission accepted", {
-              sessionID: input.sessionID,
-              parentSessionID: session.parentID,
-            })
-            const loop = runLoop(
-              input.sessionID,
-              admission.manualRecovery,
-              admission.manualRecovery,
-              admission.manualRecovery,
-              true,
-              admission.fence,
-              task?.managedChildAuthorization?.runner,
-            ).pipe(
-              Effect.onExit((exit) =>
-                Effect.sync(() => (interrupted = Exit.isFailure(exit) && Cause.hasInterrupts(exit.cause))),
+        if (input.noReply === true && delivery) {
+          const prepared = yield* work
+          if (delivery.delivery === "queue" || delivery.state === "claimed")
+            yield* state.admit(input.sessionID, () =>
+              prepared.save().pipe(
+                Effect.map(() => {
+                  if (prepared.message.info.role !== "user") throw new Error("Expected admitted user message")
+                  return prepared.message.info
+                }),
               ),
             )
-            if (!(yield* runtime.beforeTurn(input.sessionID)))
-              return yield* new RuntimeLifecycle.RuntimeDrainingError({
-                message: "Session execution is no longer active",
+          else yield* prepared.save()
+          yield* notifyQueue(input.sessionID).pipe(Effect.orDie)
+          return prepared.message
+        }
+        yield* Effect.logInfo("restart diagnostic runtime admission requested", {
+          sessionID: input.sessionID,
+          parentSessionID: session.parentID,
+        })
+        let interrupted = false
+        return yield* Effect.acquireUseRelease(
+          runtime
+            .admit({
+              sessionID: input.sessionID,
+              directory: session.directory,
+              parentSessionID: session.parentID,
+              managedChildAuthorization: task?.managedChildAuthorization?.prompt,
+              parentMessageID: task?.parentMessageID,
+              parentCallID: task?.parentCallID,
+              parentMode: task?.parentMode,
+              rejectCancelled: task?.notification || input.noReply,
+              rejectRecoveryNeeded: task?.notification,
+              recoveryFence: task?.recoveryFence,
+              manualRecovery: task === undefined || task.admission !== undefined,
+            })
+            .pipe(Effect.tapError((error) => (task?.admission ? Deferred.fail(task.admission, error) : Effect.void))),
+          (admission) =>
+            Effect.gen(function* () {
+              yield* Effect.logInfo("restart diagnostic runtime admission accepted", {
+                sessionID: input.sessionID,
+                parentSessionID: session.parentID,
               })
-            const message = yield* work
-            if (!(yield* runtime.beforeTurn(input.sessionID)))
-              return yield* new RuntimeLifecycle.RuntimeDrainingError({
-                message: "Session execution is no longer active",
-              })
-            return input.noReply ? message : yield* state.enqueue(input.sessionID, lastAssistant(input.sessionID), loop)
-          }).pipe(
-            Effect.onExit((exit) =>
-              Effect.sync(() => {
-                if (Exit.isFailure(exit) && Cause.squash(exit.cause) instanceof Runner.Interrupted) interrupted = true
-              }),
+              const loop = runLoop(
+                input.sessionID,
+                admission.manualRecovery,
+                admission.manualRecovery,
+                admission.manualRecovery,
+                true,
+                admission.fence,
+                task?.managedChildAuthorization?.runner,
+              ).pipe(
+                Effect.onExit((exit) =>
+                  Effect.sync(() => (interrupted = Exit.isFailure(exit) && Cause.hasInterrupts(exit.cause))),
+                ),
+              )
+              if (!(yield* runtime.beforeTurn(input.sessionID)))
+                return yield* new RuntimeLifecycle.RuntimeDrainingError({
+                  message: "Session execution is no longer active",
+                })
+              const prepared = yield* work
+              if (!(yield* runtime.beforeTurn(input.sessionID)))
+                return yield* new RuntimeLifecycle.RuntimeDrainingError({
+                  message: "Session execution is no longer active",
+                })
+              if (input.noReply) {
+                yield* state.admit(input.sessionID, (active) =>
+                  prepared.save(active).pipe(
+                    Effect.map(() => {
+                      if (prepared.message.info.role !== "user") throw new Error("Expected admitted user message")
+                      return prepared.message.info
+                    }),
+                  ),
+                )
+                yield* notifyQueue(input.sessionID).pipe(Effect.orDie)
+                if (task?.admission) yield* Deferred.succeed(task.admission, undefined)
+                return prepared.message
+              }
+              return yield* state.enqueue(input.sessionID, lastAssistant(input.sessionID), loop, (active) =>
+                prepared.save(active).pipe(
+                  Effect.andThen(notifyQueue(input.sessionID).pipe(Effect.orDie)),
+                  Effect.tap(() => (task?.admission ? Deferred.succeed(task.admission, undefined) : Effect.void)),
+                  Effect.map(() => {
+                    if (prepared.message.info.role !== "user") throw new Error("Expected admitted user message")
+                    return prepared.message.info
+                  }),
+                ),
+              )
+            }).pipe(
+              Effect.tapError((error) =>
+                task?.admission && error._tag === "PromptInputError"
+                  ? Deferred.fail(task.admission, error)
+                  : Effect.void,
+              ),
+              Effect.onExit((exit) =>
+                Effect.sync(() => {
+                  if (Exit.isFailure(exit) && Cause.squash(exit.cause) instanceof Runner.Interrupted) interrupted = true
+                }),
+              ),
             ),
-          ),
-        (admission) =>
-          interrupted
-            ? Effect.gen(function* () {
-                yield* releaseInterrupted(input.sessionID, admission.fence)
-              })
-            : runtime.release(input.sessionID, admission.fence),
-      )
-    })
+          (admission) =>
+            interrupted
+              ? Effect.gen(function* () {
+                  yield* releaseInterrupted(input.sessionID, admission.fence)
+                })
+              : runtime.release(input.sessionID, admission.fence),
+        )
+      })
 
     const lastAssistant = Effect.fnUntraced(function* (sessionID: SessionID) {
       const match = yield* sessions.findMessage(sessionID, (m) => m.info.role !== "user").pipe(Effect.orDie)
@@ -1684,6 +1815,7 @@ const layer = Layer.effect(
           modelID: ModelV2.ID.make(payload.model.modelID),
         },
         variant: payload.variant,
+        selection: payload.selection ? { ...payload.selection, inheritActive: false } : undefined,
         noReply: true,
       }
       if (payload.kind === "prompt") {
@@ -1943,6 +2075,44 @@ const layer = Layer.effect(
         })
     })
 
+    const commandDefaultModel = Effect.fnUntraced(function* (cmd: Command.Info) {
+      if (cmd.model) return Provider.parseModel(cmd.model)
+      if (!cmd.agent) return
+      const agent = yield* agents.get(cmd.agent)
+      return agent?.model
+    })
+
+    const validateQueueSelection = Effect.fn("SessionPrompt.validateQueueSelection")(function* (
+      sessionID: SessionID,
+      payload: SessionQueueV1.Payload,
+    ) {
+      if ((payload.kind !== "prompt" && payload.kind !== "command") || !payload.selection) return
+      const commandModel =
+        payload.kind === "command"
+          ? yield* Effect.gen(function* () {
+              const session = yield* sessions.get(sessionID).pipe(Effect.orDie)
+              const cmd = yield* commands.get(payload.command, McpActivation.names(session.metadata))
+              if (!cmd) return
+              const agent = yield* agents.get(cmd.agent ?? payload.agent)
+              if (cmd.subtask === true || (agent?.mode === "subagent" && cmd.subtask !== false)) return
+              return yield* commandDefaultModel(cmd)
+            })
+          : undefined
+      const selected = payload.selection.model ?? commandModel ?? payload.model
+      const model = yield* getModel(
+        ProviderV2.ID.make(selected.providerID),
+        ModelV2.ID.make(selected.modelID),
+        sessionID,
+      )
+      const variant = payload.selection.variant
+      if (variant !== undefined && variant !== "default" && !Object.hasOwn(model.variants ?? {}, variant))
+        return yield* new SessionQueue.QueueError({
+          reason: "invalid",
+          message: `Variant not found: "${variant}" for ${selected.providerID}/${selected.modelID}`,
+        })
+      return selected
+    })
+
     const queueSubmit = Effect.fn("SessionPrompt.queueSubmit")(function* (
       sessionID: SessionID,
       input: SessionQueueV1.Submit,
@@ -1965,6 +2135,7 @@ const layer = Layer.effect(
           message: "Structured subtasks are unavailable in the managed profile",
         })
       yield* requireManagedRootQueue(sessionID)
+      yield* validateQueueSelection(sessionID, input.payload)
       yield* queue.enqueue(sessionID, input)
       yield* wakeQueue(sessionID)
       return yield* notifyQueue(sessionID)
@@ -1976,6 +2147,7 @@ const layer = Layer.effect(
       origin: SessionV1.ScheduledOrigin,
     ) {
       yield* requireManagedRootQueue(sessionID)
+      yield* validateQueueSelection(sessionID, input.payload)
       yield* queue.enqueueScheduled(sessionID, input, origin)
       yield* wakeQueue(sessionID, false, true)
       return yield* notifyQueue(sessionID)
@@ -2001,6 +2173,7 @@ const layer = Layer.effect(
               .get()
               .pipe(Effect.orDie)
           : undefined
+      const selected = entry && !entry.messageID ? yield* validateQueueSelection(sessionID, entry.payload) : undefined
       const prepared =
         entry && !entry.messageID && entry.payload.kind !== "compact"
           ? yield* prepareUserMessage(
@@ -2010,10 +2183,11 @@ const layer = Layer.effect(
                 messageID: MessageID.make(`msg_queue_${entry.id}`),
                 agent: entry.payload.agent,
                 model: {
-                  providerID: ProviderV2.ID.make(entry.payload.model.providerID),
-                  modelID: ModelV2.ID.make(entry.payload.model.modelID),
+                  providerID: ProviderV2.ID.make((selected ?? entry.payload.model).providerID),
+                  modelID: ModelV2.ID.make((selected ?? entry.payload.model).modelID),
                 },
                 variant: entry.payload.variant,
+                selection: entry.payload.selection ? { ...entry.payload.selection, inheritActive: false } : undefined,
                 parts:
                   entry.payload.kind === "prompt"
                     ? [...entry.payload.parts]
@@ -2028,7 +2202,7 @@ const layer = Layer.effect(
               original?.delivery === "steer",
             )
           : undefined
-      yield* db
+      const mutation = db
         .transaction(
           () =>
             Effect.gen(function* () {
@@ -2036,12 +2210,20 @@ const layer = Layer.effect(
               if (input.mutation.action === "pause" && !input.mutation.paused) yield* queue.unblock(sessionID)
               if (input.mutation.action !== "convert" || input.mutation.delivery !== "steer") return
               const entry = yield* queue.get(sessionID, input.mutation.id)
-              if (prepared) yield* prepared.save
+              if (prepared) yield* prepared.save()
               else if (!entry.messageID) yield* materialize(entry)
             }),
           { behavior: "immediate" },
         )
         .pipe(Effect.catchTag("SqlError", Effect.die))
+      const existing = entry?.messageID
+        ? yield* sessions.findMessage(sessionID, (message) => message.info.id === entry.messageID).pipe(Effect.orDie)
+        : Option.none<SessionV1.WithParts>()
+      const parent =
+        prepared?.message.info ??
+        (Option.isSome(existing) && existing.value.info.role === "user" ? existing.value.info : undefined)
+      if (parent) yield* state.admit(sessionID, () => mutation.pipe(Effect.as(parent)))
+      else yield* mutation
       yield* notifyQueue(sessionID)
       if (
         (input.mutation.action === "convert" && input.mutation.delivery === "steer") ||
@@ -2325,6 +2507,7 @@ const layer = Layer.effect(
             continue
 
           if (!lastUser) throw new Error("No user message found in stream. This should never happen.")
+          yield* state.observe(sessionID, lastUser, new Set(msgs.map((message) => message.info.id)))
           if (userID !== lastUser.id) {
             const internalCompaction =
               process.env.OPENCODE_MANAGED_PROFILE === "1" &&
@@ -2843,7 +3026,7 @@ const layer = Layer.effect(
       const activated = McpActivation.names((yield* sessions.get(input.sessionID).pipe(Effect.orDie)).metadata)
       const cmd = yield* commands.get(input.command, activated)
       if (!cmd) {
-        const available = (yield* commands.list(activated)).map((c) => c.name)
+        const available = (yield* commands.list(activated)).filter((c) => c.source !== "skill").map((c) => c.name)
         const hint = available.length ? ` Available commands: ${available.join(", ")}` : ""
         const error = new NamedError.Unknown({ message: `Command not found: "${input.command}".${hint}` })
         yield* events.publish(Session.Event.Error, { sessionID: input.sessionID, error: error.toObject() })
@@ -2906,12 +3089,14 @@ const layer = Layer.effect(
       }
       template = template.trim()
 
+      const commandModel = yield* commandDefaultModel(cmd)
       const taskModel = yield* Effect.gen(function* () {
-        if (cmd.model) return Provider.parseModel(cmd.model)
-        if (cmd.agent) {
-          const cmdAgent = yield* agents.get(cmd.agent)
-          if (cmdAgent?.model) return cmdAgent.model
-        }
+        if (input.selection?.model)
+          return {
+            providerID: ProviderV2.ID.make(input.selection.model.providerID),
+            modelID: ModelV2.ID.make(input.selection.model.modelID),
+          }
+        if (commandModel) return commandModel
         if (input.model) return Provider.parseModel(input.model)
         return yield* currentModel(input.sessionID)
       })
@@ -2970,6 +3155,12 @@ const layer = Layer.effect(
           agent: userAgent,
           parts,
           variant: input.variant,
+          selection: input.selection
+            ? {
+                ...input.selection,
+                model: input.selection.model ?? (!isSubtask ? commandModel : undefined),
+              }
+            : undefined,
           noReply: delivery ? true : undefined,
         },
         undefined,
@@ -3020,6 +3211,7 @@ export const PromptInput = Schema.Struct({
   format: Schema.optional(SessionV1.Format),
   system: Schema.optional(Schema.String),
   variant: Schema.optional(Schema.String),
+  selection: Schema.optional(SessionQueueV1.Selection),
   parts: Schema.Array(
     Schema.Union([
       SessionV1.TextPartInput,
@@ -3056,6 +3248,7 @@ export const CommandInput = Schema.Struct({
   arguments: Schema.String,
   command: Schema.String,
   variant: Schema.optional(Schema.String),
+  selection: Schema.optional(SessionQueueV1.Selection),
   // Inlined (no identifier annotation) to keep the original SDK output — the
   // PromptInput call site below references FilePartInput by ref via the
   // Schema export in message-v2.ts.
@@ -3141,6 +3334,8 @@ export const node = LayerNode.make({
     EventV2Bridge.node,
     RuntimeFlags.node,
     Database.node,
+    Skill.node,
+    Ripgrep.node,
   ],
 })
 

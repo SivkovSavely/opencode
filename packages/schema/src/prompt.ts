@@ -1,6 +1,14 @@
 import { Schema } from "effect"
 import { optional } from "./schema"
 import { statics } from "./schema"
+import { Model } from "./model"
+
+export interface Selection extends Schema.Schema.Type<typeof Selection> {}
+export const Selection = Schema.Struct({
+  inheritActive: Schema.Boolean.pipe(optional),
+  model: Schema.Struct({ providerID: Model.Ref.fields.providerID, modelID: Model.Ref.fields.id }).pipe(optional),
+  variant: Model.Ref.fields.variant,
+}).annotate({ identifier: "Prompt.Selection" })
 
 export interface Source extends Schema.Schema.Type<typeof Source> {}
 export const Source = Schema.Struct({
@@ -42,16 +50,24 @@ export const Prompt = Schema.Struct({
   text: Schema.String,
   files: Schema.Array(FileAttachment).pipe(optional),
   agents: Schema.Array(AgentAttachment).pipe(optional),
+  agent: Schema.String.pipe(optional),
+  model: Model.Ref.pipe(optional),
+  requestedModel: Model.Ref.pipe(optional),
+  selection: Selection.pipe(optional),
 })
   .annotate({ identifier: "Prompt" })
   .pipe(
     statics((schema) => ({
       equivalence: Schema.toEquivalence(schema),
-      fromUserMessage: (input: Pick<Prompt, "text" | "files" | "agents">) =>
+      fromUserMessage: (input: Prompt) =>
         schema.make({
           text: input.text,
           ...(input.files === undefined ? {} : { files: input.files }),
           ...(input.agents === undefined ? {} : { agents: input.agents }),
+          ...(input.agent === undefined ? {} : { agent: input.agent }),
+          ...(input.model === undefined ? {} : { model: input.model }),
+          ...(input.requestedModel === undefined ? {} : { requestedModel: input.requestedModel }),
+          ...(input.selection === undefined ? {} : { selection: input.selection }),
         }),
     })),
   )

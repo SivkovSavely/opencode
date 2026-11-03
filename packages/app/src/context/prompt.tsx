@@ -29,6 +29,9 @@ export {
 } from "./prompt-state"
 export type {
   AgentPart,
+  ModelPart,
+  VariantPart,
+  SkillPart,
   ContentPart,
   ContextItem,
   FileAttachmentPart,

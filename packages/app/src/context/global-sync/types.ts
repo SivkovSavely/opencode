@@ -33,7 +33,7 @@ export type ProjectMeta = {
 export type State = {
   status: "loading" | "partial" | "complete"
   agent: Agent[]
-  command: CommandInfo[]
+  command: (CommandInfo & { source?: "command" | "mcp" | "skill" })[]
   reference: ReferenceInfo[]
   project: string
   projectMeta: ProjectMeta | undefined

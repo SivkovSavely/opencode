@@ -122,7 +122,10 @@ function toLLMMessage(message: SessionMessage.Message, model: Model): Message[] 
         Message.make({
           id: message.id,
           role: "user",
-          content: [{ type: "text", text: message.text }, ...(message.files ?? []).map(media)],
+          content: [
+            { type: "text", text: message.text },
+            ...(message.files ?? []).filter((file) => !file.uri.startsWith("skill:")).map(media),
+          ],
           metadata: {
             ...message.metadata,
             ...(message.agents?.length ? { agents: message.agents } : {}),

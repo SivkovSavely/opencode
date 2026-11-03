@@ -19,6 +19,33 @@ const it = testEffect(AppNodeBuilder.build(LayerNode.group([CommandV2.node, FSUt
 const decode = Schema.decodeUnknownSync(Config.Info)
 
 describe("ConfigCommandPlugin.Plugin", () => {
+  it.effect("retains a command variant default without requiring a command model default", () =>
+    Effect.gen(function* () {
+      const command = yield* CommandV2.Service
+      yield* ConfigCommandPlugin.Plugin.effect(host({ command: { ...command, reload: command.reload } })).pipe(
+        Effect.provideService(
+          Config.Service,
+          Config.Service.of({
+            entries: () =>
+              Effect.succeed([
+                new Config.Document({
+                  type: "document",
+                  info: decode({ commands: { review: { template: "Review", variant: "high" } } }),
+                }),
+              ]),
+          }),
+        ),
+      )
+      expect(yield* command.get("review")).toEqual(
+        CommandV2.Info.make({
+          name: "review",
+          template: "Review",
+          variant: ModelV2.VariantID.make("high"),
+        }),
+      )
+    }),
+  )
+
   it.live("loads inline and file-based commands in config order", () =>
     Effect.acquireRelease(
       Effect.promise(() => tmpdir()),

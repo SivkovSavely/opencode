@@ -12,11 +12,27 @@ export function queueSubmissionKey(input: {
 
 export function queuePayload(
   command: Extract<QueueCommand.Result, { type: "enqueue" }>,
-  captured: { agent: string; model: { providerID: string; modelID: string }; variant?: string },
+  captured: {
+    agent: string
+    model: { providerID: string; modelID: string }
+    variant?: string
+    selection?: { model?: { providerID: string; modelID: string }; variant?: string }
+  },
   parts: Extract<SessionQueueV1.Payload, { kind: "prompt" }>["parts"],
   sourceText = command.body,
 ): SessionQueueV1.Payload {
-  const selection = { ...captured, model: { ...captured.model } }
+  const selection = {
+    ...captured,
+    model: { ...captured.model },
+    ...(captured.selection
+      ? {
+          selection: {
+            ...captured.selection,
+            ...(captured.selection.model ? { model: { ...captured.selection.model } } : {}),
+          },
+        }
+      : {}),
+  }
   if (command.kind === "compact") return { ...selection, kind: "compact" }
   if (command.kind === "shell") return { ...selection, kind: "shell", command: command.command }
   if (command.kind === "command")

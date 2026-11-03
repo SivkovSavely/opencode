@@ -5,6 +5,7 @@ import { encodeFilePath } from "@/context/file/path"
 import type { AgentPart, FileAttachmentPart, ImageAttachmentPart, Prompt } from "@/context/prompt"
 import { Identifier } from "@/utils/id"
 import { createCommentMetadata, formatCommentNote } from "@/utils/comment-note"
+import { materializePrompt } from "./controls"
 
 type PromptRequestPart = (TextPartInput | FilePartInput | AgentPartInput) & { id: string }
 
@@ -89,6 +90,9 @@ const toOptimisticPart = (part: PromptRequestPart, sessionID: string, messageID:
 }
 
 export function buildRequestParts(input: BuildRequestPartsInput) {
+  const clean = materializePrompt(input.prompt)
+  if (input.prompt.some((part) => part.type === "model" || part.type === "variant"))
+    input = { ...input, prompt: clean.prompt, text: clean.text }
   const requestParts: PromptRequestPart[] = input.text.trim()
     ? [
         {
@@ -204,7 +208,20 @@ export function buildRequestParts(input: BuildRequestPartsInput) {
     } satisfies PromptRequestPart
   })
 
-  requestParts.push(...files, ...context, ...agents, ...images)
+  const skills = input.prompt.flatMap((part) =>
+    part.type === "skill"
+      ? [
+          {
+            id: Identifier.ascending("part"),
+            type: "file" as const,
+            mime: "application/x-opencode-skill",
+            filename: part.name,
+            url: `skill:${encodeURIComponent(part.name)}`,
+          },
+        ]
+      : [],
+  )
+  requestParts.push(...files, ...context, ...agents, ...skills, ...images)
 
   return {
     requestParts,

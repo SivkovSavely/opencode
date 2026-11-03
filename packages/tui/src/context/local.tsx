@@ -173,6 +173,7 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
         }
         state.pending = false
         void writeJsonAtomic(filePath, {
+          model: modelStore.model,
           recent: modelStore.recent,
           favorite: modelStore.favorite,
           variant: modelStore.variant,
@@ -183,6 +184,25 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
         .then((x) => {
           if (!x || typeof x !== "object") return
           const value = x as Record<string, unknown>
+          if (typeof value.model === "object" && value.model !== null)
+            setModelStore("model", {
+              ...Object.fromEntries(
+                Object.entries(value.model).filter(
+                  (entry): entry is [string, { providerID: string; modelID: string }] => {
+                    const model: unknown = entry[1]
+                    return (
+                      !!model &&
+                      typeof model === "object" &&
+                      "providerID" in model &&
+                      typeof model.providerID === "string" &&
+                      "modelID" in model &&
+                      typeof model.modelID === "string"
+                    )
+                  },
+                ),
+              ),
+              ...modelStore.model,
+            })
           if (Array.isArray(value.recent)) setModelStore("recent", value.recent)
           if (Array.isArray(value.favorite)) setModelStore("favorite", value.favorite)
           if (typeof value.variant === "object" && value.variant !== null)
@@ -286,6 +306,7 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
           const a = agent.current()
           if (!a) return
           setModelStore("model", a.name, { ...val })
+          save()
         },
         cycleFavorite(direction: 1 | -1) {
           const favorites = modelStore.favorite.filter((item) => isModelValid(item))
@@ -330,6 +351,7 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
             const a = agent.current()
             if (!a) return
             setModelStore("model", a.name, model)
+            save()
             if (options?.recent) {
               setModelStore("recent", recentModels(model, modelStore.recent))
               save()

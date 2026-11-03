@@ -1,8 +1,10 @@
 import { createEffect, on, type Accessor } from "solid-js"
 import { createStore, reconcile } from "solid-js/store"
 import { useFilteredList } from "@opencode-ai/ui/hooks"
+import { promptInputV2Suggestions } from "./suggestions"
 import { createPromptInputV2Attachments, type PromptInputV2AttachmentConfig } from "./attachments"
 import { createPromptInputV2Store, type PromptInputV2StoreInput } from "./store"
+import { isPromptInputV2Control } from "./logical"
 import type {
   PromptInputV2Attachment,
   PromptInputV2Comment,
@@ -77,11 +79,20 @@ export function createPromptInputV2Controller(input: {
   const draft = createPromptInputV2Store(input.store)
   const [state, setState] = input.state ?? createPromptInputV2State()
   if (input.identity) {
-    createEffect(on(input.identity, () => setState(reconcile(createPromptInputV2InteractionState())), { defer: true }))
+    createEffect(
+      on(
+        input.identity,
+        () => {
+          draft.clearUndo()
+          setState(reconcile(createPromptInputV2InteractionState()))
+        },
+        { defer: true },
+      ),
+    )
   }
   function addPart(part: PromptInputV2PersistedState["prompt"][number]) {
     if (part.type === "image") return false
-    if (part.type === "file" || part.type === "agent") {
+    if (part.type !== "text") {
       draft.addMention(part)
       return true
     }
@@ -110,17 +121,10 @@ export function createPromptInputV2Controller(input: {
     attachments.pick(() => fileInput?.click())
   }
   const contextList = useFilteredList<PromptInputV2Suggestion>({
-    items: async (query) => {
-      const fixed = input.context().filter((item) => item.kind !== "file")
-      const recent = input.context().filter((item) => item.kind === "file" && item.recent)
-      if (!query.trim()) return [...fixed, ...recent]
-      const seen = new Set(recent.map((item) => item.id))
-      const files = (await input.searchContextFiles(query)).filter((item) => !seen.has(item.id))
-      return [...fixed, ...recent, ...files]
-    },
+    items: (query) => promptInputV2Suggestions(query, input.context(), input.searchContextFiles),
     key: (item) => item.id,
-    filterKeys: ["label"],
-    skipFilter: (item) => item.kind === "file" && !item.recent,
+    filterKeys: ["label", "description", "path"],
+    skipFilter: () => true,
     groupBy: (item) => {
       if (item.kind === "reference") return "reference"
       if (item.kind === "agent") return "agent"
@@ -142,6 +146,10 @@ export function createPromptInputV2Controller(input: {
   const suggestions = () => list().flat()
 
   const execute = (command: PromptInputV2InteractionCommand) => {
+    if (command.type === "draft.replace") {
+      draft.replaceRange(command.start, command.end, command.value)
+      return
+    }
     if (command.type === "draft.setText") {
       draft.setText(command.value)
       return
@@ -159,7 +167,7 @@ export function createPromptInputV2Controller(input: {
       if (item) dispatch({ type: "popover.select", item })
       return
     }
-    if (command.type === "focus.editor") requestAnimationFrame(() => editor?.focus())
+    if (command.type === "focus.editor") restoreFocus()
   }
 
   function dispatch(event: PromptInputV2InteractionEvent) {
@@ -189,8 +197,14 @@ export function createPromptInputV2Controller(input: {
   }
 
   const onKeyDown = (event: KeyboardEvent) => {
+    if (event.isComposing) return false
     input.view.onKeyDown?.(event)
     if (event.defaultPrevented) return true
+    if ((event.metaKey || event.ctrlKey) && !event.altKey && event.key.toLowerCase() === "z") {
+      event.preventDefault()
+      if (draft.undo(event.shiftKey)) restoreFocus()
+      return true
+    }
     if (
       state.mode === "normal" &&
       (event.metaKey || event.ctrlKey) &&
@@ -218,6 +232,46 @@ export function createPromptInputV2Controller(input: {
       )
     }
     if (handled) return true
+    const selection = window.getSelection()
+    if (
+      editor &&
+      selection?.isCollapsed &&
+      editor.contains(selection.anchorNode) &&
+      !event.altKey &&
+      !event.ctrlKey &&
+      !event.metaKey &&
+      !event.shiftKey &&
+      ["Backspace", "Delete", "ArrowLeft", "ArrowRight"].includes(event.key)
+    ) {
+      const cursor = editorCursor(editor)
+      const backward = event.key === "Backspace" || event.key === "ArrowLeft"
+      const part = draft.state.prompt.find(
+        (part) =>
+          part.type !== "text" && part.type !== "image" && (backward ? part.end === cursor : part.start === cursor),
+      )
+      if (part && part.type !== "image") {
+        event.preventDefault()
+        if (event.key === "Backspace" || event.key === "Delete") {
+          let offset = 0
+          draft.setPrompt(
+            draft.state.prompt
+              .filter((entry) => entry !== part)
+              .map((entry) => {
+                if (entry.type === "image") return entry
+                const next = { ...entry, start: offset, end: offset + entry.content.length }
+                offset = next.end
+                return next
+              }),
+            part.start,
+          )
+          restoreFocus(part.start)
+        } else {
+          draft.setCursor(backward ? part.start : part.end)
+          restoreFocus()
+        }
+        return true
+      }
+    }
     const stop =
       input.view.submit.working?.() &&
       ((event.ctrlKey && !event.metaKey && !event.altKey && !event.shiftKey && event.key.toLowerCase() === "g") ||
@@ -248,7 +302,8 @@ export function createPromptInputV2Controller(input: {
   })
 
   const restoreFocus = (cursor = draft.state.cursor ?? promptLength(draft.state.prompt)) => {
-    requestAnimationFrame(() => {
+    // Flush the reactive DOM update first, but never replay an old caret after the next keystroke.
+    queueMicrotask(() => {
       editor?.focus()
       setEditorCursor(editor, cursor)
     })
@@ -333,20 +388,24 @@ export function createPromptInputV2Controller(input: {
     },
     canSubmit() {
       const persisted = draft.state
-      if (persisted.prompt.some((part) => part.type !== "text")) return true
+      if (persisted.prompt.some((part) => part.type !== "text" && !isPromptInputV2Control(part))) return true
       if (persisted.context.items.length > 0) return true
-      return persisted.prompt.some((part) => "content" in part && !!part.content.trim())
+      return persisted.prompt.some((part) => part.type === "text" && !!part.content.trim())
     },
     setEditor(element: HTMLElement) {
       editor = element
       input.onEditor?.(element)
     },
     restoreFocus,
+    undo(redo = false) {
+      if (draft.undo(redo)) restoreFocus()
+    },
     onInput(value: string, prompt?: PromptInputV2PersistedState["prompt"], cursor?: number) {
       if (prompt) draft.setPrompt(prompt, cursor)
       dispatch({ type: "input.changed", value, persist: !prompt })
     },
     onCursor(cursor: number) {
+      dispatch({ type: "cursor.changed", cursor })
       draft.setCursor(cursor)
     },
     openCommands() {
@@ -470,14 +529,24 @@ function editorCursor(editor: HTMLElement) {
 
 function setEditorCursor(editor: HTMLElement | undefined, cursor: number) {
   if (!editor) return
-  const walker = document.createTreeWalker(editor, NodeFilter.SHOW_TEXT)
+  const walker = document.createTreeWalker(editor, NodeFilter.SHOW_TEXT | NodeFilter.SHOW_ELEMENT, {
+    acceptNode(node) {
+      if (node.parentElement?.closest('[contenteditable="false"]')) return NodeFilter.FILTER_REJECT
+      return node.nodeType === Node.TEXT_NODE || (node instanceof HTMLElement && node.contentEditable === "false")
+        ? NodeFilter.FILTER_ACCEPT
+        : NodeFilter.FILTER_SKIP
+    },
+  })
   let remaining = cursor
   let node = walker.nextNode()
   while (node) {
     const length = node.textContent?.length ?? 0
     if (remaining <= length) {
       const range = document.createRange()
-      range.setStart(node, remaining)
+      if (node instanceof HTMLElement) {
+        if (remaining === 0) range.setStartBefore(node)
+        else range.setStartAfter(node)
+      } else range.setStart(node, remaining)
       range.collapse(true)
       const selection = window.getSelection()
       selection?.removeAllRanges()
@@ -487,4 +556,10 @@ function setEditorCursor(editor: HTMLElement | undefined, cursor: number) {
     remaining -= length
     node = walker.nextNode()
   }
+  const range = document.createRange()
+  range.selectNodeContents(editor)
+  range.collapse(false)
+  const selection = window.getSelection()
+  selection?.removeAllRanges()
+  selection?.addRange(range)
 }

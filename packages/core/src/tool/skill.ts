@@ -54,12 +54,43 @@ export const toModelOutput = (skill: SkillV2.Info, files: ReadonlyArray<string>)
 const unableToLoad = (name: string, error?: unknown) =>
   new ToolFailure({ message: `Unable to load skill ${name}`, error })
 
+export const loader = (fs: FSUtil.Interface, skills: SkillV2.Interface, permission: PermissionV2.Interface) =>
+  Effect.fn("SkillTool.load")(function* (input: {
+    name: string
+    sessionID: Tool.Context["sessionID"]
+    agent: Tool.Context["agent"]
+    source?: PermissionV2.Source
+  }) {
+    const skill = (yield* skills.list()).find((skill) => skill.name === input.name)
+    if (!skill) return yield* unableToLoad(input.name)
+    return yield* Effect.gen(function* () {
+      yield* permission.assert({
+        action: name,
+        resources: [skill.name],
+        save: [skill.name],
+        sessionID: input.sessionID,
+        agent: input.agent,
+        source: input.source,
+      })
+      const directory = path.dirname(skill.location)
+      const files =
+        path.basename(skill.location) === "SKILL.md"
+          ? (yield* fs.glob("**/*", { cwd: directory, absolute: true, include: "file", dot: true }))
+              .filter((file) => path.basename(file) !== "SKILL.md")
+              .toSorted()
+              .slice(0, FILE_LIMIT)
+          : []
+      return { name: skill.name, directory, output: toModelOutput(skill, files) }
+    }).pipe(Effect.mapError((error) => unableToLoad(input.name, error)))
+  })
+
 const layer = Layer.effectDiscard(
   Effect.gen(function* () {
     const tools = yield* Tools.Service
     const fs = yield* FSUtil.Service
     const skills = yield* SkillV2.Service
     const permission = yield* PermissionV2.Service
+    const load = loader(fs, skills, permission)
     yield* tools
       .register({
         [name]: Tool.make({
@@ -68,33 +99,11 @@ const layer = Layer.effectDiscard(
           output: Output,
           toModelOutput: ({ output }) => [{ type: "text", text: output.output }],
           execute: (input, context) =>
-            Effect.gen(function* () {
-              const current = yield* skills.list()
-              const skill = current.find((skill) => skill.name === input.name)
-              if (!skill) return yield* unableToLoad(input.name)
-              return yield* Effect.gen(function* () {
-                yield* permission.assert({
-                  action: name,
-                  resources: [skill.name],
-                  save: [skill.name],
-                  sessionID: context.sessionID,
-                  agent: context.agent,
-                  source: { type: "tool", messageID: context.assistantMessageID, callID: context.toolCallID },
-                })
-                const directory = path.dirname(skill.location)
-                const files =
-                  path.basename(skill.location) === "SKILL.md"
-                    ? (yield* fs.glob("**/*", { cwd: directory, absolute: true, include: "file", dot: true }))
-                        .filter((file) => path.basename(file) !== "SKILL.md")
-                        .toSorted()
-                        .slice(0, FILE_LIMIT)
-                    : []
-                return {
-                  name: skill.name,
-                  directory,
-                  output: toModelOutput(skill, files),
-                }
-              }).pipe(Effect.mapError((error) => unableToLoad(input.name, error)))
+            load({
+              name: input.name,
+              sessionID: context.sessionID,
+              agent: context.agent,
+              source: { type: "tool", messageID: context.assistantMessageID, callID: context.toolCallID },
             }),
         }),
       })

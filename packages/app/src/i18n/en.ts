@@ -1,6 +1,11 @@
 import { DESKTOP_NATIVE_ENGLISH } from "./desktop-native"
 
 export const dict = {
+  "prompt.controls.savedModel": "Saved: {{model}}",
+  "prompt.controls.savedVariant": "Saved: {{variant}}",
+  "prompt.controls.effectiveSelection": "This message: {{model}} / {{variant}}",
+  "prompt.controls.modelUnavailable": "The selected model is no longer available. Choose a connected model.",
+  "prompt.controls.variantUnavailable": "The selected variant is not supported by this model.",
   "schedule.title": "Scheduled messages",
   "schedule.create": "New schedule",
   "schedule.refresh": "Refresh",

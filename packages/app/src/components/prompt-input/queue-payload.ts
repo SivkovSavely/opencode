@@ -1,10 +1,12 @@
 import { Schema } from "effect"
+import { unwrap } from "solid-js/store"
 import { SessionQueueV1 } from "@opencode-ai/schema/v1/session-queue"
 import { QueueCommand } from "@opencode-ai/schema/queue-command"
 import type { SessionQueueV1Payload } from "@opencode-ai/sdk/v2"
 import type { FollowupDraft } from "./submit"
 import { buildRequestParts } from "./build-request-parts"
 import { blobDataUrl } from "@/utils/draft-store"
+import { materializePrompt, commandBody } from "./controls"
 
 export class QueuePayloadError extends Error {
   readonly key = "queue.attachmentsUnsupported"
@@ -16,27 +18,54 @@ export async function queuePayload(
     mode?: "normal" | "shell"
     command?: Extract<QueueCommand.Result, { type: "enqueue" }>
     custom?: boolean
+    commands?: { name: string; source?: string; model?: { providerID: string; id: string; variant?: string } }[]
   },
 ): Promise<SessionQueueV1Payload> {
-  const text = draft.prompt.map((part) => ("content" in part ? part.content : "")).join("")
+  draft = structuredClone(unwrap(draft))
+  options = options ? structuredClone(unwrap(options)) : undefined
+  const clean =
+    options?.mode === "shell"
+      ? {
+          prompt: draft.prompt,
+          text: draft.prompt.map((part) => ("content" in part ? part.content : "")).join(""),
+          selection: {},
+        }
+      : materializePrompt(
+          draft.prompt,
+          options?.commands?.filter((item) => item.source === "skill").map((item) => item.name),
+        )
+  const selection = { ...clean.selection, ...draft.selection }
+  const text = clean.text
   const body = options?.command?.body ?? text
+  const command = commandBody(body)
+  const defaults = options?.commands?.find((item) => item.name === command?.name && item.source !== "skill")?.model
+  const variant = selection.variant ?? defaults?.variant ?? draft.variant
   const common = {
     agent: draft.agent,
-    model: draft.model,
-    ...(draft.variant !== undefined ? { variant: draft.variant } : {}),
+    model: selection.model ?? (defaults ? { providerID: defaults.providerID, modelID: defaults.id } : draft.model),
+    ...(variant !== undefined ? { variant } : {}),
+    selection: {
+      ...(selection.model ? { model: selection.model } : {}),
+      ...(selection.variant !== undefined ? { variant: selection.variant } : {}),
+    },
   }
-  const kind =
+  const requestedKind =
     options?.command?.kind ??
     (options?.mode === "shell"
       ? "shell"
       : body.trim() === "/compact"
         ? "compact"
-        : options?.custom && body.startsWith("/")
+        : options?.custom && command
           ? "command"
           : "prompt")
+  const kind =
+    requestedKind === "command" &&
+    options?.commands?.some((item) => item.name === command?.name && item.source === "skill")
+      ? "prompt"
+      : requestedKind
   if (
     (kind === "compact" || kind === "shell") &&
-    (draft.context.length || draft.prompt.some((part) => part.type !== "text"))
+    (draft.context.length || clean.prompt.some((part) => part.type !== "text"))
   ) {
     throw new QueuePayloadError()
   }
@@ -47,7 +76,7 @@ export async function queuePayload(
 
   // Rebase mention offsets after stripping queue syntax, without losing captured files or agents.
   const offset = text.indexOf(body)
-  const prompt = draft.prompt.map((part) =>
+  const prompt = clean.prompt.map((part) =>
     part.type === "file" || part.type === "agent"
       ? { ...part, start: Math.max(0, part.start - offset), end: Math.max(0, part.end - offset) }
       : part,
@@ -70,13 +99,12 @@ export async function queuePayload(
     sessionDirectory: draft.sessionDirectory,
   }).requestParts.map(({ id, ...part }) => part)
   if (kind === "command") {
-    const [head, ...tail] = body.split(" ")
     const payload = {
       kind,
       ...common,
-      command: options?.command?.kind === "command" ? options.command.command : head.slice(1),
+      command: options?.command?.kind === "command" ? options.command.command : command!.name,
       arguments: [
-        options?.command?.kind === "command" ? options.command.arguments : tail.join(" "),
+        options?.command?.kind === "command" ? options.command.arguments : command!.arguments,
         ...parts.flatMap((part) => (part.type === "text" && part.synthetic ? [part.text] : [])),
       ]
         .filter(Boolean)

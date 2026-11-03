@@ -25,6 +25,29 @@ export type PromptInputV2AgentPart = PromptInputV2PartBase & {
   name: string
 }
 
+export type PromptInputV2ModelPart = PromptInputV2PartBase & {
+  type: "model"
+  providerID: string
+  modelID: string
+}
+
+export type PromptInputV2VariantPart = PromptInputV2PartBase & {
+  type: "variant"
+  variant: string
+}
+
+export type PromptInputV2SkillPart = PromptInputV2PartBase & {
+  type: "skill"
+  name: string
+}
+
+export type PromptInputV2Mention =
+  | PromptInputV2FilePart
+  | PromptInputV2AgentPart
+  | PromptInputV2ModelPart
+  | PromptInputV2VariantPart
+  | PromptInputV2SkillPart
+
 export type PromptInputV2Attachment = {
   type: "image"
   id: string
@@ -39,6 +62,9 @@ export type PromptInputV2Prompt = (
   | PromptInputV2FilePart
   | PromptInputV2AgentPart
   | PromptInputV2Attachment
+  | PromptInputV2ModelPart
+  | PromptInputV2VariantPart
+  | PromptInputV2SkillPart
 )[]
 
 export type PromptInputV2Model = {
@@ -94,7 +120,7 @@ export type PromptInputV2Option = {
 
 export type PromptInputV2Suggestion = {
   id: string
-  kind: "agent" | "command" | "file" | "reference" | "resource"
+  kind: "agent" | "command" | "file" | "reference" | "resource" | "model" | "variant" | "skill" | "namespace"
   label: string
   title?: string
   trigger?: string
@@ -102,5 +128,5 @@ export type PromptInputV2Suggestion = {
   path?: string
   keybind?: string[]
   recent?: boolean
-  mention?: PromptInputV2FilePart | PromptInputV2AgentPart
+  mention?: PromptInputV2Mention
 }

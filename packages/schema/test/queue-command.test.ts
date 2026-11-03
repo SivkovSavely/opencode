@@ -125,6 +125,7 @@ describe("queue command", () => {
 
   test.each([
     ["/queue first\nsecond", "first\nsecond", false],
+    [" \n /queue first\nsecond", "first\nsecond", false],
     ["first\nsecond /queue", "first\nsecond", false],
     ["/queue front first\nsecond", "first\nsecond", true],
     ["first\nsecond /queue front", "first\nsecond", true],
@@ -143,6 +144,7 @@ describe("queue command", () => {
 
   test.each([
     ["/queue /review", false],
+    [" \n /queue /review", false],
     ["/review /queue", false],
     ["/queue front /review", true],
     ["/review /queue front", true],

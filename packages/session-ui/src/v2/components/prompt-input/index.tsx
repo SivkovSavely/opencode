@@ -52,8 +52,9 @@ export function PromptInputV2(props: PromptInputV2Props) {
   const view = props.controller.view
   let editor: HTMLDivElement | undefined
   let localInput = false
+  let composing = false
   const updateCursor = () => {
-    if (!editor || !window.getSelection()?.isCollapsed) return
+    if (composing || !editor || !window.getSelection()?.isCollapsed) return
     props.controller.onCursor(promptInputV2Cursor(editor))
   }
   const mode = createMemo(() => state.mode)
@@ -65,7 +66,7 @@ export function PromptInputV2(props: PromptInputV2Props) {
 
   createEffect(() => {
     const parts = props.controller.parts()
-    if (!editor) return
+    if (!editor || composing) return
     if (localInput) {
       localInput = false
       return
@@ -162,14 +163,34 @@ export function PromptInputV2(props: PromptInputV2Props) {
             autocomplete="off"
             class="relative z-10 block min-h-[60px] max-h-[180px] w-full overflow-y-auto whitespace-pre-wrap bg-transparent px-4 pt-4 pb-2 text-[13px] font-[440] leading-5 text-v2-text-text-base focus:outline-none empty:before:content-['\200B'] [&_[data-mention=file]]:text-syntax-property [&_[data-mention=agent]]:text-syntax-type [&_[data-mention=reference]]:text-syntax-keyword"
             classList={{ "font-mono!": state.mode === "shell", "opacity-50": props.disabled }}
+            onBeforeInput={(event) => {
+              if (composing || !["historyUndo", "historyRedo"].includes(event.inputType)) return
+              event.preventDefault()
+              props.controller.undo(event.inputType === "historyRedo")
+            }}
             onInput={(event) => {
               const cursor = promptInputV2Cursor(event.currentTarget)
               const prompt = parsePromptInputV2Editor(event.currentTarget)
               const images = props.controller.parts().filter((part) => part.type === "image")
               localInput = true
-              props.controller.onInput(prompt.map((part) => part.content).join(""), [...prompt, ...images], cursor)
+              if (!composing)
+                props.controller.onInput(prompt.map((part) => part.content).join(""), [...prompt, ...images], cursor)
+            }}
+            onCompositionStart={() => {
+              composing = true
+            }}
+            onCompositionEnd={(event) => {
+              composing = false
+              const prompt = parsePromptInputV2Editor(event.currentTarget)
+              localInput = true
+              props.controller.onInput(
+                prompt.map((part) => part.content).join(""),
+                [...prompt, ...props.controller.attachments()],
+                promptInputV2Cursor(event.currentTarget),
+              )
             }}
             onKeyDown={(event) => {
+              if (composing || event.isComposing) return
               if (props.controller.onKeyDown(event)) return
               if (event.key === "Enter" && !event.isComposing && event.shiftKey === !!props.enterNewline) {
                 event.preventDefault()
@@ -282,6 +303,7 @@ function renderPromptInputV2Editor(editor: HTMLDivElement, prompt: PromptInputV2
       const mention = document.createElement("span")
       mention.textContent = part.content
       mention.contentEditable = "false"
+      mention.dataset.part = JSON.stringify(part)
       mention.dataset.mention =
         part.type === "file" && part.mime === "application/x-directory" ? "reference" : part.type
       if (part.type === "agent") mention.dataset.name = part.name
@@ -316,6 +338,13 @@ function parsePromptInputV2Editor(editor: HTMLDivElement) {
   const mention = (element: HTMLElement) => {
     flush()
     const content = element.textContent ?? ""
+    // Metadata lives on our own DOM nodes, not in display strings or clipboard HTML.
+    if (element.dataset.part) {
+      const part = JSON.parse(element.dataset.part) as Exclude<PromptInputV2Prompt[number], PromptInputV2Attachment>
+      parts.push({ ...part, content, start: position, end: position + content.length })
+      position += content.length
+      return
+    }
     if (element.dataset.mention === "agent") {
       parts.push({
         type: "agent",

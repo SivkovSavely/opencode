@@ -410,7 +410,9 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
           Effect.mapError((error) =>
             error._tag === "RuntimeDrainingError"
               ? new ConflictError({ resource: ctx.params.sessionID, message: error.message })
-              : new HttpApiError.BadRequest({}),
+              : error._tag === "PromptInputError"
+                ? new InvalidRequestError({ message: error.message })
+                : new HttpApiError.BadRequest({}),
           ),
         )
       return HttpServerResponse.stream(Stream.make(JSON.stringify(message)).pipe(Stream.encodeText), {
@@ -423,7 +425,7 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       payload: typeof PromptPayload.Type
     }) {
       yield* requireSession(ctx.params.sessionID)
-      const admission = yield* Deferred.make<void, RuntimeLifecycle.RuntimeDrainingError>()
+      const admission = yield* Deferred.make<void, RuntimeLifecycle.RuntimeDrainingError | SessionPrompt.InputError>()
       yield* promptSvc.prompt({ ...ctx.payload, sessionID: ctx.params.sessionID }, { admission }).pipe(
         Effect.catchCause((cause) =>
           Effect.gen(function* () {
@@ -441,7 +443,11 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
         Effect.forkIn(scope, { startImmediately: true }),
       )
       yield* Deferred.await(admission).pipe(
-        Effect.mapError((error) => new ConflictError({ resource: ctx.params.sessionID, message: error.message })),
+        Effect.mapError((error) =>
+          error._tag === "PromptInputError"
+            ? new InvalidRequestError({ message: error.message })
+            : new ConflictError({ resource: ctx.params.sessionID, message: error.message }),
+        ),
       )
       return HttpApiSchema.NoContent.make()
     })
@@ -519,7 +525,9 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
           Effect.mapError((error) =>
             error._tag === "RuntimeDrainingError"
               ? new ConflictError({ resource: ctx.params.sessionID, message: error.message })
-              : new HttpApiError.BadRequest({}),
+              : error._tag === "PromptInputError"
+                ? new InvalidRequestError({ message: error.message })
+                : new HttpApiError.BadRequest({}),
           ),
         )
     })
