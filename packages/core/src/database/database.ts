@@ -2,13 +2,14 @@ export * as Database from "./database.js"
 
 import { EffectDrizzleSqlite } from "./drizzle.js"
 import { sqliteLayer, supportsForeignKeyToggle, supportsTuningPragmas } from "#sqlite"
-import { Context, Effect, Layer, Schema, Semaphore } from "effect"
+import { Cause, Context, Effect, Layer, Schema, Semaphore } from "effect"
 import type { SqlClient } from "effect/sql"
 import { Global } from "@opencode/util/global"
 import { closeSync, existsSync, openSync } from "node:fs"
 import { chmod } from "node:fs/promises"
 import { isAbsolute, join } from "path"
 import { DatabaseMigration } from "./migration.js"
+import { DatabaseCompatibility } from "./compatibility.js"
 import { makeGlobalNode } from "@opencode/util/effect/app-node"
 
 const makeDatabase = EffectDrizzleSqlite.makeWithDefaults()
@@ -74,6 +75,15 @@ export function layer(options: Options = { path: ":memory:" }) {
       const filename = options.path ?? ":memory:"
       if (filename === ":memory:") return provide(filename)
       const file = isAbsolute(filename) ? filename : join((yield* Global.Service).data, filename)
+      if (existsSync(file)) {
+        yield* DatabaseCompatibility.check.pipe(
+          Effect.provide(sqliteLayer({ filename: file, readonly: true, create: false, disableWAL: true })),
+          Effect.scoped,
+          Effect.catchCause((cause) =>
+            Effect.die(new Error(`Cannot open database ${file}: ${Cause.pretty(cause)}`, { cause })),
+          ),
+        )
+      }
       yield* Effect.promise(() => restrictToOwner(file))
       return provide(file)
     }),

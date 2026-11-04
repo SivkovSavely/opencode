@@ -86,11 +86,11 @@ const nativeLayer = (config: Config) =>
     Effect.gen(function* () {
       const native = new Database(config.filename, {
         readonly: config.readonly,
-        readwrite: config.readwrite ?? true,
-        create: config.create ?? true,
+        readwrite: config.readwrite ?? !config.readonly,
+        create: config.create ?? !config.readonly,
       })
       yield* Effect.addFinalizer(() => Effect.sync(() => native.close()))
-      if (config.disableWAL !== true) native.run("PRAGMA journal_mode = WAL;")
+      if (config.disableWAL !== true && config.readonly !== true) native.run("PRAGMA journal_mode = WAL;")
       return native
     }),
   )
