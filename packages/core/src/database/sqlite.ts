@@ -1,6 +1,6 @@
 export * as Sqlite from "./sqlite.js"
 
-import { Context, Effect, Fiber, Scope, Semaphore, Stream } from "effect"
+import { Context, Effect, References, Semaphore, Stream } from "effect"
 import { identity } from "effect/Function"
 import { SqlClient, Statement } from "effect/sql"
 import type { Connection } from "effect/sql/SqlConnection"
@@ -56,28 +56,26 @@ export const makeClient = <
   options: Config,
   connection: SqliteConnection,
   typeId: TypeId,
-  extensions: (acquirer: Effect.Effect<SqliteConnection, SqlError, Scope.Scope>) => Extensions,
+  extensions: (
+    borrow: <A, E, R>(use: (connection: SqliteConnection) => Effect.Effect<A, E, R>) => Effect.Effect<A, E | SqlError, R>,
+  ) => Extensions,
 ) =>
   Effect.gen(function* () {
     const semaphore = yield* Semaphore.make(1)
-    const acquirer = semaphore.withPermits(1)(Effect.succeed(connection))
-    const transactionAcquirer = Effect.uninterruptibleMask((restore) => {
-      const fiber = Fiber.getCurrent()!
-      const scope = Context.getUnsafe(fiber.context, Scope.Scope)
-      return Effect.as(
-        Effect.tap(restore(semaphore.take(1)), () => Scope.addFinalizer(scope, semaphore.release(1))),
-        connection,
-      )
-    })
+    const access = SqlClient.makeSqliteAcquirers({ connection: Effect.succeed(connection), semaphore })
+    // Effect 4.0.6 can auto-yield after taking the permit, before registering its release.
+    const acquirer = access.acquirer.pipe(Effect.provideService(References.PreventSchedulerYield, true))
     const transformRows = options.transformResultNames
       ? Statement.defaultTransforms(options.transformResultNames).array
       : undefined
 
     return Object.assign(
       yield* SqlClient.make({
+        ...access,
         acquirer,
+        transactionAcquirer: acquirer,
         compiler: Statement.makeCompilerSqlite(options.transformQueryNames),
-        transactionAcquirer,
+        releaseSavepoint: (name) => `RELEASE SAVEPOINT ${name}`,
         driver: "sqlite",
         spanAttributes: [
           ...(options.spanAttributes ? Object.entries(options.spanAttributes) : []),
@@ -88,7 +86,7 @@ export const makeClient = <
       {
         [typeId]: typeId,
         config: options,
-        ...extensions(acquirer),
+        ...extensions((use) => access.borrower(() => use(connection))),
       },
     ) as SqlClient.SqlClient &
       Record<TypeId, TypeId> & {

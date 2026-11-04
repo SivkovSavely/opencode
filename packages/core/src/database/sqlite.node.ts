@@ -7,6 +7,8 @@ import { Sqlite } from "./sqlite.js"
 
 const TypeId = "~@opencode/core/database/SqliteNode" as const
 
+export class Client extends Context.Service<Client, Effect.Success<ReturnType<typeof make>>>()(TypeId) {}
+
 export const supportsTuningPragmas = true
 
 // Foreign keys default OFF and can be toggled per connection.
@@ -70,8 +72,8 @@ const make = (options: Config) =>
         }),
     })
 
-    return yield* Sqlite.makeClient(options, connection, TypeId, (acquirer) => ({
-      loadExtension: (path: string) => Effect.flatMap(acquirer, (_) => _.loadExtension(path)),
+    return yield* Sqlite.makeClient(options, connection, TypeId, (borrow) => ({
+      loadExtension: (path: string) => borrow((connection) => connection.loadExtension(path)),
     }))
   })
 
@@ -92,7 +94,10 @@ const nativeLayer = (config: Config) =>
     }),
   )
 
-const clientLayer = (config: Config) => Layer.effect(SqlClient.SqlClient, make(config))
+const clientLayer = (config: Config) =>
+  Layer.effectContext(
+    Effect.map(make(config), (client) => Context.make(SqlClient.SqlClient, client).pipe(Context.add(Client, client))),
+  )
 
 export const sqliteLayer = (config: Config) => {
   const native = nativeLayer(config)
