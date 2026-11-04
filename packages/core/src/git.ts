@@ -48,6 +48,8 @@ const temporaryIndexPrefix = "index.opencode-"
 // Room for paths on one Git command line after the Git path, repository flags, and quoting. Windows caps a command
 // line at 32,767 characters. macOS caps arguments plus environment at 1 MiB, and Linux caps them at 2 MiB by default.
 const argumentBudget = process.platform === "win32" ? 24_000 : 128 * 1024
+const maximumFullDiffFileBytes = 2 * 1024 * 1024
+const maximumFullDiffChurn = 20_000
 const looseObjectLimit = 2048
 const packCountLimit = 16
 
@@ -1034,44 +1036,33 @@ const layer = Layer.effect(
       patchBudget: number,
     ) {
       const args = ["--no-renames", input.from, input.to, "--", ...(input.paths ?? [])]
-      // Patch headers have no -z form: unquoted paths keep chunksByFile matching non-ASCII names.
-      const [names, numbers, patch] = yield* Effect.all(
+      const [names, numbers] = yield* Effect.all(
         [
           repositoryOperation("diff", input.repository, [
             "--literal-pathspecs",
             "diff",
-            "--name-status",
+            "--raw",
+            "--no-abbrev",
             "-z",
             ...args,
           ]),
           repositoryOperation("diff", input.repository, ["--literal-pathspecs", "diff", "--numstat", "-z", ...args]),
-          patchBudget > 0
-            ? repositoryOperation(
-                "diff",
-                input.repository,
-                [
-                  "--literal-pathspecs",
-                  "-c",
-                  "core.quotepath=false",
-                  "diff",
-                  "--no-ext-diff",
-                  `--unified=${input.context ?? 3}`,
-                  ...args,
-                ],
-                { maxOutputBytes: patchBudget },
-              )
-            : Effect.succeed({ text: "", stderr: "", truncated: true }),
         ],
-        { concurrency: 3 },
+        { concurrency: 2 },
       )
       const statuses = nuls(names.text)
-      const files = statuses.flatMap((code, index) => {
+      const files = statuses.flatMap((metadata, index) => {
         const file = statuses[index + 1]
         if (index % 2 !== 0 || !file) return []
+        const [beforeMode, afterMode, before, after, code] = metadata.split(" ")
+        if (!before || !after || !code) return []
         return [
           {
             file: RelativePath.make(file),
             status: code.startsWith("A") ? "added" : code.startsWith("D") ? "deleted" : "modified",
+            blobs: [...(beforeMode === ":160000" ? [] : [before]), ...(afterMode === "160000" ? [] : [after])].filter(
+              (object) => !/^0+$/.test(object),
+            ),
           } as const,
         ]
       })
@@ -1089,19 +1080,95 @@ const layer = Layer.effect(
           ]
         }),
       )
-      const patches = VcsPatch.chunksByFile(patch, (index) => files[index]?.file)
+      const objects = [...new Set(files.flatMap((entry) => entry.blobs))]
+      const sizes = new Map(
+        objects.length === 0
+          ? []
+          : (yield* repositoryOperation(
+              "diff",
+              input.repository,
+              ["cat-file", "--batch-check=%(objectname) %(objectsize)"],
+              {
+                stdin: objects.join("\n") + "\n",
+              },
+            )).text
+              .trim()
+              .split("\n")
+              .map((line) => {
+                const [object, size] = line.split(" ")
+                return [object, Number(size)] as const
+              }),
+      )
+      const skipped = new Set(
+        files
+          .filter((entry) => {
+            const stat = stats.get(entry.file)
+            return (
+              entry.blobs.some((object) => (sizes.get(object) ?? 0) > maximumFullDiffFileBytes) ||
+              (stat?.additions ?? 0) + (stat?.deletions ?? 0) > maximumFullDiffChurn
+            )
+          })
+          .map((entry) => entry.file),
+      )
+      // A file on one side can be a directory on the other. Isolate its patch so a
+      // recursive literal pathspec cannot pull a skipped descendant back into Git's patch work.
+      const parents = new Set(
+        files.flatMap((entry) => {
+          const parts = entry.file.split("/")
+          return parts.slice(1).map((_, index) => parts.slice(0, index + 1).join("/"))
+        }),
+      )
+      const patches = new Map<string, string>()
+      let patchBytes = 0
+      let truncated = patchBudget <= 0
+      for (const paths of pathGroups(
+        files.filter((entry) => !skipped.has(entry.file)).map((entry) => entry.file),
+        parents,
+        literalPathspec("").length + 3,
+      )) {
+        if (truncated || patchBytes >= patchBudget) break
+        // Patch headers have no -z form: unquoted paths keep chunksByFile matching non-ASCII names.
+        const patch = yield* repositoryOperation(
+          "diff",
+          input.repository,
+          [
+            "--no-literal-pathspecs",
+            "-c",
+            "core.quotepath=false",
+            "diff",
+            "--no-renames",
+            "--no-ext-diff",
+            `--unified=${input.context ?? 3}`,
+            input.from,
+            input.to,
+            "--",
+            ...paths.map(literalPathspec),
+            ...(paths.length === 1 && parents.has(paths[0]!)
+              ? [`:(exclude,glob)${paths[0]!.replace(/[?*[\]\\]/g, "\\$&")}/**`]
+              : []),
+          ],
+          { env: { GIT_ICASE_PATHSPECS: "0" }, maxOutputBytes: patchBudget - patchBytes },
+        )
+        VcsPatch.chunksByFile(patch, (index) => paths[index]).forEach((chunk, file) => patches.set(file, chunk))
+        patchBytes += Buffer.byteLength(patch.text)
+        truncated = patch.truncated
+      }
       return {
         diffs: files.map((entry) => {
           const stat = stats.get(entry.file)
           return {
-            ...entry,
+            file: entry.file,
+            status: entry.status,
             additions: stat?.additions ?? 0,
             deletions: stat?.deletions ?? 0,
-            patch: stat?.binary ? "" : (patches.get(entry.file) ?? VcsPatch.emptyPatch(entry.file)),
+            patch:
+              stat?.binary || skipped.has(entry.file)
+                ? ""
+                : (patches.get(entry.file) ?? VcsPatch.emptyPatch(entry.file)),
           } satisfies FileDiff.Info
         }),
-        patchBytes: Buffer.byteLength(patch.text),
-        truncated: patch.truncated,
+        patchBytes,
+        truncated,
       }
     })
 
@@ -1583,14 +1650,19 @@ function packIndexObjectIDs(bytes: Uint8Array) {
  * order one call prints them. Each path is counted with room for the quotes Windows
  * adds around spaces.
  */
-function pathGroups(paths: readonly RelativePath[]) {
+function pathGroups(paths: readonly RelativePath[], isolated?: ReadonlySet<string>, overhead = 3) {
   return paths
     .toSorted((left, right) => Buffer.compare(Buffer.from(left), Buffer.from(right)))
     .reduce<{ groups: RelativePath[][]; length: number }>(
       (state, file) => {
-        const cost = file.length + 3
+        const cost = file.length + overhead
         const current = state.groups.at(-1)
-        if (current && state.length + cost <= argumentBudget) {
+        if (
+          current &&
+          !isolated?.has(file) &&
+          !isolated?.has(current.at(-1)!) &&
+          state.length + cost <= argumentBudget
+        ) {
           current.push(file)
           return { groups: state.groups, length: state.length + cost }
         }

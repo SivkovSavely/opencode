@@ -245,6 +245,292 @@ describe("Git trees", () => {
     }),
   )
 
+  it.live("guards tree full-diff input bytes before generating patches and keeps file metadata", () =>
+    Effect.gen(function* () {
+      const root = yield* Effect.acquireRelease(
+        Effect.promise(() => tmpdir()),
+        (dir) => Effect.promise(() => dir[Symbol.asyncDispose]()),
+      )
+      const limit = 2 * 1024 * 1024
+      const oversized = `${"x".repeat(limit)}\n`
+      yield* Effect.promise(async () => {
+        await initRepo(root.path)
+        await Bun.write(path.join(root.path, "grown.txt"), "small\n")
+        await Bun.write(path.join(root.path, "shrunk.txt"), oversized)
+        await Bun.write(path.join(root.path, "deleted.txt"), oversized)
+        await Bun.write(path.join(root.path, "z-normal.txt"), "before\n")
+      })
+      const git = yield* Git.Service
+      const repository = yield* git.repo.discover(AbsolutePath.make(root.path))
+      if (!repository) throw new Error("Repository not found")
+      const before = yield* git.tree.capture({ repository, scopes: [RelativePath.make(".")] })
+      yield* Effect.promise(async () => {
+        await Bun.write(path.join(root.path, "grown.txt"), oversized)
+        await Bun.write(path.join(root.path, "shrunk.txt"), "small\n")
+        await fs.rm(path.join(root.path, "deleted.txt"))
+        await Bun.write(path.join(root.path, "added.txt"), oversized)
+        await Bun.write(path.join(root.path, "exact.txt"), `${"\u00e9".repeat(limit / 2 - 1)}x\n`)
+        await Bun.write(path.join(root.path, "utf-above.txt"), `${"\u00e9".repeat(limit / 2)}\n`)
+        await Bun.write(path.join(root.path, "z-normal.txt"), "after\n")
+      })
+      const after = yield* git.tree.capture({ repository, scopes: [RelativePath.make(".")] })
+      const trace = path.join(repository.gitDirectory, "patch-trace")
+      const diffs = yield* withEnv({ GIT_TRACE: trace, OPENCODE_HANG_DIAGNOSTICS: undefined }, () =>
+        git.tree.diff({ repository, from: before, to: after, context: VcsPatch.PATCH_CONTEXT_LINES }),
+      )
+      expect(diffs.map((entry) => [entry.file, entry.status, entry.additions, entry.deletions])).toEqual([
+        ["added.txt", "added", 1, 0],
+        ["deleted.txt", "deleted", 0, 1],
+        ["exact.txt", "added", 1, 0],
+        ["grown.txt", "modified", 1, 1],
+        ["shrunk.txt", "modified", 1, 1],
+        ["utf-above.txt", "added", 1, 0],
+        ["z-normal.txt", "modified", 1, 1],
+      ])
+      const skipped = ["added.txt", "deleted.txt", "grown.txt", "shrunk.txt", "utf-above.txt"]
+      skipped.forEach((file) => expect(diffs.find((entry) => entry.file === file)?.patch.length).toBe(0))
+      expect(diffs.find((entry) => entry.file === "exact.txt")?.patch.length).toBeGreaterThan(limit / 2)
+      expect(diffs.find((entry) => entry.file === "z-normal.txt")?.patch).toContain("-before\n+after\n")
+      const commands = (yield* Effect.promise(() => fs.readFile(trace, "utf8")))
+        .split("\n")
+        .filter((line) => line.includes("--unified="))
+      expect(commands.length).toBeGreaterThan(0)
+      skipped.forEach((file) => expect(commands.some((command) => command.includes(file))).toBe(false))
+      const reverse = yield* git.tree.diff({
+        repository,
+        from: after,
+        to: before,
+        paths: ["exact.txt", "grown.txt", "shrunk.txt"].map((file) => RelativePath.make(file)),
+      })
+      expect(reverse.map((entry) => [entry.file, entry.status, entry.additions, entry.deletions])).toEqual([
+        ["exact.txt", "deleted", 0, 1],
+        ["grown.txt", "modified", 1, 1],
+        ["shrunk.txt", "modified", 1, 1],
+      ])
+      expect(reverse[0]?.patch.length).toBeGreaterThan(limit / 2)
+      expect(reverse[1]?.patch.length).toBe(0)
+      expect(reverse[2]?.patch.length).toBe(0)
+    }),
+  )
+
+  it.live("guards tree full-diff churn above but not at the limit", () =>
+    Effect.gen(function* () {
+      const root = yield* Effect.acquireRelease(
+        Effect.promise(() => tmpdir()),
+        (dir) => Effect.promise(() => dir[Symbol.asyncDispose]()),
+      )
+      yield* Effect.promise(async () => {
+        await initRepo(root.path)
+        await Bun.write(path.join(root.path, "churn-exact.txt"), "before\n".repeat(10_000))
+        await Bun.write(path.join(root.path, "churn-above.txt"), "before\n".repeat(10_000))
+        await Bun.write(path.join(root.path, "z-normal.txt"), "before\n")
+      })
+      const git = yield* Git.Service
+      const repository = yield* git.repo.discover(AbsolutePath.make(root.path))
+      if (!repository) throw new Error("Repository not found")
+      const before = yield* git.tree.capture({ repository, scopes: [RelativePath.make(".")] })
+      yield* Effect.promise(async () => {
+        await Bun.write(path.join(root.path, "churn-exact.txt"), "after\n".repeat(10_000))
+        await Bun.write(path.join(root.path, "churn-above.txt"), "after\n".repeat(10_001))
+        await Bun.write(path.join(root.path, "churn-added.txt"), "after\n".repeat(20_001))
+        await Bun.write(path.join(root.path, "z-normal.txt"), "after\n")
+      })
+      const after = yield* git.tree.capture({ repository, scopes: [RelativePath.make(".")] })
+      const trace = path.join(repository.gitDirectory, "patch-trace")
+      const diffs = yield* withEnv({ GIT_TRACE: trace, OPENCODE_HANG_DIAGNOSTICS: undefined }, () =>
+        git.tree.diff({ repository, from: before, to: after, context: VcsPatch.PATCH_CONTEXT_LINES }),
+      )
+      expect(diffs.map((entry) => [entry.file, entry.status, entry.additions, entry.deletions])).toEqual([
+        ["churn-above.txt", "modified", 10_001, 10_000],
+        ["churn-added.txt", "added", 20_001, 0],
+        ["churn-exact.txt", "modified", 10_000, 10_000],
+        ["z-normal.txt", "modified", 1, 1],
+      ])
+      expect(diffs[0]?.patch.length).toBe(0)
+      expect(diffs[1]?.patch.length).toBe(0)
+      expect(diffs[2]?.patch).toContain("-before\n")
+      expect(diffs[2]?.patch).toContain("+after\n")
+      expect(diffs[3]?.patch).toContain("-before\n+after\n")
+      const commands = (yield* Effect.promise(() => fs.readFile(trace, "utf8")))
+        .split("\n")
+        .filter((line) => line.includes("--unified="))
+      expect(commands.length).toBeGreaterThan(0)
+      expect(commands.some((command) => command.includes("churn-above.txt"))).toBe(false)
+      expect(commands.some((command) => command.includes("churn-added.txt"))).toBe(false)
+    }),
+  )
+
+  it.live("guards tree full-diff descendants across file-directory replacements", () =>
+    Effect.gen(function* () {
+      const root = yield* Effect.acquireRelease(
+        Effect.promise(() => tmpdir()),
+        (dir) => Effect.promise(() => dir[Symbol.asyncDispose]()),
+      )
+      yield* Effect.promise(async () => {
+        await initRepo(root.path)
+        await fs.mkdir(path.join(root.path, "collapsed"))
+        await Bun.write(path.join(root.path, "expanded"), "before\n")
+        await Bun.write(path.join(root.path, "collapsed", "large.txt"), `${"x".repeat(2 * 1024 * 1024)}\n`)
+        await Bun.write(path.join(root.path, "collapsed", "small.txt"), "small before\n")
+      })
+      const git = yield* Git.Service
+      const repository = yield* git.repo.discover(AbsolutePath.make(root.path))
+      if (!repository) throw new Error("Repository not found")
+      const before = yield* git.tree.capture({ repository, scopes: [RelativePath.make(".")] })
+      yield* Effect.promise(async () => {
+        await fs.rm(path.join(root.path, "expanded"))
+        await fs.rm(path.join(root.path, "collapsed"), { recursive: true })
+        await fs.mkdir(path.join(root.path, "expanded"))
+        await Bun.write(path.join(root.path, "collapsed"), "after\n")
+        await Bun.write(path.join(root.path, "expanded", "large.txt"), `${"y".repeat(2 * 1024 * 1024)}\n`)
+        await Bun.write(path.join(root.path, "expanded", "[small] caf\u00e9.txt"), "small after\n")
+      })
+      const after = yield* git.tree.capture({ repository, scopes: [RelativePath.make(".")] })
+      const trace = path.join(repository.gitDirectory, "patch-trace")
+      const diffs = yield* withEnv({ GIT_TRACE: trace }, () => git.tree.diff({ repository, from: before, to: after }))
+      expect(diffs.map((entry) => [entry.file, entry.status, entry.additions, entry.deletions])).toEqual([
+        ["collapsed", "added", 1, 0],
+        ["collapsed/large.txt", "deleted", 0, 1],
+        ["collapsed/small.txt", "deleted", 0, 1],
+        ["expanded", "deleted", 0, 1],
+        ["expanded/[small] caf\u00e9.txt", "added", 1, 0],
+        ["expanded/large.txt", "added", 1, 0],
+      ])
+      expect(diffs[0]?.patch).toContain("+after\n")
+      expect(diffs[1]?.patch.length).toBe(0)
+      expect(diffs[2]?.patch).toContain("-small before\n")
+      expect(diffs[3]?.patch).toContain("-before\n")
+      expect(diffs[4]?.patch).toContain("+small after\n")
+      expect(diffs[5]?.patch.length).toBe(0)
+      const commands = (yield* Effect.promise(() => fs.readFile(trace, "utf8")))
+        .split("\n")
+        .filter((line) => line.includes("--unified="))
+      expect(commands.some((command) => command.includes(":(exclude,glob)collapsed/**"))).toBe(true)
+      expect(commands.some((command) => command.includes(":(exclude,glob)expanded/**"))).toBe(true)
+      expect(commands.some((command) => command.includes("large.txt"))).toBe(false)
+    }),
+  )
+
+  it.live("guards tree full-diff patch matching against inherited case folding", () =>
+    Effect.gen(function* () {
+      const root = yield* Effect.acquireRelease(
+        Effect.promise(() => tmpdir()),
+        (dir) => Effect.promise(() => dir[Symbol.asyncDispose]()),
+      )
+      yield* Effect.promise(() => initRepo(root.path))
+      const git = yield* Git.Service
+      const repository = yield* git.repo.discover(AbsolutePath.make(root.path))
+      if (!repository) throw new Error("Repository not found")
+      const before = yield* git.tree.write(repository)
+      yield* Effect.promise(async () => {
+        // Index-only entries also exercise this combination on case-insensitive filesystems.
+        const large = (
+          await $`git hash-object -w --stdin < ${Buffer.from("x".repeat(VcsPatch.MAX_TOTAL_PATCH_BYTES) + "\n")}`
+            .cwd(root.path)
+            .text()
+        ).trim()
+        const small = (await $`git hash-object -w --stdin < ${Buffer.from("small\n")}`.cwd(root.path).text()).trim()
+        await $`git update-index --add --cacheinfo 100644 ${large} README.txt`.cwd(root.path).quiet()
+        await $`git update-index --add --cacheinfo 100644 ${small} readme.txt`.cwd(root.path).quiet()
+      })
+      const after = yield* git.tree.write(repository)
+      const diffs = yield* withEnv({ GIT_ICASE_PATHSPECS: "1" }, () =>
+        git.tree.diff({ repository, from: before, to: after }),
+      )
+      expect(diffs.map((entry) => [entry.file, entry.status, entry.additions, entry.deletions])).toEqual([
+        ["README.txt", "added", 1, 0],
+        ["readme.txt", "added", 1, 0],
+      ])
+      expect(diffs[0]?.patch.length).toBe(0)
+      expect(diffs[1]?.patch).toContain("+small\n")
+    }),
+  )
+
+  it.live("tree full-diff keeps gitlink parents while excluding guarded descendants", () =>
+    Effect.gen(function* () {
+      const root = yield* Effect.acquireRelease(
+        Effect.promise(() => tmpdir()),
+        (dir) => Effect.promise(() => dir[Symbol.asyncDispose]()),
+      )
+      yield* Effect.promise(() => initRepo(root.path))
+      const git = yield* Git.Service
+      const repository = yield* git.repo.discover(AbsolutePath.make(root.path))
+      if (!repository) throw new Error("Repository not found")
+      const objects = yield* Effect.promise(async () => {
+        const large = (
+          await $`git hash-object -w --stdin < ${Buffer.from("x".repeat(2 * 1024 * 1024) + "\n")}`.cwd(root.path).text()
+        ).trim()
+        const small = (await $`git hash-object -w --stdin < ${Buffer.from("small\n")}`.cwd(root.path).text()).trim()
+        await $`git update-index --add --cacheinfo 160000 ${"c".repeat(40)} 'expanded[link]'`.cwd(root.path).quiet()
+        await $`git update-index --add --cacheinfo 100644 ${large} 'collapsed[link]/large.txt'`.cwd(root.path).quiet()
+        await $`git update-index --add --cacheinfo 100644 ${small} 'collapsed[link]/small.txt'`.cwd(root.path).quiet()
+        return { large, small }
+      })
+      const before = yield* git.tree.write(repository)
+      yield* Effect.promise(async () => {
+        await $`git update-index --force-remove -- 'expanded[link]' 'collapsed[link]/large.txt' 'collapsed[link]/small.txt'`
+          .cwd(root.path)
+          .quiet()
+        await $`git update-index --add --cacheinfo 160000 ${"c".repeat(40)} 'collapsed[link]'`.cwd(root.path).quiet()
+        await $`git update-index --add --cacheinfo 100644 ${objects.large} 'expanded[link]/large.txt'`
+          .cwd(root.path)
+          .quiet()
+        await $`git update-index --add --cacheinfo 100644 ${objects.small} 'expanded[link]/small.txt'`
+          .cwd(root.path)
+          .quiet()
+      })
+      const after = yield* git.tree.write(repository)
+      const trace = path.join(repository.gitDirectory, "patch-trace")
+      const diffs = yield* withEnv({ GIT_TRACE: trace }, () => git.tree.diff({ repository, from: before, to: after }))
+      expect(diffs.map((entry) => [entry.file, entry.status, entry.additions, entry.deletions])).toEqual([
+        ["collapsed[link]", "added", 1, 0],
+        ["collapsed[link]/large.txt", "deleted", 0, 1],
+        ["collapsed[link]/small.txt", "deleted", 0, 1],
+        ["expanded[link]", "deleted", 0, 1],
+        ["expanded[link]/large.txt", "added", 1, 0],
+        ["expanded[link]/small.txt", "added", 1, 0],
+      ])
+      expect(diffs[0]?.patch).toContain(`+Subproject commit ${"c".repeat(40)}`)
+      expect(diffs[1]?.patch.length).toBe(0)
+      expect(diffs[2]?.patch).toContain("-small\n")
+      expect(diffs[3]?.patch).toContain(`-Subproject commit ${"c".repeat(40)}`)
+      expect(diffs[4]?.patch.length).toBe(0)
+      expect(diffs[5]?.patch).toContain("+small\n")
+      expect(
+        (yield* Effect.promise(() => fs.readFile(trace, "utf8")))
+          .split("\n")
+          .some((line) => line.includes("--unified=") && line.includes("large.txt")),
+      ).toBe(false)
+    }),
+  )
+
+  it.live("tree full-diff size checks support symlink blobs and do not read submodule commits", () =>
+    Effect.gen(function* () {
+      const root = yield* Effect.acquireRelease(
+        Effect.promise(() => tmpdir()),
+        (dir) => Effect.promise(() => dir[Symbol.asyncDispose]()),
+      )
+      yield* Effect.promise(() => initRepo(root.path))
+      const git = yield* Git.Service
+      const repository = yield* git.repo.discover(AbsolutePath.make(root.path))
+      if (!repository) throw new Error("Repository not found")
+      const before = yield* git.tree.write(repository)
+      yield* Effect.promise(async () => {
+        const object = (await $`git hash-object -w --stdin < ${Buffer.from("target.txt")}`.cwd(root.path).text()).trim()
+        await $`git update-index --add --cacheinfo 120000 ${object} symbolic-link`.cwd(root.path).quiet()
+        await $`git update-index --add --cacheinfo 160000 ${"c".repeat(40)} submodule`.cwd(root.path).quiet()
+      })
+      const after = yield* git.tree.write(repository)
+      const diffs = yield* git.tree.diff({ repository, from: before, to: after })
+      expect(diffs.map((entry) => [entry.file, entry.status, entry.additions, entry.deletions])).toEqual([
+        ["submodule", "added", 1, 0],
+        ["symbolic-link", "added", 1, 0],
+      ])
+      expect(diffs[0]?.patch).toContain(`+Subproject commit ${"c".repeat(40)}`)
+      expect(diffs[1]?.patch).toContain("+target.txt")
+    }),
+  )
+
   it.live("caps batched tree patches, keeps per-file stats past the cap, and matches non-ASCII names", () =>
     Effect.gen(function* () {
       const root = yield* Effect.acquireRelease(
@@ -256,10 +542,12 @@ describe("Git trees", () => {
       const repository = yield* git.repo.discover(AbsolutePath.make(root.path))
       if (!repository) throw new Error("Repository not found")
       const before = yield* git.tree.capture({ repository, scopes: [RelativePath.make(".")] })
-      const lines = Math.ceil(VcsPatch.MAX_TOTAL_PATCH_BYTES / 80) + 1
+      const largeFiles = Array.from({ length: 6 }, (_, index) => `b-large-${index}.txt`)
       yield* Effect.promise(async () => {
         await Bun.write(path.join(root.path, "a-small.txt"), "small\n")
-        await Bun.write(path.join(root.path, "b-large.txt"), `${"x".repeat(79)}\n`.repeat(lines))
+        await Promise.all(
+          largeFiles.map((file) => Bun.write(path.join(root.path, file), `${"x".repeat(2 * 1024 * 1024 - 1)}\n`)),
+        )
         await Bun.write(path.join(root.path, "c-binary.bin"), new Uint8Array([0, 1, 2, 3]))
         await Bun.write(path.join(root.path, "a-caf\u00e9.txt"), "caf\u00e9\n")
       })
@@ -269,14 +557,16 @@ describe("Git trees", () => {
       expect(diffs.map((item) => [item.file, item.status, item.additions, item.deletions])).toEqual([
         ["a-caf\u00e9.txt", "added", 1, 0],
         ["a-small.txt", "added", 1, 0],
-        ["b-large.txt", "added", lines, 0],
+        ...largeFiles.map((file) => [file, "added", 1, 0]),
         ["c-binary.bin", "added", 0, 0],
       ])
       // Patch headers are not NUL-delimited; a quoted (octal-escaped) header would orphan this chunk.
       expect(diffs[0]?.patch).toContain("+caf\u00e9\n")
       expect(diffs[1]?.patch).toContain("+small\n")
-      expect(diffs[2]?.patch).toBe(VcsPatch.emptyPatch("b-large.txt"))
-      expect(diffs[3]?.patch).toBe("")
+      expect(diffs.slice(2, 6).every((entry) => entry.patch.startsWith("diff --git "))).toBe(true)
+      expect(diffs[6]?.patch).toBe(VcsPatch.emptyPatch(largeFiles[4]!))
+      expect(diffs[7]?.patch).toBe(VcsPatch.emptyPatch(largeFiles[5]!))
+      expect(diffs[8]?.patch).toBe("")
       expect(yield* git.tree.diff({ repository, from: before, to: after, paths: [] })).toEqual([])
     }),
   )
@@ -585,9 +875,9 @@ describe("Git capture", () => {
 
       yield* Effect.promise(() => Bun.write(path.join(storage, "index"), "not an index"))
       expect(yield* capture()).toBe(before)
-      expect((yield* Effect.promise(() => fs.readdir(storage))).filter((entry) => entry.startsWith("sharedindex."))).toEqual(
-        [],
-      )
+      expect(
+        (yield* Effect.promise(() => fs.readdir(storage))).filter((entry) => entry.startsWith("sharedindex.")),
+      ).toEqual([])
     }),
   )
 })

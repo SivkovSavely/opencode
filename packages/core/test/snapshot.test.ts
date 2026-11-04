@@ -82,6 +82,50 @@ describe("Snapshot", () => {
     ),
   )
 
+  testEffect(Layer.empty).live("guards snapshot full-diff patches without losing counts or restore data", () =>
+    Effect.acquireUseRelease(
+      Effect.promise(() => tmpdir()),
+      (tmp) =>
+        Effect.gen(function* () {
+          const project = path.join(tmp.path, "project")
+          const oversized = `${"x".repeat(2 * 1024 * 1024)}\n`
+          yield* Effect.promise(async () => {
+            await fs.mkdir(project)
+            await Bun.write(path.join(project, "large.txt"), oversized)
+            await Bun.write(path.join(project, "normal.txt"), "before\n")
+            await initGit(project)
+          })
+          yield* Effect.gen(function* () {
+            const snapshot = yield* Snapshot.Service
+            const before = yield* snapshot.capture()
+            expect(before).toBeDefined()
+            if (!before) return
+            yield* Effect.promise(async () => {
+              await Bun.write(path.join(project, "large.txt"), "small\n")
+              await Bun.write(path.join(project, "normal.txt"), "after\n")
+            })
+            const after = yield* snapshot.capture()
+            expect(after).toBeDefined()
+            if (!after) return
+            const diffs = yield* snapshot.diff({ from: before, to: after })
+            expect(diffs.map((entry) => [entry.file, entry.additions, entry.deletions])).toEqual([
+              ["large.txt", 1, 1],
+              ["normal.txt", 1, 1],
+            ])
+            expect(diffs[0]?.patch.length).toBe(0)
+            expect(diffs[1]?.patch).toContain("-before\n+after\n")
+            const files = yield* snapshot.files({ from: before, to: after })
+            yield* snapshot.restore({ files: new Map(files.map((file) => [file, before])) })
+            expect((yield* Effect.promise(() => fs.stat(path.join(project, "large.txt")))).size).toBe(
+              Buffer.byteLength(oversized),
+            )
+            expect(yield* read(path.join(project, "normal.txt"))).toBe("before\n")
+          }).pipe(Effect.provide(snapshotLayer(tmp.path, project)))
+        }),
+      (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
+    ),
+  )
+
   testEffect(Layer.empty).live("captures and restores Location-scoped changes", () =>
     Effect.acquireUseRelease(
       Effect.promise(() => tmpdir()),
