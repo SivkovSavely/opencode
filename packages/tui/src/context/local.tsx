@@ -360,8 +360,14 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
         current: currentModel,
         async flush() {
           await loaded
-          // Worker-backed session creation can finish after the renderer has been disposed.
-          while (state.initializing.size) await Promise.allSettled(Array.from(state.initializing))
+          if (state.initializing.size) {
+            // Give worker-backed creations a short grace period, then abandon unfinished selections.
+            const cutoff = Promise.withResolvers<void>()
+            const timer = setTimeout(cutoff.resolve, 250)
+            await Promise.race([Promise.allSettled(state.initializing), cutoff.promise])
+            clearTimeout(timer)
+            state.initializing.clear()
+          }
           await state.write
           if (!state.session.size) return
           save()
@@ -372,7 +378,7 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
           selection: { providerID: string; modelID: string; variant?: string },
         ) {
           const pending = Promise.all([sessionID, loaded]).then(([id]) => {
-            if (!id || modelStore.session[id]) return
+            if (!state.initializing.has(pending) || !id || modelStore.session[id]) return
             setModelStore("session", id, { ...selection })
             state.session.set(id, { mode: "remember" })
             save()

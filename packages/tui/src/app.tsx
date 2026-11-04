@@ -502,26 +502,34 @@ function App(props: { onSnapshot?: () => Promise<string[]>; pluginHost: TuiPlugi
     const match = sync.data.session
       .toSorted((a, b) => b.time.updated - a.time.updated)
       .find((x) => x.parentID === undefined)?.id
-    if (match) {
+    if (!match) {
+      if (sync.status !== "complete") return
       continued = true
-      if (args.fork) {
-        void sdk.client.session.fork({ sessionID: match }).then((result) => {
-          if (result.data?.id) {
-            batch(() => {
-              route.navigate({ type: "session", sessionID: result.data.id })
-              local.model.selectInitial()
-            })
-          } else {
-            toast.show({ message: "Failed to fork session", variant: "error" })
-          }
-        })
-      } else {
-        batch(() => {
-          route.navigate({ type: "session", sessionID: match })
-          local.model.selectInitial()
-        })
-      }
+      batch(() => {
+        route.navigate({ type: "home" })
+        local.model.selectInitial()
+      })
+      return
     }
+    continued = true
+    if (args.fork) {
+      void sdk.client.session
+        .fork({ sessionID: match })
+        .catch(() => undefined)
+        .then((result) => {
+          if (renderer.isDestroyed) return
+          if (!result?.data?.id) toast.show({ message: "Failed to fork session", variant: "error" })
+          batch(() => {
+            route.navigate(result?.data?.id ? { type: "session", sessionID: result.data.id } : { type: "home" })
+            local.model.selectInitial()
+          })
+        })
+      return
+    }
+    batch(() => {
+      route.navigate({ type: "session", sessionID: match })
+      local.model.selectInitial()
+    })
   })
 
   // Handle --session with --fork: wait for sync to be fully complete before forking
@@ -531,16 +539,17 @@ function App(props: { onSnapshot?: () => Promise<string[]>; pluginHost: TuiPlugi
   createEffect(() => {
     if (forked || sync.status !== "complete" || !args.sessionID || !args.fork) return
     forked = true
-    void sdk.client.session.fork({ sessionID: args.sessionID }).then((result) => {
-      if (result.data?.id) {
+    void sdk.client.session
+      .fork({ sessionID: args.sessionID })
+      .catch(() => undefined)
+      .then((result) => {
+        if (renderer.isDestroyed) return
+        if (!result?.data?.id) toast.show({ message: "Failed to fork session", variant: "error" })
         batch(() => {
-          route.navigate({ type: "session", sessionID: result.data.id })
+          route.navigate(result?.data?.id ? { type: "session", sessionID: result.data.id } : { type: "home" })
           local.model.selectInitial()
         })
-      } else {
-        toast.show({ message: "Failed to fork session", variant: "error" })
-      }
-    })
+      })
   })
 
   createEffect(

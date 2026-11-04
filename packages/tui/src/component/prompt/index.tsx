@@ -1266,10 +1266,15 @@ export function Prompt(props: PromptProps) {
           variant,
         },
       })
-      await local.model.remember(
-        creating.then((res) => res.data?.id),
-        { ...selectedModel, variant: persistentVariant },
-      )
+      await local.model
+        .remember(
+          creating.then((res) => res.data?.id),
+          { ...selectedModel, variant: persistentVariant },
+        )
+        .catch((error) => {
+          if (!renderer.isDestroyed) throw error
+        })
+      if (renderer.isDestroyed) return false
       const res = await creating
       if (renderer.isDestroyed) return false
 

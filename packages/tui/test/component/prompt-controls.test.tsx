@@ -749,10 +749,10 @@ test("prompt controls remain one-shot across navigation and persistent model res
           concurrent.renderer.destroy()
           const finished = { value: false }
           const shutdown = flush!().then(() => (finished.value = true))
-          await Bun.sleep(20)
+          await Bun.sleep(0)
           expect(finished.value, "shutdown must wait for session initialization").toBe(false)
           shutdownCreationRelease.resolve()
-          await Bun.sleep(20)
+          await Bun.sleep(0)
           expect(finished.value, "shutdown must then wait for the locked model save").toBe(false)
           await lock.release()
           await shutdown
