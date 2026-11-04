@@ -243,32 +243,40 @@ describe("tool.registry", () => {
     }),
   )
 
-  it.instance("ignores non-tool exports in .opencode/tool files", () =>
-    Effect.gen(function* () {
-      const test = yield* TestInstance
-      const tool = path.join(test.directory, ".opencode", "tool")
-      yield* Effect.promise(() => fs.mkdir(tool, { recursive: true }))
-      yield* Effect.promise(() =>
-        Bun.write(
-          path.join(tool, "mixed.ts"),
-          [
-            "export const helper = 'not a tool'",
-            "export default {",
-            "  description: 'mixed tool',",
-            "  args: {},",
-            "  execute: async () => 'ok',",
-            "}",
-            "",
-          ].join("\n"),
-        ),
-      )
+  for (const directory of ["tool", "tools"]) {
+    it.instance(`ignores helpers without args in .opencode/${directory} files`, () =>
+      withDiagnostics(({ logs, notifications }) =>
+        Effect.gen(function* () {
+          const test = yield* TestInstance
+          yield* Effect.promise(() =>
+            Bun.write(
+              path.join(test.directory, ".opencode", directory, "mixed.ts"),
+              [
+                "export const label = 'not a tool'",
+                "export const helper = { description: 'Internal utility', execute: async () => 'internal result' }",
+                "export default helper",
+                "export const intended = { description: 'mixed tool', args: {}, execute: async () => 'ok' }",
+                "",
+              ].join("\n"),
+            ),
+          )
 
-      const registry = yield* ToolRegistry.Service
-      const ids = yield* registry.ids()
-      expect(ids).toContain("mixed")
-      expect(ids).not.toContain("mixed_helper")
-    }),
-  )
+          const registry = yield* ToolRegistry.Service
+          const agents = yield* Agent.Service
+          const ids = yield* registry.ids()
+          const tools = yield* registry.tools({
+            providerID: ProviderV2.ID.opencode,
+            modelID: ModelV2.ID.make("test"),
+            agent: yield* agents.defaultInfo(),
+          })
+          expect(ids.filter((id) => id.startsWith("mixed"))).toEqual(["mixed_intended"])
+          expect(tools.filter((tool) => tool.id.startsWith("mixed")).map((tool) => tool.id)).toEqual(["mixed_intended"])
+          expect(logs).toEqual([])
+          expect(notifications).toEqual([])
+        }),
+      ),
+    )
+  }
 
   for (const directory of ["tool", "tools"]) {
     it.instance(`skips missing V2 exports in ${directory} without poisoning the registry`, () =>
@@ -613,6 +621,7 @@ describe("tool.registry", () => {
             "  args: undefined,",
             "  execute: async () => 'ok',",
             "}",
+            "export const nullargs = { description: 'tool with null args', args: null, execute: async () => 'ok' }",
             "",
           ].join("\n"),
         ),
@@ -626,6 +635,9 @@ describe("tool.registry", () => {
       const loaded = (yield* registry.all()).find((t) => t.id === "noargs")
       if (!loaded) throw new Error("noargs tool was not loaded")
       expect(loaded.jsonSchema).toMatchObject({ type: "object", properties: {} })
+      const nullargs = (yield* registry.all()).find((t) => t.id === "noargs_nullargs")
+      if (!nullargs) throw new Error("nullargs tool was not loaded")
+      expect(nullargs.jsonSchema).toMatchObject({ type: "object", properties: {} })
     }),
   )
 

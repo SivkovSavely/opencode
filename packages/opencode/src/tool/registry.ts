@@ -228,16 +228,20 @@ const layer = Layer.effect(
           source: string,
           id: string,
           get: () => unknown,
-          explicit: boolean,
+          origin: "named" | "default" | "plugin",
         ) {
           const tool = yield* Effect.try({
             try: () => {
               const def = get()
               if (!isPluginTool(def)) {
-                if (!explicit && !(typeof def === "object" && def !== null && ("args" in def || "execute" in def)))
+                if (
+                  origin === "named" &&
+                  !(typeof def === "object" && def !== null && ("args" in def || "execute" in def))
+                )
                   return
                 throw new TypeError("Expected a tool definition with description and execute")
               }
+              if (origin !== "plugin" && !("args" in def)) return
               return fromPlugin(id, def)
             },
             catch: (error) => error,
@@ -275,7 +279,12 @@ const layer = Layer.effect(
             Effect.catch((error) => skip(match, "registration", error).pipe(Effect.as([]))),
           )
           for (const id of ids) {
-            yield* register(match, id === "default" ? namespace : `${namespace}_${id}`, () => mod[id], id === "default")
+            yield* register(
+              match,
+              id === "default" ? namespace : `${namespace}_${id}`,
+              () => mod[id],
+              id === "default" ? "default" : "named",
+            )
           }
         }
 
@@ -290,7 +299,7 @@ const layer = Layer.effect(
             Effect.catch((error) => skip(source, "registration", error).pipe(Effect.as([]))),
           )
           for (const id of ids) {
-            yield* register(source, id, () => tools[id], true)
+            yield* register(source, id, () => tools[id], "plugin")
           }
         }
 
