@@ -1,4 +1,5 @@
 import { getDirectory, getFilename } from "@opencode-ai/core/util/path"
+import { SnapshotDiff } from "@opencode-ai/core/snapshot-diff"
 import type { SelectedLineRange } from "@pierre/diffs"
 import { DiffChanges } from "@opencode-ai/ui/v2/diff-changes-v2"
 import { FileIcon } from "@opencode-ai/ui/file-icon"
@@ -33,6 +34,7 @@ type ReviewDiff = (SnapshotFileDiff & { file: string }) | FileDiffInfo | VcsFile
 export type SessionReviewFilePreviewV2Props = {
   file: string
   diff: ReviewDiff
+  snapshot?: boolean
   diffStyle: SessionReviewDiffStyle
   expandMode?: SessionReviewExpandMode
   readFile?: (path: string) => Promise<FileContent | undefined>
@@ -96,6 +98,57 @@ function ReviewCommentMenuV2(props: {
 }
 
 export function SessionReviewFilePreviewV2(props: SessionReviewFilePreviewV2Props) {
+  const i18n = useI18n()
+  const bounded = createMemo(() => {
+    const diff = props.diff
+    if (props.snapshot === false || "before" in diff || "after" in diff) return diff
+    return SnapshotDiff.limit([diff])[0]
+  })
+  const renderable = createMemo(() => {
+    const diff = bounded()
+    if (!diff?.file || ("omitted" in diff && diff.omitted)) return
+    return { ...diff, file: diff.file }
+  })
+  createEffect(() => {
+    if (renderable() || !props.focusedComment) return
+    // Omitted previews cannot open an anchor, but must still release comment focus for navigation.
+    const frame = requestAnimationFrame(() => props.onFocusedCommentChange?.(null))
+    onCleanup(() => cancelAnimationFrame(frame))
+  })
+
+  return (
+    <Show
+      when={renderable()}
+      fallback={
+        <>
+          <div data-slot="session-review-v2-file-header">
+            <div data-slot="session-review-v2-file-title">
+              <div data-slot="session-review-v2-file-status" data-type={statusType(props.diff.status)}>
+                {statusLabel(props.diff.status)}
+              </div>
+              <FileIcon node={{ path: props.file, type: "file" }} />
+              <span data-slot="session-review-v2-file-name">{getFilename(props.file)}</span>
+              <Show when={props.file.includes("/")}>
+                <span data-slot="session-review-v2-file-path">{getDirectory(props.file)}</span>
+              </Show>
+            </div>
+            <Show when={!("omitted" in props.diff && props.diff.omitted?.statisticsIncomplete)}>
+              <DiffChanges changes={props.diff} />
+            </Show>
+          </div>
+          <div role="status" data-slot="snapshot-diff-file-omitted" class="p-3 text-12-regular text-text-weak">
+            <div>{i18n.t("ui.snapshotDiff.patchOmitted")}</div>
+            {i18n.t("ui.snapshotDiff.omitted")}
+          </div>
+        </>
+      }
+    >
+      {(diff) => <ReviewFilePreviewV2 {...props} diff={diff()} />}
+    </Show>
+  )
+}
+
+function ReviewFilePreviewV2(props: SessionReviewFilePreviewV2Props) {
   const i18n = useI18n()
   const fileComponent = useFileComponent()
   let scrollRef: HTMLDivElement | undefined

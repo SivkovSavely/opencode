@@ -1,15 +1,11 @@
-import {
-  AssistantMessage,
-  type SnapshotFileDiff,
-  Message as MessageType,
-  Part as PartType,
-} from "@opencode-ai/sdk/v2/client"
+import { AssistantMessage, Message as MessageType, Part as PartType } from "@opencode-ai/sdk/v2/client"
 import type { FileDiffInfo } from "@opencode-ai/client/promise"
 import type { SessionStatus } from "@opencode-ai/sdk/v2"
 import { useData } from "../context"
 import { useFileComponent } from "@opencode-ai/ui/context/file"
 
 import { Binary } from "@opencode-ai/core/util/binary"
+import { SnapshotDiff } from "@opencode-ai/core/snapshot-diff"
 import { getDirectory, getFilename } from "@opencode-ai/core/util/path"
 import { createEffect, createMemo, createSignal, For, on, ParentProps, Show } from "solid-js"
 import { createStore } from "solid-js/store"
@@ -91,9 +87,9 @@ function list<T>(value: T[] | undefined | null, fallback: T[]) {
   return fallback
 }
 
-type SummaryDiff = (SnapshotFileDiff & { file: string }) | FileDiffInfo
+type SummaryDiff = ReturnType<typeof SnapshotDiff.limit>[number] | FileDiffInfo
 
-function summaryDiff(value: SnapshotFileDiff): value is SummaryDiff {
+function summaryDiff(value: SummaryDiff): value is SummaryDiff & { file: string } {
   return typeof value.file === "string"
 }
 
@@ -244,9 +240,13 @@ export function SessionTurn(
     if (!files?.length) return emptyDiffs
 
     const seen = new Set<string>()
-    return files
+    const bounded = files.some((diff) => "before" in diff || "after" in diff) ? files : SnapshotDiff.limit(files)
+    return bounded
       .reduceRight<SummaryDiff[]>((result, diff) => {
-        if (!summaryDiff(diff)) return result
+        if (!summaryDiff(diff)) {
+          result.push(diff)
+          return result
+        }
         if (seen.has(diff.file)) return result
         seen.add(diff.file)
         result.push(diff)
@@ -254,16 +254,18 @@ export function SessionTurn(
       }, [])
       .reverse()
   })
+  const totals = createMemo(() => SnapshotDiff.totals(diffs()))
+  const omitted = createMemo(() => diffs().some((diff) => "omitted" in diff && diff.omitted))
+  const files = createMemo(() => diffs().filter(summaryDiff))
   const MAX_FILES = 10
-  const edited = createMemo(() => diffs().length)
   const [state, setState] = createStore({
     showAll: false,
     expanded: [] as string[],
   })
   const showAll = () => state.showAll
   const expanded = () => state.expanded
-  const overflow = createMemo(() => Math.max(0, edited() - MAX_FILES))
-  const visible = createMemo(() => (showAll() ? diffs() : diffs().slice(0, MAX_FILES)))
+  const overflow = createMemo(() => Math.max(0, files().length - MAX_FILES))
+  const visible = createMemo(() => (showAll() ? files() : files().slice(0, MAX_FILES)))
   const toggleAll = () => {
     autoScroll.pause()
     setState("showAll", !showAll())
@@ -433,7 +435,7 @@ export function SessionTurn(
                 </div>
               </Show>
               <SessionRetry status={status()} show={active()} />
-              <Show when={edited() > 0 && !working()}>
+              <Show when={diffs().length > 0 && !working()}>
                 <div
                   data-slot="session-turn-diffs"
                   data-component="session-turn-diffs-group"
@@ -441,7 +443,9 @@ export function SessionTurn(
                 >
                   <div data-slot="session-turn-diffs-header">
                     <span data-slot="session-turn-diffs-label">
-                      {i18n.plural("ui.sessionTurn.diffs.changed", edited())}
+                      {totals().filesComplete
+                        ? i18n.plural("ui.sessionTurn.diffs.changed", totals().files)
+                        : i18n.t("ui.snapshotDiff.filesUnknown")}
                     </span>
                     <DiffChanges changes={diffs()} />
                     <Show when={overflow() > 0}>
@@ -450,6 +454,11 @@ export function SessionTurn(
                       </span>
                     </Show>
                   </div>
+                  <Show when={omitted()}>
+                    <div role="status" data-slot="snapshot-diff-omitted" class="p-3 text-12-regular text-text-weak">
+                      {i18n.t("ui.snapshotDiff.omitted")}
+                    </div>
+                  </Show>
                   <div data-component="session-turn-diffs-content">
                     <Accordion
                       multiple
@@ -459,7 +468,7 @@ export function SessionTurn(
                     >
                       <For each={visible()}>
                         {(diff) => {
-                          const view = normalize(diff)
+                          const view = "omitted" in diff && diff.omitted ? undefined : normalize(diff)
                           const active = createMemo(() => expanded().includes(diff.file))
                           const [shown, setShown] = createSignal(false)
 
@@ -508,7 +517,18 @@ export function SessionTurn(
                               <Accordion.Content>
                                 <Show when={shown()}>
                                   <div data-slot="session-turn-diff-view" data-scrollable>
-                                    <Dynamic component={fileComponent} mode="diff" fileDiff={view.fileDiff} />
+                                    <Show
+                                      when={view}
+                                      fallback={
+                                        <div class="p-3 text-12-regular text-text-weak">
+                                          {i18n.t("ui.snapshotDiff.patchOmitted")}
+                                        </div>
+                                      }
+                                    >
+                                      {(view) => (
+                                        <Dynamic component={fileComponent} mode="diff" fileDiff={view().fileDiff} />
+                                      )}
+                                    </Show>
                                   </div>
                                 </Show>
                               </Accordion.Content>

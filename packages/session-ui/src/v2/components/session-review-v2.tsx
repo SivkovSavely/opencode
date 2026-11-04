@@ -25,6 +25,7 @@ export type SessionReviewV2Props = {
   title?: JSX.Element
   stats?: JSX.Element
   empty?: JSX.Element
+  notice?: JSX.Element
   sidebarOpen?: boolean
   sidebar?: JSX.Element
   activeFile?: string
@@ -317,6 +318,7 @@ export function SessionReviewV2(props: SessionReviewV2Props) {
       toolbarStart={toolbarStart()}
       toolbarEnd={toolbarEnd()}
     >
+      {props.notice}
       <Show when={props.hasDiffs} fallback={props.empty}>
         <Show when={props.activeFile} fallback={<SessionFilePanelV2Empty>{props.empty}</SessionFilePanelV2Empty>}>
           {props.preview}

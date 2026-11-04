@@ -1,6 +1,7 @@
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { Effect, Layer, Context, Schema } from "effect"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
+import { SnapshotDiff } from "@opencode-ai/core/snapshot-diff"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { Snapshot } from "../snapshot"
 import { Storage } from "@/storage/storage"
@@ -86,7 +87,7 @@ const layer = Layer.effect(
         summary: {
           additions: diffs.reduce((sum, x) => sum + x.additions, 0),
           deletions: diffs.reduce((sum, x) => sum + x.deletions, 0),
-          files: diffs.length,
+          files: SnapshotDiff.totals(diffs).files,
         },
       })
       return yield* sessions.get(input.sessionID).pipe(Effect.orDie)

@@ -21,6 +21,7 @@ export interface SessionReviewTabProps {
   title?: JSX.Element
   empty?: JSX.Element
   diffs: () => ReviewDiff[]
+  snapshot?: boolean
   view: () => ReturnType<ReturnType<typeof useLayout>["view"]>
   diffStyle: DiffStyle
   onDiffStyleChange?: (style: DiffStyle) => void
@@ -154,6 +155,7 @@ export function SessionReviewTab(props: SessionReviewTabProps) {
         container: props.classes?.container ?? "pl-3",
       }}
       diffs={props.diffs()}
+      snapshot={props.snapshot}
       diffStyle={props.diffStyle}
       onDiffStyleChange={props.onDiffStyleChange}
       onViewFile={props.onViewFile}

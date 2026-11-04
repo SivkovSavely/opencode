@@ -103,10 +103,16 @@ const layer = Layer.effect(
       // Pre-capture snapshot before the LLM stream starts. The AI SDK
       // may execute tools internally before emitting start-step events,
       // so capturing inside the event handler can be too late.
+      const fence = yield* runtime.ownershipFence(input.sessionID)
       yield* Effect.logInfo("snapshot initialization started", {
         sessionID: input.sessionID,
         messageID: input.assistantMessage.id,
         directory: input.assistantMessage.path.cwd,
+        operation: "snapshot.track",
+        phase: "snapshot-initialization",
+        ownerLineage: runtime.identity.lineage,
+        ownerInstance: runtime.identity.instance,
+        fence,
       })
       const initialSnapshot = yield* snapshot.track().pipe(
         Effect.onExit((exit) =>
@@ -114,9 +120,18 @@ const layer = Layer.effect(
             sessionID: input.sessionID,
             messageID: input.assistantMessage.id,
             directory: input.assistantMessage.path.cwd,
+            phase: "snapshot-initialization",
+            ownerLineage: runtime.identity.lineage,
+            ownerInstance: runtime.identity.instance,
+            fence,
             outcome: Exit.isSuccess(exit) ? "success" : Cause.hasInterrupts(exit.cause) ? "interrupted" : "failure",
             hasDefects: Exit.isFailure(exit) && Cause.hasDies(exit.cause),
             interruptors: Exit.isFailure(exit) ? Array.from(Cause.interruptors(exit.cause)) : [],
+            ...(Exit.isFailure(exit)
+              ? RuntimeLifecycle.recoveryFailureFields(exit.cause, "snapshot-initialization")
+              : {}),
+            operation: "snapshot.track",
+            rowTransitioned: false,
           }),
         ),
       )
@@ -457,7 +472,9 @@ const layer = Layer.effect(
           }
 
           case "tool-error": {
-            yield* failToolCall(toolCallKey(value.id), value.error ?? new Error(value.message)).pipe(toolLock.withPermits(1))
+            yield* failToolCall(toolCallKey(value.id), value.error ?? new Error(value.message)).pipe(
+              toolLock.withPermits(1),
+            )
             return
           }
 
@@ -665,8 +682,11 @@ const layer = Layer.effect(
         yield* Effect.logError("process", {
           "session.id": input.sessionID,
           messageID: input.assistantMessage.id,
-          error: errorMessage(e),
-          stack: e instanceof Error ? e.stack : undefined,
+          ownerLineage: runtime.identity.lineage,
+          ownerInstance: runtime.identity.instance,
+          fence,
+          ...RuntimeLifecycle.recoveryFailureFields(Cause.die(e), "provider-turn"),
+          rowTransitioned: false,
         })
         const error = parse(e)
         if (SessionV1.ContextOverflowError.isInstance(error)) {
@@ -760,11 +780,14 @@ const layer = Layer.effect(
                     })
                     const scheduled = status.get(ctx.sessionID)
                     const retryStatus = yield* scheduled
-                    if (retryStatus.type !== "retry") return yield* new RuntimeLifecycle.RuntimeDrainingError({ message: "Retry status was cleared" })
+                    if (retryStatus.type !== "retry")
+                      return yield* new RuntimeLifecycle.RuntimeDrainingError({ message: "Retry status was cleared" })
                     const outcome = yield* Effect.raceFirst(
                       Effect.sleep(duration).pipe(Effect.as("deadline" as const)),
                       Effect.raceFirst(
-                        runtime.awaitRetryWake(ctx.sessionID, retryStatus.attempt, retryStatus.next).pipe(Effect.as("manual" as const)),
+                        runtime
+                          .awaitRetryWake(ctx.sessionID, retryStatus.attempt, retryStatus.next)
+                          .pipe(Effect.as("manual" as const)),
                         runtime.awaitDraining.pipe(Effect.as("drain" as const)),
                       ),
                     )
@@ -772,7 +795,12 @@ const layer = Layer.effect(
                     yield* Effect.logInfo("restart diagnostic retry wait ended", {
                       sessionID: ctx.sessionID,
                       provider: input.model.providerID,
-                      outcome: outcome === "deadline" ? "retry_deadline" : outcome === "manual" ? "manual_retry" : "runtime_drain",
+                      outcome:
+                        outcome === "deadline"
+                          ? "retry_deadline"
+                          : outcome === "manual"
+                            ? "manual_retry"
+                            : "runtime_drain",
                       waitMs,
                       resumeRetry: resumed,
                     })

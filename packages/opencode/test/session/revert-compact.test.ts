@@ -2,6 +2,7 @@ import { describe, expect } from "bun:test"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
+import { SnapshotDiff } from "@opencode-ai/core/snapshot-diff"
 import fs from "fs/promises"
 import path from "path"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
@@ -433,6 +434,64 @@ describe("revert + compact workflow", () => {
           expect(ids).toContain(a1.id)
           expect(ids).not.toContain(u2.id)
           expect(ids).not.toContain(a2.id)
+        }),
+      { git: true },
+    ),
+  )
+
+  it.live(
+    "counts omitted summary files without changing revert and unrevert manifests",
+    provideTmpdirInstance(
+      (dir) =>
+        Effect.gen(function* () {
+          const session = yield* Session.Service
+          const revert = yield* SessionRevert.Service
+          const snapshot = yield* Snapshot.Service
+          const info = yield* session.create({})
+          const u1 = yield* user(info.id)
+          yield* text(info.id, u1.id, "add files")
+          const a1 = yield* assistant(info.id, u1.id, dir)
+          const before = yield* snapshot.track()
+          const files = Array.from({ length: SnapshotDiff.MAX_FILES + 7 }, (_, index) =>
+            path.join(dir, `change-${String(index).padStart(3, "0")}.txt`),
+          )
+          yield* Effect.forEach(files, (file) => write(file, "new\n"), { concurrency: 8 })
+          const after = yield* snapshot.track()
+          if (!before || !after) throw new Error("expected git snapshots")
+          yield* session.updatePart({
+            id: PartID.ascending(),
+            sessionID: info.id,
+            messageID: a1.id,
+            type: "step-start",
+            snapshot: before,
+          })
+          yield* session.updatePart({
+            id: PartID.ascending(),
+            sessionID: info.id,
+            messageID: a1.id,
+            type: "patch",
+            ...(yield* snapshot.patch(before)),
+          })
+          yield* session.updatePart({
+            id: PartID.ascending(),
+            sessionID: info.id,
+            messageID: a1.id,
+            type: "step-finish",
+            snapshot: after,
+            reason: "stop",
+            cost: 0,
+            tokens,
+          })
+
+          const reverted = yield* revert.revert({ sessionID: info.id, messageID: u1.id })
+          expect(reverted.summary).toEqual({ additions: files.length, deletions: 0, files: files.length })
+          expect((yield* session.get(info.id)).summary?.files).toBe(files.length)
+          expect(yield* Effect.promise(() => Bun.file(files[0]).exists())).toBe(false)
+          expect(yield* Effect.promise(() => Bun.file(files[files.length - 1]).exists())).toBe(false)
+
+          yield* revert.unrevert({ sessionID: info.id })
+          expect(yield* read(files[0])).toBe("new\n")
+          expect(yield* read(files[files.length - 1])).toBe("new\n")
         }),
       { git: true },
     ),

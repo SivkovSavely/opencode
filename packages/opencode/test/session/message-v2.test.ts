@@ -1259,67 +1259,73 @@ describe("session.message-v2.toModelMessage", () => {
     ])
   })
 
-  test("keeps crash-interrupted partial output as an uncertain tool error", async () => {
-    const userID = "m-user"
-    const assistantID = "m-assistant"
-    const warning = "The tool was interrupted by an unexpected OpenCode shutdown. Its final outcome is unknown."
-    const input: SessionV1.WithParts[] = [
-      {
-        info: userInfo(userID),
-        parts: [{ ...basePart(userID, "u1"), type: "text", text: "run tool" }] as SessionV1.Part[],
-      },
-      {
-        info: assistantInfo(assistantID, userID),
-        parts: [
-          {
-            ...basePart(assistantID, "a1"),
-            type: "tool",
-            callID: "call-crashed",
-            tool: "bash",
-            state: {
-              status: "error",
-              input: { command: "touch side-effect" },
-              error: warning,
-              metadata: {
-                interrupted: true,
-                crashInterrupted: true,
-                crashRawInput: '{"command":',
-                output: "partial output",
+  test.each(['{"command":', '{"command":"touch side-effect",}', "", '{"command":"touch side-effect"}'])(
+    "keeps crash-interrupted partial output as an uncertain tool error with raw %j",
+    async (raw) => {
+      const userID = "m-user"
+      const assistantID = "m-assistant"
+      const warning = "The tool was interrupted by an unexpected OpenCode shutdown. Its final outcome is unknown."
+      const input: SessionV1.WithParts[] = [
+        {
+          info: userInfo(userID),
+          parts: [{ ...basePart(userID, "u1"), type: "text", text: "run tool" }] as SessionV1.Part[],
+        },
+        {
+          info: assistantInfo(assistantID, userID),
+          parts: [
+            {
+              ...basePart(assistantID, "a1"),
+              type: "tool",
+              callID: "call-crashed",
+              tool: "bash",
+              state: {
+                status: "error",
+                input: { command: "touch side-effect" },
+                error: warning,
+                metadata: {
+                  interrupted: true,
+                  crashInterrupted: true,
+                  crashRawInput: raw,
+                  output: "partial output",
+                },
+                time: { start: 0, end: 1 },
               },
-              time: { start: 0, end: 1 },
             },
-          },
-        ] as SessionV1.Part[],
-      },
-    ]
+          ] as SessionV1.Part[],
+        },
+      ]
 
-    expect(await MessageV2.toModelMessages(input, model)).toStrictEqual([
-      { role: "user", content: [{ type: "text", text: "run tool" }] },
-      {
-        role: "assistant",
-        content: [
-          {
-            type: "tool-call",
-            toolCallId: "call-crashed",
-            toolName: "bash",
-            input: '{"command":',
-            providerExecuted: undefined,
-          },
-        ],
-      },
-      {
-        role: "tool",
-        content: [
-          {
-            type: "tool-result",
-            toolCallId: "call-crashed",
-            toolName: "bash",
-            output: { type: "error-text", value: warning },
-          },
-        ],
-      },
-    ])
-  })
+      expect(await MessageV2.toModelMessages(input, model)).toStrictEqual([
+        { role: "user", content: [{ type: "text", text: "run tool" }] },
+        {
+          role: "assistant",
+          content: [
+            {
+              type: "tool-call",
+              toolCallId: "call-crashed",
+              toolName: "bash",
+              input: { command: "touch side-effect" },
+              providerExecuted: undefined,
+            },
+          ],
+        },
+        {
+          role: "tool",
+          content: [
+            {
+              type: "tool-result",
+              toolCallId: "call-crashed",
+              toolName: "bash",
+              output: { type: "error-text", value: warning },
+            },
+          ],
+        },
+      ])
+      expect(input[1]?.parts[0]).toMatchObject({
+        state: { metadata: { crashRawInput: raw, output: "partial output" } },
+      })
+    },
+  )
 
   test("substitutes space for empty text between signed reasoning blocks", async () => {
     // Reproduces the bug pattern: [reasoning(sig), text(""), reasoning(sig), text(full)]

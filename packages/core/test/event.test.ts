@@ -8,11 +8,12 @@ import { SessionV1 } from "@opencode-ai/schema/session-v1"
 import { Database } from "@opencode-ai/core/database/database"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
-import { EventSequenceTable, EventTable } from "@opencode-ai/core/event/sql"
+import { EventSequenceTable, EventTable, EventTransportColumns } from "@opencode-ai/core/event/sql"
+import { EventData } from "@opencode-ai/core/event/data"
 import { Location } from "@opencode-ai/core/location"
 import { AbsolutePath } from "@opencode-ai/core/schema"
 import { WorkspaceV2 } from "@opencode-ai/core/workspace"
-import { eq } from "drizzle-orm"
+import { eq, sql } from "drizzle-orm"
 import { location } from "./fixture/location"
 import { testEffect } from "./lib/effect"
 
@@ -574,6 +575,76 @@ describe("EventV2", () => {
       ).toEqual([])
     }),
   )
+
+  for (const storage of ["text", "blob"]) {
+    it.effect(`rejects oversized historical ${storage} transport without changing canonical storage or replay`, () =>
+      Effect.gen(function* () {
+        const events = yield* EventV2.Service
+        const { db } = yield* Database.Service
+        const aggregateID = Session.ID.create()
+        const id = EventV2.ID.create()
+        const data = {
+          sessionID: aggregateID,
+          time: 0,
+          part: {
+            id: SessionV1.PartID.ascending(),
+            messageID: SessionV1.MessageID.ascending(),
+            sessionID: aggregateID,
+            type: "text" as const,
+            text: "x".repeat(EventData.MAX_TRANSPORT_BYTES + 1),
+          },
+        }
+        yield* db.insert(EventSequenceTable).values({ aggregate_id: aggregateID, seq: 0 }).run()
+        // A fixture from before transport limits, bypassing normal publication.
+        yield* db
+          .insert(EventTable)
+          .values({
+            id,
+            aggregate_id: aggregateID,
+            seq: 0,
+            type: EventV2.versionedType(SessionV1.Event.PartUpdated.type, 1),
+            data: storage === "text" ? sql`${JSON.stringify(data)}` : data,
+          })
+          .run()
+        const before = yield* db.get(sql`SELECT data FROM event WHERE id = ${id}`)
+        const projected = yield* db
+          .select(EventTransportColumns)
+          .from(EventTable)
+          .where(eq(EventTable.id, id))
+          .get()
+          .pipe(Effect.exit)
+        expect(Exit.isFailure(projected)).toBe(true)
+        if (Exit.isFailure(projected))
+          expect(Cause.pretty(projected.cause)).toContain("Event payload exceeds transport limit")
+
+        const durable = yield* events.durable({ aggregateID }).pipe(Stream.take(1), Stream.runCollect, Effect.exit)
+        expect(Exit.isFailure(durable)).toBe(true)
+        if (Exit.isFailure(durable))
+          expect(Cause.pretty(durable.cause)).toContain("Event payload exceeds transport limit")
+        const aggregate = yield* EventV2.readAggregate(db, {
+          aggregateID,
+          limit: 1,
+          manifest: { definitions: Event.durable([SessionV1.Event.PartUpdated]), schema: SessionV1.Event.PartUpdated },
+        }).pipe(Effect.exit)
+        expect(Exit.isFailure(aggregate)).toBe(true)
+        if (Exit.isFailure(aggregate))
+          expect(Cause.pretty(aggregate.cause)).toContain("Event payload exceeds transport limit")
+
+        expect((yield* db.select().from(EventTable).where(eq(EventTable.id, id)).get())?.data).toEqual(data)
+        yield* events.replay({
+          id,
+          aggregateID,
+          seq: 0,
+          type: EventV2.versionedType(SessionV1.Event.PartUpdated.type, 1),
+          data,
+        })
+        expect(yield* db.get(sql`SELECT data FROM event WHERE id = ${id}`)).toEqual(before)
+        expect(yield* db.get(sql`SELECT count(*) AS count FROM event WHERE aggregate_id = ${aggregateID}`)).toEqual({
+          count: 1,
+        })
+      }),
+    )
+  }
 
   it.effect("replays durable aggregate events after a sequence and tails new events", () =>
     Effect.gen(function* () {

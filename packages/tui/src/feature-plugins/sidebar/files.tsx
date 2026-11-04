@@ -2,6 +2,9 @@ import type { TuiPlugin, TuiPluginApi } from "@opencode-ai/plugin/tui"
 import type { BuiltinTuiPlugin } from "../builtins"
 import { createMemo, For, Show, createSignal } from "solid-js"
 import { Locale } from "../../util/locale"
+import { useSync } from "../../context/sync"
+import { SnapshotDiff } from "@opencode-ai/core/snapshot-diff"
+import type { FileDiff } from "@opencode-ai/schema/file-diff"
 
 const id = "internal:sidebar-files"
 
@@ -13,20 +16,31 @@ function changeCountWidth(item: { additions: number; deletions: number }) {
 
 function View(props: { api: TuiPluginApi; session_id: string }) {
   const [open, setOpen] = createSignal(true)
+  const sync = useSync()
   const theme = () => props.api.theme.current
-  const list = createMemo(() => props.api.state.session.diff(props.session_id))
+  // The public sidebar API only exposes named files, so retain aggregates from the raw summary here.
+  const summary = createMemo(() => SnapshotDiff.limit(sync.data.session_diff[props.session_id] ?? []))
+  const totals = createMemo(() => SnapshotDiff.totals(summary()))
+  const omitted = createMemo(() => summary().some((item) => item.omitted))
+  const list = createMemo(() => summary().filter((item): item is FileDiff.Info & { file: string } => !!item.file))
 
   return (
-    <Show when={list().length > 0}>
+    <Show when={summary().length > 0}>
       <box>
         <box flexDirection="row" gap={1} onMouseDown={() => list().length > 2 && setOpen((x) => !x)}>
           <Show when={list().length > 2}>
             <text fg={theme().text}>{open() ? "▼" : "▶"}</text>
           </Show>
           <text fg={theme().text}>
-            <b>Modified Files</b>
+            <b>Modified Files ({totals().filesComplete ? totals().files : "?"})</b>
           </text>
         </box>
+        <Show when={omitted()}>
+          <text fg={theme().warning}>Some change details were omitted. Statistics may be incomplete.</text>
+          <text fg={theme().textMuted}>
+            +{totals().additions} -{totals().deletions}
+          </text>
+        </Show>
         <Show when={list().length <= 2 || open()}>
           <For each={list()}>
             {(item) => (

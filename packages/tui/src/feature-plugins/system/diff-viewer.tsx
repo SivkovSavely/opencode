@@ -1,6 +1,7 @@
 /** @jsxImportSource @opentui/solid */
 import type { TuiPlugin, TuiPluginApi, TuiRouteCurrent } from "@opencode-ai/plugin/tui"
-import type { SnapshotFileDiff, VcsFileDiff } from "@opencode-ai/sdk/v2"
+import type { FileDiff } from "@opencode-ai/schema/file-diff"
+import { SnapshotDiff } from "@opencode-ai/core/snapshot-diff"
 import {
   TextAttributes,
   type BorderSides,
@@ -54,9 +55,10 @@ type DiffFile = {
   readonly additions: number
   readonly deletions: number
   readonly status: "added" | "deleted" | "modified"
+  readonly omitted?: FileDiff.Info["omitted"]
 }
 
-const normalizeDiffs = (diffs: readonly (VcsFileDiff | SnapshotFileDiff)[]): DiffFile[] =>
+const normalizeDiffs = (diffs: readonly FileDiff.Info[]): DiffFile[] =>
   diffs.flatMap((item) =>
     item.file
       ? [
@@ -66,6 +68,7 @@ const normalizeDiffs = (diffs: readonly (VcsFileDiff | SnapshotFileDiff)[]): Dif
             additions: item.additions,
             deletions: item.deletions,
             status: item.status ?? "modified",
+            omitted: item.omitted,
           } satisfies DiffFile,
         ]
       : [],
@@ -119,16 +122,18 @@ function DiffViewer(props: { api: TuiPluginApi }) {
         { sessionID, messageID: input.messageID },
         { throwOnError: true },
       )
-      return normalizeDiffs(result.data ?? [])
+      return SnapshotDiff.limit(result.data ?? [])
     }
 
     const result = await props.api.client.vcs.diff(
       { directory: input.directory, mode: input.mode, context: VCS_DIFF_CONTEXT_LINES },
       { throwOnError: true },
     )
-    return normalizeDiffs(result.data ?? [])
+    return result.data ?? []
   })
-  const files = createMemo(() => diff() ?? [])
+  const files = createMemo(() => normalizeDiffs(diff() ?? []))
+  const totals = createMemo(() => SnapshotDiff.totals(diff() ?? []))
+  const omitted = createMemo(() => (diff() ?? []).some((item: FileDiff.Info) => item.omitted))
   const [focus, setFocus] = createSignal<DiffViewerFocus>("patches")
   const [fileTreeEnabled, setFileTreeEnabled] = createSignal(
     props.api.kv.get<boolean>(KV_SHOW_FILE_TREE, true) !== false,
@@ -757,9 +762,18 @@ function DiffViewer(props: { api: TuiPluginApi }) {
           <text fg={theme().textMuted}>{diffSourceLabel(mode())}</text>
           <box flexGrow={1} />
           <text fg={theme().textMuted}>
-            {files().length} {files().length === 1 ? "file" : "files"}
+            {totals().filesComplete ? totals().files : "?"}{" "}
+            {totals().files === 1 && totals().filesComplete ? "file" : "files"}
           </text>
         </Panel>
+        <Show when={omitted()}>
+          <box flexShrink={0} paddingLeft={1} paddingRight={1}>
+            <text fg={theme().warning}>Some change details were omitted. Statistics may be incomplete.</text>
+            <text fg={theme().textMuted}>
+              +{totals().additions} -{totals().deletions}
+            </text>
+          </box>
+        </Show>
 
         <box flexGrow={1} minHeight={0}>
           <Switch>
@@ -769,7 +783,7 @@ function DiffViewer(props: { api: TuiPluginApi }) {
                 <text fg={theme().textMuted}>Loading diff…</text>
               </box>
             </Match>
-            <Match when={!diff.loading && files().length === 0}>
+            <Match when={!diff.loading && !diff.error && files().length === 0 && !omitted()}>
               <Separator axis="x" />
               <box flexGrow={1} paddingLeft={1}>
                 <text fg={theme().textMuted}>No diff!</text>
@@ -835,8 +849,12 @@ function DiffViewer(props: { api: TuiPluginApi }) {
                             </box>
                             <Separator axis="x" start={showFileTree() ? "edge" : undefined} />
                             <Show
-                              when={entry.file.patch}
-                              fallback={<text fg={theme().textMuted}>No patch available for this file.</text>}
+                              when={!entry.file.omitted && entry.file.patch}
+                              fallback={
+                                <text fg={entry.file.omitted ? theme().warning : theme().textMuted}>
+                                  {entry.file.omitted ? "Patch omitted" : "No patch available for this file."}
+                                </text>
+                              }
                             >
                               {(patch) => (
                                 <box border={patchLeftBorder()} borderColor={theme().border}>

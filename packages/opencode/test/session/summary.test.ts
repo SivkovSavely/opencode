@@ -134,7 +134,7 @@ it.instance(
         SessionSummary.node.implementation as Layer.Layer<
           SessionSummary.Service,
           never,
-          Session.Service | Snapshot.Service | EventV2Bridge.Service | Config.Service
+          Session.Service | Snapshot.Service | EventV2Bridge.Service | Config.Service | Database.Service
         >,
       )
       const context = yield* Layer.build(fresh).pipe(
@@ -182,6 +182,90 @@ it.instance(
       })
       yield* recreated.summarize(input)
       expect(updates).toHaveLength(1)
+    }),
+  { git: true },
+)
+;(process.platform === "win32" ? it.instance.skip : it.instance)(
+  "round trips raw snapshot filenames through persisted and legacy quoted summaries",
+  () =>
+    Effect.gen(function* () {
+      const sessions = yield* Session.Service
+      const summary = yield* SessionSummary.Service
+      const snapshot = yield* Snapshot.Service
+      const instance = yield* TestInstance
+      const session = yield* sessions.create({})
+      const files = [
+        '"report.txt"',
+        '"caf\u00e9-\ud83d\ude00.txt"',
+        '"back\\slash.txt"',
+        "tab\tname.txt",
+        'quote"name.txt',
+      ]
+      yield* Effect.forEach(files, (file) =>
+        Effect.promise(() => Bun.write(path.join(instance.directory, file), "before\n")),
+      )
+      const before = yield* snapshot.track()
+      yield* Effect.forEach(files, (file) =>
+        Effect.promise(() => Bun.write(path.join(instance.directory, file), "after\n")),
+      )
+      const after = yield* snapshot.track()
+      if (!before || !after) throw new Error("expected git snapshots")
+      const message = {
+        id: MessageID.ascending(),
+        sessionID: session.id,
+        role: "user",
+        time: { created: Date.now() },
+        agent: "build",
+        model: { providerID: "test", modelID: "test" },
+      } as SessionV1.User
+      const assistantID = MessageID.ascending()
+      yield* sessions.updateMessage(message)
+      yield* sessions.updateMessage({
+        id: assistantID,
+        sessionID: session.id,
+        parentID: message.id,
+        role: "assistant",
+        time: { created: Date.now() },
+        agent: "build",
+        mode: "build",
+        path: { cwd: instance.directory, root: instance.directory },
+        modelID: "test",
+        providerID: "test",
+        cost: 0,
+        tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+      } as SessionV1.Assistant)
+      yield* sessions.updatePart({
+        id: PartID.ascending(),
+        messageID: assistantID,
+        sessionID: session.id,
+        type: "step-start",
+        snapshot: before,
+      })
+      yield* sessions.updatePart({
+        id: PartID.ascending(),
+        messageID: assistantID,
+        sessionID: session.id,
+        type: "step-finish",
+        reason: "stop",
+        snapshot: after,
+        cost: 0,
+        tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+      })
+      const input = { sessionID: session.id, messageID: message.id }
+      yield* summary.summarize(input)
+      const diffs = yield* summary.diff(input)
+      expect(diffs.map((diff) => diff.file).sort()).toEqual([...files].sort())
+      expect(
+        diffs.every((diff) => diff.patch?.includes("+after") && diff.additions === 1 && diff.deletions === 1),
+      ).toBe(true)
+
+      yield* sessions.updateMessage({
+        ...message,
+        summary: {
+          diffs: [{ file: '"\\"report.txt\\""', additions: 1, deletions: 1 }],
+        },
+      })
+      expect((yield* summary.diff(input))[0]?.file).toBe('"report.txt"')
     }),
   { git: true },
 )

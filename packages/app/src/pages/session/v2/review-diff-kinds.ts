@@ -14,6 +14,7 @@ export function filterRenderableDiff(value: FileDiffInfo | SnapshotFileDiff | Vc
 }
 
 export function reviewDiffNeedsLoad(diff: RenderDiff) {
+  if ("omitted" in diff && diff.omitted) return false
   if (diff.additions === 0 && diff.deletions === 0) return false
   return !diff.patch || !/^@@ /m.test(diff.patch)
 }

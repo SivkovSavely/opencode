@@ -52,6 +52,18 @@ describe("reviewDiffNeedsLoad", () => {
     ).toBe(false)
     expect(reviewDiffNeedsLoad({ file: "empty.txt", additions: 0, deletions: 0 })).toBe(false)
   })
+
+  test("does not reload deliberately omitted snapshot patches", () => {
+    expect(
+      reviewDiffNeedsLoad({
+        file: "large.ts",
+        patch: "",
+        additions: 10,
+        deletions: 4,
+        omitted: { reason: "patch-budget", files: 1 },
+      }),
+    ).toBe(false)
+  })
 })
 
 describe("reviewDiffDirectory", () => {

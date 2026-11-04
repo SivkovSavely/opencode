@@ -55,6 +55,7 @@ import type {
 import { showToast } from "@/utils/toast"
 import { downloadSessionExport, fetchSessionExport, sessionExportFilename } from "@/utils/session-export"
 import { getDirectory, getFilename } from "@opencode-ai/core/util/path"
+import { SnapshotDiff } from "@opencode-ai/core/snapshot-diff"
 import { Popover as KobaltePopover } from "@kobalte/core/popover"
 import { normalize } from "@opencode-ai/session-ui/session-diff"
 import { useFileComponent } from "@opencode-ai/ui/context/file"
@@ -158,8 +159,11 @@ function TimelineDiffSummaryRow(props: { diffs: SummaryDiff[] }) {
   })
   const showAll = () => state.showAll
   const expanded = () => state.expanded
-  const overflow = createMemo(() => Math.max(0, props.diffs.length - maxFiles))
-  const visible = createMemo(() => (showAll() ? props.diffs : props.diffs.slice(0, maxFiles)))
+  const totals = createMemo(() => SnapshotDiff.totals(props.diffs))
+  const omitted = createMemo(() => props.diffs.some((diff) => diff.omitted))
+  const files = createMemo(() => props.diffs.filter((diff): diff is SummaryDiff & { file: string } => !!diff.file))
+  const overflow = createMemo(() => Math.max(0, files().length - maxFiles))
+  const visible = createMemo(() => (showAll() ? files() : files().slice(0, maxFiles)))
 
   return (
     <div
@@ -169,7 +173,9 @@ function TimelineDiffSummaryRow(props: { diffs: SummaryDiff[] }) {
     >
       <div data-slot="session-turn-diffs-header">
         <span data-slot="session-turn-diffs-label">
-          {language.plural("ui.sessionTurn.diffs.changed", props.diffs.length)}
+          {totals().filesComplete
+            ? language.plural("ui.sessionTurn.diffs.changed", totals().files)
+            : language.t("ui.snapshotDiff.filesUnknown")}
         </span>
         <DiffChanges changes={props.diffs} />
         <Show when={overflow() > 0}>
@@ -178,6 +184,11 @@ function TimelineDiffSummaryRow(props: { diffs: SummaryDiff[] }) {
           </span>
         </Show>
       </div>
+      <Show when={omitted()}>
+        <div role="status" data-slot="snapshot-diff-omitted" class="p-3 text-12-regular text-text-weak">
+          {language.t("ui.snapshotDiff.omitted")}
+        </div>
+      </Show>
       <div data-component="session-turn-diffs-content">
         <Accordion
           multiple
@@ -213,7 +224,16 @@ function TimelineDiffSummaryRow(props: { diffs: SummaryDiff[] }) {
                   </StickyAccordionHeader>
                   <Accordion.Content>
                     <Show when={opened()}>
-                      <TimelineDiffView diff={diff} />
+                      <Show
+                        when={!diff.omitted}
+                        fallback={
+                          <div class="p-3 text-12-regular text-text-weak">
+                            {language.t("ui.snapshotDiff.patchOmitted")}
+                          </div>
+                        }
+                      >
+                        <TimelineDiffView diff={diff} />
+                      </Show>
                     </Show>
                   </Accordion.Content>
                 </Accordion.Item>
@@ -231,7 +251,7 @@ function TimelineDiffSummaryRow(props: { diffs: SummaryDiff[] }) {
   )
 }
 
-function TimelineDiffView(props: { diff: SummaryDiff }) {
+function TimelineDiffView(props: { diff: SummaryDiff & { file: string } }) {
   const fileComponent = useFileComponent()
   const view = normalize(props.diff)
 

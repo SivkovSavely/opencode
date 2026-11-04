@@ -72,6 +72,16 @@ export type ManagedResult = { cleanup: "confirmed" | "failed" }
 export type ManagedHandle<T extends ManagedResult> = { start: () => Promise<T>; cancel: () => Promise<T> }
 export type ManagedAuthorization = (open: () => void) => Promise<boolean>
 
+const RecoveryPhase = Context.Service<string>("@opencode/RuntimeLifecycle/RecoveryPhase")
+
+export function withRecoveryPhase(phase: string) {
+  return <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+    effect.pipe(
+      // Cause annotations preserve the innermost phase when an outer operation also fails.
+      Effect.catchCause((cause) => Effect.failCause(Cause.annotate(cause, Context.make(RecoveryPhase, phase)))),
+    )
+}
+
 export type Interface = {
   readonly identity: {
     readonly lineage: string
@@ -2586,13 +2596,19 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
             yield* Effect.logInfo("runtime recovery continuation returned successfully", {
               ...recordFields(recoveryRecord),
             })
-            yield* complete(record.sessionID)
+            yield* complete(record.sessionID).pipe(withRecoveryPhase("execution-completion"))
           })
           const exit = yield* permitHeld ? Effect.exit(work) : recoveryPermits.withPermit(Effect.exit(work))
           if (Exit.isSuccess(exit)) break
           if (recoveryPreparedSessions.has(record.sessionID) || Cause.hasInterrupts(exit.cause))
             return yield* Effect.failCause(exit.cause)
 
+          yield* Effect.logWarning("restart diagnostic recovery preparation failed", {
+            ...recordFields(record),
+            ...recoveryFailureFields(exit.cause, "preparation"),
+            preparationAttempt: preparationAttempts + 1,
+            rowTransitioned: false,
+          })
           const retry = yield* retryRecoveryPreparation({ ...record, recoveryPreparationAttempts: preparationAttempts })
           if (retry.status === "quarantined") return false
           if (retry.status === "conflict") return yield* Effect.failCause(exit.cause)
@@ -2618,14 +2634,13 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
           yield* scheduleNotification(
             record.parentSessionID,
             run({ ...recoveryRecord, state: "completed", parentNotificationState: "pending" }).pipe(
-              Effect.catchCause((cause) => {
-                const error = Cause.squash(cause)
-                return Effect.logWarning("background task recovery notification remains pending", {
-                  sessionID: record.sessionID,
-                  parentSessionID: record.parentSessionID,
-                  errorType: error instanceof Error ? error.name : typeof error,
-                })
-              }),
+              Effect.catchCause((cause) =>
+                Effect.logWarning("background task recovery notification remains pending", {
+                  ...recordFields(record),
+                  ...recoveryFailureFields(cause, "child-notification"),
+                  rowTransitioned: false,
+                }),
+              ),
             ),
           )
         return true
@@ -2634,10 +2649,19 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
           Effect.uninterruptible(
             Effect.gen(function* () {
               const fence = yield* markRecoveryNeeded(record.sessionID).pipe(
-                Effect.catchCause(() => Effect.succeed(undefined)),
+                Effect.catchCause((failure) =>
+                  Effect.logError("restart diagnostic recovery transition failed", {
+                    ...recordFields(record),
+                    ...recoveryFailureFields(failure, "recovery-needed-transition"),
+                    rowTransitioned: false,
+                  }).pipe(Effect.as(undefined)),
+                ),
               )
               yield* Effect.logWarning("restart diagnostic recovery interrupted", {
-                sessionID: record.sessionID,
+                ...recordFields(record),
+                operation: "recovery",
+                phase: "interrupted",
+                claimedFence: record.fence,
                 rowTransitioned: fence !== undefined,
                 fence,
                 lineage: identity.lineage,
@@ -2651,18 +2675,24 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
             const fence = yield* markRecoveryNeeded(record.sessionID).pipe(
               Effect.catchCause((failure) =>
                 Effect.logError("restart diagnostic recovery transition failed", {
-                  sessionID: record.sessionID,
-                  causeType: typeof failure,
+                  ...recordFields(record),
+                  ...recoveryFailureFields(failure, "recovery-needed-transition"),
+                  rowTransitioned: false,
                   lineage: identity.lineage,
                   instance: identity.instance,
                 }).pipe(Effect.as(undefined)),
               ),
             )
-            const error = Cause.squash(cause)
             yield* Effect.logError("restart diagnostic recovery failed", {
-              sessionID: record.sessionID,
-              errorType: error instanceof Error ? error.name : typeof error,
+              ...recordFields(record),
+              ...recoveryFailureFields(
+                cause,
+                recoveryPreparedSessions.has(record.sessionID) ? "continuation" : "preparation",
+              ),
+              claimedFence: record.fence,
+              recoveryPrepared: recoveryPreparedSessions.has(record.sessionID),
               rowTransitioned: fence !== undefined,
+              fence,
               lineage: identity.lineage,
               instance: identity.instance,
             })
@@ -2932,6 +2962,95 @@ export function unavailable(): Interface {
 function decodeRow(value: unknown): Row | undefined {
   if (!value || typeof value !== "object") return
   return value as Row
+}
+
+export function recoveryFailureFields(cause: Cause.Cause<unknown>, phase: string) {
+  const reasons = cause.reasons.slice(0, 4).map((reason) => {
+    const failurePhase = diagnosticText(
+      Context.getOrUndefined(Cause.reasonAnnotations(reason), RecoveryPhase) ?? phase,
+      80,
+    )
+    if (reason._tag === "Interrupt")
+      return { kind: reason._tag, phase: failurePhase, errorType: "Interrupt", fiberID: reason.fiberId }
+
+    // Diagnostics must not replace the original failure, including errors with throwing accessors.
+    try {
+      const error = reason._tag === "Die" ? reason.defect : reason.error
+      const errorType = diagnosticText(
+        error instanceof Error ? (diagnosticErrorField(error, "name") ?? "Error") : typeof error,
+        80,
+      )
+      const message =
+        error instanceof Error
+          ? (diagnosticErrorField(error, "message") ?? "Error message unavailable (accessor omitted)")
+          : "Non-Error failure (payload omitted)"
+      const errorMessage = diagnosticText(
+        errorType === "SyntaxError"
+          ? message
+              .slice(0, 4096)
+              .replace(
+                /\b((?:unexpected|invalid|unrecognized)\s+(?:token|identifier|character))\b.*/i,
+                "$1 [redacted data]",
+              )
+          : message,
+        512,
+      )
+      const stack = error instanceof Error ? diagnosticErrorField(error, "stack") : undefined
+      // Project before rendering: Effect's pretty printer otherwise traverses arbitrary error payloads and causes.
+      const projected = Cause.annotate(
+        Cause.die({
+          name: errorType,
+          message: errorMessage,
+          stack: stack?.slice(0, 8192),
+        }),
+        Cause.reasonAnnotations(reason),
+      )
+      const errorStack = Cause.prettyErrors(projected)[0]
+        ?.stack?.slice(0, 8192)
+        .split("\n")
+        .filter((line) => /^\s*at\s/.test(line))
+        .slice(0, 8)
+        .map((line) => diagnosticText(line, 384))
+        .join("\n")
+      return { kind: reason._tag, phase: failurePhase, errorType, errorMessage, errorStack }
+    } catch {
+      return { kind: reason._tag, phase: failurePhase, errorType: "Unknown", errorMessage: "Error details unavailable" }
+    }
+  })
+  const first = reasons.find((reason) => reason.kind !== "Interrupt") ?? reasons[0]
+  return {
+    operation: diagnosticText(phase, 80),
+    phase: first?.phase ?? diagnosticText(phase, 80),
+    errorType: first?.errorType,
+    errorMessage: first && "errorMessage" in first ? first.errorMessage : undefined,
+    errorStack: first && "errorStack" in first ? first.errorStack : undefined,
+    causeReasons: reasons,
+    omittedCauseReasons: Math.max(0, cause.reasons.length - reasons.length),
+  }
+}
+
+function diagnosticErrorField(error: Error, key: "name" | "message" | "stack") {
+  let current: object | null = error
+  for (let depth = 0; current && depth < 8; depth++) {
+    const descriptor = Object.getOwnPropertyDescriptor(current, key)
+    if (descriptor) {
+      // Drizzle's message getter, for example, renders every query parameter before it can be truncated.
+      const value: unknown = descriptor.value
+      return typeof value === "string" ? value : undefined
+    }
+    current = Object.getPrototypeOf(current)
+  }
+}
+
+function diagnosticText(value: string, limit: number) {
+  return (value.slice(0, 4096).split(/[\r\n]/, 1)[0] ?? "")
+    .replace(/[\u0000-\u001f\u007f]/g, " ")
+    .replace(/\b(?:https?|wss?):\/\/[^\s)]+/gi, "[redacted URL]")
+    .replace(/\b(?:bearer|basic)\s+\S+/gi, "[redacted credential]")
+    .replace(/\b(?:authorization|api[-_]?key|token|password|secret)\s*[:=]\s*\S+/gi, "[redacted credential]")
+    .replace(/\b(?:prompt|output|arguments?|payload|request(?: body)?|body|input)\s*[:=].*/gi, "[redacted data]")
+    .replace(/["'`\[{<].*$/, "[redacted data]")
+    .slice(0, limit)
 }
 
 function rowFields(row: Row) {

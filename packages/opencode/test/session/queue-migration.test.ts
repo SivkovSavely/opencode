@@ -1,7 +1,7 @@
 import { describe, expect } from "bun:test"
 import { createHash } from "node:crypto"
 import fs from "node:fs/promises"
-import { eq } from "drizzle-orm"
+import { eq, sql } from "drizzle-orm"
 import { Effect, Result } from "effect"
 import { Database } from "@opencode-ai/core/database/database"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
@@ -39,11 +39,16 @@ const setup = Effect.gen(function* () {
   return { ctx, sessions, queue, db, session, file, write, store }
 })
 
-const message = Effect.fnUntraced(function* (sessionID: SessionID, text: string, hidden = false) {
+const message = Effect.fnUntraced(function* (
+  sessionID: SessionID,
+  text: string,
+  hidden = false,
+  role: "user" | "assistant" = "user",
+) {
   const { db } = yield* Database.Service
   const id = MessageID.ascending()
   const data = {
-    role: "user" as const,
+    role,
     agent: "plan",
     model: { providerID: ProviderV2.ID.make("test"), modelID: ModelV2.ID.make("test-model") },
     time: { created: Date.now() },
@@ -189,12 +194,19 @@ describe("legacy queue migration", () => {
     () =>
       Effect.gen(function* () {
         const s = yield* setup
+        const assistant = yield* message(s.session.id, "assistant", false, "assistant")
         const visible = yield* message(s.session.id, "visible")
         const hidden = yield* Effect.forEach(Array.from({ length: 55 }), () => message(s.session.id, "", true))
         const normal = yield* message(s.session.id, "do not hide me")
         const foreign = yield* s.sessions.create({})
         const foreignID = yield* message(foreign.id, "", true)
-        yield* s.store({ items: [], stopped: false, hidden: [...hidden, normal, foreignID, "msg_missing", 123] })
+        const oversized = JSON.stringify([{ file: "historical.txt", patch: "x".repeat(1024 * 1024) }])
+        yield* s.db.run(sql`UPDATE session SET summary_diffs = ${oversized} WHERE id = ${s.session.id}`)
+        yield* s.store({
+          items: [],
+          stopped: false,
+          hidden: [...hidden, normal, assistant, foreignID, "msg_missing", 123],
+        })
         // Transcript reads, not queue list, must trigger migration first.
         expect((yield* s.sessions.messages({ sessionID: s.session.id, limit: 1 })).map((item) => item.info.id)).toEqual(
           [normal],
@@ -203,17 +215,24 @@ describe("legacy queue migration", () => {
           (yield* MessageV2.page({ sessionID: s.session.id, limit: 2 })).items.map((item) => item.info.id),
         ).toEqual([visible, normal])
         expect((yield* MessageV2.filterCompactedEffect(s.session.id)).map((item) => item.info.id)).toEqual([
+          assistant,
           visible,
           normal,
         ])
         yield* Effect.promise(() => fs.rm(s.file))
         expect((yield* MessageV2.filterCompactedEffect(s.session.id)).map((item) => item.info.id)).toEqual([
+          assistant,
           visible,
           normal,
         ])
         expect(
           yield* s.db.select().from(MessageTable).where(eq(MessageTable.session_id, s.session.id)).all(),
-        ).toHaveLength(57)
+        ).toHaveLength(58)
+        expect(
+          yield* s.db.get(
+            sql`SELECT summary_diffs = ${oversized} AS unchanged FROM session WHERE id = ${s.session.id}`,
+          ),
+        ).toEqual({ unchanged: 1 })
         expect((yield* s.sessions.messages({ sessionID: foreign.id })).map((item) => item.info.id)).toEqual([foreignID])
       }),
     { git: true },

@@ -4,7 +4,7 @@ import { Session } from "@/session/session"
 import { Database } from "@opencode-ai/core/database/database"
 import { EventV2 } from "@opencode-ai/core/event"
 import { EventV2Bridge } from "@/event-v2-bridge"
-import { EventTable } from "@opencode-ai/core/event/sql"
+import { EventTable, EventTransportColumns } from "@opencode-ai/core/event/sql"
 import { asc } from "drizzle-orm"
 import { and } from "drizzle-orm"
 import { eq } from "drizzle-orm"
@@ -72,7 +72,7 @@ export const syncHandlers = HttpApiBuilder.group(InstanceHttpApi, "sync", (handl
     const history = Effect.fn("SyncHttpApi.history")(function* (ctx: { payload: typeof HistoryPayload.Type }) {
       const exclude = Object.entries(ctx.payload)
       return yield* db
-        .select()
+        .select(EventTransportColumns)
         .from(EventTable)
         .where(
           exclude.length > 0

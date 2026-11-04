@@ -44,6 +44,52 @@ describe("event payload storage codec", () => {
     expect(EventData.decode(EventData.encode(entropy))).toEqual(entropy)
   })
 
+  test("rejects oversized TEXT before JSON parsing, including multi-byte UTF-8", () => {
+    const invalid = "not JSON ".repeat(EventData.MAX_TRANSPORT_BYTES / 8)
+    expect(() => EventData.decode(invalid, EventData.MAX_TRANSPORT_BYTES)).toThrow(EventData.LimitError)
+    const text = JSON.stringify({ text: "\u96ea".repeat(64) })
+    expect(text.length).toBeLessThan(128)
+    expect(() => EventData.decode(text, 128)).toThrow(EventData.LimitError)
+    expect(EventData.decode(text)).toEqual({ text: "\u96ea".repeat(64) })
+    const error = new EventData.LimitError(128)
+    expect(error.name).toBe("EventData.LimitError")
+    expect(error.message).toBe("Event payload exceeds transport limit of 128 bytes")
+    expect(error.cause).toBeUndefined()
+  })
+
+  test("rejects oversized declared lengths before examining or decompressing the frame", () => {
+    const encoded = Buffer.alloc(42)
+    encoded.write("OCEZ")
+    encoded[4] = 1
+    encoded.writeUInt32LE(EventData.MAX_TRANSPORT_BYTES + 1, 5)
+    expect(() => EventData.decode(encoded, EventData.MAX_TRANSPORT_BYTES)).toThrow(EventData.LimitError)
+    expect(() => EventData.decode(encoded)).toThrow("checksum mismatch")
+  })
+
+  test("caps actual decompression output when the declared length is dishonest", () => {
+    const encoded = frame(Buffer.from(JSON.stringify({ text: "x".repeat(64 * 1024) })))
+    encoded.writeUInt32LE(512, 5)
+    expect(() => EventData.decode(encoded, 1024)).toThrow(EventData.LimitError)
+    expect(() => EventData.decode(encoded)).toThrow("invalid Zstandard, UTF-8, or JSON")
+  })
+
+  test("bounded TEXT and BLOB reads preserve exact round trips up to the byte limit", () => {
+    const text = JSON.stringify(large)
+    const size = Buffer.byteLength(text)
+    const encoded = EventData.encode(large)
+    expect(EventData.decode(text, size)).toEqual(large)
+    expect(EventData.decode(encoded, size)).toEqual(large)
+    expect(() => EventData.decode(text, size - 1)).toThrow(EventData.LimitError)
+    expect(() => EventData.decode(encoded, size - 1)).toThrow(EventData.LimitError)
+    expect(EventData.decode(encoded)).toEqual(large)
+  })
+
+  test("rejects invalid byte limits rather than silently using an unbounded decoder", () => {
+    for (const limit of [0, -1, NaN, Infinity, 1.5]) {
+      expect(() => EventData.decode("{}", limit)).toThrow("Event payload byte limit must be a positive safe integer")
+    }
+  })
+
   test("rejects unknown formats, unknown versions, truncation, and corruption", () => {
     const encoded = Buffer.from(EventData.encode(large))
     expect(() => EventData.decode(Buffer.from("not a codec"))).toThrow("Unknown event payload BLOB format")

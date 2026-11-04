@@ -1,4 +1,5 @@
 import { sqliteTable, text, integer, index, uniqueIndex, customType } from "drizzle-orm/sqlite-core"
+import { getTableColumns, sql } from "drizzle-orm"
 import type { EventV2 } from "../event"
 import { EventData } from "./data"
 
@@ -30,3 +31,11 @@ export const EventTable = sqliteTable(
     index("event_aggregate_type_seq_idx").on(table.aggregate_id, table.type, table.seq),
   ],
 )
+
+// Transport rejects oversized historical payloads; canonical storage/replay decoding stays exact.
+export const EventTransportColumns = {
+  ...getTableColumns(EventTable),
+  data: sql<string | Uint8Array>`${EventTable.data}`.mapWith((value: string | Uint8Array) =>
+    EventData.decode(value, EventData.MAX_TRANSPORT_BYTES),
+  ),
+}

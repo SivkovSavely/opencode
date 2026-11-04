@@ -72,7 +72,7 @@ export function SessionSidePanel(props: {
   empty: () => string
   hasReview: () => boolean
   reviewHasFocusableContent: () => boolean
-  reviewCount: () => number
+  reviewCount: () => number | "?"
   reviewPanel: () => JSX.Element
   reviewSidebarToggle?: (disabled: boolean) => JSX.Element
   fileBrowserState?: SessionFileBrowserState

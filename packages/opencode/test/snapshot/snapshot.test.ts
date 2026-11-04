@@ -918,8 +918,15 @@ it.instance(
     const diffs = yield* snapshot.diffFull(before!, after!)
     const large = diffs.find((item) => item.file === "large.txt")
     const normal = diffs.find((item) => item.file === "normal.txt")
-    expect(large).toMatchObject({ file: "large.txt", patch: "", status: "modified" })
-    expect(large?.additions).toBeGreaterThan(0)
+    // Preflight excludes oversized blobs before numstat or content loading.
+    expect(large).toMatchObject({
+      file: "large.txt",
+      patch: "",
+      status: "modified",
+      additions: 0,
+      deletions: 0,
+      omitted: { reason: "size", files: 1, statisticsIncomplete: true },
+    })
     expect(normal?.patch).toContain("+after")
   }),
   { git: true },
@@ -951,9 +958,9 @@ it.instance(
     const tmp = yield* bootstrap()
     const snapshot = yield* Snapshot.Service
     const lines = MAX_FULL_DIFF_CHURN + 1
-    const exactLines = MAX_FULL_DIFF_CHURN / 2
+    const exactLines = MAX_FULL_DIFF_CHURN
     yield* write(`${tmp.path}/generated.c`, "old\n".repeat(lines))
-    yield* write(`${tmp.path}/exact.c`, "old\n".repeat(exactLines))
+    yield* write(`${tmp.path}/exact.c`, "")
     const before = yield* snapshot.track()
     expect(before).toBeTruthy()
     yield* write(`${tmp.path}/generated.c`, "new\n".repeat(lines))
@@ -965,9 +972,11 @@ it.instance(
     const generated = diffs.find((item) => item.file === "generated.c")!
     const exact = diffs.find((item) => item.file === "exact.c")!
     expect(generated).toMatchObject({ file: "generated.c", patch: "", status: "modified" })
+    expect(generated.omitted).toEqual({ reason: "churn", files: 1 })
     expect(generated.additions + generated.deletions).toBeGreaterThan(MAX_FULL_DIFF_CHURN)
     expect(exact.additions + exact.deletions).toBe(MAX_FULL_DIFF_CHURN)
     expect(exact.patch).not.toBe("")
+    expect(exact.omitted).toBeUndefined()
   }),
   { git: true },
 )
@@ -1185,6 +1194,7 @@ it.instance(
       expect(diffs.length).toBe(1)
       expect(diffs[0].file).toBe("binary.bin")
       expect(diffs[0].patch).toBe("")
+      expect(diffs[0].omitted).toBeUndefined()
     }),
   ),
   { git: true },

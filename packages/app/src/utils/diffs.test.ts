@@ -34,6 +34,16 @@ describe("diffs", () => {
       ]),
     ).toEqual([item])
   })
+
+  test("retains named omissions and no-file aggregate statistics", () => {
+    const omitted = { ...item, patch: "", omitted: { reason: "patch-budget", files: 1 } }
+    const aggregate = { additions: 200, deletions: 100, omitted: { reason: "input-budget", files: 900 } }
+    const unknown = { additions: 0, deletions: 0, omitted: { reason: "input-budget" } }
+
+    expect(diffs([omitted, aggregate, unknown])).toEqual([omitted, aggregate, unknown])
+    expect(diffs({ first: aggregate })).toEqual([aggregate])
+    expect(diffs([{ additions: 1, deletions: 0, omitted: { reason: "bad", files: -1 } }])).toEqual([])
+  })
 })
 
 describe("message", () => {

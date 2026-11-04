@@ -11,6 +11,7 @@ import { Config } from "@/config/config"
 import { Global } from "@opencode-ai/core/global"
 import { Info } from "@opencode-ai/schema/file-diff"
 import { EventDiagnostics } from "@opencode-ai/core/event-diagnostics"
+import { SnapshotDiff } from "@opencode-ai/core/snapshot-diff"
 
 export const Patch = Schema.Struct({
   hash: Schema.String,
@@ -30,6 +31,12 @@ const prune = "7.days"
 const MAX_SNAPSHOT_UNTRACKED_FILE_BYTES = 2 * 1024 * 1024
 export const MAX_FULL_DIFF_FILE_BYTES = 2 * 1024 * 1024
 export const MAX_FULL_DIFF_CHURN = 20_000
+const MAX_FULL_DIFF_METADATA_BYTES = 4 * 1024 * 1024
+const MAX_FULL_DIFF_STDERR_BYTES = 8 * 1024
+const MAX_FULL_DIFF_STATS_FILES = 20_000
+const MAX_FULL_DIFF_STATS_PATH_BYTES = 16 * 1024
+const FULL_DIFF_GIT_TIMEOUT = 15_000
+const FULL_DIFF_PATCH_TIMEOUT = 1_000
 const core = ["-c", "core.longpaths=true", "-c", "core.symlinks=true"]
 const cfg = ["-c", "core.autocrlf=false", ...core]
 const quote = [...cfg, "-c", "core.quotepath=false"]
@@ -61,6 +68,7 @@ const layer: Layer.Layer<Service, never, FSUtil.Service | AppProcess.Service | C
     const appProcess = yield* AppProcess.Service
     const config = yield* Config.Service
     const locks = new Map<string, Semaphore.Semaphore>()
+    const details = Semaphore.makeUnsafe(2)
 
     const lock = (key: string) => {
       const hit = locks.get(key)
@@ -570,190 +578,268 @@ const layer: Layer.Layer<Service, never, FSUtil.Service | AppProcess.Service | C
               type Row = {
                 file: string
                 status: "added" | "deleted" | "modified"
+                before?: string
+                after?: string
                 binary: boolean
                 additions: number
                 deletions: number
+                reason?: string
               }
 
-              type Ref = {
-                file: string
-                side: "before" | "after"
-                ref: string
-              }
-
-              const show = Effect.fnUntraced(function* (row: Row) {
-                if (row.binary) return ["", ""]
-                if (row.status === "added") {
-                  return [
-                    "",
-                    yield* git([...cfg, ...args(["show", `${to}:${row.file}`])]).pipe(Effect.map((item) => item.text)),
-                  ]
-                }
-                if (row.status === "deleted") {
-                  return [
-                    yield* git([...cfg, ...args(["show", `${from}:${row.file}`])]).pipe(
-                      Effect.map((item) => item.text),
-                    ),
-                    "",
-                  ]
-                }
-                return yield* Effect.all(
-                  [
-                    git([...cfg, ...args(["show", `${from}:${row.file}`])]).pipe(Effect.map((item) => item.text)),
-                    git([...cfg, ...args(["show", `${to}:${row.file}`])]).pipe(Effect.map((item) => item.text)),
-                  ],
-                  { concurrency: 2 },
-                )
-              })
-
-              const load = Effect.fnUntraced(
-                function* (rows: Row[]) {
-                  const refs = rows.flatMap((row) => {
-                    if (row.binary) return []
-                    if (row.status === "added")
-                      return [{ file: row.file, side: "after", ref: `${to}:${row.file}` } satisfies Ref]
-                    if (row.status === "deleted") {
-                      return [{ file: row.file, side: "before", ref: `${from}:${row.file}` } satisfies Ref]
-                    }
-                    return [
-                      { file: row.file, side: "before", ref: `${from}:${row.file}` } satisfies Ref,
-                      { file: row.file, side: "after", ref: `${to}:${row.file}` } satisfies Ref,
-                    ]
-                  })
-                  if (!refs.length) return new Map<string, { before: string; after: string }>()
-
-                  const batch = yield* appProcess.run(
-                    ChildProcess.make("git", [...cfg, ...args(["cat-file", "--batch"])], {
-                      cwd: state.directory,
-                      extendEnv: true,
-                    }),
-                    { stdin: refs.map((item) => item.ref).join("\n") + "\n" },
-                  )
-                  if (batch.exitCode !== 0) {
-                    yield* Effect.logInfo(
-                      "git cat-file --batch failed during snapshot diff, falling back to per-file git show",
+              const run = Effect.fnUntraced(
+                function* (
+                  cmd: string[],
+                  opts?: { stdin?: string; cwd?: string; maxOutputBytes?: number; okExitCodes?: number[] },
+                ) {
+                  const result = yield* appProcess.run(
+                    ChildProcess.make(
+                      "git",
+                      [...cfg, "-c", `core.bigFileThreshold=${MAX_FULL_DIFF_FILE_BYTES}`, ...cmd],
                       {
-                        stderr: batch.stderr.toString("utf8"),
-                        refs: refs.length,
+                        cwd: opts?.cwd ?? state.directory,
+                        extendEnv: true,
                       },
-                    )
+                    ),
+                    {
+                      stdin: opts?.stdin,
+                      maxOutputBytes: opts?.maxOutputBytes ?? MAX_FULL_DIFF_METADATA_BYTES,
+                      maxErrorBytes: MAX_FULL_DIFF_STDERR_BYTES,
+                      timeout: FULL_DIFF_GIT_TIMEOUT,
+                    },
+                  )
+                  if (
+                    !(opts?.okExitCodes ?? [0]).includes(result.exitCode) ||
+                    result.stdoutTruncated ||
+                    result.stderrTruncated
+                  )
                     return
+                  return result.stdout
+                },
+                Effect.catch(() => Effect.void),
+              )
+              const unavailable = (files?: number): FileDiff[] => [
+                {
+                  additions: 0,
+                  deletions: 0,
+                  omitted: {
+                    reason: "git-metadata-unavailable",
+                    ...(files === undefined ? {} : { files, statisticsIncomplete: true }),
+                  },
+                },
+              ]
+
+              // Keep root-relative paths for ignore checks and numstat pathspecs despite diff.relative.
+              // Raw object IDs avoid line-delimited revision:path requests for unusual filenames.
+              const metadata = yield* run(
+                args([
+                  "diff",
+                  "--raw",
+                  "--no-abbrev",
+                  "-z",
+                  "--no-textconv",
+                  "--no-ext-diff",
+                  "--no-renames",
+                  "--no-relative",
+                  from,
+                  to,
+                  "--",
+                  ".",
+                ]),
+              )
+              if (!metadata) return unavailable()
+              if (metadata.length && metadata[metadata.length - 1] !== 0) return unavailable()
+              const entries = metadata.toString("utf8").split("\0")
+              const objects = new Map<string, Row>()
+              for (let i = 0; i < entries.length - 1; i++) {
+                const match = entries[i].match(/^:\d{6} \d{6} ([0-9a-f]+) ([0-9a-f]+) ([ADMT])$/)
+                const file = entries[++i]
+                if (!match || !file || objects.has(file)) return unavailable()
+                objects.set(file, {
+                  file,
+                  before: /^0+$/.test(match[1]) ? undefined : match[1],
+                  after: /^0+$/.test(match[2]) ? undefined : match[2],
+                  status: match[3] === "A" ? "added" : match[3] === "D" ? "deleted" : "modified",
+                  binary: false,
+                  additions: 0,
+                  deletions: 0,
+                  reason: "git-statistics-unavailable",
+                })
+              }
+
+              // Hide ignored-file removals, but do not silently fail open on incomplete ignore metadata.
+              const check = objects.size
+                ? yield* run(
+                    [
+                      "--git-dir",
+                      path.join(state.worktree, ".git"),
+                      "--work-tree",
+                      state.worktree,
+                      "check-ignore",
+                      "--no-index",
+                      "--stdin",
+                      "-z",
+                    ],
+                    {
+                      cwd: state.worktree,
+                      stdin: encodeNulTerminatedPaths(
+                        Array.from(objects.keys(), (file) => (file.startsWith(":") ? `./${file}` : file)),
+                      ),
+                      okExitCodes: [0, 1],
+                    },
+                  )
+                : Buffer.alloc(0)
+              if (!check || (check.length && check[check.length - 1] !== 0)) return unavailable()
+              const ignored = new Set(
+                check
+                  .toString("utf8")
+                  .split("\0")
+                  .map((file) => (file.startsWith("./:") ? file.slice(2) : file)),
+              )
+              const rows = Array.from(objects.values()).filter((row) => !ignored.has(row.file))
+              if (!rows.length) return []
+
+              // Even numstat reads blob contents, so inspect every object before allowing statistics work.
+              const refs = Array.from(
+                new Set(rows.flatMap((row) => [row.before, row.after]).filter((ref): ref is string => Boolean(ref))),
+              )
+              const sizes = new Map<string, { type: string; size: number }>()
+              if (refs.length) {
+                const preflight = yield* run(args(["cat-file", "--batch-check"]), { stdin: refs.join("\n") + "\n" })
+                if (!preflight) return unavailable(rows.length)
+                const lines = preflight.toString("utf8").split("\n")
+                if (lines.pop() !== "" || lines.length !== refs.length) return unavailable(rows.length)
+                for (let i = 0; i < refs.length; i++) {
+                  const match = lines[i].match(/^([0-9a-f]+) (\S+) (\d+)$/)
+                  if (!match || match[1] !== refs[i] || !Number.isSafeInteger(Number(match[3])))
+                    return unavailable(rows.length)
+                  sizes.set(refs[i], { type: match[2], size: Number(match[3]) })
+                }
+              }
+
+              const eligible: Row[] = []
+              let statisticsBytes = 0
+              for (const row of rows) {
+                const before = row.before ? sizes.get(row.before) : { type: "blob", size: 0 }
+                const after = row.after ? sizes.get(row.after) : { type: "blob", size: 0 }
+                if (!before || !after) return unavailable(rows.length)
+                const reason =
+                  Math.max(before.size, after.size) > MAX_FULL_DIFF_FILE_BYTES
+                    ? "size"
+                    : before.type !== "blob" || after.type !== "blob"
+                      ? "non-blob"
+                      : eligible.length >= MAX_FULL_DIFF_STATS_FILES
+                        ? "statistics-file-budget"
+                        : before.size + after.size > SnapshotDiff.MAX_INPUT_BYTES - statisticsBytes
+                          ? "input-budget"
+                          : undefined
+                if (reason) {
+                  row.reason = reason
+                  continue
+                }
+                statisticsBytes += before.size + after.size
+                eligible.push(row)
+              }
+
+              // A whole-scope command is safe only if it cannot include ignored or unbudgeted changes.
+              const all = eligible.length === objects.size
+              const batches: Row[][] = []
+              if (all) batches.push(eligible)
+              if (!all) {
+                const paths = Array.from(objects.keys()).sort()
+                let batch: Row[] = []
+                let pathBytes = 0
+                for (const row of eligible) {
+                  const bytes = SnapshotDiff.bytes(row.file) + 1
+                  if (bytes > MAX_FULL_DIFF_STATS_PATH_BYTES) {
+                    row.reason = "path-budget"
+                    continue
                   }
-                  const out = batch.stdout
-
-                  const fail = (msg: string, extra?: Record<string, string>) => {
-                    return undefined
-                  }
-
-                  const map = new Map<string, { before: string; after: string }>()
-                  const dec = new TextDecoder()
-                  let i = 0
-                  for (const ref of refs) {
-                    let end = i
-                    while (end < out.length && out[end] !== 10) end += 1
-                    if (end >= out.length) {
-                      return fail(
-                        "git cat-file --batch returned a truncated header during snapshot diff, falling back to per-file git show",
-                      )
-                    }
-
-                    const head = dec.decode(out.slice(i, end))
-                    i = end + 1
-                    const hit = map.get(ref.file) ?? { before: "", after: "" }
-                    if (head.endsWith(" missing")) {
-                      map.set(ref.file, hit)
+                  // Literal pathspecs still include descendants during file/directory transitions.
+                  const prefix = row.file + "/"
+                  let start = 0
+                  let end = paths.length
+                  while (start < end) {
+                    const middle = (start + end) >>> 1
+                    if (paths[middle] < prefix) {
+                      start = middle + 1
                       continue
                     }
-
-                    const match = head.match(/^[0-9a-f]+ blob (\d+)$/)
-                    if (!match) {
-                      return fail(
-                        "git cat-file --batch returned an unexpected header during snapshot diff, falling back to per-file git show",
-                        { head },
-                      )
-                    }
-
-                    const size = Number(match[1])
-                    if (!Number.isInteger(size) || size < 0 || i + size >= out.length || out[i + size] !== 10) {
-                      return fail(
-                        "git cat-file --batch returned truncated content during snapshot diff, falling back to per-file git show",
-                        { head },
-                      )
-                    }
-
-                    const text = dec.decode(out.slice(i, i + size))
-                    if (ref.side === "before") hit.before = text
-                    if (ref.side === "after") hit.after = text
-                    map.set(ref.file, hit)
-                    i += size + 1
+                    end = middle
                   }
-
-                  if (i !== out.length) {
-                    return fail(
-                      "git cat-file --batch returned trailing data during snapshot diff, falling back to per-file git show",
-                    )
+                  if (paths[start]?.startsWith(prefix)) continue
+                  if (batch.length && (batch.length >= 100 || pathBytes + bytes > MAX_FULL_DIFF_STATS_PATH_BYTES)) {
+                    batches.push(batch)
+                    batch = []
+                    pathBytes = 0
                   }
+                  batch.push(row)
+                  pathBytes += bytes
+                }
+                if (batch.length) batches.push(batch)
+              }
+              for (const batch of batches) {
+                const statistics = yield* run(
+                  [
+                    "--literal-pathspecs",
+                    ...args([
+                      "diff",
+                      "--numstat",
+                      "-z",
+                      "--no-textconv",
+                      "--no-ext-diff",
+                      "--no-renames",
+                      "--no-relative",
+                      from,
+                      to,
+                      "--",
+                      ...(all ? ["."] : batch.map((row) => row.file)),
+                    ]),
+                  ],
+                  { cwd: all ? state.directory : state.worktree },
+                )
+                if (!statistics) continue
+                const entries = statistics.toString("utf8").split("\0")
+                if (entries.pop() !== "" || entries.length !== batch.length) continue
+                const files = new Set(batch.map((row) => row.file))
+                const counts = new Map<string, { additions: number; deletions: number; binary: boolean }>()
+                for (const entry of entries) {
+                  const match = entry.match(/^(\d+|-)\t(\d+|-)\t([\s\S]+)$/)
+                  if (
+                    !match ||
+                    !files.has(match[3]) ||
+                    counts.has(match[3]) ||
+                    (match[1] === "-") !== (match[2] === "-")
+                  )
+                    break
+                  const binary = match[1] === "-"
+                  const additions = binary ? 0 : Number(match[1])
+                  const deletions = binary ? 0 : Number(match[2])
+                  if (!Number.isSafeInteger(additions) || !Number.isSafeInteger(deletions)) break
+                  counts.set(match[3], { additions, deletions, binary })
+                }
+                if (counts.size !== batch.length) continue
+                for (const row of batch) Object.assign(row, counts.get(row.file), { reason: undefined })
+              }
 
-                  return map
-                },
-                Effect.scoped,
-                Effect.catch(() =>
-                  Effect.succeed<Map<string, { before: string; after: string }> | undefined>(undefined),
-                ),
-              )
+              const selected: Row[] = []
+              const omitted = { additions: 0, deletions: 0, files: 0, statisticsIncomplete: false }
+              for (const row of rows) {
+                if (selected.length < SnapshotDiff.MAX_FILES && row.file.length <= SnapshotDiff.MAX_PATH_CHARS) {
+                  selected.push(row)
+                  continue
+                }
+                omitted.additions += row.additions
+                omitted.deletions += row.deletions
+                omitted.files++
+                if (row.reason) omitted.statisticsIncomplete = true
+              }
 
               const result: FileDiff[] = []
-              const status = new Map<string, "added" | "deleted" | "modified">()
+              let inputBytes = 0
+              // Reserve the JSON quotes of every empty patch, including those omitted later.
+              let patchBytes = selected.length * SnapshotDiff.bytes("")
 
-              const statuses = yield* git(
-                [...quote, ...args(["diff", "--no-ext-diff", "--name-status", "--no-renames", from, to, "--", "."])],
-                { cwd: state.directory },
-              )
-
-              for (const line of statuses.text.trim().split("\n")) {
-                if (!line) continue
-                const [code, file] = line.split("\t")
-                if (!code || !file) continue
-                status.set(file, code.startsWith("A") ? "added" : code.startsWith("D") ? "deleted" : "modified")
-              }
-
-              const numstat = yield* git(
-                [...quote, ...args(["diff", "--no-ext-diff", "--no-renames", "--numstat", from, to, "--", "."])],
-                {
-                  cwd: state.directory,
-                },
-              )
-
-              const rows = numstat.text
-                .trim()
-                .split("\n")
-                .filter(Boolean)
-                .flatMap((line) => {
-                  const [adds, dels, file] = line.split("\t")
-                  if (!file) return []
-                  const binary = adds === "-" && dels === "-"
-                  const additions = binary ? 0 : parseInt(adds)
-                  const deletions = binary ? 0 : parseInt(dels)
-                  return [
-                    {
-                      file,
-                      status: status.get(file) ?? "modified",
-                      binary,
-                      additions: Number.isFinite(additions) ? additions : 0,
-                      deletions: Number.isFinite(deletions) ? deletions : 0,
-                    } satisfies Row,
-                  ]
-                })
-
-              // Hide ignored-file removals from the user-facing diff output.
-              const ignored = yield* ignore(rows.map((r) => r.file))
-              if (ignored.size > 0) {
-                const filtered = rows.filter((r) => !ignored.has(r.file))
-                rows.length = 0
-                rows.push(...filtered)
-              }
-
-              EventDiagnostics.diffFullFiles(operationID, rows.length)
+              EventDiagnostics.diffFullFiles(operationID, selected.length + omitted.files)
               let totalBeforeChars = 0
               let totalBeforeBytes = 0
               let totalAfterChars = 0
@@ -767,144 +853,173 @@ const layer: Layer.Layer<Service, never, FSUtil.Service | AppProcess.Service | C
               let skippedBytes = 0
               let largestSkippedInput: { filename: string; bytes: number } | undefined
               const skippedReasonCounts = { size: 0, churn: 0 }
-              const step = 100
-              const sizes = (value: string) => {
-                const chars = value.length
-                // UTF-8 is at most three bytes per JavaScript string code unit.
-                const bytes =
-                  !diagnosticsEnabled && chars <= MAX_FULL_DIFF_FILE_BYTES / 3 ? chars : Buffer.byteLength(value)
-                return { chars, bytes }
-              }
-              const patch = (row: Row, before: string, after: string) => {
-                const started = diagnosticsEnabled ? performance.now() : 0
-                const output = formatPatch(
-                  structuredPatch(row.file, row.file, before, after, "", "", { context: Number.MAX_SAFE_INTEGER }),
-                )
-                if (diagnosticsEnabled) {
-                  const elapsedMs = performance.now() - started
-                  const patchSize = { chars: output.length, bytes: Buffer.byteLength(output) }
-                  EventDiagnostics.diffFileEnd({
-                    operationID,
-                    filename: row.file,
-                    elapsedMs,
-                    patchChars: patchSize.chars,
-                    patchBytes: patchSize.bytes,
-                  })
-                  if (!slowestFile || elapsedMs > slowestFile.elapsedMs) slowestFile = { filename: row.file, elapsedMs }
-                  if (!largestPatch || patchSize.bytes > largestPatch.bytes) {
-                    largestPatch = { filename: row.file, bytes: patchSize.bytes }
-                  }
-                  totalPatchChars += patchSize.chars
-                  totalPatchBytes += patchSize.bytes
+              for (const row of selected) {
+                const beforeObject = row.before ? sizes.get(row.before) : { type: "blob", size: 0 }
+                const afterObject = row.after ? sizes.get(row.after) : { type: "blob", size: 0 }
+                if (!beforeObject || !afterObject) return unavailable(rows.length)
+                const beforeSize = beforeObject.size
+                const afterSize = afterObject.size
+                const bytes = beforeSize + afterSize
+                const item: { -readonly [K in keyof FileDiff]: FileDiff[K] } = {
+                  file: row.file,
+                  patch: "",
+                  additions: row.additions,
+                  deletions: row.deletions,
+                  status: row.status,
                 }
-                return output
-              }
-
-              for (let i = 0; i < rows.length; i += step) {
-                const run = rows.slice(i, i + step)
-                const text = yield* load(run)
-                const loadedSizes = text
-                  ? new Map(
-                      Array.from(text, ([file, value]) => [
-                        file,
-                        { before: sizes(value.before), after: sizes(value.after) },
-                      ]),
-                    )
-                  : undefined
-                if (diagnosticsEnabled) {
-                  const batchSizes = Array.from(loadedSizes?.values() ?? []).reduce(
-                    (sum, item) => ({
-                      beforeChars: sum.beforeChars + item.before.chars,
-                      beforeBytes: sum.beforeBytes + item.before.bytes,
-                      afterChars: sum.afterChars + item.after.chars,
-                      afterBytes: sum.afterBytes + item.after.bytes,
-                    }),
-                    { beforeChars: 0, beforeBytes: 0, afterChars: 0, afterBytes: 0 },
-                  )
-                  EventDiagnostics.diffBatch({
-                    operationID,
-                    batchIndex: i / step,
-                    files: run.length,
-                    ...batchSizes,
-                  })
-                }
-
-                for (const row of run) {
-                  const hit = text?.get(row.file) ?? { before: "", after: "" }
-                  const [before, after] = row.binary ? ["", ""] : text ? [hit.before, hit.after] : yield* show(row)
-                  if (row.binary) {
-                    result.push({
-                      file: row.file,
-                      patch: "",
-                      additions: row.additions,
-                      deletions: row.deletions,
-                      status: row.status,
-                    })
-                    continue
+                result.push(item)
+                const reason =
+                  row.reason ??
+                  (row.additions + row.deletions > MAX_FULL_DIFF_CHURN
+                    ? "churn"
+                    : row.binary
+                      ? undefined
+                      : bytes > SnapshotDiff.MAX_INPUT_BYTES - inputBytes
+                        ? "input-budget"
+                        : 3 * SnapshotDiff.bytes(row.file) + 512 > SnapshotDiff.MAX_PATCH_BYTES - patchBytes + 2
+                          ? "patch-budget"
+                          : undefined)
+                if (reason) {
+                  item.omitted = {
+                    reason,
+                    files: 1,
+                    ...(row.reason ? { statisticsIncomplete: true } : {}),
                   }
-                  const beforeSize = loadedSizes?.get(row.file)?.before ?? sizes(before)
-                  const afterSize = loadedSizes?.get(row.file)?.after ?? sizes(after)
-                  const inputBytes = beforeSize.bytes + afterSize.bytes
-                  if (diagnosticsEnabled) {
-                    totalBeforeChars += beforeSize.chars
-                    totalBeforeBytes += beforeSize.bytes
-                    totalAfterChars += afterSize.chars
-                    totalAfterBytes += afterSize.bytes
-                    if (!largestInput || inputBytes > largestInput.bytes)
-                      largestInput = { filename: row.file, bytes: inputBytes }
-                  }
-                  EventDiagnostics.diffFileStart({
-                    operationID,
-                    filename: row.file,
-                    beforeChars: beforeSize.chars,
-                    beforeBytes: beforeSize.bytes,
-                    afterChars: afterSize.chars,
-                    afterBytes: afterSize.bytes,
-                    additions: row.additions,
-                    deletions: row.deletions,
-                    status: row.status,
-                  })
-                  const reason = [
-                    ...(Math.max(beforeSize.bytes, afterSize.bytes) > MAX_FULL_DIFF_FILE_BYTES
-                      ? ["size" as const]
-                      : []),
-                    ...(row.additions + row.deletions > MAX_FULL_DIFF_CHURN ? ["churn" as const] : []),
-                  ]
-                  if (reason.length) {
-                    skippedFiles++
-                    skippedBytes += inputBytes
-                    if (!largestSkippedInput || inputBytes > largestSkippedInput.bytes)
-                      largestSkippedInput = { filename: row.file, bytes: inputBytes }
-                    for (const item of reason) skippedReasonCounts[item]++
+                  skippedFiles++
+                  skippedBytes += bytes
+                  if (!largestSkippedInput || bytes > largestSkippedInput.bytes)
+                    largestSkippedInput = { filename: row.file, bytes }
+                  if (reason === "size" || reason === "churn") {
+                    skippedReasonCounts[reason]++
                     EventDiagnostics.diffFileSkipped({
                       operationID,
                       filename: row.file,
-                      reason,
-                      beforeBytes: beforeSize.bytes,
-                      afterBytes: afterSize.bytes,
+                      reason: [reason],
+                      beforeBytes: beforeSize,
+                      afterBytes: afterSize,
                       additions: row.additions,
                       deletions: row.deletions,
                       sizeLimit: MAX_FULL_DIFF_FILE_BYTES,
                       churnLimit: MAX_FULL_DIFF_CHURN,
                     })
-                    result.push({
-                      file: row.file,
-                      patch: "",
-                      additions: row.additions,
-                      deletions: row.deletions,
-                      status: row.status,
-                    })
-                    continue
                   }
-                  result.push({
-                    file: row.file,
-                    patch: patch(row, before, after),
-                    additions: row.additions,
-                    deletions: row.deletions,
-                    status: row.status,
+                  continue
+                }
+                if (row.binary) continue
+
+                const refs = [row.before, row.after].filter((ref): ref is string => Boolean(ref))
+                inputBytes += bytes
+                const content = yield* run(args(["cat-file", "--batch"]), {
+                  stdin: refs.join("\n") + "\n",
+                  maxOutputBytes: bytes + refs.length * 128,
+                })
+                if (!content) {
+                  item.omitted = { reason: "git-content-unavailable", files: 1 }
+                  continue
+                }
+                const text = new Map<string, string>()
+                let offset = 0
+                for (const ref of refs) {
+                  const end = content.indexOf(10, offset)
+                  const size = sizes.get(ref)?.size
+                  if (
+                    size === undefined ||
+                    end < offset ||
+                    content.toString("ascii", offset, end) !== `${ref} blob ${size}`
+                  )
+                    break
+                  if (content[end + 1 + size] !== 10) break
+                  text.set(ref, content.toString("utf8", end + 1, end + 1 + size))
+                  offset = end + size + 2
+                }
+                if (offset !== content.length || refs.some((ref) => !text.has(ref))) {
+                  item.omitted = { reason: "git-content-unavailable", files: 1 }
+                  continue
+                }
+                const before = row.before ? (text.get(row.before) ?? "") : ""
+                const after = row.after ? (text.get(row.after) ?? "") : ""
+                if (diagnosticsEnabled) {
+                  totalBeforeChars += before.length
+                  totalBeforeBytes += beforeSize
+                  totalAfterChars += after.length
+                  totalAfterBytes += afterSize
+                  if (!largestInput || bytes > largestInput.bytes) largestInput = { filename: row.file, bytes }
+                }
+                EventDiagnostics.diffFileStart({
+                  operationID,
+                  filename: row.file,
+                  beforeChars: before.length,
+                  beforeBytes: beforeSize,
+                  afterChars: after.length,
+                  afterBytes: afterSize,
+                  additions: row.additions,
+                  deletions: row.deletions,
+                  status: row.status,
+                })
+
+                const lines = [before, after].reduce((sum, value) => {
+                  let count = value.length && !value.endsWith("\n") ? 1 : 0
+                  for (let i = value.indexOf("\n"); i !== -1; i = value.indexOf("\n", i + 1)) count++
+                  return sum + count
+                }, 0)
+                // Full context has one hunk. Bound escaped content, line prefixes, headers and EOF markers.
+                // A successful capped diff shares at least this many lines, each costing >= 2 encoded bytes.
+                const common = Math.max(0, Math.ceil((lines - MAX_FULL_DIFF_CHURN) / 2))
+                const bound =
+                  SnapshotDiff.bytes(before) +
+                  SnapshotDiff.bytes(after) +
+                  lines -
+                  2 * common +
+                  3 * SnapshotDiff.bytes(row.file) +
+                  512
+                if (bound > SnapshotDiff.MAX_PATCH_BYTES - patchBytes + 2) {
+                  item.omitted = { reason: "patch-budget", files: 1 }
+                  continue
+                }
+                const started = performance.now()
+                const patch = structuredPatch(row.file, row.file, before, after, "", "", {
+                  context: Number.MAX_SAFE_INTEGER,
+                  timeout: FULL_DIFF_PATCH_TIMEOUT,
+                  maxEditLength: MAX_FULL_DIFF_CHURN,
+                })
+                if (!patch) {
+                  item.omitted = { reason: "diff-complexity", files: 1 }
+                  continue
+                }
+                const output = formatPatch(patch)
+                const encoded = SnapshotDiff.bytes(output)
+                if (encoded > SnapshotDiff.MAX_PATCH_BYTES - patchBytes + 2) {
+                  item.omitted = { reason: "patch-budget", files: 1 }
+                  continue
+                }
+                item.patch = output
+                patchBytes += encoded - 2
+                if (diagnosticsEnabled) {
+                  const elapsedMs = performance.now() - started
+                  const bytes = Buffer.byteLength(output)
+                  EventDiagnostics.diffFileEnd({
+                    operationID,
+                    filename: row.file,
+                    elapsedMs,
+                    patchChars: output.length,
+                    patchBytes: bytes,
                   })
+                  if (!slowestFile || elapsedMs > slowestFile.elapsedMs) slowestFile = { filename: row.file, elapsedMs }
+                  if (!largestPatch || bytes > largestPatch.bytes) largestPatch = { filename: row.file, bytes }
+                  totalPatchChars += output.length
+                  totalPatchBytes += bytes
                 }
               }
+              if (omitted.files)
+                result.push({
+                  additions: omitted.additions,
+                  deletions: omitted.deletions,
+                  omitted: {
+                    reason: "aggregate-budget",
+                    files: omitted.files,
+                    ...(omitted.statisticsIncomplete ? { statisticsIncomplete: true } : {}),
+                  },
+                })
 
               if (diagnosticsEnabled) {
                 EventDiagnostics.diffFullEnd({
@@ -928,7 +1043,7 @@ const layer: Layer.Layer<Service, never, FSUtil.Service | AppProcess.Service | C
                 completed = true
               }
               return result
-            }),
+            }).pipe(details.withPermits(1)),
           ).pipe(
             Effect.ensuring(
               Effect.sync(() => {

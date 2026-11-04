@@ -1,6 +1,7 @@
 import { createMemo, createResource, createSignal, Show, type JSX } from "solid-js"
 import type { SnapshotFileDiff, VcsFileDiff } from "@opencode-ai/sdk/v2"
 import type { FileDiffInfo } from "@opencode-ai/client/promise"
+import { SnapshotDiff } from "@opencode-ai/core/snapshot-diff"
 import {
   SESSION_REVIEW_V2_SIDEBAR_WIDTH_MAX,
   SESSION_REVIEW_V2_SIDEBAR_WIDTH_MIN,
@@ -38,6 +39,8 @@ export type ReviewPanelV2Props = {
   empty?: JSX.Element
   diffs: () => ReviewDiff[]
   diffsReady: () => boolean
+  // VCS and snapshot patches have the same shape; live VCS reviews opt out of summary limits.
+  snapshot?: boolean
   diffVersion?: number
   loadDiff?: (path: string, version?: number) => Promise<RenderDiff | undefined>
   activeFile?: string
@@ -56,8 +59,30 @@ export type ReviewPanelV2Props = {
 
 export function ReviewPanelV2(props: ReviewPanelV2Props) {
   const sdk = useSDK()
+  const language = useLanguage()
 
-  const diffs = createMemo(() => props.diffs().filter(filterRenderableDiff))
+  const summary = createMemo<ReviewDiff[]>(() => {
+    const value = props.diffs()
+    if (props.snapshot === false || value.some((diff) => "before" in diff || "after" in diff)) return value
+    return SnapshotDiff.limit(value)
+  })
+  const totals = createMemo(() => SnapshotDiff.totals(summary()))
+  const omitted = createMemo(() => summary().some((diff) => "omitted" in diff && diff.omitted))
+  const diffs = createMemo(() => summary().filter(filterRenderableDiff))
+  const stats = () => (
+    <div class="flex flex-col text-12-regular text-text-weak">
+      <Show when={omitted()}>
+        <span>
+          {totals().filesComplete
+            ? language.plural("ui.sessionTurn.diffs.changed", totals().files)
+            : language.t("ui.snapshotDiff.filesUnknown")}
+        </span>
+      </Show>
+      <Show when={totals().complete}>
+        <DiffChanges changes={totals()} />
+      </Show>
+    </div>
+  )
   const filteredFiles = createMemo(() =>
     filterReviewFiles(
       diffs().map((diff) => diff.file),
@@ -112,8 +137,15 @@ export function ReviewPanelV2(props: ReviewPanelV2Props) {
   return (
     <SessionReviewV2
       title={props.title}
-      stats={<DiffChanges changes={diffs()} />}
-      empty={props.empty}
+      stats={stats()}
+      empty={omitted() ? undefined : props.empty}
+      notice={
+        <Show when={omitted()}>
+          <div role="status" data-slot="snapshot-diff-omitted" class="p-3 text-12-regular text-text-weak">
+            {language.t("ui.snapshotDiff.omitted")}
+          </div>
+        </Show>
+      }
       sidebarOpen={props.state.sidebarOpened()}
       sidebar={
         // Always mounted: the sidebar header hosts the changes-mode dropdown,
@@ -123,7 +155,7 @@ export function ReviewPanelV2(props: ReviewPanelV2Props) {
           state={props.state}
           diffsReady={props.diffsReady}
           onSelectFile={props.onSelectFile}
-          diffs={diffs}
+          stats={stats()}
           filteredFiles={filteredFiles}
           searching={searching}
           kinds={treeKinds}
@@ -137,7 +169,7 @@ export function ReviewPanelV2(props: ReviewPanelV2Props) {
       onDiffStyleChange={props.onDiffStyleChange}
       expandMode={props.state.expandMode()}
       onExpandModeChange={props.state.setExpandMode}
-      hasDiffs={diffs().length > 0}
+      hasDiffs={summary().length > 0}
       preview={
         // Key on the file path, not the diff object identity, so refreshed diff data
         // updates the mounted preview instead of remounting the whole viewer.
@@ -148,6 +180,7 @@ export function ReviewPanelV2(props: ReviewPanelV2Props) {
                 <SessionReviewFilePreviewV2
                   file={file}
                   diff={diff()}
+                  snapshot={props.snapshot}
                   diffStyle={props.diffStyle}
                   expandMode={props.state.expandMode()}
                   readFile={readFile}
@@ -173,7 +206,7 @@ function ReviewPanelV2Sidebar(props: {
   state: ReviewPanelV2State
   diffsReady: () => boolean
   onSelectFile: (path: string) => void
-  diffs: () => RenderDiff[]
+  stats?: JSX.Element
   filteredFiles: () => string[]
   searching: () => boolean
   kinds: () => ReturnType<typeof reviewDiffKinds>
@@ -203,7 +236,7 @@ function ReviewPanelV2Sidebar(props: {
       open={props.state.sidebarOpened()}
       transition={props.state.sidebarTransition()}
       title={props.title}
-      stats={<DiffChanges changes={props.diffs()} />}
+      stats={props.stats}
       filter={props.state.filter()}
       onFilterChange={props.state.setFilter}
       onFilterKeyDown={onFilterKeyDown}

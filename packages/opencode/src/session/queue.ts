@@ -148,7 +148,12 @@ export const layer = Layer.effect(
                 const ctx = yield* InstanceRef
                 const workspaceID = yield* WorkspaceRef
                 const session = yield* db
-                  .select()
+                  .select({
+                    project_id: SessionTable.project_id,
+                    directory: SessionTable.directory,
+                    workspace_id: SessionTable.workspace_id,
+                    time_archived: SessionTable.time_archived,
+                  })
                   .from(SessionTable)
                   .where(eq(SessionTable.id, sessionID))
                   .get()

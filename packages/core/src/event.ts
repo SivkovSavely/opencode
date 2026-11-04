@@ -5,7 +5,7 @@ import { Event } from "@opencode-ai/schema/event"
 import type { Data, Definition, Payload } from "@opencode-ai/schema/event"
 import { and, asc, eq, gt, inArray, sql } from "drizzle-orm"
 import { Database } from "./database/database"
-import { EventSequenceTable, EventTable } from "./event/sql"
+import { EventSequenceTable, EventTable, EventTransportColumns } from "./event/sql"
 import { Location } from "./location"
 import { makeGlobalNode } from "./effect/app-node"
 import { EventDiagnostics, type SubscriberHandle } from "./event-diagnostics"
@@ -76,7 +76,7 @@ export const readAggregate = Effect.fn("EventV2.readAggregate")(function* <A>(
 ) {
   const after = input.after ?? -1
   const rows = yield* db
-    .select()
+    .select(EventTransportColumns)
     .from(EventTable)
     .where(
       and(
@@ -579,7 +579,7 @@ export const layerWith = (options?: LayerOptions) =>
         (options?.beforeAggregateRead?.(aggregateID) ?? Effect.void).pipe(
           Effect.andThen(
             db
-              .select()
+              .select(EventTransportColumns)
               .from(EventTable)
               .where(and(eq(EventTable.aggregate_id, aggregateID), gt(EventTable.seq, after)))
               .orderBy(asc(EventTable.seq))

@@ -14,6 +14,7 @@ import diffViewerPlugin from "../../../src/feature-plugins/system/diff-viewer"
 import { createTuiPluginApi } from "../../fixture/tui-plugin"
 import { createTuiResolvedConfig } from "../../fixture/tui-runtime"
 import { TestTuiContexts } from "../../fixture/tui-environment"
+import { SnapshotDiff } from "@opencode-ai/core/snapshot-diff"
 
 test("closing the diff viewer returns to the route it opened from", async () => {
   const viewer = await renderDiffViewer([])
@@ -98,7 +99,12 @@ test("brackets navigate diff hunks", async () => {
   }
 })
 
-async function renderDiffViewer(vcsDiff: unknown[], height = 20, initialRoute?: TuiRouteCurrent) {
+async function renderDiffViewer(
+  vcsDiff: unknown[],
+  height = 20,
+  initialRoute?: TuiRouteCurrent,
+  sessionDiff: unknown[] = [],
+) {
   const commands = new Map<
     string,
     NonNullable<Parameters<TuiPluginApi["keymap"]["registerLayer"]>[0]["commands"]>[number]
@@ -128,7 +134,7 @@ async function renderDiffViewer(vcsDiff: unknown[], height = 20, initialRoute?: 
         session: {
           diff: async (input: unknown) => {
             sessionDiffInput = input
-            return { data: [] }
+            return { data: sessionDiff }
           },
         },
       } as unknown as TuiPluginApi["client"],
@@ -237,6 +243,119 @@ test("last-turn diff source requests session diff", async () => {
     })
     expect(viewer.sessionDiffInput()).toEqual({ sessionID: "session-1", messageID: "message-1" })
     expect(viewer.vcsDiffInput()).toBeUndefined()
+  } finally {
+    viewer.app.renderer.destroy()
+  }
+})
+
+test("last-turn summaries bound historical arrays and display the full changed-file count", async () => {
+  const viewer = await renderDiffViewer(
+    [],
+    20,
+    {
+      name: "diff",
+      params: { mode: "last-turn", sessionID: "session-1" },
+    },
+    Array.from({ length: SnapshotDiff.MAX_FILES + 3 }, (_, index) => ({
+      file: `src/${index}.ts`,
+      patch: "",
+      additions: 1,
+      deletions: 0,
+    })),
+  )
+  try {
+    await viewer.app.waitForFrame((frame) => frame.includes("203 files") && frame.includes("details were omitted"))
+    const frame = viewer.app.captureCharFrame()
+    expect(frame).toContain("+203 -0")
+    expect(frame).not.toContain("No diff!")
+    expect(frame).not.toContain("aggregate-budget")
+  } finally {
+    viewer.app.renderer.destroy()
+  }
+})
+
+test("aggregate-only summaries remain visible without a fake file or an empty-state claim", async () => {
+  const viewer = await renderDiffViewer(
+    [],
+    20,
+    {
+      name: "diff",
+      params: { mode: "last-turn", sessionID: "session-1" },
+    },
+    [{ additions: 21, deletions: 13, omitted: { reason: "input-budget", files: 700 } }],
+  )
+  try {
+    await viewer.app.waitForFrame((frame) => frame.includes("700 files") && frame.includes("details were omitted"))
+    const frame = viewer.app.captureCharFrame()
+    expect(frame).toContain("+21 -13")
+    expect(frame).not.toContain("No diff!")
+    expect(containsDiff(viewer.app.renderer.root)).toBe(false)
+  } finally {
+    viewer.app.renderer.destroy()
+  }
+})
+
+test("unknown summary totals are not displayed as zero changed files", async () => {
+  const viewer = await renderDiffViewer(
+    [],
+    20,
+    {
+      name: "diff",
+      params: { mode: "last-turn", sessionID: "session-1" },
+    },
+    [{ additions: 0, deletions: 0, omitted: { reason: "input-budget" } }],
+  )
+  try {
+    await viewer.app.waitForFrame((frame) => frame.includes("? files") && frame.includes("details were omitted"))
+    expect(viewer.app.captureCharFrame()).not.toContain("No diff!")
+  } finally {
+    viewer.app.renderer.destroy()
+  }
+})
+
+test("unknown line statistics preserve the known changed-file count", async () => {
+  const viewer = await renderDiffViewer(
+    [],
+    20,
+    { name: "diff", params: { mode: "last-turn", sessionID: "session-1" } },
+    [
+      {
+        file: "unknown.png",
+        patch: "",
+        additions: 0,
+        deletions: 0,
+        omitted: { reason: "input-budget", files: 1, statisticsIncomplete: true },
+      },
+    ],
+  )
+  try {
+    await viewer.app.waitForFrame((frame) => frame.includes("1 file") && frame.includes("Patch omitted"))
+    const frame = viewer.app.captureCharFrame()
+    expect(frame).toContain("Statistics may be incomplete")
+    expect(frame).not.toContain("? files")
+    expect(containsDiff(viewer.app.renderer.root)).toBe(false)
+  } finally {
+    viewer.app.renderer.destroy()
+  }
+})
+
+test("oversized summary patches never mount a diff widget or pretend to be empty", async () => {
+  const viewer = await renderDiffViewer(
+    [],
+    20,
+    {
+      name: "diff",
+      params: { mode: "last-turn", sessionID: "session-1" },
+    },
+    [{ file: "large.ts", patch: "x".repeat(SnapshotDiff.MAX_PATCH_BYTES + 1), additions: 2, deletions: 1 }],
+  )
+  try {
+    await viewer.app.waitForFrame((frame) => frame.includes("Patch omitted"))
+    const frame = viewer.app.captureCharFrame()
+    expect(frame).toContain("large.ts")
+    expect(frame).toContain("1 file")
+    expect(frame).not.toContain("No patch available")
+    expect(containsDiff(viewer.app.renderer.root)).toBe(false)
   } finally {
     viewer.app.renderer.destroy()
   }

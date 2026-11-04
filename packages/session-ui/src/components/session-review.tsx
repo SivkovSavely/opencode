@@ -13,9 +13,10 @@ import { useFileComponent } from "@opencode-ai/ui/context/file"
 import { useI18n } from "@opencode-ai/ui/context/i18n"
 import { getDirectory, getFilename } from "@opencode-ai/core/util/path"
 import { checksum } from "@opencode-ai/core/util/encode"
+import { SnapshotDiff } from "@opencode-ai/core/snapshot-diff"
 import { createEffect, createMemo, For, Match, onCleanup, Show, Switch, untrack, type JSX } from "solid-js"
 import { createStore } from "solid-js/store"
-import { type FileContent, type SnapshotFileDiff, type VcsFileDiff } from "@opencode-ai/sdk/v2"
+import { type FileContent, type VcsFileDiff } from "@opencode-ai/sdk/v2"
 import type { FileDiffInfo } from "@opencode-ai/client/promise"
 import { PreloadMultiFileDiffResult } from "@pierre/diffs/ssr"
 import { type SelectedLineRange } from "@pierre/diffs"
@@ -63,10 +64,11 @@ export type SessionReviewCommentActions = {
 
 export type SessionReviewFocus = { file: string; id: string }
 
-type RawReviewDiff = (SnapshotFileDiff | FileDiffInfo | VcsFileDiff) & {
+type SnapshotDiffInfo = ReturnType<typeof SnapshotDiff.limit>[number]
+type RawReviewDiff = (SnapshotDiffInfo | FileDiffInfo | VcsFileDiff) & {
   preloaded?: PreloadMultiFileDiffResult<any>
 }
-type ReviewDiff = ((SnapshotFileDiff & { file: string }) | FileDiffInfo | VcsFileDiff) & {
+type ReviewDiff = ((SnapshotDiffInfo & { file: string }) | FileDiffInfo | VcsFileDiff) & {
   preloaded?: PreloadMultiFileDiffResult<any>
 }
 type Item = ViewDiff & { preloaded?: PreloadMultiFileDiffResult<any> }
@@ -115,6 +117,7 @@ export interface SessionReviewProps {
   classes?: { root?: string; header?: string; container?: string }
   actions?: JSX.Element
   diffs: RawReviewDiff[]
+  snapshot?: boolean
   onViewFile?: (file: string) => void
   readFile?: (path: string) => Promise<FileContent | undefined>
   lineCommentMention?: LineCommentEditorProps["mention"]
@@ -183,10 +186,23 @@ export const SessionReview = (props: SessionReviewProps) => {
   const opened = () => store.opened
 
   const open = () => props.open ?? store.open
-  const itemsMap = createMemo(() =>
-    Object.fromEntries(list(props.diffs).map((diff) => [diff.file, { ...normalize(diff), preloaded: diff.preloaded }])),
+  // Live VCS patches share the snapshot shape, so their callers explicitly opt out.
+  const bounded = createMemo<RawReviewDiff[]>(() =>
+    props.snapshot === false || props.diffs.some((diff) => "before" in diff || "after" in diff)
+      ? props.diffs
+      : SnapshotDiff.limit(props.diffs),
   )
-  const files = createMemo(() => props.diffs.map((diff) => diff.file!))
+  const totals = createMemo(() => SnapshotDiff.totals(bounded()))
+  const omitted = createMemo(() => bounded().some((diff) => "omitted" in diff && diff.omitted))
+  const omittedFiles = createMemo(() => list(bounded()).filter((diff) => "omitted" in diff && diff.omitted))
+  const itemsMap = createMemo(() =>
+    Object.fromEntries(
+      list(bounded())
+        .filter((diff) => !("omitted" in diff && diff.omitted))
+        .map((diff) => [diff.file, { ...normalize(diff), preloaded: diff.preloaded }]),
+    ),
+  )
+  const files = createMemo(() => Object.keys(itemsMap()))
   const grouped = createMemo(() => {
     const next = new Map<string, SessionReviewComment[]>()
     for (const comment of props.comments ?? []) {
@@ -386,7 +402,32 @@ export const SessionReview = (props: SessionReviewProps) => {
         }}
       >
         <div data-slot="session-review-container" class={props.classes?.container}>
-          <Show when={hasDiffs()} fallback={props.empty}>
+          <Show when={omitted()}>
+            <div role="status" data-slot="snapshot-diff-omitted" class="p-3 text-12-regular text-text-weak">
+              <div>
+                {totals().filesComplete
+                  ? i18n.plural("ui.sessionTurn.diffs.changed", totals().files)
+                  : i18n.t("ui.snapshotDiff.filesUnknown")}
+                <DiffChanges changes={totals()} />
+              </div>
+              {i18n.t("ui.snapshotDiff.omitted")}
+            </div>
+            <For each={omittedFiles()}>
+              {(diff) => (
+                <div
+                  id={diffId(diff.file)}
+                  data-file={diff.file}
+                  data-slot="snapshot-diff-file-omitted"
+                  class="p-3 text-12-regular"
+                >
+                  <div class="break-all">{diff.file}</div>
+                  <DiffChanges changes={diff} />
+                  <span class="text-text-weak">{i18n.t("ui.snapshotDiff.patchOmitted")}</span>
+                </div>
+              )}
+            </For>
+          </Show>
+          <Show when={hasDiffs()} fallback={omitted() ? undefined : props.empty}>
             <div data-slot="session-review-list" class="pb-6">
               <Accordion multiple value={open()} onChange={handleChange}>
                 <For each={files()}>

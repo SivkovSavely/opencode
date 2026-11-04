@@ -79,7 +79,16 @@ export const ensure = Effect.fn("SessionQueueMigration.ensure")(function* (sessi
   const ctx = yield* InstanceRef
   const workspaceID = yield* WorkspaceRef
   if (!ctx) return
-  const session = yield* db.select().from(SessionTable).where(eq(SessionTable.id, sessionID)).get().pipe(Effect.orDie)
+  const session = yield* db
+    .select({
+      project_id: SessionTable.project_id,
+      directory: SessionTable.directory,
+      workspace_id: SessionTable.workspace_id,
+    })
+    .from(SessionTable)
+    .where(eq(SessionTable.id, sessionID))
+    .get()
+    .pipe(Effect.orDie)
   if (
     !session ||
     session.project_id !== ctx.project.id ||
@@ -170,7 +179,12 @@ export const ensure = Effect.fn("SessionQueueMigration.ensure")(function* (sessi
           )
             return
           const current = yield* db
-            .select()
+            .select({
+              project_id: SessionTable.project_id,
+              directory: SessionTable.directory,
+              workspace_id: SessionTable.workspace_id,
+              time_archived: SessionTable.time_archived,
+            })
             .from(SessionTable)
             .where(eq(SessionTable.id, sessionID))
             .get()
@@ -185,12 +199,12 @@ export const ensure = Effect.fn("SessionQueueMigration.ensure")(function* (sessi
           const verified = yield* Effect.forEach([...new Set(hidden)], (id) =>
             Effect.gen(function* () {
               const message = yield* db
-                .select()
+                .select({ role: sql<string>`json_extract(${MessageTable.data}, '$.role')` })
                 .from(MessageTable)
                 .where(and(eq(MessageTable.id, id), eq(MessageTable.session_id, sessionID)))
                 .get()
                 .pipe(Effect.orDie)
-              if (!message || message.data.role !== "user") return []
+              if (!message || message.role !== "user") return []
               const parts = yield* db
                 .select()
                 .from(PartTable)

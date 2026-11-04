@@ -157,6 +157,11 @@ export type SnapshotFileDiff = {
   additions: number
   deletions: number
   status?: "added" | "deleted" | "modified"
+  omitted?: {
+    reason: string
+    files?: number
+    statisticsIncomplete?: boolean
+  }
 }
 
 export type PermissionAction = "allow" | "deny" | "ask"
@@ -646,6 +651,10 @@ export type Prompt = {
   text: string
   files?: Array<PromptFileAttachment>
   agents?: Array<PromptAgentAttachment>
+  agent?: string
+  model?: ModelRef
+  requestedModel?: ModelRef
+  selection?: PromptSelection
 }
 
 export type Pty = {
@@ -2791,6 +2800,9 @@ export type PromptInput = {
   text: string
   files?: Array<PromptInputFileAttachment>
   agents?: Array<PromptAgentAttachment>
+  agent?: string
+  model?: ModelRef
+  selection?: PromptSelection
 }
 
 export type ServiceUnavailableError = {
@@ -3142,6 +3154,15 @@ export type PromptFileAttachment = {
 export type PromptAgentAttachment = {
   name: string
   source?: PromptSource
+}
+
+export type PromptSelection = {
+  inheritActive?: boolean
+  model?: {
+    providerID: string
+    modelID: string
+  }
+  variant?: string
 }
 
 export type SessionErrorUnknown = {
@@ -4265,6 +4286,10 @@ export type SessionMessageUser = {
   text: string
   files?: Array<PromptFileAttachment>
   agents?: Array<PromptAgentAttachment>
+  agent?: string
+  model?: ModelRef
+  requestedModel?: ModelRef
+  selection?: PromptSelection
   type: "user"
 }
 
@@ -5294,6 +5319,7 @@ export type CommandV2Info = {
   description?: string
   agent?: string
   model?: ModelRef
+  variant?: string
   subtask?: boolean
 }
 
@@ -13051,6 +13077,62 @@ export type V2SessionPromptResponses = {
 }
 
 export type V2SessionPromptResponse = V2SessionPromptResponses[keyof V2SessionPromptResponses]
+
+export type V2SessionCommandData = {
+  body: {
+    id?: string
+    command: string
+    arguments?: string
+    agent?: string
+    model?: ModelRef
+    selection?: PromptSelection
+    files?: Array<PromptInputFileAttachment>
+    agents?: Array<PromptAgentAttachment>
+    delivery?: "steer" | "queue"
+    resume?: boolean
+  }
+  path: {
+    sessionID: string
+  }
+  query?: never
+  url: "/api/session/{sessionID}/command"
+}
+
+export type V2SessionCommandErrors = {
+  /**
+   * InvalidRequestError
+   */
+  400: InvalidRequestError
+  /**
+   * UnauthorizedError
+   */
+  401: UnauthorizedError
+  /**
+   * SessionNotFoundError
+   */
+  404: SessionNotFoundError
+  /**
+   * ConflictError
+   */
+  409: ConflictError
+  /**
+   * ServiceUnavailableError
+   */
+  503: ServiceUnavailableError
+}
+
+export type V2SessionCommandError = V2SessionCommandErrors[keyof V2SessionCommandErrors]
+
+export type V2SessionCommandResponses = {
+  /**
+   * Success
+   */
+  200: {
+    data: SessionInputAdmitted
+  }
+}
+
+export type V2SessionCommandResponse = V2SessionCommandResponses[keyof V2SessionCommandResponses]
 
 export type V2SessionCompactData = {
   body?: never

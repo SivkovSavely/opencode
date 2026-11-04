@@ -20,13 +20,15 @@ import { NamedError } from "@opencode-ai/core/util/error"
 import { APICallError, convertToModelMessages, LoadAPIKeyError, type ModelMessage, type UIMessage } from "ai"
 import { Database } from "@opencode-ai/core/database/database"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
+import { SnapshotDiff } from "@opencode-ai/core/snapshot-diff"
 import { NotFoundError } from "@/storage/storage"
-import { and } from "drizzle-orm"
+import { and, asc } from "drizzle-orm"
 import { desc } from "drizzle-orm"
 import { eq } from "drizzle-orm"
 import { inArray } from "drizzle-orm"
 import { lt } from "drizzle-orm"
 import { or } from "drizzle-orm"
+import { getTableColumns, sql, type SQLWrapper } from "drizzle-orm"
 import { MessageTable, PartTable, SessionTable } from "@opencode-ai/core/session/sql"
 import { ProviderError } from "@/provider/error"
 import { iife } from "@/util/iife"
@@ -78,12 +80,51 @@ export const cursor = {
   },
 }
 
-const info = (row: typeof MessageTable.$inferSelect) =>
-  ({
+// Keep oversized historical patches in SQLite, not in the JSON column decoder.
+// The projection changes only the selected summary, never the stored record.
+export function summaryProjection(data: SQLWrapper, path: string) {
+  return sql`CASE
+    WHEN length(CAST(${data} AS BLOB)) > ${SnapshotDiff.MAX_INPUT_BYTES}
+      AND json_type(${data}, ${path}) = 'array'
+    THEN (
+      SELECT CASE WHEN
+        total(length(CAST(json_quote(coalesce(json_extract(value, '$.patch'), '')) AS BLOB))) > ${SnapshotDiff.MAX_PATCH_BYTES}
+        OR count(*) > ${SnapshotDiff.MAX_FILES + 1}
+        OR max(length(json_extract(value, '$.file'))) > ${SnapshotDiff.MAX_PATH_CHARS}
+        OR length(CAST(json_extract(${data}, ${path}) AS BLOB)) > ${SnapshotDiff.MAX_INPUT_BYTES * 2}
+      THEN json_set(${data}, ${path}, json_array(json_object(
+        'additions', total(json_extract(value, '$.additions')),
+        'deletions', total(json_extract(value, '$.deletions')),
+        'omitted', json_patch(json(CASE WHEN sum(CASE
+          WHEN coalesce(json_extract(value, '$.file'), '') = ''
+            AND json_extract(value, '$.omitted.files') IS NULL THEN 1 ELSE 0 END) > 0
+          THEN json_object('reason', 'historical-budget')
+          ELSE json_object('reason', 'historical-budget', 'files', sum(CASE
+            WHEN coalesce(json_extract(value, '$.file'), '') != '' THEN 1
+            ELSE coalesce(json_extract(value, '$.omitted.files'), 0) END))
+        END), CASE WHEN max(coalesce(json_extract(value, '$.omitted.statisticsIncomplete'), 0)) = 1
+          THEN json_object('statisticsIncomplete', json('true')) ELSE '{}' END)
+      ))) ELSE ${data} END
+      FROM json_each(${data}, ${path})
+    )
+    ELSE ${data}
+  END`
+}
+
+const columns = {
+  ...getTableColumns(MessageTable),
+  data: summaryProjection(MessageTable.data, "$.summary.diffs").mapWith(MessageTable.data),
+}
+
+const info = (row: typeof MessageTable.$inferSelect): Info => {
+  const value = {
     ...row.data,
     id: row.id,
     sessionID: row.session_id,
-  }) as Info
+  } as Info
+  if (value.role !== "user" || !value.summary) return value
+  return { ...value, summary: { ...value.summary, diffs: SnapshotDiff.limit(value.summary.diffs) } }
+}
 
 const part = (row: typeof PartTable.$inferSelect) =>
   ({
@@ -332,16 +373,13 @@ export const toModelMessagesEffect = Effect.fnUntraced(function* (
             const crashed = part.state.metadata?.crashInterrupted === true
             const output =
               !crashed && part.state.metadata?.interrupted === true ? part.state.metadata.output : undefined
-            const toolInput =
-              crashed && typeof part.state.metadata?.crashRawInput === "string"
-                ? part.state.metadata.crashRawInput
-                : part.state.input
+            // Raw crash fragments are diagnostic metadata, not structured model arguments.
             if (typeof output === "string") {
               assistantMessage.parts.push({
                 type: ("tool-" + part.tool) as `tool-${string}`,
                 state: "output-available",
                 toolCallId: part.callID,
-                input: toolInput,
+                input: part.state.input,
                 output,
                 ...(part.metadata?.providerExecuted ? { providerExecuted: true } : {}),
                 ...(differentModel ? {} : { callProviderMetadata: providerMeta(part.metadata) }),
@@ -351,7 +389,7 @@ export const toModelMessagesEffect = Effect.fnUntraced(function* (
                 type: ("tool-" + part.tool) as `tool-${string}`,
                 state: "output-error",
                 toolCallId: part.callID,
-                input: toolInput,
+                input: part.state.input,
                 errorText: part.state.error,
                 ...(part.metadata?.providerExecuted ? { providerExecuted: true } : {}),
                 ...(differentModel ? {} : { callProviderMetadata: providerMeta(part.metadata) }),
@@ -446,7 +484,7 @@ export const page = Effect.fn("MessageV2.page")(function* (input: {
     ? and(eq(MessageTable.session_id, input.sessionID), older(before))
     : eq(MessageTable.session_id, input.sessionID)
   const rows = yield* db
-    .select()
+    .select(columns)
     .from(MessageTable)
     .where(and(where, SessionQueueMigration.visible))
     .orderBy(desc(MessageTable.time_created), desc(MessageTable.id))
@@ -516,19 +554,51 @@ export function parts(messageID: MessageID) {
   })
 }
 
-export const get = Effect.fn("MessageV2.get")(function* (input: { sessionID: SessionID; messageID: MessageID }) {
+export const getInfo = Effect.fn("MessageV2.getInfo")(function* (input: {
+  sessionID: SessionID
+  messageID: MessageID
+}) {
   const { db } = yield* Database.Service
   const row = yield* db
-    .select()
+    .select(columns)
     .from(MessageTable)
     .where(and(eq(MessageTable.id, input.messageID), eq(MessageTable.session_id, input.sessionID)))
     .get()
     .pipe(Effect.orDie)
   if (!row) return yield* new NotFoundError({ message: `Message not found: ${input.messageID}` })
+  return info(row)
+})
+
+export const get = Effect.fn("MessageV2.get")(function* (input: { sessionID: SessionID; messageID: MessageID }) {
   return {
-    info: info(row),
+    info: yield* getInfo(input),
     parts: yield* parts(input.messageID),
   }
+})
+
+export const turn = Effect.fn("MessageV2.turn")(function* (input: { sessionID: SessionID; messageID: MessageID }) {
+  const database = yield* Database.Service
+  yield* SessionQueueMigration.ensure(input.sessionID)
+  const rows = yield* database.db
+    .select(columns)
+    .from(MessageTable)
+    .where(
+      and(
+        eq(MessageTable.session_id, input.sessionID),
+        SessionQueueMigration.visible,
+        or(
+          eq(MessageTable.id, input.messageID),
+          and(
+            sql`json_extract(${MessageTable.data}, '$.role') = 'assistant'`,
+            sql`json_extract(${MessageTable.data}, '$.parentID') = ${input.messageID}`,
+          ),
+        ),
+      ),
+    )
+    .orderBy(asc(MessageTable.time_created), asc(MessageTable.id))
+    .all()
+    .pipe(Effect.orDie)
+  return yield* hydrate(database.db, rows)
 })
 
 export function filterCompacted(msgs: Iterable<WithParts>) {
@@ -617,8 +687,7 @@ export function latest(msgs: WithParts[]) {
         continue
       const subtaskPartID = part.state.input.subtaskPartID
       if (typeof subtaskPartID === "string") {
-        if (part.state.status === "completed" || part.state.status === "error")
-          settledSubtaskIDs.add(subtaskPartID)
+        if (part.state.status === "completed" || part.state.status === "error") settledSubtaskIDs.add(subtaskPartID)
         else if (!part.state.metadata) unstartedSubtaskIDs.add(subtaskPartID)
         continue
       }

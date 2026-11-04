@@ -99,6 +99,7 @@ import { useSessionCommands } from "@/pages/session/use-session-commands"
 import { useSessionHashScroll } from "@/pages/session/use-session-hash-scroll"
 import { Identifier } from "@/utils/id"
 import { diffs as list } from "@/utils/diffs"
+import { SnapshotDiff } from "@opencode-ai/core/snapshot-diff"
 import { Persist, persisted } from "@/utils/persist"
 import { extractPromptFromParts } from "@/utils/prompt"
 import { formatServerError, isLocalSessionNotFoundError, isSessionNotFoundError } from "@/utils/server-errors"
@@ -655,7 +656,7 @@ export default function Page() {
     return open
   }, desktopReviewOpen())
 
-  const turnDiffs = createMemo(() => list(lastUserMessage()?.summary?.diffs))
+  const turnDiffs = createMemo(() => SnapshotDiff.limit(list(lastUserMessage()?.summary?.diffs)))
   const nogit = createMemo(() => {
     const project = sync().project
     return !!project && project.vcs !== "git"
@@ -718,8 +719,9 @@ export default function Page() {
     if (selected && diffs.some((diff) => diff.file === selected)) return selected
     return diffs[0]?.file
   }
-  const reviewCount = () => reviewDiffs().length
-  const hasReview = () => reviewCount() > 0
+  const reviewTotals = createMemo(() => SnapshotDiff.totals(reviewDiffs()))
+  const reviewCount = () => (reviewTotals().filesComplete ? reviewTotals().files : "?")
+  const hasReview = () => reviewDiffs().length > 0
   const reviewReady = () => {
     if (reviewMode() === "git" || reviewMode() === "branch") return !vcsQuery.isPending
     return true
@@ -1278,6 +1280,7 @@ export default function Page() {
         title={changesTitle()}
         empty={reviewEmpty(input)}
         diffs={reviewDiffs}
+        snapshot={reviewMode() === "turn"}
         view={view}
         diffStyle={input.diffStyle}
         onDiffStyleChange={input.onDiffStyleChange}
@@ -1313,6 +1316,9 @@ export default function Page() {
     },
     diffs: reviewDiffs,
     diffsReady: reviewReady,
+    get snapshot() {
+      return reviewMode() === "turn"
+    },
     get diffVersion() {
       return vcsQuery.dataUpdatedAt
     },

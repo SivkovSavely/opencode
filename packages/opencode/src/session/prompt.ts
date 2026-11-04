@@ -2656,15 +2656,42 @@ const layer = Layer.effect(
           }
           yield* sessions.updateMessage(msg)
 
-          const finalizeInterruptedAssistant = Effect.gen(function* () {
-            if (msg.time.completed) return
-            msg.error ??= MessageV2.fromError(new DOMException("Aborted", "AbortError"), {
-              providerID: msg.providerID,
-              aborted: true,
-            })
-            msg.time.completed = Date.now()
-            yield* sessions.updateMessage(msg)
-          })
+          const finalizeFailedAssistant = (cause: Cause.Cause<unknown>) =>
+            Effect.gen(function* () {
+              if (msg.time.completed) return
+              if (!Cause.hasInterrupts(cause))
+                yield* Effect.logError("assistant turn preparation failed", {
+                  sessionID,
+                  messageID: msg.id,
+                  ownerLineage: runtime.identity.lineage,
+                  ownerInstance: runtime.identity.instance,
+                  fence: executionFence,
+                  ...RuntimeLifecycle.recoveryFailureFields(cause, "assistant-preparation"),
+                  rowTransitioned: false,
+                })
+              msg.error ??= Cause.hasInterrupts(cause)
+                ? MessageV2.fromError(new DOMException("Aborted", "AbortError"), {
+                    providerID: msg.providerID,
+                    aborted: true,
+                  })
+                : new NamedError.Unknown({
+                    message: "Assistant turn preparation failed; see server logs for details.",
+                  }).toObject()
+              msg.time.completed = Date.now()
+              yield* sessions.updateMessage(msg)
+            }).pipe(
+              Effect.catchCause((failure) =>
+                Effect.logError("assistant failure finalization failed", {
+                  sessionID,
+                  messageID: msg.id,
+                  ownerLineage: runtime.identity.lineage,
+                  ownerInstance: runtime.identity.instance,
+                  fence: executionFence,
+                  ...RuntimeLifecycle.recoveryFailureFields(failure, "assistant-finalization"),
+                  rowTransitioned: false,
+                }),
+              ),
+            )
 
           const handle = yield* processor
             .create({
@@ -2672,7 +2699,10 @@ const layer = Layer.effect(
               sessionID,
               model,
             })
-            .pipe(Effect.onInterrupt(() => finalizeInterruptedAssistant))
+            .pipe(
+              RuntimeLifecycle.withRecoveryPhase("snapshot-initialization"),
+              Effect.onExit((exit) => (Exit.isFailure(exit) ? finalizeFailedAssistant(exit.cause) : Effect.void)),
+            )
 
           const outcome: "break" | "continue" = yield* Effect.gen(function* () {
             const lastUserMsg = msgs.findLast((m) => m.info.role === "user")
@@ -2705,6 +2735,7 @@ const layer = Layer.effect(
               Effect.provideService(MCP.Service, mcp),
               Effect.provideService(Truncate.Service, truncate),
               Effect.provideService(RuntimeFlags.Service, flags),
+              RuntimeLifecycle.withRecoveryPhase("tool-resolution"),
             )
 
             if (lastUser.format?.type === "json_schema") {
@@ -2719,18 +2750,22 @@ const layer = Layer.effect(
             if (step === 1 && process.env.OPENCODE_MANAGED_PROFILE !== "1")
               yield* summary.summarize({ sessionID, messageID: lastUser.id }).pipe(Effect.ignore, Effect.forkIn(scope))
 
-            yield* plugin.trigger("experimental.chat.messages.transform", {}, { messages: msgs })
+            yield* plugin
+              .trigger("experimental.chat.messages.transform", {}, { messages: msgs })
+              .pipe(RuntimeLifecycle.withRecoveryPhase("message-transform"))
 
             const currentSession = yield* sessions.get(sessionID).pipe(Effect.orDie)
             const [skills, env, instructions, mcpInstructions, modelMsgs] = yield* Effect.all([
-              sys.skills(agent),
-              sys.environment(model),
-              instruction.system().pipe(Effect.orDie),
+              sys.skills(agent).pipe(RuntimeLifecycle.withRecoveryPhase("system-skills")),
+              sys.environment(model).pipe(RuntimeLifecycle.withRecoveryPhase("system-environment")),
+              instruction.system().pipe(Effect.orDie, RuntimeLifecycle.withRecoveryPhase("system-instructions")),
               process.env.OPENCODE_MANAGED_PROFILE === "1"
                 ? Effect.succeed(undefined)
-                : sys.mcp(agent, session.permission, McpActivation.names(currentSession.metadata)),
-              MessageV2.toModelMessagesEffect(msgs, model),
-            ])
+                : sys
+                    .mcp(agent, session.permission, McpActivation.names(currentSession.metadata))
+                    .pipe(RuntimeLifecycle.withRecoveryPhase("system-mcp")),
+              MessageV2.toModelMessagesEffect(msgs, model).pipe(RuntimeLifecycle.withRecoveryPhase("model-history")),
+            ]).pipe(RuntimeLifecycle.withRecoveryPhase("system-context"))
             const system = [
               ...env,
               ...instructions,
@@ -2739,21 +2774,23 @@ const layer = Layer.effect(
             ]
             const format = lastUser.format ?? { type: "text" as const }
             if (format.type === "json_schema") system.push(STRUCTURED_OUTPUT_SYSTEM_PROMPT)
-            const result = yield* handle.process({
-              user: lastUser,
-              agent,
-              permission: session.permission,
-              sessionID,
-              parentSessionID: session.parentID,
-              system,
-              messages: [
-                ...modelMsgs,
-                ...(isLastStep ? [{ role: "assistant" as const, content: MAX_STEPS_PROMPT }] : []),
-              ],
-              tools,
-              model,
-              toolChoice: format.type === "json_schema" ? "required" : undefined,
-            })
+            const result = yield* handle
+              .process({
+                user: lastUser,
+                agent,
+                permission: session.permission,
+                sessionID,
+                parentSessionID: session.parentID,
+                system,
+                messages: [
+                  ...modelMsgs,
+                  ...(isLastStep ? [{ role: "assistant" as const, content: MAX_STEPS_PROMPT }] : []),
+                ],
+                tools,
+                model,
+                toolChoice: format.type === "json_schema" ? "required" : undefined,
+              })
+              .pipe(RuntimeLifecycle.withRecoveryPhase("provider-turn"))
 
             if (structured !== undefined) {
               handle.message.structured = structured
@@ -2799,8 +2836,10 @@ const layer = Layer.effect(
             }
             return "continue" as const
           }).pipe(
-            Effect.ensuring(instruction.clear(handle.message.id)),
-            Effect.onInterrupt(() => finalizeInterruptedAssistant),
+            Effect.ensuring(
+              instruction.clear(handle.message.id).pipe(RuntimeLifecycle.withRecoveryPhase("instruction-cleanup")),
+            ),
+            Effect.onExit((exit) => (Exit.isFailure(exit) ? finalizeFailedAssistant(exit.cause) : Effect.void)),
           )
           if (
             outcome === "break" &&
@@ -2915,14 +2954,17 @@ const layer = Layer.effect(
           sessionID,
           Effect.die(new Runner.Cancelled()),
           Effect.gen(function* () {
-            yield* queue.block(sessionID).pipe(Effect.orDie)
+            yield* queue.block(sessionID).pipe(Effect.orDie, RuntimeLifecycle.withRecoveryPhase("queue-block"))
             if (input)
               yield* prompt({ ...input, sessionID, noReply: true }, { recoveryFence: executionFence }).pipe(
                 Effect.orDie,
+                RuntimeLifecycle.withRecoveryPhase("child-prompt"),
               )
-            yield* reconcileCrashTools(sessionID)
-            yield* runtime.recoveryPrepared(sessionID)
-            return yield* runLoop(sessionID, true, false, false, true, executionFence)
+            yield* reconcileCrashTools(sessionID).pipe(RuntimeLifecycle.withRecoveryPhase("tool-reconciliation"))
+            yield* runtime.recoveryPrepared(sessionID).pipe(RuntimeLifecycle.withRecoveryPhase("recovery-prepared"))
+            return yield* runLoop(sessionID, true, false, false, true, executionFence).pipe(
+              RuntimeLifecycle.withRecoveryPhase("continuation"),
+            )
           }),
         )
         .pipe(Effect.exit)

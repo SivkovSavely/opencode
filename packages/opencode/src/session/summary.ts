@@ -7,6 +7,21 @@ import { Snapshot } from "@/snapshot"
 import { Session } from "./session"
 import { SessionID, MessageID } from "./schema"
 import { Config } from "@/config/config"
+import { SnapshotDiff } from "@opencode-ai/core/snapshot-diff"
+import { Database } from "@opencode-ai/core/database/database"
+import { MessageV2 } from "./message-v2"
+import { NotFoundError } from "@/storage/storage"
+
+function quoteGitPath(input: string) {
+  if (!/["\\\x00-\x1f\x7f]/.test(input)) return input
+  return `"${Array.from(Buffer.from(input), (byte) =>
+    byte === 34 || byte === 92
+      ? `\\${String.fromCharCode(byte)}`
+      : byte < 32 || byte >= 127
+        ? `\\${byte.toString(8).padStart(3, "0")}`
+        : String.fromCharCode(byte),
+  ).join("")}"`
+}
 
 function unquoteGitPath(input: string) {
   if (!input.startsWith('"')) return input
@@ -83,7 +98,13 @@ const layer = Layer.effect(
     const snapshot = yield* Snapshot.Service
     const events = yield* EventV2Bridge.Service
     const config = yield* Config.Service
+    const database = yield* Database.Service
     const locks = new Map<MessageID, { semaphore: Semaphore.Semaphore; users: number }>()
+    const getInfo = (input: { sessionID: SessionID; messageID: MessageID }) =>
+      MessageV2.getInfo(input).pipe(
+        Effect.provideService(Database.Service, database),
+        Effect.catchIf(NotFoundError.isInstance, () => Effect.void),
+      )
 
     const computeDiff = Effect.fn("SessionSummary.computeDiff")(function* (input: {
       messages: SessionV1.WithParts[]
@@ -106,7 +127,11 @@ const layer = Layer.effect(
         }
       }
       if (from && to) {
-        return yield* snapshot.diffFull(from, to, { sessionID: input.sessionID, messageID: input.messageID })
+        const diffs = yield* snapshot.diffFull(from, to, { sessionID: input.sessionID, messageID: input.messageID })
+        // Summary storage historically contains Git-quoted paths, while NUL-delimited snapshot metadata is raw.
+        return SnapshotDiff.limit(
+          diffs.map((diff) => (diff.file === undefined ? diff : { ...diff, file: quoteGitPath(diff.file) })),
+        )
       }
       return []
     })
@@ -134,28 +159,22 @@ const layer = Layer.effect(
         }),
         (lock) =>
           Effect.gen(function* () {
-            const all = yield* sessions.messages({ sessionID: input.sessionID }).pipe(Effect.orDie)
-            const messages = all.filter(
-              (m) =>
-                m.info.id === input.messageID || (m.info.role === "assistant" && m.info.parentID === input.messageID),
-            )
+            const messages = yield* MessageV2.turn(input).pipe(Effect.provideService(Database.Service, database))
             const target = messages.find((m) => m.info.id === input.messageID)
             if (!target || target.info.role !== "user") return
             const msgDiffs = yield* computeDiff({ messages, sessionID: input.sessionID, messageID: input.messageID })
-            const current = (yield* sessions.messages({ sessionID: input.sessionID }).pipe(Effect.orDie)).find(
-              (m) => m.info.id === input.messageID,
-            )
-            if (!current || current.info.role !== "user") return
-            const summary = { ...current.info.summary, diffs: msgDiffs }
-            if (isDeepStrictEqual(current.info.summary, summary)) return
+            const current = yield* getInfo(input)
+            if (!current || current.role !== "user") return
+            const summary = { ...current.summary, diffs: msgDiffs }
+            if (isDeepStrictEqual(current.summary, summary)) return
             // Persisted formats are plain JSON, but message events require schema class instances.
             yield* sessions.updateMessage({
-              ...current.info,
-              ...(current.info.format && {
+              ...current,
+              ...(current.format && {
                 format:
-                  current.info.format.type === "text"
-                    ? new SessionV1.OutputFormatText(current.info.format)
-                    : new SessionV1.OutputFormatJsonSchema(current.info.format),
+                  current.format.type === "text"
+                    ? new SessionV1.OutputFormatText(current.format)
+                    : new SessionV1.OutputFormatJsonSchema(current.format),
               }),
               summary,
             })
@@ -169,11 +188,9 @@ const layer = Layer.effect(
 
     const diff = Effect.fn("SessionSummary.diff")(function* (input: { sessionID: SessionID; messageID?: MessageID }) {
       if (!input.messageID) return []
-      const message = (yield* sessions.messages({ sessionID: input.sessionID }).pipe(Effect.orDie)).find(
-        (item) => item.info.id === input.messageID,
-      )
-      if (!message || message.info.role !== "user") return []
-      const diffs = message.info.summary?.diffs ?? []
+      const message = yield* getInfo({ sessionID: input.sessionID, messageID: input.messageID })
+      if (!message || message.role !== "user") return []
+      const diffs = SnapshotDiff.limit(message.summary?.diffs ?? [])
       return diffs.map((item) => {
         if (item.file === undefined) return item
         const file = unquoteGitPath(item.file)
@@ -195,7 +212,7 @@ export type DiffInput = Schema.Schema.Type<typeof DiffInput>
 export const node = LayerNode.make({
   service: Service,
   layer: layer,
-  deps: [Session.node, Snapshot.node, EventV2Bridge.node, Config.node],
+  deps: [Session.node, Snapshot.node, EventV2Bridge.node, Config.node, Database.node],
 })
 
 export * as SessionSummary from "./summary"

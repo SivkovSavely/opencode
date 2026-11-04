@@ -6,7 +6,7 @@ import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { eq, sql } from "drizzle-orm"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { expect } from "bun:test"
-import { Cause, Deferred, Duration, Effect, Exit, Fiber, Layer, Scope } from "effect"
+import { Cause, Deferred, Duration, Effect, Exit, Fiber, Layer, Logger, Scope } from "effect"
 import path from "path"
 import { fileURLToPath } from "url"
 import { randomUUID } from "node:crypto"
@@ -708,6 +708,35 @@ const retryCommandRuntime = testEffect(
 const ownedBlockingRuntime = testEffect(makeOwnedRuntime(false, "blocking"))
 const archivingRuntime = testEffect(makeOwnedRuntime(true))
 const interruptedReleaseRetryRuntime = testEffect(makeOwnedRuntime(false, undefined, interruptedSnapshot, true))
+const recoveryFailureRuntime = testEffect(
+  makeOwnedRuntime(
+    false,
+    undefined,
+    undefined,
+    false,
+    Layer.sync(Plugin.Service, () => {
+      let fail = true
+      return Plugin.Service.of({
+        trigger: (name, _input, output) => {
+          if (name !== "experimental.chat.messages.transform" || !fail) return Effect.succeed(output)
+          fail = false
+          return Effect.die(new SyntaxError('JSON Parse error: Unexpected EOF "private recovery payload"'))
+        },
+        list: () => Effect.succeed([]),
+        init: () => Effect.void,
+      })
+    }),
+  ),
+)
+const recoverySnapshotFailureRuntime = testEffect(
+  makeOwnedRuntime(
+    false,
+    undefined,
+    Layer.mock(Snapshot.Service)({
+      track: () => Effect.die(new SyntaxError('JSON Parse error: Unexpected EOF "private snapshot payload"')),
+    }),
+  ),
+)
 const noLLMServer = testEffect(makeHttpNoLLMServer())
 const raceNoLLMServer = testEffect(makeHttpNoLLMServer({ processor: "blocking" }))
 const withMcpInstructions = testEffect(
@@ -3157,9 +3186,27 @@ it.instance("crash recovery preserves completed tools and continues after uncert
         time: { start: 3, end: 4 },
       },
     }
+    const pending = [
+      '{"command":',
+      `{"command":"touch ${sideEffect}",}`,
+      "",
+      JSON.stringify({ command: `touch ${sideEffect}` }),
+    ].map(
+      (raw) =>
+        ({
+          id: PartID.ascending(),
+          messageID: assistant.id,
+          sessionID: session.id,
+          type: "tool",
+          callID: PartID.ascending(),
+          tool: "bash",
+          state: { status: "pending", input: {}, raw },
+        }) satisfies SessionV1.ToolPart,
+    )
     yield* sessions.updatePart(running)
     yield* sessions.updatePart(completed)
     yield* sessions.updatePart(failed)
+    yield* Effect.forEach(pending, (part) => sessions.updatePart(part))
     yield* llm.push(reply().text("recovered continuation").stop())
 
     const result = yield* prompt.recover(session.id)
@@ -3193,6 +3240,29 @@ it.instance("crash recovery preserves completed tools and continues after uncert
     }
     expect(preserved).toEqual(completed)
     expect(preservedFailure).toEqual(failed)
+    pending.forEach((original) => {
+      const restored = parts.find((part) => part.type === "tool" && part.callID === original.callID)
+      expect(restored).toMatchObject({
+        state: {
+          status: "error",
+          input: {},
+          metadata: { crashInterrupted: true, crashRawInput: original.state.raw },
+        },
+      })
+    })
+    const provider = yield* ProviderSvc.Service
+    const modelHistory = yield* MessageV2.toModelMessagesEffect(
+      messages,
+      yield* provider.getModel(ref.providerID, ref.modelID),
+    )
+    const calls = modelHistory.flatMap((message) =>
+      message.role === "assistant" && typeof message.content !== "string"
+        ? message.content.filter((part) => part.type === "tool-call")
+        : [],
+    )
+    pending.forEach((original) => {
+      expect(calls.find((part) => part.toolCallId === original.callID)).toMatchObject({ type: "tool-call", input: {} })
+    })
     expect(yield* Effect.promise(() => Bun.file(sideEffect).exists())).toBe(false)
     expect(JSON.stringify(yield* llm.inputs)).toContain("partial shell output")
     expect(JSON.stringify(yield* llm.inputs)).toContain("unexpected OpenCode shutdown")
@@ -3228,6 +3298,13 @@ it.instance("runtime takeover continues persisted history after an abandoned own
       },
     }
     yield* sessions.updatePart(call)
+    const pending: SessionV1.ToolPart = {
+      ...call,
+      id: PartID.ascending(),
+      callID: "abandoned-incomplete-shell-call",
+      state: { status: "pending", input: {}, raw: '{"command":' },
+    }
+    yield* sessions.updatePart(pending)
 
     const lineage = randomUUID()
     const abandoned = RuntimeLifecycle.make({ lineage, instance: randomUUID() }, scope, database)
@@ -3258,6 +3335,11 @@ it.instance("runtime takeover continues persisted history after an abandoned own
     expect(yield* llm.calls).toBe(1)
     expect(users).toHaveLength(1)
     expect(tool?.type).toBe("tool")
+    expect(
+      messages
+        .flatMap((message) => message.parts)
+        .find((part) => part.type === "tool" && part.callID === pending.callID),
+    ).toMatchObject({ state: { status: "error", input: {}, metadata: { crashRawInput: '{"command":' } } })
     if (tool?.type === "tool" && tool.state.status === "error") {
       expect(tool.state.metadata?.crashInterrupted).toBe(true)
       expect(tool.state.error).toContain("final outcome is unknown")
@@ -3277,6 +3359,261 @@ it.instance("runtime takeover continues persisted history after an abandoned own
     ).toBe(session.id)
     expect(input.id).toBe(users[0]?.info.id)
   }),
+)
+
+recoveryFailureRuntime.instance("failed recovery requires explicit manual continuation without replaying tools", () =>
+  Effect.gen(function* () {
+    const { dir: directory, llm } = yield* useServerConfig(providerCfg)
+    const database = yield* Database.Service
+    const runtime = yield* RuntimeLifecycle.Service
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const session = yield* sessions.create({ title: "Manual continuation after failed recovery" })
+    const { assistant } = yield* seed(session.id, { finish: "stop" })
+    const sideEffect = path.join(directory, "must-not-replay")
+    const raw = `{"command":"touch ${sideEffect}",}`
+    const pending: SessionV1.ToolPart = {
+      id: PartID.ascending(),
+      messageID: assistant.id,
+      sessionID: session.id,
+      type: "tool",
+      tool: "bash",
+      callID: "failed-recovery-shell",
+      state: { status: "pending", input: {}, raw },
+    }
+    const completed: SessionV1.ToolPart = {
+      ...pending,
+      id: PartID.ascending(),
+      callID: "completed-before-recovery",
+      tool: "read",
+      state: {
+        status: "completed",
+        input: { filePath: "already-read.txt" },
+        title: "Already read",
+        metadata: {},
+        output: "durable completed output",
+        time: { start: 1, end: 2 },
+      },
+    }
+    yield* sessions.updatePart(pending)
+    yield* sessions.updatePart(completed)
+    const abandoned = RuntimeLifecycle.make(
+      { lineage: runtime.identity.lineage, instance: randomUUID() },
+      yield* Scope.Scope,
+      database,
+    )
+    yield* abandoned.admit({ sessionID: session.id, directory: session.directory })
+    yield* database.db.run(sql`
+      UPDATE runtime_execution SET owner_start_time = ${"0"} WHERE session_id = ${session.id}
+    `)
+    const logs: unknown[] = []
+    yield* runtime
+      .recover((record) => prompt.recover(SessionID.make(record.sessionID), record.fence))
+      .pipe(
+        Effect.provide(
+          Logger.layer([
+            Logger.make((options) => {
+              if (!Array.isArray(options.message) || options.message[0] !== "restart diagnostic recovery failed") return
+              logs.push(options.message)
+            }),
+          ]),
+        ),
+      )
+    yield* pollWithTimeout(
+      database.db
+        .get<{
+          state: string
+          fence: number
+        }>(sql`SELECT state, fence FROM runtime_execution WHERE session_id = ${session.id}`)
+        .pipe(Effect.map((row) => (row?.state === "recovery_needed" && logs.length > 0 ? row : undefined))),
+      "failed recovery did not quarantine the execution",
+    )
+    expect(logs).toEqual([
+      [
+        "restart diagnostic recovery failed",
+        expect.objectContaining({
+          sessionID: session.id,
+          phase: "message-transform",
+          errorType: "SyntaxError",
+          rowTransitioned: true,
+          ownerInstance: runtime.identity.instance,
+          claimedFence: 1,
+        }),
+      ],
+    ])
+    expect(JSON.stringify(logs)).not.toContain("private recovery payload")
+    expect(yield* llm.calls).toBe(0)
+    const failedHistory = yield* sessions.messages({ sessionID: session.id })
+    const failedAssistant = failedHistory.findLast((message) => message.info.role === "assistant")
+    expect(failedAssistant?.info).toMatchObject({
+      time: { completed: expect.any(Number) },
+      error: {
+        name: "UnknownError",
+        data: { message: "Assistant turn preparation failed; see server logs for details." },
+      },
+    })
+    const interrupted = failedHistory
+      .flatMap((message) => message.parts)
+      .find((part) => part.type === "tool" && part.callID === pending.callID)
+    expect(interrupted).toMatchObject({ state: { status: "error", input: {}, metadata: { crashRawInput: raw } } })
+
+    yield* runtime.recover(() => Effect.die(new Error("must not automatically retry quarantined recovery")))
+    yield* llm.push(reply().text("safely continued after manual admission").stop())
+    yield* prompt.prompt({
+      sessionID: session.id,
+      model: ref,
+      parts: [{ type: "text", text: "Continue safely without replaying uncertain tools." }],
+    })
+    expect(yield* llm.calls).toBe(1)
+    expect(yield* Effect.promise(() => Bun.file(sideEffect).exists())).toBe(false)
+    const messages = yield* sessions.messages({ sessionID: session.id })
+    const parts = messages.flatMap((message) => message.parts)
+    expect(parts.find((part) => part.type === "tool" && part.callID === pending.callID)).toEqual(interrupted)
+    expect(parts.find((part) => part.type === "tool" && part.callID === completed.callID)).toEqual(completed)
+    expect(parts.some((part) => part.type === "text" && part.text === "safely continued after manual admission")).toBe(
+      true,
+    )
+    expect(JSON.stringify(yield* llm.inputs)).toContain("durable completed output")
+    expect(
+      yield* database.db.get(sql`SELECT state, fence FROM runtime_execution WHERE session_id = ${session.id}`),
+    ).toMatchObject({ state: "completed", fence: 2 })
+  }),
+)
+
+recoveryFailureRuntime.instance("pre-stream preparation failure is terminal before normal runtime release", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const database = yield* Database.Service
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const runtime = yield* RuntimeLifecycle.Service
+    const chat = yield* sessions.create({ title: "Request preparation failure" })
+    const logs: unknown[] = []
+    const exit = yield* prompt
+      .prompt({ sessionID: chat.id, model: ref, parts: [{ type: "text", text: "Prepare safely" }] })
+      .pipe(
+        Effect.exit,
+        Effect.provide(
+          Logger.layer([
+            Logger.make((options) => {
+              if (
+                !Array.isArray(options.message) ||
+                (options.message[0] !== "assistant turn preparation failed" &&
+                  options.message[0] !== "restart diagnostic release")
+              )
+                return
+              logs.push(options.message)
+            }),
+          ]),
+        ),
+      )
+    expect(Exit.isFailure(exit)).toBe(true)
+    if (Exit.isFailure(exit))
+      expect(Cause.squash(exit.cause)).toMatchObject({
+        name: "SyntaxError",
+        message: 'JSON Parse error: Unexpected EOF "private recovery payload"',
+      })
+    expect(
+      yield* database.db.get(sql`SELECT state, fence FROM runtime_execution WHERE session_id = ${chat.id}`),
+    ).toEqual({
+      state: "completed",
+      fence: 0,
+    })
+    expect((yield* runtime.status()).active).toBe(0)
+    expect(yield* llm.calls).toBe(0)
+    const assistant = (yield* sessions.messages({ sessionID: chat.id })).findLast(
+      (message) => message.info.role === "assistant",
+    )
+    expect(assistant?.info).toMatchObject({
+      time: { completed: expect.any(Number) },
+      error: {
+        name: "UnknownError",
+        data: { message: "Assistant turn preparation failed; see server logs for details." },
+      },
+    })
+    expect(logs).toEqual([
+      [
+        "assistant turn preparation failed",
+        expect.objectContaining({
+          sessionID: chat.id,
+          messageID: assistant?.info.id,
+          phase: "message-transform",
+          errorType: "SyntaxError",
+          ownerInstance: runtime.identity.instance,
+          fence: 0,
+          rowTransitioned: false,
+        }),
+      ],
+      ["restart diagnostic release", expect.objectContaining({ nextState: "completed", fence: 0 })],
+    ])
+    expect(JSON.stringify(logs)).not.toContain("private recovery payload")
+
+    yield* llm.push(reply().text("continued after explicit prompt").stop())
+    yield* prompt.prompt({ sessionID: chat.id, model: ref, parts: [{ type: "text", text: "Continue explicitly" }] })
+    expect(yield* llm.calls).toBe(1)
+    expect(
+      (yield* sessions.messages({ sessionID: chat.id })).find((message) => message.info.id === assistant?.info.id),
+    ).toEqual(assistant)
+  }),
+)
+
+recoverySnapshotFailureRuntime.instance(
+  "pre-stream snapshot failure finalizes the assistant and preserves the cause",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const runtime = yield* RuntimeLifecycle.Service
+      const chat = yield* sessions.create({ title: "Snapshot preparation failure" })
+      const logs: unknown[] = []
+      const exit = yield* prompt
+        .prompt({ sessionID: chat.id, model: ref, parts: [{ type: "text", text: "Prepare safely" }] })
+        .pipe(
+          Effect.exit,
+          Effect.provide(
+            Logger.layer([
+              Logger.make((options) => {
+                if (!Array.isArray(options.message) || options.message[0] !== "snapshot initialization exited") return
+                logs.push(options.message)
+              }),
+            ]),
+          ),
+        )
+      expect(Exit.isFailure(exit)).toBe(true)
+      if (Exit.isFailure(exit)) {
+        expect(Cause.squash(exit.cause)).toBeInstanceOf(SyntaxError)
+        expect(Cause.squash(exit.cause)).toMatchObject({
+          message: 'JSON Parse error: Unexpected EOF "private snapshot payload"',
+        })
+      }
+      const assistant = (yield* sessions.messages({ sessionID: chat.id })).findLast(
+        (message) => message.info.role === "assistant",
+      )
+      expect(assistant?.info).toMatchObject({
+        time: { completed: expect.any(Number) },
+        error: { name: "UnknownError" },
+      })
+      expect(logs).toEqual([
+        [
+          "snapshot initialization exited",
+          expect.objectContaining({
+            sessionID: chat.id,
+            messageID: assistant?.info.id,
+            ownerLineage: runtime.identity.lineage,
+            ownerInstance: runtime.identity.instance,
+            fence: 0,
+            operation: "snapshot.track",
+            phase: "snapshot-initialization",
+            outcome: "failure",
+            errorType: "SyntaxError",
+            rowTransitioned: false,
+          }),
+        ],
+      ])
+      expect(JSON.stringify(logs)).not.toContain("private snapshot payload")
+      expect(yield* llm.calls).toBe(0)
+    }),
 )
 
 it.instance("crash recovery does not repeat an assistant turn with durable completion", () =>

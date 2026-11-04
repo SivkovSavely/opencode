@@ -2,6 +2,7 @@ import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { Slug } from "@opencode-ai/core/util/slug"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
+import { SnapshotDiff } from "@opencode-ai/core/snapshot-diff"
 import { serviceUse } from "@opencode-ai/core/effect/service-use"
 import path from "path"
 import { BackgroundJob } from "@/background/job"
@@ -26,6 +27,7 @@ import { sql } from "drizzle-orm"
 import { inArray } from "drizzle-orm"
 import { lt } from "drizzle-orm"
 import { or } from "drizzle-orm"
+import { getTableColumns } from "drizzle-orm"
 import type { SQL } from "drizzle-orm"
 import { PartTable, SessionTable } from "@opencode-ai/core/session/sql"
 import { ProjectTable } from "@opencode-ai/core/project/sql"
@@ -60,6 +62,11 @@ export function isDefaultTitle(title: string) {
 
 type SessionRow = typeof SessionTable.$inferSelect
 
+const columns = {
+  ...getTableColumns(SessionTable),
+  summary_diffs: MessageV2.summaryProjection(SessionTable.summary_diffs, "$").mapWith(SessionTable.summary_diffs),
+}
+
 export function fromRow(row: SessionRow): Info {
   const summary =
     row.summary_additions !== null || row.summary_deletions !== null || row.summary_files !== null
@@ -67,7 +74,7 @@ export function fromRow(row: SessionRow): Info {
           additions: row.summary_additions ?? 0,
           deletions: row.summary_deletions ?? 0,
           files: row.summary_files ?? 0,
-          diffs: row.summary_diffs ?? undefined,
+          diffs: row.summary_diffs ? SnapshotDiff.limit(row.summary_diffs) : undefined,
         }
       : undefined
   const share = row.share_url ? { url: row.share_url } : undefined
@@ -139,7 +146,7 @@ export function toRow(info: Info) {
     summary_additions: info.summary?.additions,
     summary_deletions: info.summary?.deletions,
     summary_files: info.summary?.files,
-    summary_diffs: info.summary?.diffs,
+    summary_diffs: info.summary?.diffs ? SnapshotDiff.limit(info.summary.diffs) : undefined,
     metadata: info.metadata,
     bookmarked: info.bookmarked,
     cost: info.cost ?? 0,
@@ -585,7 +592,7 @@ const layer: Layer.Layer<
     })
 
     const get = Effect.fn("Session.get")(function* (id: SessionID) {
-      const row = yield* db.select().from(SessionTable).where(eq(SessionTable.id, id)).get().pipe(Effect.orDie)
+      const row = yield* db.select(columns).from(SessionTable).where(eq(SessionTable.id, id)).get().pipe(Effect.orDie)
       if (!row) return yield* Effect.fail(new NotFoundError({ message: `Session not found: ${id}` }))
       return fromRow(row)
     })
@@ -611,10 +618,10 @@ const layer: Layer.Layer<
       const query =
         conditions.length > 0
           ? db
-              .select()
+              .select(columns)
               .from(SessionTable)
               .where(and(...conditions))
-          : db.select().from(SessionTable)
+          : db.select(columns).from(SessionTable)
       const rows = yield* query
         .orderBy(desc(SessionTable.time_updated), desc(SessionTable.id))
         .limit(input?.limit ?? 100)
@@ -642,7 +649,7 @@ const layer: Layer.Layer<
 
     const children = Effect.fn("Session.children")(function* (parentID: SessionID) {
       const rows = yield* db
-        .select()
+        .select(columns)
         .from(SessionTable)
         .where(and(eq(SessionTable.parent_id, parentID)))
         .all()
@@ -701,8 +708,12 @@ const layer: Layer.Layer<
 
     const updateMessage = <T extends SessionV1.Info>(msg: T): Effect.Effect<T> =>
       Effect.gen(function* () {
-        yield* events.publish(SessionV1.Event.MessageUpdated, { sessionID: msg.sessionID, info: msg })
-        return msg
+        const next =
+          msg.role === "user" && msg.summary
+            ? { ...msg, summary: { ...msg.summary, diffs: SnapshotDiff.limit(msg.summary.diffs) } }
+            : msg
+        yield* events.publish(SessionV1.Event.MessageUpdated, { sessionID: next.sessionID, info: next })
+        return next
       }).pipe(Effect.withSpan("Session.updateMessage"))
 
     const updatePart = <T extends SessionV1.Part>(part: T): Effect.Effect<T> =>
@@ -816,12 +827,13 @@ const layer: Layer.Layer<
     ) =>
       Effect.gen(function* () {
         const current = yield* get(sessionID)
+        const summary = info.summary === null ? undefined : (info.summary ?? current.summary)
         const next = {
           ...current,
           ...info,
           time: info.time ? { ...current.time, ...info.time } : current.time,
           share: info.share === null ? undefined : info.share ? { ...current.share, ...info.share } : current.share,
-          summary: info.summary === null ? undefined : (info.summary ?? current.summary),
+          summary: summary?.diffs ? { ...summary, diffs: SnapshotDiff.limit(summary.diffs) } : summary,
           revert: info.revert === null ? undefined : (info.revert ?? current.revert),
           permission: info.permission === null ? undefined : (info.permission ?? current.permission),
         } as Info
@@ -1157,7 +1169,7 @@ function listByProject(
   const limit = input.limit ?? 100
 
   return db
-    .select()
+    .select(columns)
     .from(SessionTable)
     .where(and(...conditions))
     .orderBy(desc(SessionTable.time_updated))

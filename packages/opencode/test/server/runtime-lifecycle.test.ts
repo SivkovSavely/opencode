@@ -1,10 +1,11 @@
 import { describe, expect, test } from "bun:test"
 import { Database } from "@opencode-ai/core/database/database"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
-import { Clock, Deferred, Duration, Effect, Exit, Fiber, Logger, Ref, References, Scope } from "effect"
+import { Cause, Clock, Deferred, Duration, Effect, Exit, Fiber, Logger, Ref, References, Scope } from "effect"
 import * as TestClock from "effect/testing/TestClock"
 import { randomUUID } from "node:crypto"
 import { sql } from "drizzle-orm"
+import { EffectDrizzleQueryError } from "drizzle-orm/effect-core/errors"
 import { Server } from "../../src/server/server"
 import { RuntimeLifecycle } from "../../src/server/runtime-lifecycle"
 import { testEffect } from "../lib/effect"
@@ -83,6 +84,87 @@ const replaceOwner = Effect.fnUntraced(function* (
     SET owner_instance = ${ownerInstance}, fence = ${fence}, time_updated = ${Date.now()}
     WHERE session_id = ${sessionID}
   `)
+})
+
+test("recovery diagnostics redact parse input, credentials and attached error payloads", () => {
+  for (const message of [
+    'JSON Parse error: Unexpected EOF "private-input"',
+    "Unexpected token private-input in JSON at position 0",
+    "Unexpected identifier private-input",
+    "Failed request body: private-input",
+    "Failed https://example.test/private-input?token=private-input",
+    "Request failed: Authorization=private-input",
+    "Request failed: Bearer private-input",
+  ]) {
+    const error = Object.assign(new SyntaxError(message), { request: { prompt: "private-input" } })
+    error.cause = error
+    const fields = RuntimeLifecycle.recoveryFailureFields(Cause.die(error), "model-history")
+    expect(fields).toMatchObject({ operation: "model-history", phase: "model-history", errorType: "SyntaxError" })
+    expect(JSON.stringify(fields)).not.toContain("private-input")
+    expect(fields.errorMessage?.length).toBeLessThanOrEqual(512)
+    expect(fields.errorStack?.split("\n").length).toBeLessThanOrEqual(8)
+  }
+})
+
+test("recovery diagnostics omit non-Error values and survive throwing error accessors", () => {
+  const payload = {
+    message: "private-input",
+    toString() {
+      throw new Error("must not inspect private-input")
+    },
+  }
+  expect(RuntimeLifecycle.recoveryFailureFields(Cause.fail(payload), "preparation")).toMatchObject({
+    errorType: "object",
+    errorMessage: "Non-Error failure (payload omitted)",
+  })
+  const error = Object.defineProperty(new Error(), "message", {
+    get() {
+      throw new Error("must not inspect private-input")
+    },
+  })
+  expect(RuntimeLifecycle.recoveryFailureFields(Cause.die(error), "preparation")).toMatchObject({
+    errorType: "Error",
+    errorMessage: "Error message unavailable (accessor omitted)",
+  })
+  expect(RuntimeLifecycle.recoveryFailureFields(Cause.empty, "phase".repeat(1000))).toMatchObject({
+    operation: "phase".repeat(16),
+    phase: "phase".repeat(16),
+  })
+})
+
+test("recovery diagnostics do not render query parameters or invoke error accessors", () => {
+  let rendered = 0
+  const error = new EffectDrizzleQueryError({
+    query: "INSERT INTO message (data) VALUES (?)",
+    params: [
+      {
+        toString() {
+          rendered++
+          return "private-input".repeat(100_000)
+        },
+      },
+    ],
+    cause: new Error("write failed"),
+  })
+  const fields = RuntimeLifecycle.recoveryFailureFields(Cause.fail(error), "assistant-finalization")
+  expect(rendered).toBe(0)
+  expect(fields).toMatchObject({ errorType: "EffectDrizzleQueryError" })
+  expect(JSON.stringify(fields)).not.toContain("private-input")
+
+  const accessed: string[] = []
+  const guarded = new Error()
+  for (const key of ["name", "message", "stack"]) {
+    Object.defineProperty(guarded, key, {
+      get() {
+        accessed.push(key)
+        return "private-input".repeat(100_000)
+      },
+    })
+  }
+  expect(JSON.stringify(RuntimeLifecycle.recoveryFailureFields(Cause.die(guarded), "preparation"))).not.toContain(
+    "private-input",
+  )
+  expect(accessed).toEqual([])
 })
 
 describe("runtime lifecycle", () => {
@@ -1342,13 +1424,42 @@ describe("runtime lifecycle", () => {
 
       const started = yield* Deferred.make<void>()
       const replacement = RuntimeLifecycle.make({ lineage, instance: randomUUID() }, scope, database)
-      yield* replacement.recover(() =>
-        Effect.gen(function* () {
-          yield* replacement.recoveryPrepared(sessionID)
-          yield* Deferred.succeed(started, undefined)
-          return yield* Effect.fail(new Error("recovery failure"))
-        }),
+      const logs: unknown[] = []
+      const error = Object.assign(
+        new SyntaxError(
+          'JSON Parse error: Unexpected EOF password=private-credential "private-prompt"\nprivate-output',
+        ),
+        { request: { prompt: "private-request", output: "private-output" } },
       )
+      error.cause = error
+      error.stack = `${error.name}: ${error.message}\n${Array.from(
+        { length: 20 },
+        (_, index) => `    at parse (recovery.ts:${index + 1}:1)`,
+      ).join("\n")}`
+      yield* replacement
+        .recover(() =>
+          Effect.gen(function* () {
+            yield* replacement.recoveryPrepared(sessionID)
+            yield* Deferred.succeed(started, undefined)
+            return yield* Effect.failCause(
+              Cause.fromReasons([
+                Cause.makeDieReason(error),
+                ...Array.from({ length: 5 }, () => Cause.makeFailReason(new Error("secondary failure ".repeat(1000)))),
+              ]),
+            ).pipe(RuntimeLifecycle.withRecoveryPhase("model-history"))
+          }).pipe(RuntimeLifecycle.withRecoveryPhase("continuation")),
+        )
+        .pipe(
+          Effect.provide(
+            Logger.layer([
+              Logger.make((options) => {
+                if (!Array.isArray(options.message) || options.message[0] !== "restart diagnostic recovery failed")
+                  return
+                logs.push(options.message)
+              }),
+            ]),
+          ),
+        )
       yield* Deferred.await(started)
       while ((yield* executionDetails(database, sessionID))?.state !== "recovery_needed") yield* Effect.yieldNow
       expect((yield* replacement.status()).active).toBe(0)
@@ -1357,12 +1468,178 @@ describe("runtime lifecycle", () => {
         owner_instance: replacement.identity.instance,
         fence: 1,
       })
+      while (logs.length === 0) yield* Effect.yieldNow
+      expect(logs).toEqual([
+        [
+          "restart diagnostic recovery failed",
+          expect.objectContaining({
+            sessionID,
+            ownerLineage: lineage,
+            ownerInstance: replacement.identity.instance,
+            claimedFence: 1,
+            fence: 1,
+            rowTransitioned: true,
+            recoveryPrepared: true,
+            phase: "model-history",
+            errorType: "SyntaxError",
+            errorMessage: "JSON Parse error: Unexpected EOF [redacted data]",
+            errorStack: expect.stringContaining("at parse (recovery.ts:1:1)"),
+            causeReasons: [
+              expect.objectContaining({ kind: "Die", phase: "model-history", errorType: "SyntaxError" }),
+              ...Array.from({ length: 3 }, () =>
+                expect.objectContaining({
+                  kind: "Fail",
+                  errorType: "Error",
+                  errorMessage: expect.stringMatching(/^secondary failure /),
+                }),
+              ),
+            ],
+            omittedCauseReasons: 2,
+          }),
+        ],
+      ])
+      const diagnostic = JSON.stringify(logs)
+      expect(diagnostic).not.toContain("private-")
+      expect(diagnostic.length).toBeLessThan(18_000)
+      expect(diagnostic).not.toContain("recovery.ts:9:1")
 
       const next = RuntimeLifecycle.make({ lineage, instance: randomUUID() }, scope, database)
       yield* next.admit({ sessionID, directory: "/tmp" })
       expect(yield* executionDetails(database, sessionID)).toMatchObject({
         state: "active",
         owner_instance: next.identity.instance,
+        fence: 2,
+      })
+    }),
+  )
+
+  it.effect("retains the recovery failure when the recovery_needed transition is fenced out", () =>
+    Effect.gen(function* () {
+      const database = yield* Database.Service
+      const scope = yield* Scope.Scope
+      const lineage = randomUUID()
+      const sessionID = yield* seedSession(database)
+      const old = RuntimeLifecycle.make({ lineage, instance: randomUUID() }, scope, database)
+      yield* old.admit({ sessionID, directory: "/tmp" })
+      yield* old.request("shutdown")
+      yield* old.release(sessionID)
+
+      const replacement = RuntimeLifecycle.make({ lineage, instance: randomUUID() }, scope, database)
+      const logs: unknown[] = []
+      yield* replacement
+        .recover(() =>
+          Effect.gen(function* () {
+            yield* replacement.recoveryPrepared(sessionID)
+            yield* database.db.run(sql`
+              UPDATE runtime_execution SET fence = fence + 1 WHERE session_id = ${sessionID}
+            `)
+            return yield* Effect.die(new SyntaxError("JSON Parse error: Unexpected EOF"))
+          }),
+        )
+        .pipe(
+          Effect.provide(
+            Logger.layer([
+              Logger.make((options) => {
+                if (
+                  !Array.isArray(options.message) ||
+                  (options.message[0] !== "restart diagnostic recovery failed" &&
+                    options.message[0] !== "restart diagnostic recovery transition failed")
+                )
+                  return
+                logs.push(options.message)
+              }),
+            ]),
+          ),
+        )
+      while (logs.length < 2) yield* Effect.yieldNow
+      expect(logs).toEqual([
+        [
+          "restart diagnostic recovery transition failed",
+          expect.objectContaining({
+            phase: "recovery-needed-transition",
+            errorType: "RuntimeFencedTransitionError",
+            rowTransitioned: false,
+            fence: 1,
+          }),
+        ],
+        [
+          "restart diagnostic recovery failed",
+          expect.objectContaining({
+            sessionID,
+            ownerInstance: replacement.identity.instance,
+            claimedFence: 1,
+            errorType: "SyntaxError",
+            rowTransitioned: false,
+          }),
+        ],
+      ])
+      expect(yield* executionDetails(database, sessionID)).toMatchObject({ state: "active", fence: 2 })
+    }),
+  )
+
+  it.effect("logs a fenced recovery failure without changing a replacement owner", () =>
+    Effect.gen(function* () {
+      const database = yield* Database.Service
+      const scope = yield* Scope.Scope
+      const lineage = randomUUID()
+      const sessionID = yield* seedSession(database)
+      const old = RuntimeLifecycle.make({ lineage, instance: randomUUID() }, scope, database)
+      yield* old.admit({ sessionID, directory: "/tmp" })
+      yield* old.request("shutdown")
+      yield* old.release(sessionID)
+      const replacement = RuntimeLifecycle.make({ lineage, instance: randomUUID() }, scope, database)
+      const newOwner = randomUUID()
+      const logs: unknown[] = []
+      yield* replacement
+        .recover((record) =>
+          Effect.gen(function* () {
+            yield* replacement.recoveryPrepared(sessionID)
+            yield* replaceOwner(database, sessionID, newOwner, record.fence + 1)
+            return yield* Effect.die(new SyntaxError("Unexpected end of JSON input")).pipe(
+              RuntimeLifecycle.withRecoveryPhase("model-history"),
+            )
+          }),
+        )
+        .pipe(
+          Effect.provide(
+            Logger.layer([
+              Logger.make((options) => {
+                if (
+                  Array.isArray(options.message) &&
+                  ["restart diagnostic recovery failed", "restart diagnostic recovery transition failed"].includes(
+                    options.message[0],
+                  )
+                )
+                  logs.push(options.message)
+              }),
+            ]),
+          ),
+        )
+      while (logs.length < 2) yield* Effect.yieldNow
+      expect(logs).toEqual([
+        [
+          "restart diagnostic recovery transition failed",
+          expect.objectContaining({
+            sessionID,
+            phase: "recovery-needed-transition",
+            errorType: "RuntimeFencedTransitionError",
+            rowTransitioned: false,
+          }),
+        ],
+        [
+          "restart diagnostic recovery failed",
+          expect.objectContaining({
+            sessionID,
+            phase: "model-history",
+            errorType: "SyntaxError",
+            claimedFence: 1,
+            rowTransitioned: false,
+          }),
+        ],
+      ])
+      expect(yield* executionDetails(database, sessionID)).toMatchObject({
+        state: "active",
+        owner_instance: newOwner,
         fence: 2,
       })
     }),

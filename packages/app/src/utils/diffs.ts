@@ -1,15 +1,25 @@
-import type { SnapshotFileDiff, VcsFileDiff } from "@opencode-ai/sdk/v2"
+import type { VcsFileDiff } from "@opencode-ai/sdk/v2"
+import type { FileDiff } from "@opencode-ai/schema/file-diff"
 import type { FileDiffInfo } from "@opencode-ai/client/promise"
 import type { Message } from "@opencode-ai/sdk/v2/client"
 
-type Diff = FileDiffInfo | SnapshotFileDiff | VcsFileDiff
+type Diff = FileDiffInfo | FileDiff.Info | VcsFileDiff
 
 function diff(value: unknown): value is Diff {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false
-  if (!("file" in value) || typeof value.file !== "string") return false
-  if (!("patch" in value) || typeof value.patch !== "string") return false
   if (!("additions" in value) || typeof value.additions !== "number") return false
   if (!("deletions" in value) || typeof value.deletions !== "number") return false
+  if ("omitted" in value && value.omitted !== undefined) {
+    if (!object(value.omitted) || typeof value.omitted.reason !== "string") return false
+    if (
+      value.omitted.files !== undefined &&
+      (typeof value.omitted.files !== "number" || !Number.isInteger(value.omitted.files) || value.omitted.files < 0)
+    )
+      return false
+    if (!("file" in value) || value.file === undefined) return true
+  }
+  if (!("file" in value) || typeof value.file !== "string") return false
+  if (!("patch" in value) || typeof value.patch !== "string") return false
   if (!("status" in value) || value.status === undefined) return true
   return value.status === "added" || value.status === "deleted" || value.status === "modified"
 }

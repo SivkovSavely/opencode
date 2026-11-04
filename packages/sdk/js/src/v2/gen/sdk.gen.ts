@@ -157,7 +157,10 @@ import type {
   ProjectListResponses,
   ProjectUpdateErrors,
   ProjectUpdateResponses,
+  PromptAgentAttachment,
   PromptInput,
+  PromptInputFileAttachment,
+  PromptSelection,
   ProviderAuthErrors,
   ProviderAuthResponses,
   ProviderListErrors,
@@ -390,6 +393,8 @@ import type {
   V2ReferenceListResponses,
   V2SessionActiveErrors,
   V2SessionActiveResponses,
+  V2SessionCommandErrors,
+  V2SessionCommandResponses,
   V2SessionCompactErrors,
   V2SessionCompactResponses,
   V2SessionContextErrors,
@@ -6573,6 +6578,59 @@ export class Session3 extends HeyApiClient {
     )
     return (options?.client ?? this.client).post<V2SessionPromptResponses, V2SessionPromptErrors, ThrowOnError>({
       url: "/api/session/{sessionID}/prompt",
+      ...options,
+      ...params,
+      headers: {
+        "Content-Type": "application/json",
+        ...options?.headers,
+        ...params.headers,
+      },
+    })
+  }
+
+  /**
+   * Run command
+   *
+   * Expand a registered command and durably admit its prompt before scheduling execution.
+   */
+  public command<ThrowOnError extends boolean = false>(
+    parameters: {
+      sessionID: string
+      id?: string
+      command?: string
+      arguments?: string
+      agent?: string
+      model?: ModelRef
+      selection?: PromptSelection
+      files?: Array<PromptInputFileAttachment>
+      agents?: Array<PromptAgentAttachment>
+      delivery?: "steer" | "queue"
+      resume?: boolean
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "sessionID" },
+            { in: "body", key: "id" },
+            { in: "body", key: "command" },
+            { in: "body", key: "arguments" },
+            { in: "body", key: "agent" },
+            { in: "body", key: "model" },
+            { in: "body", key: "selection" },
+            { in: "body", key: "files" },
+            { in: "body", key: "agents" },
+            { in: "body", key: "delivery" },
+            { in: "body", key: "resume" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).post<V2SessionCommandResponses, V2SessionCommandErrors, ThrowOnError>({
+      url: "/api/session/{sessionID}/command",
       ...options,
       ...params,
       headers: {

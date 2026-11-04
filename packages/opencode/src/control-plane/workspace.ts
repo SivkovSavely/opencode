@@ -12,7 +12,7 @@ import { GlobalBus } from "@/bus/global"
 import { Auth } from "@/auth"
 import { EventV2 } from "@opencode-ai/core/event"
 import { EventV2Bridge } from "@/event-v2-bridge"
-import { EventSequenceTable, EventTable } from "@opencode-ai/core/event/sql"
+import { EventSequenceTable, EventTable, EventTransportColumns } from "@opencode-ai/core/event/sql"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { ProjectV2 } from "@opencode-ai/core/project"
@@ -648,7 +648,7 @@ const layer = Layer.effect(
             aggregateID: EventTable.aggregate_id,
             seq: EventTable.seq,
             type: EventTable.type,
-            data: EventTable.data,
+            data: EventTransportColumns.data,
           })
           .from(EventTable)
           .where(eq(EventTable.aggregate_id, input.sessionID))
