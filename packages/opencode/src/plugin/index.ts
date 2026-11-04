@@ -38,6 +38,12 @@ type State = {
   hooks: Hooks[]
 }
 
+const hookSources = new WeakMap<Hooks, string>()
+
+export function source(hook: Hooks) {
+  return hookSources.get(hook)
+}
+
 // Hook names that follow the (input, output) => Promise<void> trigger pattern
 type TriggerName = {
   [K in keyof Hooks]-?: NonNullable<Hooks[K]> extends (input: any, output: any) => Promise<void> ? K : never
@@ -115,12 +121,16 @@ async function applyPlugin(load: PluginLoader.Loaded, input: PluginInput, hooks:
   const plugin = readV1Plugin(load.mod, load.spec, "server", "detect")
   if (plugin) {
     await resolvePluginId(load.source, load.spec, load.target, readPluginId(plugin.id, load.spec), load.pkg)
-    hooks.push(await (plugin as PluginModule).server(input, load.options))
+    const result = await (plugin as PluginModule).server(input, load.options)
+    hookSources.set(result, load.spec)
+    hooks.push(result)
     return
   }
 
   for (const server of getLegacyPlugins(load.mod)) {
-    hooks.push(await server(input, load.options))
+    const result = await server(input, load.options)
+    hookSources.set(result, load.spec)
+    hooks.push(result)
   }
 }
 
@@ -175,7 +185,10 @@ const layer = Layer.effect(
             Effect.tapError((error) => Effect.logError("failed to load internal plugin", { name: plugin.name, error })),
             Effect.option,
           )
-          if (init._tag === "Some") hooks.push(init.value)
+          if (init._tag === "Some") {
+            hookSources.set(init.value, plugin.name)
+            hooks.push(init.value)
+          }
         }
 
         const plugins = flags.pure ? [] : (cfg.plugin_origins ?? [])

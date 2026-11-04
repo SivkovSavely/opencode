@@ -34,7 +34,7 @@ import { ApplyPatchTool } from "./apply_patch"
 import { Glob } from "@opencode-ai/core/util/glob"
 import path from "path"
 import { pathToFileURL } from "url"
-import { Effect, Layer, Context } from "effect"
+import { Cause, Effect, Layer, Context } from "effect"
 import { ChildProcessSpawner } from "effect/unstable/process/ChildProcessSpawner"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { Format } from "../format"
@@ -58,6 +58,8 @@ import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { McpActivation } from "@/session/mcp-activation"
 import { SessionID } from "@/session/schema"
 import { ManagedSkill } from "@/skill/managed"
+import { TuiEvent } from "@/server/tui-event"
+import { diagnosticErrorFields, diagnosticText } from "@/util/diagnostic"
 
 export function webSearchEnabled(providerID: ProviderV2.ID, flags = { exa: false, parallel: false }) {
   return (
@@ -105,6 +107,7 @@ const layer = Layer.effect(
     const flags = yield* RuntimeFlags.Service
     const mcp = yield* MCP.Service
     const skills = yield* Skill.Service
+    const events = yield* EventV2Bridge.Service
 
     const invalid = yield* InvalidTool
     const task = yield* TaskTool
@@ -133,11 +136,14 @@ const layer = Layer.effect(
         const custom: Tool.Def[] = []
 
         function fromPlugin(id: string, def: ToolDefinition): Tool.Def {
+          if (typeof def.description !== "string") throw new TypeError("Tool description must be a string")
+          if (typeof def.execute !== "function") throw new TypeError("Tool execute must be a function")
           // Plugin tools still expose Zod args publicly; keep that compatibility
           // boxed at the registry boundary and give the LLM the original JSON Schema.
           // Normalize missing args to `{}` once — pre-1.14.49 the code was
           // `z.object(def.args)` and Zod silently tolerated undefined (#27451, #27630).
           const args = def.args ?? {}
+          if (typeof args !== "object" || Array.isArray(args)) throw new TypeError("Tool args must be an object")
           const entries = Object.entries(args)
           const allZod = entries.every((entry) => isZodType(entry[1]))
           const zodParams = allZod ? z.object(args) : undefined
@@ -190,10 +196,68 @@ const layer = Layer.effect(
           }
         }
 
+        const skip = Effect.fnUntraced(function* (
+          source: string,
+          stage: "discovery" | "import" | "registration",
+          error: unknown,
+          id?: string,
+        ) {
+          const fields = {
+            source: diagnosticText(source, 1024),
+            stage,
+            ...(id ? { tool: diagnosticText(id, 128) } : {}),
+            ...diagnosticErrorFields(error),
+          }
+          yield* Effect.logWarning("optional custom tool skipped", fields)
+          yield* events
+            .publish(TuiEvent.ToastShow, {
+              title: "Custom tool skipped",
+              message: `${fields.source}${fields.tool ? ` (${fields.tool})` : ""}: ${stage}: ${fields.errorType}: ${fields.errorMessage}. Other tools remain available; see server logs.`,
+              variant: "warning",
+              duration: 10000,
+            })
+            .pipe(
+              Effect.catchCauseIf(
+                (cause) => !Cause.hasInterrupts(cause),
+                () => Effect.logWarning("custom tool warning notification failed", { source: fields.source, stage }),
+              ),
+            )
+        })
+
+        const register = Effect.fnUntraced(function* (
+          source: string,
+          id: string,
+          get: () => unknown,
+          explicit: boolean,
+        ) {
+          const tool = yield* Effect.try({
+            try: () => {
+              const def = get()
+              if (!isPluginTool(def)) {
+                if (!explicit && !(typeof def === "object" && def !== null && ("args" in def || "execute" in def)))
+                  return
+                throw new TypeError("Expected a tool definition with description and execute")
+              }
+              return fromPlugin(id, def)
+            },
+            catch: (error) => error,
+          }).pipe(Effect.catch((error) => skip(source, "registration", error, id).pipe(Effect.as(undefined))))
+          if (tool) custom.push(tool)
+        })
+
         const dirs = yield* config.directories()
-        const matches = dirs.flatMap((dir) =>
-          Glob.scanSync("{tool,tools}/*.{js,ts}", { cwd: dir, absolute: true, dot: true, symlink: true }),
-        )
+        const matches = (yield* Effect.forEach(dirs, (dir) =>
+          Effect.try({
+            try: () => Glob.scanSync("{tool,tools}/*.{js,ts}", { cwd: dir, absolute: true, dot: true, symlink: true }),
+            catch: (error) => error,
+          }).pipe(
+            Effect.catch((error) =>
+              process.env.OPENCODE_MANAGED_PROFILE === "1"
+                ? Effect.die(error)
+                : skip(dir, "discovery", error).pipe(Effect.as([])),
+            ),
+          ),
+        )).flat()
         if (process.env.OPENCODE_MANAGED_PROFILE === "1" && matches.length)
           throw new Error("Custom tools are unavailable in the managed profile: their execution is not accounted")
         if (matches.length) yield* config.waitForDependencies()
@@ -201,17 +265,32 @@ const layer = Layer.effect(
           const namespace = path.basename(match, path.extname(match))
           // `match` is an absolute filesystem path from `Glob.scanSync(..., { absolute: true })`.
           // Import it as `file://` so Node on Windows accepts the dynamic import.
-          const mod = yield* Effect.promise(() => import(pathToFileURL(match).href))
-          for (const [id, def] of Object.entries(mod)) {
-            if (!isPluginTool(def)) continue
-            custom.push(fromPlugin(id === "default" ? namespace : `${namespace}_${id}`, def))
+          // Convert import/link/evaluation rejections to typed failures only at this optional boundary.
+          const mod = yield* Effect.tryPromise({
+            try: () => import(pathToFileURL(match).href),
+            catch: (error) => error,
+          }).pipe(Effect.catch((error) => skip(match, "import", error).pipe(Effect.as(undefined))))
+          if (!mod) continue
+          const ids = yield* Effect.try({ try: () => Object.keys(mod), catch: (error) => error }).pipe(
+            Effect.catch((error) => skip(match, "registration", error).pipe(Effect.as([]))),
+          )
+          for (const id of ids) {
+            yield* register(match, id === "default" ? namespace : `${namespace}_${id}`, () => mod[id], id === "default")
           }
         }
 
         const plugins = yield* plugin.list()
         for (const p of plugins) {
-          for (const [id, def] of Object.entries(p.tool ?? {})) {
-            custom.push(fromPlugin(id, def))
+          const source = Plugin.source(p) ?? "configured plugin"
+          const tools = yield* Effect.try({ try: () => p.tool ?? {}, catch: (error) => error }).pipe(
+            Effect.catch((error) => skip(source, "registration", error).pipe(Effect.as(undefined))),
+          )
+          if (!tools) continue
+          const ids = yield* Effect.try({ try: () => Object.keys(tools), catch: (error) => error }).pipe(
+            Effect.catch((error) => skip(source, "registration", error).pipe(Effect.as([]))),
+          )
+          for (const id of ids) {
+            yield* register(source, id, () => tools[id], true)
           }
         }
 
@@ -392,7 +471,7 @@ function isZodType(value: unknown): value is z.ZodType {
 }
 
 function isPluginTool(value: unknown): value is ToolDefinition {
-  return typeof value === "object" && value !== null && "args" in value && "description" in value && "execute" in value
+  return typeof value === "object" && value !== null && "description" in value && "execute" in value
 }
 
 function isJsonSchemaDefinition(value: unknown): value is JSONSchema7Definition {

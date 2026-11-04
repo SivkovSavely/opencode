@@ -22,6 +22,7 @@ import {
 import { randomUUID } from "node:crypto"
 import { readFileSync, readlinkSync } from "node:fs"
 import { hostname } from "node:os"
+import { diagnosticErrorField, diagnosticText } from "@/util/diagnostic"
 
 export type Action = "restart" | "shutdown"
 export type Phase = "running" | "draining" | "quiescent" | "stopping"
@@ -3027,30 +3028,6 @@ export function recoveryFailureFields(cause: Cause.Cause<unknown>, phase: string
     causeReasons: reasons,
     omittedCauseReasons: Math.max(0, cause.reasons.length - reasons.length),
   }
-}
-
-function diagnosticErrorField(error: Error, key: "name" | "message" | "stack") {
-  let current: object | null = error
-  for (let depth = 0; current && depth < 8; depth++) {
-    const descriptor = Object.getOwnPropertyDescriptor(current, key)
-    if (descriptor) {
-      // Drizzle's message getter, for example, renders every query parameter before it can be truncated.
-      const value: unknown = descriptor.value
-      return typeof value === "string" ? value : undefined
-    }
-    current = Object.getPrototypeOf(current)
-  }
-}
-
-function diagnosticText(value: string, limit: number) {
-  return (value.slice(0, 4096).split(/[\r\n]/, 1)[0] ?? "")
-    .replace(/[\u0000-\u001f\u007f]/g, " ")
-    .replace(/\b(?:https?|wss?):\/\/[^\s)]+/gi, "[redacted URL]")
-    .replace(/\b(?:bearer|basic)\s+\S+/gi, "[redacted credential]")
-    .replace(/\b(?:authorization|api[-_]?key|token|password|secret)\s*[:=]\s*\S+/gi, "[redacted credential]")
-    .replace(/\b(?:prompt|output|arguments?|payload|request(?: body)?|body|input)\s*[:=].*/gi, "[redacted data]")
-    .replace(/["'`\[{<].*$/, "[redacted data]")
-    .slice(0, limit)
 }
 
 function rowFields(row: Row) {

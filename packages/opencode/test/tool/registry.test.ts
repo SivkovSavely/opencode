@@ -2,11 +2,11 @@ import { afterEach, describe, expect } from "bun:test"
 import path from "path"
 import fs from "fs/promises"
 import { fileURLToPath, pathToFileURL } from "url"
-import { Effect, Layer, Result, Schema } from "effect"
+import { Cause, Effect, Exit, Layer, Logger, Result, Schema } from "effect"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { ToolRegistry } from "@/tool/registry"
 import { Tool } from "@/tool/tool"
-import { disposeAllInstances, TestInstance } from "../fixture/fixture"
+import { disposeAllInstances, provideInstance, TestInstance, tmpdirScoped } from "../fixture/fixture"
 import { testEffect } from "../lib/effect"
 import { TestConfig } from "../fixture/config"
 import { Config } from "@/config/config"
@@ -21,6 +21,10 @@ import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { MCP } from "@/mcp"
 import type { Tool as MCPToolDef } from "@modelcontextprotocol/sdk/types.js"
+import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
+import { EventV2Bridge } from "@/event-v2-bridge"
+import { InstanceStore } from "@/project/instance-store"
+import { TuiEvent } from "@/server/tui-event"
 
 const configLayer = TestConfig.layer({
   directories: () => InstanceState.directory.pipe(Effect.map((dir) => [path.join(dir, ".opencode")])),
@@ -50,7 +54,7 @@ const brokenPluginLayer = Layer.succeed(
   }),
 )
 
-const root = LayerNode.group([ToolRegistry.node, Agent.node])
+const root = LayerNode.group([ToolRegistry.node, Agent.node, EventV2Bridge.node, CrossSpawnSpawner.node])
 const replacements = [
   [Config.node, configLayer],
   [RuntimeFlags.node, RuntimeFlags.layer()],
@@ -95,6 +99,50 @@ const withEmptyCodeMode = testEffect(
   ]),
 )
 const withBrokenPlugin = testEffect(LayerNode.compile(root, [...replacements, [Plugin.node, brokenPluginLayer]]))
+const withConfiguredPlugin = testEffect(
+  LayerNode.compile(root, [
+    [
+      Config.node,
+      TestConfig.layer({
+        directories: () => InstanceState.directory.pipe(Effect.map((dir) => [path.join(dir, ".opencode")])),
+        get: () =>
+          InstanceState.directory.pipe(
+            Effect.map((dir) => ({
+              plugin_origins: [
+                { spec: pathToFileURL(path.join(dir, "plugin.ts")).href, source: dir, scope: "local" as const },
+              ],
+            })),
+          ),
+      }),
+    ],
+    [RuntimeFlags.node, RuntimeFlags.layer({ disableDefaultPlugins: true })],
+  ]),
+)
+
+function withDiagnostics<A, E, R>(
+  run: (input: { logs: unknown[]; notifications: unknown[] }) => Effect.Effect<A, E, R>,
+) {
+  return Effect.gen(function* () {
+    const events = yield* EventV2Bridge.Service
+    const logs: unknown[] = []
+    const notifications: unknown[] = []
+    const off = yield* events.listen((event) => {
+      if (event.type === TuiEvent.ToastShow.type || event.type === "session.error") notifications.push(event)
+      return Effect.void
+    })
+    yield* Effect.addFinalizer(() => off)
+    return yield* run({ logs, notifications }).pipe(
+      Effect.provide(
+        Logger.layer([
+          Logger.make((options) => {
+            if (Array.isArray(options.message) && options.message[0] === "optional custom tool skipped")
+              logs.push(options.message)
+          }),
+        ]),
+      ),
+    )
+  })
+}
 
 afterEach(async () => {
   await disposeAllInstances()
@@ -220,6 +268,329 @@ describe("tool.registry", () => {
       expect(ids).toContain("mixed")
       expect(ids).not.toContain("mixed_helper")
     }),
+  )
+
+  for (const directory of ["tool", "tools"]) {
+    it.instance(`skips missing V2 exports in ${directory} without poisoning the registry`, () =>
+      withDiagnostics(({ logs, notifications }) =>
+        Effect.gen(function* () {
+          const test = yield* TestInstance
+          const opencode = path.join(test.directory, ".opencode")
+          const broken = path.join(opencode, directory, "broken.ts")
+          yield* Effect.promise(() => Bun.write(path.join(opencode, "plugin-v2.ts"), "export const Plugin = {}\n"))
+          yield* Effect.promise(() =>
+            Bun.write(broken, "import { tool } from '../plugin-v2'\nexport default tool({})\n"),
+          )
+          yield* Effect.promise(() =>
+            Bun.write(
+              path.join(opencode, directory === "tool" ? "tools" : "tool", "working.ts"),
+              "export default { description: 'working tool', args: {}, execute: async () => 'ok' }\n",
+            ),
+          )
+          const registry = yield* ToolRegistry.Service
+          const results = yield* Effect.all([registry.ids(), registry.ids()], { concurrency: 2 })
+          expect(results[0]).toEqual(results[1])
+          expect(results[0]).toContain("working")
+          expect(results[0]).toContain("read")
+          expect(results[0]).toContain("bash")
+          expect(results[0]).not.toContain("broken")
+          expect(yield* registry.ids()).toEqual(results[0])
+          expect(logs).toEqual([
+            [
+              "optional custom tool skipped",
+              expect.objectContaining({
+                source: broken,
+                stage: "import",
+                errorType: "SyntaxError",
+                errorMessage: expect.stringContaining("Missing export tool"),
+              }),
+            ],
+          ])
+          expect(JSON.stringify(logs)).toContain("plugin-v2.ts")
+          expect(JSON.stringify(logs)).toContain("API versions")
+          expect(notifications).toEqual([
+            expect.objectContaining({
+              type: TuiEvent.ToastShow.type,
+              location: expect.objectContaining({ directory: test.directory }),
+              data: expect.objectContaining({ variant: "warning", message: expect.stringContaining(broken) }),
+            }),
+          ])
+        }),
+      ),
+    )
+  }
+
+  it.instance("isolates evaluation, resolution and individual definition conversion failures", () =>
+    withDiagnostics(({ logs }) =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        const tools = path.join(test.directory, ".opencode", "tools")
+        yield* Effect.promise(() =>
+          Bun.write(path.join(tools, "evaluate.ts"), "throw new Error('evaluation failed')\n"),
+        )
+        yield* Effect.promise(() =>
+          Bun.write(
+            path.join(tools, "resolve.ts"),
+            "import { missing } from 'nonexistent-custom-tool-package'\nexport default missing()\n",
+          ),
+        )
+        yield* Effect.promise(() =>
+          Bun.write(
+            path.join(tools, "mixed.ts"),
+            [
+              `import { tool } from ${JSON.stringify(pathToFileURL(path.resolve(import.meta.dir, "../../../plugin/src/tool.ts")).href)}`,
+              "export const helper = { value: 'not a tool' }",
+              "export const bad_args = { description: 'bad args', args: 42, execute: async () => '' }",
+              "export const bad_description = { description: 42, args: {}, execute: async () => '' }",
+              "export const bad_execute = { description: 'bad execute', args: {}, execute: 42 }",
+              "export const bad_getter = { description: 'bad getter', get args() { throw new Error('args getter failed') }, execute: async () => '' }",
+              "export const bad_schema = tool({ description: 'bad schema', args: { date: tool.schema.date() }, execute: async () => '' })",
+              "export const incomplete = { args: {} }",
+              "export const named = { description: 'named', args: {}, execute: async () => 'named' }",
+              "export default { description: 'default', args: {}, execute: async () => 'default' }",
+              "",
+            ].join("\n"),
+          ),
+        )
+        const registry = yield* ToolRegistry.Service
+        const ids = yield* registry.ids()
+        expect(ids).toContain("read")
+        expect(ids.filter((id) => id.startsWith("mixed"))).toEqual(["mixed", "mixed_named"])
+        expect(ids).not.toContain("evaluate")
+        expect(ids).not.toContain("resolve")
+        expect(logs).toHaveLength(8)
+        expect(logs).toContainEqual([
+          "optional custom tool skipped",
+          expect.objectContaining({
+            source: path.join(tools, "resolve.ts"),
+            stage: "import",
+            errorMessage: expect.stringContaining("dependencies"),
+          }),
+        ])
+        expect(logs).toContainEqual([
+          "optional custom tool skipped",
+          expect.objectContaining({
+            source: path.join(tools, "evaluate.ts"),
+            stage: "import",
+            errorMessage: "evaluation failed",
+          }),
+        ])
+        expect(logs).toContainEqual([
+          "optional custom tool skipped",
+          expect.objectContaining({
+            source: path.join(tools, "mixed.ts"),
+            stage: "registration",
+            tool: "mixed_bad_schema",
+          }),
+        ])
+        expect(logs).toContainEqual([
+          "optional custom tool skipped",
+          expect.objectContaining({
+            stage: "registration",
+            tool: "mixed_bad_execute",
+            errorMessage: "Tool execute must be a function",
+          }),
+        ])
+      }),
+    ),
+  )
+
+  it.instance("bounds and sanitizes skip diagnostics without evaluating error accessors or payloads", () =>
+    withDiagnostics(({ logs, notifications }) =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        const tools = path.join(test.directory, ".opencode", "tools")
+        for (const [name, code] of Object.entries({
+          accessor:
+            "const error = new Error(); Object.defineProperty(error, 'message', { get() { throw new Error('private accessor executed') } }); throw error",
+          object:
+            "throw { message: 'private object message', payload: 'private payload', toString() { throw new Error('private coercion') } }",
+          huge: "throw Object.assign(new Error('evaluation failed https://user:private-url@example.com password=private-password Bearer private-bearer ' + 'x'.repeat(10000)), { payload: 'private payload' })",
+          syntax: "throw new SyntaxError('Unexpected token private-source-code')",
+          bounded: "throw new Error('x'.repeat(10000))",
+        }))
+          yield* Effect.promise(() => Bun.write(path.join(tools, `${name}.ts`), code))
+        const registry = yield* ToolRegistry.Service
+        expect(yield* registry.ids()).toContain("read")
+        yield* registry.ids()
+        expect(logs).toHaveLength(5)
+        expect(notifications).toHaveLength(5)
+        const rendered = JSON.stringify({ logs, notifications })
+        expect(rendered).not.toContain("private")
+        expect(rendered).not.toContain("x".repeat(513))
+        expect(rendered).toContain("accessor omitted")
+        expect(rendered).toContain("Non-Error failure")
+        expect(rendered).toContain("redacted data")
+        expect(rendered).toContain("Unexpected token")
+        expect(logs).toContainEqual([
+          "optional custom tool skipped",
+          expect.objectContaining({ errorMessage: "x".repeat(512) }),
+        ])
+      }),
+    ),
+  )
+
+  it.instance("does not let a warning notification observer poison optional tool loading", () =>
+    withDiagnostics(({ logs }) =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        yield* Effect.promise(() =>
+          Bun.write(
+            path.join(test.directory, ".opencode", "tool", "broken.ts"),
+            "throw new Error('optional failure')\n",
+          ),
+        )
+        const events = yield* EventV2Bridge.Service
+        const off = yield* events.listen((event) =>
+          event.type === TuiEvent.ToastShow.type ? Effect.die(new Error("notification observer failed")) : Effect.void,
+        )
+        yield* Effect.addFinalizer(() => off)
+        const registry = yield* ToolRegistry.Service
+        expect(yield* registry.ids()).toContain("read")
+        expect(yield* registry.ids()).not.toContain("broken")
+        expect(logs).toHaveLength(1)
+      }),
+    ),
+  )
+
+  withConfiguredPlugin.instance(
+    "retains configured plugin tools and attributes malformed definitions to their source",
+    () =>
+      withDiagnostics(({ logs }) =>
+        Effect.gen(function* () {
+          const test = yield* TestInstance
+          const source = path.join(test.directory, "plugin.ts")
+          yield* Effect.promise(() =>
+            Bun.write(
+              source,
+              "export default async () => ({ tool: { compatible_plugin: { description: 'compatible', execute: async () => 'ok' }, malformed_plugin: { description: 'malformed', args: {}, execute: false } } })\n",
+            ),
+          )
+          yield* Effect.promise(() =>
+            Bun.write(
+              path.join(test.directory, ".opencode", "tool", "broken.ts"),
+              "throw new Error('optional failure')\n",
+            ),
+          )
+          const registry = yield* ToolRegistry.Service
+          const ids = yield* registry.ids()
+          expect(ids).toContain("read")
+          expect(ids).toContain("compatible_plugin")
+          expect(ids).not.toContain("malformed_plugin")
+          expect(ids).not.toContain("broken")
+          expect(logs).toContainEqual([
+            "optional custom tool skipped",
+            expect.objectContaining({
+              source: pathToFileURL(source).href,
+              tool: "malformed_plugin",
+              stage: "registration",
+            }),
+          ])
+        }),
+      ),
+  )
+
+  it.instance(
+    "reloads directory-scoped discovery without invalidating healthy directories or promising module reload",
+    () =>
+      withDiagnostics(({ logs }) =>
+        Effect.gen(function* () {
+          const test = yield* TestInstance
+          const healthy = yield* tmpdirScoped()
+          const tools = path.join(test.directory, ".opencode", "tool")
+          yield* Effect.promise(() =>
+            Bun.write(path.join(tools, "broken.ts"), "throw new Error('cached evaluation failure')\n"),
+          )
+          const registry = yield* ToolRegistry.Service
+          const store = yield* InstanceStore.Service
+          const first = yield* registry.all()
+          const other = yield* registry.all().pipe(provideInstance(healthy))
+          expect(first.some((tool) => tool.id === "read")).toBe(true)
+          expect(logs).toHaveLength(1)
+          yield* Effect.promise(() => fs.unlink(path.join(tools, "broken.ts")))
+          yield* Effect.promise(() =>
+            Bun.write(
+              path.join(tools, "fixed.ts"),
+              "export default { description: 'fixed at a new module URL', args: {}, execute: async () => 'ok' }\n",
+            ),
+          )
+          expect(yield* registry.all()).toEqual(first)
+          yield* store.reload({ directory: test.directory })
+          expect(yield* registry.ids()).toContain("fixed")
+          expect((yield* registry.all().pipe(provideInstance(healthy)))[0]).toBe(other[0])
+          expect(logs).toHaveLength(1)
+          yield* store.disposeDirectory(test.directory)
+          expect(yield* registry.ids()).toContain("fixed")
+        }),
+      ),
+  )
+
+  it.instance("does not swallow custom tool execution failures", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() =>
+        Bun.write(
+          path.join(test.directory, ".opencode", "tool", "execution.ts"),
+          "export default { description: 'execution failure', args: {}, execute: async () => { throw new Error('execution failed') } }\n",
+        ),
+      )
+      const registry = yield* ToolRegistry.Service
+      const agents = yield* Agent.Service
+      const loaded = (yield* registry.all()).find((tool) => tool.id === "execution")
+      if (!loaded) throw new Error("execution tool missing")
+      const exit = yield* loaded
+        .execute(
+          {},
+          {
+            sessionID: SessionID.make("ses_test"),
+            messageID: MessageID.make("msg_test"),
+            agent: (yield* agents.defaultInfo()).name,
+            abort: new AbortController().signal,
+            messages: [],
+            metadata: () => Effect.void,
+            ask: () => Effect.void,
+          },
+        )
+        .pipe(Effect.exit)
+      expect(Exit.isFailure(exit)).toBe(true)
+      if (Exit.isFailure(exit)) expect(Cause.squash(exit.cause)).toMatchObject({ message: "execution failed" })
+    }),
+  )
+
+  it.instance("keeps managed-profile custom tool rejection fatal before importing", () =>
+    withDiagnostics(({ logs, notifications }) =>
+      Effect.gen(function* () {
+        const previous = process.env.OPENCODE_MANAGED_PROFILE
+        yield* Effect.acquireRelease(
+          Effect.sync(() => {
+            process.env.OPENCODE_MANAGED_PROFILE = "1"
+          }),
+          () =>
+            Effect.sync(() => {
+              if (previous === undefined) delete process.env.OPENCODE_MANAGED_PROFILE
+              else process.env.OPENCODE_MANAGED_PROFILE = previous
+            }),
+        )
+        const test = yield* TestInstance
+        const marker = path.join(test.directory, "must-not-import")
+        yield* Effect.promise(() =>
+          Bun.write(
+            path.join(test.directory, ".opencode", "tool", "restricted.ts"),
+            `await Bun.write(${JSON.stringify(marker)}, 'imported'); export default {}\n`,
+          ),
+        )
+        const registry = yield* ToolRegistry.Service
+        const exit = yield* registry.ids().pipe(Effect.exit)
+        expect(Exit.isFailure(exit)).toBe(true)
+        if (Exit.isFailure(exit))
+          expect(Cause.squash(exit.cause)).toMatchObject({
+            message: expect.stringContaining("Custom tools are unavailable in the managed profile"),
+          })
+        expect(yield* Effect.promise(() => Bun.file(marker).exists())).toBe(false)
+        expect(logs).toEqual([])
+        expect(notifications).toEqual([])
+      }),
+    ),
   )
 
   // Regression for #27451 / #27630: a custom tool that omits `args` must not

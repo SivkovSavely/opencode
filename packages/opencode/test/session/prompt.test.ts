@@ -365,6 +365,61 @@ const makeOwnedRuntime = (
   )
 const ownedRuntime = testEffect(makeOwnedRuntime())
 
+ownedRuntime.instance("optional custom tool import failures do not block prompt completion", () =>
+  Effect.gen(function* () {
+    const { dir, llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const events = yield* EventV2Bridge.Service
+    const tool = path.join(dir, ".opencode", "tool")
+    yield* writeText(path.join(dir, ".opencode", "plugin-v2.ts"), "export const Plugin = {}\n")
+    yield* writeText(
+      path.join(tool, "broken.ts"),
+      "import { tool } from '../plugin-v2'\nexport default tool({ description: 'broken', args: {}, execute: async () => 'bad' })\n",
+    )
+    yield* writeText(
+      path.join(dir, ".opencode", "tools", "working.ts"),
+      "export default { description: 'working tool', args: {}, execute: async () => 'ok' }\n",
+    )
+    const errors: unknown[] = []
+    const off = yield* events.listen((event) => {
+      if (event.type === Session.Event.Error.type) errors.push(event.data)
+      return Effect.void
+    })
+    yield* Effect.addFinalizer(() => off)
+
+    const chats = yield* Effect.forEach(["first", "second"], (title) => sessions.create({ title }))
+    yield* llm.push(reply().text("completed normally").stop())
+    yield* llm.push(reply().text("completed normally").stop())
+    for (const chat of chats) {
+      yield* prompt.prompt({ sessionID: chat.id, model: ref, parts: [{ type: "text", text: "hello" }] })
+    }
+    yield* llm.wait(2)
+    yield* off
+
+    const hits = yield* llm.hits
+    expect(hits).toHaveLength(2)
+    for (const hit of hits) {
+      const body = JSON.stringify(hit.body)
+      expect(body).toContain("working")
+      expect(body).toContain("bash")
+      expect(body).not.toContain("broken")
+    }
+    for (const chat of chats) {
+      const assistant = (yield* sessions.messages({ sessionID: chat.id })).findLast(
+        (message) => message.info.role === "assistant",
+      )
+      expect(assistant?.info).toMatchObject({
+        time: { completed: expect.any(Number) },
+        finish: "stop",
+      })
+      if (assistant?.info.role === "assistant") expect(assistant.info.error).toBeUndefined()
+      expect(assistant?.parts).toContainEqual(expect.objectContaining({ type: "text", text: "completed normally" }))
+    }
+    expect(errors).toEqual([])
+  }),
+)
+
 ownedRuntime.instance("managed active children reject public prompt, loop and queue admission", () =>
   Effect.gen(function* () {
     const previous = process.env.OPENCODE_MANAGED_PROFILE
