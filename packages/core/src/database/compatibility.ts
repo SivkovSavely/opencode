@@ -47,6 +47,15 @@ function inspect(sql: SqlClient.SqlClient) {
     if (![...tables].some((name) => !name.startsWith("sqlite_") && !name.startsWith("_"))) return
     if (!tables.has("session") && !tables.has("session_v2"))
       return yield* Effect.die(new Error("Database is not empty and has no session table"))
+    if (tables.has("event")) {
+      const encoded = yield* sql`SELECT 1 FROM event WHERE typeof(data) <> 'text' LIMIT 1`
+      if (encoded.length > 0)
+        return yield* Effect.die(
+          new Error(
+            "Database contains non-TEXT durable event payloads; a separately validated event-history migration is required",
+          ),
+        )
+    }
 
     const completed = yield* journal(sql, tables)
     const unknown = [...completed].find(

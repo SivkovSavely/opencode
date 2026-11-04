@@ -10,6 +10,7 @@ import { SqlClient, Statement } from "effect/sql"
 import { Reactivity } from "effect/reactivity"
 import { Global } from "@opencode/util/global"
 import { tmpdirScoped } from "./fixture/tmpdir"
+import { encodedEventPayloads } from "./fixture/encoded-events"
 import { it } from "./lib/effect"
 
 // Retained journal entries from the native V2 registry before 0fbe489e35.
@@ -172,6 +173,86 @@ it.live("refuses unrelated databases without enabling WAL or creating a migratio
     expect(Buffer.from(yield* Effect.promise(() => Bun.file(filename).bytes())).equals(before)).toBe(true)
     expect(native.query("PRAGMA journal_mode").get()).toEqual({ journal_mode: "delete" })
     expect(native.query("SELECT name FROM sqlite_master WHERE name = 'migration'").get()).toBeNull()
+  }),
+)
+
+it.live("refuses encoded durable event storage before writable open without touching committed WAL", () =>
+  Effect.gen(function* () {
+    const directory = yield* tmpdirScoped()
+    yield* Effect.forEach(encodedEventPayloads(), (payload, index) =>
+      Effect.gen(function* () {
+        const filename = path.join(directory.path, `encoded-${index}.sqlite`)
+        yield* Layer.build(layer({ path: filename })).pipe(
+          Effect.provideService(Global.Service, Global.make({ data: directory.path })),
+          Effect.scoped,
+        )
+        const native = yield* Effect.acquireRelease(
+          Effect.sync(() => new Database(filename)),
+          (db) => Effect.sync(() => db.close()),
+        )
+        native.exec(`
+          PRAGMA wal_autocheckpoint = 0;
+          INSERT INTO event_sequence (aggregate_id, seq) VALUES ('encoded', 1);
+          INSERT INTO event (id, aggregate_id, seq, created, type, data)
+          VALUES ('evt_text', 'encoded', 0, 1, 'test.encoded.1', '{"text":"legacy"}');
+        `)
+        native
+          .query("INSERT INTO event (id, aggregate_id, seq, created, type, data) VALUES (?, ?, ?, ?, ?, ?)")
+          .run("evt_encoded", "encoded", 1, 2, "test.encoded.1", payload.value)
+        const before = yield* Effect.promise(() =>
+          Promise.all([Bun.file(filename).bytes(), Bun.file(`${filename}-wal`).bytes()]),
+        )
+        expect(before[1].byteLength).toBeGreaterThan(0)
+        yield* Effect.forEach([1, 2], () =>
+          Effect.gen(function* () {
+            const exit = yield* Layer.build(layer({ path: filename })).pipe(
+              Effect.provideService(Global.Service, Global.make({ data: directory.path })),
+              Effect.scoped,
+              Effect.exit,
+            )
+            expect(Exit.isFailure(exit), payload.name).toBe(true)
+            if (Exit.isFailure(exit)) {
+              expect(Cause.pretty(exit.cause)).toContain("non-TEXT durable event payloads")
+              expect(Cause.pretty(exit.cause)).toContain(filename)
+            }
+            expect(Buffer.from(yield* Effect.promise(() => Bun.file(filename).bytes())).equals(before[0])).toBe(true)
+            expect(
+              Buffer.from(yield* Effect.promise(() => Bun.file(`${filename}-wal`).bytes())).equals(before[1]),
+            ).toBe(true)
+            expect(native.query("SELECT typeof(data) AS storage FROM event ORDER BY seq").all()).toEqual([
+              { storage: "text" },
+              { storage: "blob" },
+            ])
+          }),
+        )
+      }),
+    )
+  }),
+)
+
+it.live("admits legacy TEXT durable event storage without converting its bytes", () =>
+  Effect.gen(function* () {
+    const directory = yield* tmpdirScoped()
+    const filename = path.join(directory.path, "text-events.sqlite")
+    const native = yield* Effect.acquireRelease(
+      Effect.sync(() => new Database(filename)),
+      (db) => Effect.sync(() => db.close()),
+    )
+    native.exec(`
+      CREATE TABLE session (id TEXT PRIMARY KEY);
+      CREATE TABLE event (data TEXT NOT NULL);
+      INSERT INTO event VALUES ('{"text":"legacy"}');
+    `)
+    const before = yield* Effect.promise(() => Bun.file(filename).bytes())
+    yield* DatabaseCompatibility.check.pipe(
+      Effect.provide(sqliteLayer({ filename, readonly: true, create: false, disableWAL: true })),
+      Effect.scoped,
+    )
+    expect(Buffer.from(yield* Effect.promise(() => Bun.file(filename).bytes())).equals(before)).toBe(true)
+    expect(native.query("SELECT typeof(data) AS storage, data FROM event").get()).toEqual({
+      storage: "text",
+      data: '{"text":"legacy"}',
+    })
   }),
 )
 

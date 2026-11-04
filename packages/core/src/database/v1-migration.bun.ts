@@ -548,6 +548,14 @@ export function run(
       const state = yield* readState(db)
       if (state?.phase === "completed") return { status: "completed" as const }
       if (!(yield* hasLegacySessions(db))) return { status: "completed" as const }
+      const encoded = yield* db.get(sql`SELECT 1 FROM event WHERE typeof(data) <> 'text' LIMIT 1`)
+      if (encoded)
+        return yield* Effect.die(
+          new Error(
+            "Database contains non-TEXT durable event payloads; a separately validated event-history migration is required",
+          ),
+        )
+      const sourceTotal = yield* countNextSessions(nextPath(options, global.data))
       const now = Date.now()
       yield* db.run(sql`
           INSERT OR IGNORE INTO project (id, worktree, time_created, time_updated, time_active, sandboxes)
@@ -573,7 +581,6 @@ export function run(
             }),
           )
           .pipe(Effect.orDie)
-      const sourceTotal = yield* countNextSessions(nextPath(options, global.data))
       const legacyTotal = (yield* db.get<{ value: number }>(sql`SELECT COUNT(*) AS value FROM session`))?.value ?? 0
       const cursor = state?.phase === "sessions" ? state.cursor : undefined
       const migrated =
@@ -817,6 +824,7 @@ function countNextSessions(sourcePath: string | undefined) {
   return Effect.scoped(
     Effect.gen(function* () {
       const source = yield* openNextDatabase(sourcePath)
+      requireTextEvents(source)
       if (!isNextDatabase(source)) return 0
       return source.query<{ value: number }, []>("SELECT COUNT(*) AS value FROM session").get()?.value ?? 0
     }),
@@ -832,6 +840,7 @@ function importNextDatabase(
   return Effect.scoped(
     Effect.gen(function* () {
       const source = yield* openNextDatabase(sourcePath)
+      requireTextEvents(source)
       if (!isNextDatabase(source)) {
         yield* Effect.logWarning("Skipped incompatible opencode-next.db", { path: sourcePath })
         return
@@ -931,6 +940,14 @@ function importNextDatabase(
       source.run("COMMIT")
     }),
   )
+}
+
+function requireTextEvents(source: SQLiteDatabase) {
+  if (!source.query("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'event'").get()) return
+  if (source.query("SELECT 1 FROM event WHERE typeof(data) <> 'text' LIMIT 1").get())
+    throw new Error(
+      "opencode-next.db contains non-TEXT durable event payloads; importing encoded event history is not supported",
+    )
 }
 
 function isNextDatabase(source: SQLiteDatabase) {

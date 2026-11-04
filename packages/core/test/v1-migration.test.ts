@@ -15,11 +15,12 @@ import { AppNodeBuilder } from "@opencode/core/effect/app-node-builder"
 import { LayerNode } from "@opencode/util/effect/layer-node"
 import { FSUtil } from "@opencode/util/fs-util"
 import { Global } from "@opencode/util/global"
-import { Effect, Fiber, Layer, Logger, Schedule, Schema, Scope } from "effect"
+import { Cause, Effect, Exit, Fiber, Layer, Logger, Schedule, Schema, Scope } from "effect"
 import { eq, sql } from "drizzle-orm"
 import type { SqlClient } from "effect/sql/SqlClient"
 import { tmpdir } from "./fixture/tmpdir"
 import { initRepo } from "./fixture/git"
+import { encodedEventPayloads } from "./fixture/encoded-events"
 import fs from "fs/promises"
 import path from "path"
 
@@ -942,6 +943,112 @@ describe("V1Migration database workflow", () => {
     )
   })
 
+  test.each(encodedEventPayloads())("refuses $name target events before clearing history", async (payload) => {
+    await database(
+      Effect.gen(function* () {
+        const database = yield* Database.Service
+        yield* database.db.run(sql`INSERT INTO event_sequence (aggregate_id, seq) VALUES ('preserved', 0)`)
+        yield* database.db.run(sql`
+          INSERT INTO event (id, aggregate_id, seq, created, type, data)
+          VALUES ('evt_preserved', 'preserved', 0, 1, 'test.encoded.1', ${payload.value})
+        `)
+        const exit = yield* V1Migration.run().pipe(Effect.exit)
+        expect(Exit.isFailure(exit)).toBe(true)
+        if (Exit.isFailure(exit)) expect(Cause.pretty(exit.cause)).toContain("non-TEXT durable event payloads")
+        expect(yield* database.db.get(sql`SELECT id, typeof(data) AS storage FROM event`)).toEqual({
+          id: "evt_preserved",
+          storage: "blob",
+        })
+        expect(yield* database.db.all(sql`SELECT id FROM project`)).toEqual([])
+        expect(yield* database.db.get(sql`SELECT value FROM kv WHERE key = 'migration.v1-v2'`)).toBeUndefined()
+      }),
+    )
+  })
+
+  test.each(
+    encodedEventPayloads().flatMap((payload) => [
+      { ...payload, shape: "recognized", recognized: true },
+      { ...payload, shape: "incompatible", recognized: false },
+    ]),
+  )("refuses $name events from $shape sources before changing migration state or target history", async (payload) => {
+    await using tmp = await tmpdir()
+    const filename = path.join(tmp.path, "opencode-next.db")
+    const sqlite = await import("bun:sqlite")
+    const source = new sqlite.Database(filename)
+    source.run(`
+      CREATE TABLE project (
+        id text PRIMARY KEY, worktree text NOT NULL, vcs text, name text, icon_url text, icon_url_override text,
+        icon_color text, time_created integer NOT NULL, time_updated integer NOT NULL, time_initialized integer,
+        sandboxes text NOT NULL, commands text
+      );
+      CREATE TABLE session (
+        id text PRIMARY KEY, project_id text NOT NULL, workspace_id text, parent_id text, fork_session_id text,
+        fork_boundary text, slug text NOT NULL, directory text NOT NULL, path text, title text, version text NOT NULL,
+        share_url text, summary_additions integer, summary_deletions integer, summary_files integer, summary_diffs text,
+        metadata text, cost real DEFAULT 0 NOT NULL, tokens_input integer DEFAULT 0 NOT NULL,
+        tokens_output integer DEFAULT 0 NOT NULL, tokens_reasoning integer DEFAULT 0 NOT NULL,
+        tokens_cache_read integer DEFAULT 0 NOT NULL, tokens_cache_write integer DEFAULT 0 NOT NULL, revert text,
+        permission text, agent text, model text, time_created integer NOT NULL, time_updated integer NOT NULL,
+        time_compacting integer, time_archived integer, time_suspended integer
+      );
+      CREATE TABLE session_message (
+        id text PRIMARY KEY, session_id text NOT NULL, type text NOT NULL, seq integer NOT NULL,
+        time_created integer NOT NULL, time_updated integer NOT NULL, data text NOT NULL
+      );
+      CREATE TABLE event (id text PRIMARY KEY, aggregate_id text NOT NULL, seq integer NOT NULL, type text NOT NULL, data text NOT NULL);
+      INSERT INTO project VALUES ('next-project', '/tmp/next', 'git', 'Source project', NULL, NULL, NULL, 1, 2, NULL, '[]', NULL);
+      INSERT INTO session (id, project_id, slug, directory, title, version, time_created, time_updated)
+      VALUES ('ses_next', 'next-project', 'next', '/tmp/next', 'Imported', '2', 1, 2);
+      INSERT INTO session_message VALUES ('msg_next', 'ses_next', 'user', 0, 1, 2, '{"text":"retained","time":{"created":1}}');
+      INSERT INTO event VALUES ('evt_text', 'ses_next', 0, 'test.encoded.1', '{"text":"legacy"}');
+    `)
+    source
+      .query("INSERT INTO event VALUES (?, ?, ?, ?, ?)")
+      .run("evt_encoded", "ses_next", 1, "test.encoded.1", payload.value)
+    if (!payload.recognized) source.run("DROP TABLE session_message")
+    source.close()
+    const before = await Bun.file(filename).bytes()
+    await database(
+      Effect.gen(function* () {
+        const database = yield* Database.Service
+        yield* database.db.run(sql`INSERT INTO event_sequence (aggregate_id, seq) VALUES ('preserved', 0)`)
+        yield* database.db.run(sql`
+          INSERT INTO event (id, aggregate_id, seq, created, type, data)
+          VALUES ('evt_preserved', 'preserved', 0, 1, 'test.encoded.1', '{"text":"keep"}')
+        `)
+        yield* Effect.forEach([1, 2], () =>
+          Effect.gen(function* () {
+            const exit = yield* V1Migration.run({ nextDatabasePath: filename }).pipe(Effect.exit)
+            expect(Exit.isFailure(exit)).toBe(true)
+            if (Exit.isFailure(exit)) expect(Cause.pretty(exit.cause)).toContain("non-TEXT durable event payloads")
+            expect(yield* database.db.all(sql`SELECT id, data FROM event`)).toEqual([
+              { id: "evt_preserved", data: '{"text":"keep"}' },
+            ])
+            expect(yield* database.db.all(sql`SELECT aggregate_id, seq FROM event_sequence`)).toEqual([
+              { aggregate_id: "preserved", seq: 0 },
+            ])
+            expect(yield* database.db.all(sql`SELECT id FROM project`)).toEqual([])
+            expect(yield* database.db.all(sql`SELECT id FROM session_v2`)).toEqual([])
+            expect(yield* database.db.get(sql`SELECT value FROM kv WHERE key = 'migration.v1-v2'`)).toBeUndefined()
+          }),
+        )
+      }),
+    )
+    expect(Buffer.from(await Bun.file(filename).bytes()).equals(before)).toBe(true)
+    const reopened = new sqlite.Database(filename, { readonly: true })
+    try {
+      expect(reopened.query("SELECT id, typeof(data) AS storage FROM event ORDER BY seq").all()).toEqual([
+        { id: "evt_text", storage: "text" },
+        { id: "evt_encoded", storage: "blob" },
+      ])
+      expect(
+        reopened.query<{ data: Uint8Array }, []>("SELECT data FROM event WHERE id = 'evt_encoded'").get()?.data,
+      ).toEqual(payload.value)
+    } finally {
+      reopened.close()
+    }
+  })
+
   test("imports previous V2 sessions and messages containing apostrophes", async () => {
     await using tmp = await tmpdir()
     const filename = path.join(tmp.path, "opencode-next.db")
@@ -967,6 +1074,7 @@ describe("V1Migration database workflow", () => {
         id text PRIMARY KEY, session_id text NOT NULL, type text NOT NULL, seq integer NOT NULL,
         time_created integer NOT NULL, time_updated integer NOT NULL, data text NOT NULL
       );
+      CREATE TABLE event (id text PRIMARY KEY, aggregate_id text NOT NULL, seq integer NOT NULL, type text NOT NULL, data text NOT NULL);
       INSERT INTO project VALUES (
         'next-project', 'C:/Users/sewer', 'git', 'Source project', NULL, NULL, NULL, 1, 2, NULL, '[]', NULL
       );
@@ -981,8 +1089,10 @@ describe("V1Migration database workflow", () => {
         ('msg_next', 'ses_next', 'user', 4, 12, 13, '{"text":"from next''s history","time":{"created":12}}'),
         ('msg_source_existing', 'ses_existing', 'user', 2, 12, 13, '{"text":"source","time":{"created":12}}'),
         ('msg_orphan', 'ses_orphan', 'user', 0, 12, 13, '{"text":"orphan","time":{"created":12}}');
+      INSERT INTO event VALUES ('evt_text', 'ses_next', 0, 'test.encoded.1', '{"text":"legacy"}');
     `)
     source.close()
+    const before = await Bun.file(filename).bytes()
 
     await database(
       Effect.gen(function* () {
@@ -1056,8 +1166,10 @@ describe("V1Migration database workflow", () => {
         expect(yield* db.get(sql`SELECT value FROM kv WHERE key = 'migration.v1-v2'`)).toEqual({
           value: '{"phase":"completed"}',
         })
+        expect(yield* db.all(sql`SELECT id FROM event`)).toEqual([])
       }),
     )
+    expect(Buffer.from(await Bun.file(filename).bytes()).equals(before)).toBe(true)
   })
 
   test("imports previous V2 databases missing newer nullable columns", async () => {
