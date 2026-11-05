@@ -59,6 +59,40 @@ for (const row of [
   })
 }
 
+test("unselected model and skill lookalikes remain literal prompt text", async ({ page }) => {
+  const prompts: Parameters<NonNullable<MockServerConfig["onPrompt"]>>[0]["body"][] = []
+  const typed = "Keep @model:literal @variant:default $VARIABLE $something as literal text."
+  const pasted = "🙂 café 界 @model:literal\n$VARIABLE $something @variant:default\n終わり"
+
+  const view = await openSession(page, {
+    name: "LiteralPromptControls",
+    findFiles: () => [],
+    onPrompt: (input) => void prompts.push(input.body),
+  })
+
+  await view.editor.pressSequentially(typed)
+  await view.editor.press("Escape")
+  await expect(page.locator('[data-component="composer-suggestions"]')).toBeHidden()
+  await expect(view.editor).toHaveText(typed)
+  await expect(view.editor.locator("[data-mention]")).toHaveCount(0)
+  await view.editor.press("Enter")
+  await expect.poll(() => prompts.length).toBe(1)
+  await expect(view.editor).toBeEmpty()
+  await page.evaluate((text) => navigator.clipboard.writeText(text), pasted)
+  await view.editor.press("ControlOrMeta+V")
+  await expect(view.editor).toHaveJSProperty("innerText", pasted)
+  await view.editor.press("Enter")
+  await expect.poll(() => prompts.length).toBe(2)
+  expect(
+    prompts.map((prompt) => ({
+      text: prompt.text,
+      files: prompt.files ?? [],
+      agents: prompt.agents ?? [],
+      skills: prompt.skills ?? [],
+    })),
+  ).toEqual([typed, pasted].map((text) => ({ text, files: [], agents: [], skills: [] })))
+})
+
 test("mention a session by title, send its stable token, and open its own tab", async ({ page }) => {
   const target = "ses_0123456789abcdefghijklmnop"
   const prompts: Parameters<NonNullable<MockServerConfig["onPrompt"]>>[0]["body"][] = []
@@ -970,6 +1004,7 @@ test("pastes plain text without markup and keeps native undo", async ({ page }) 
     "\n\n  indented\ttext  \n\nlast\n\n",
     'literal <b>bold</b> &amp; & < > "quotes"\n<script>not code</script>\n<img src="example">',
     "first\r\nsecond\rthird",
+    "🙂 café 界 @model:literal\n$VARIABLE $something @variant:default\n終わり",
   ]) {
     await page.evaluate((text) => navigator.clipboard.writeText(text), text)
     await page.keyboard.press("ControlOrMeta+V")
