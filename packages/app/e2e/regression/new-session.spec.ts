@@ -1,6 +1,6 @@
 import { expect, test, type Locator, type Page } from "@playwright/test"
 import type { OpenCodeEvent, WorktreeDirectory } from "@opencode/client/promise"
-import { draftHref, expectPath, NO_PROVIDER, project, provider, seed, sessionHref, T0 } from "../utils/app"
+import { draftHref, expectPath, holdRoute, NO_PROVIDER, project, provider, seed, sessionHref, T0 } from "../utils/app"
 import { mockOpenCodeServer } from "../utils/mock-server"
 import {
   newSessionLocation,
@@ -396,6 +396,118 @@ test("the worktree trigger opens the current project's worktree step", async ({ 
   await expect(newSessionWorktree(page)).toContainText("quiet-river")
   await expect(screen.getByText("quiet-river-branch", { exact: true })).toBeVisible()
   await expect(view.editor).toBeFocused()
+})
+
+test("the workspace selector recovers after inventory removal and submits to Local", async ({ page }) => {
+  const root = "C:/OpenCode/InventoryRecovery"
+  const removed = `${root}/.worktrees/removed`
+  const added = `${root}/.worktrees/added`
+  const inventory: WorktreeDirectory[] = [{ directory: root }, { directory: removed, strategy: "git" }]
+  const locations: unknown[] = []
+  const prompts: unknown[] = []
+
+  const view = await openDraft(page, {
+    name: "InventoryRecovery",
+    worktrees: () => inventory,
+    vcs: (directory) => ({
+      current: directory === root ? "main" : `branch-${directory.split("/").at(-1)}`,
+      default: "main",
+    }),
+    seed: { settings: { workspaces: { defaultDestination: "local" } } },
+    onSessionCreate: (body) => {
+      locations.push(body.location)
+    },
+    onPrompt: (input) => {
+      prompts.push(input.body.text)
+    },
+  })
+
+  const screen = page.locator('[data-component="new-session"]')
+  const path = screen.locator('[data-slot="new-session-location-path"]')
+
+  await newSessionWorktree(page).click()
+  await page.getByRole("option", { name: /^removed / }).click()
+  await expect(path).toHaveText(removed)
+  await expect(screen.getByText("branch-removed", { exact: true })).toBeVisible()
+
+  inventory.splice(1, 1, { directory: added, strategy: "git" })
+  const refresh = await holdRoute(page, /\/api\/worktree\?/, { method: "GET" })
+
+  try {
+    await view.push([
+      { id: "evt_inventory_recovery", created: T0 + 1, type: "worktree.updated", data: { projectID: view.projectID } },
+    ])
+    await refresh.arrived
+    await expect(path).toHaveText(removed)
+    await expect(view.editor).toBeEditable()
+  } finally {
+    refresh.release()
+  }
+
+  await expect(newSessionWorktree(page)).toHaveText("Local")
+  await expect(path).toHaveText(root)
+  await expect(screen.getByText("main", { exact: true })).toBeVisible()
+
+  await newSessionWorktree(page).click()
+  await expect(page.getByRole("option", { name: /^removed / })).toHaveCount(0)
+  await page.getByRole("option", { name: /^added / }).click()
+  await expect(path).toHaveText(added)
+  await expect(screen.getByText("branch-added", { exact: true })).toBeVisible()
+  await newSessionWorktree(page).click()
+  await page.getByRole("option", { name: /InventoryRecovery C:/ }).click()
+  await expect(newSessionWorktree(page)).toHaveText("Local")
+  await expect(view.editor).toBeEditable()
+  await view.editor.fill("Use Local after inventory recovery")
+  await submit(page).click()
+  await expect.poll(() => locations).toEqual([{ directory: root }])
+  await expect.poll(() => prompts).toEqual(["Use Local after inventory recovery"])
+})
+
+test("the workspace selector remembers destination kind across new drafts and reload", async ({ page }) => {
+  const root = "C:/OpenCode/RememberedWorkspace"
+  const existing = `${root}/.worktrees/remembered`
+
+  const view = await openDraft(page, {
+    name: "RememberedWorkspace",
+    worktrees: () => [{ directory: root }, { directory: existing, strategy: "git" }],
+    seed: { settings: { workspaces: { defaultDestination: "last-used" } } },
+  })
+
+  await newSessionWorktree(page).click()
+  await page.getByRole("option", { name: /^remembered / }).click()
+  await expect(page.locator('[data-slot="new-session-location-path"]')).toHaveText(existing)
+  await page.reload()
+  await expect(view.editor).toBeEditable()
+  await expect(page.locator('[data-slot="new-session-location-path"]')).toHaveText(existing)
+
+  const existingDraft = new URL(page.url()).searchParams.get("draftId")
+
+  await view.editor.fill("Keep the existing-worktree draft")
+  await page.getByRole("button", { name: "New session", exact: true }).click()
+  await expect(page).toHaveURL((url) => {
+    const next = url.searchParams.get("draftId")
+
+    return !!next && next !== existingDraft
+  })
+  await expect(view.editor).toBeEditable()
+  await expect(view.editor).toBeEmpty()
+  await expect(newSessionWorktree(page)).toContainText("New worktree")
+  await newSessionWorktree(page).click()
+  await page.getByRole("option", { name: /RememberedWorkspace C:/ }).click()
+  await expect(newSessionWorktree(page)).toHaveText("Local")
+
+  const workspaceDraft = new URL(page.url()).searchParams.get("draftId")
+
+  await view.editor.fill("Keep the Local draft")
+  await page.getByRole("button", { name: "New session", exact: true }).click()
+  await expect(page).toHaveURL((url) => {
+    const next = url.searchParams.get("draftId")
+
+    return !!next && next !== workspaceDraft
+  })
+  await expect(view.editor).toBeEditable()
+  await expect(view.editor).toBeEmpty()
+  await expect(newSessionWorktree(page)).toHaveText("Local")
 })
 
 test("the branch shortcut chooses a base branch and stays inactive on Local", async ({ page }) => {
