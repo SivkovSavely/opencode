@@ -226,6 +226,106 @@ describe("MCP OAuth", () => {
     expect(result.exit._tag).toBe("Failure")
   })
 
+  test.each([
+    { name: "missing state with code", query: "code=untrusted" },
+    { name: "empty state with code", query: "state=&code=untrusted" },
+    { name: "unknown state with code", query: "state=unrelated&code=untrusted" },
+    { name: "missing state with error", query: "error=access_denied" },
+    { name: "unknown state with error", query: "state=unrelated&error=access_denied" },
+  ])("keeps the valid OAuth callback available after $name", async (row) => {
+    const server = authorizationServer({})
+    const previous = credential({ access: "working", refresh: "working-refresh", url: server.server.url.href })
+    const store = memoryCredentials([previous])
+    const result = await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const { authorization, url } = yield* start(server.server, { client_id: "client" }, store)
+          const callback = new URL(url.searchParams.get("redirect_uri") ?? "")
+          callback.search = row.query
+          expect((yield* Effect.promise(() => fetch(callback))).status).toBe(400)
+          expect(server.tokenRequests).toHaveLength(0)
+          callback.search = new URLSearchParams({
+            state: url.searchParams.get("state") ?? "",
+            code: "accepted",
+          }).toString()
+          expect((yield* Effect.promise(() => fetch(callback))).status).toBe(200)
+          return yield* authorization.callback
+        }),
+      ),
+    ).finally(() => server.server.stop(true))
+
+    expect(result.access).toBe("access")
+    expect(server.tokenRequests).toHaveLength(1)
+    expect(server.tokenRequests[0]?.get("code")).toBe("accepted")
+    expect(Array.from(store.rows.values())).toEqual([previous])
+  })
+
+  test("isolates concurrent OAuth callbacks and rejects another flow's state", async () => {
+    const server = authorizationServer({})
+    await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const first = yield* start(server.server, { client_id: "client" })
+          const second = yield* start(server.server, { client_id: "client" })
+          const firstState = first.url.searchParams.get("state") ?? ""
+          const secondState = second.url.searchParams.get("state") ?? ""
+          const firstCallback = new URL(first.url.searchParams.get("redirect_uri") ?? "")
+          const secondCallback = new URL(second.url.searchParams.get("redirect_uri") ?? "")
+          expect(firstState).not.toBe(secondState)
+          expect(firstCallback.origin).not.toBe(secondCallback.origin)
+          secondCallback.search = new URLSearchParams({ state: firstState, code: "wrong-listener" }).toString()
+          expect((yield* Effect.promise(() => fetch(secondCallback))).status).toBe(400)
+          expect(server.tokenRequests).toHaveLength(0)
+          firstCallback.search = new URLSearchParams({ state: firstState, code: "first" }).toString()
+          expect((yield* Effect.promise(() => fetch(firstCallback))).status).toBe(200)
+          expect((yield* Effect.promise(() => fetch(firstCallback))).status).toBe(409)
+          expect((yield* first.authorization.callback).access).toBe("access")
+          secondCallback.search = new URLSearchParams({ state: secondState, code: "second" }).toString()
+          expect((yield* Effect.promise(() => fetch(secondCallback))).status).toBe(200)
+          expect((yield* second.authorization.callback).access).toBe("access")
+        }),
+      ),
+    ).finally(() => server.server.stop(true))
+
+    expect(server.tokenRequests.map((request) => request.get("code"))).toEqual(["first", "second"])
+  })
+
+  test.each([
+    {
+      name: "authorization error",
+      query: "error=access_denied&error_description=Synthetic+authorization+rejected",
+      message: "Synthetic authorization rejected",
+    },
+    { name: "missing code", query: "", message: "Missing authorization code" },
+  ])("fails only the matching OAuth flow for $name", async (row) => {
+    const server = authorizationServer({})
+    await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const first = yield* start(server.server, { client_id: "client" })
+          const second = yield* start(server.server, { client_id: "client" })
+          const firstCallback = new URL(first.url.searchParams.get("redirect_uri") ?? "")
+          firstCallback.search = row.query
+          firstCallback.searchParams.set("state", first.url.searchParams.get("state") ?? "")
+          expect((yield* Effect.promise(() => fetch(firstCallback))).status).toBe(400)
+          const exit = yield* Effect.exit(first.authorization.callback)
+          expect(Exit.isFailure(exit) && Cause.squash(exit.cause)).toMatchObject({
+            message: row.message,
+          })
+          const secondCallback = new URL(second.url.searchParams.get("redirect_uri") ?? "")
+          secondCallback.search = new URLSearchParams({
+            state: second.url.searchParams.get("state") ?? "",
+            code: "second",
+          }).toString()
+          expect((yield* Effect.promise(() => fetch(secondCallback))).status).toBe(200)
+          expect((yield* second.authorization.callback).access).toBe("access")
+        }),
+      ),
+    ).finally(() => server.server.stop(true))
+
+    expect(server.tokenRequests.map((request) => request.get("code"))).toEqual(["second"])
+  })
+
   test("refreshes tokens loaded from a persisted credential", async () => {
     const tokenRequests: URLSearchParams[] = []
     const server = Bun.serve({

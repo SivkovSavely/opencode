@@ -364,16 +364,16 @@ export const authorize = (input: {
         response.writeHead(404).end("Not found")
         return
       }
+      const returned = url.searchParams.get("state")
       const fail = (reason: string, failure: string) => {
         runFork(Effect.logWarning("mcp oauth callback rejected", { ...fields, reason: failure }))
-        Effect.runSync(Deferred.fail(code, new Error(reason)))
+        // Reject unrelated requests without consuming this flow's valid callback.
+        if (returned === state) Effect.runSync(Deferred.fail(code, new Error(reason)))
         response
           .writeHead(400, { "Content-Type": "text/html" })
           .end(OauthCallbackPage.error(reason, { provider: input.name }))
       }
       const error = url.searchParams.get("error_description") ?? url.searchParams.get("error")
-      if (error) return fail(error, "authorization_error")
-      const returned = url.searchParams.get("state")
       const value = url.searchParams.get("code")
       // Browsers can reach the callback without any OAuth parameters (preflights, prefetches, reloads). Only a
       // redirect from the authorization server may end the login, so keep waiting for it.
@@ -384,6 +384,7 @@ export const authorize = (input: {
         return
       }
       if (returned !== state) return fail("OAuth state mismatch", "state_mismatch")
+      if (error) return fail(error, "authorization_error")
       if (!value) return fail("Missing authorization code", "missing_code")
       // The page waits for the token exchange so the browser never reports success for a rejected code.
       if (

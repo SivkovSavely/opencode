@@ -29,7 +29,7 @@ Every row refers to the audited V1 HEAD above. `-` means no port commit, not nat
 | F011 | source-only    | -       | Native bounded retry differs from repeated typed-429 policy; parser/deadline/recovery tests needed.                                   |
 | F012 | source-only    | -       | Attempt/deadline-bound one-shot manual wake and UI races depend on F009-F011.                                                         |
 | F013 | source-only    | -       | Location-scoped MCP connection is not a durable session grant across every model-facing lookup.                                       |
-| F014 | source-only    | -       | Native OAuth happy path does not establish replacement-attempt ownership and stale credential completion safety.                      |
+| F014 | partial        | B08     | Callback-state isolation fixed; replacement/commit ownership and account-scope decisions remain unverified.                            |
 | F015 | source-only    | -       | Worktree backend exists; external discovery, request capture and actual execution isolation need assertions.                          |
 | F016 | source-only    | -       | Deep child navigation, unavailable child model handling and explicit Default depend on F009/F036.                                     |
 | F017 | needs-decision | -       | Choose globally shared explicit project ordering versus native client-local visibility. Never copy V1 malformed-storage data loss.    |
@@ -257,7 +257,7 @@ Review pass 1: PASS, no actionable findings; stop after this clean pass. Static 
 
 ## B07: persisted native Enter/newline preference
 
-Commit: review pass 1 passed; prepared for an authorized local commit, whose verified SHA will be recorded in the next ledger update. Validation passed for the selected assertions below, with separate benchmark/E2E-typecheck failures recorded explicitly. Frozen F018 reference: `75ca2a5cfd7e2e03f05d0540eed51c96c2275bf3`; relevant V1 settings and English copy were inspected through Git objects, not executed.
+Commit: `246feb0830f2500e6f30a9ad29c850916bc66d91` (`feat(app): restore Enter newline preference`), full body, parsed `Behavior-Spec: F018` trailer, ten intended paths and clean post-commit status verified. Validation passed for the selected assertions below, with separate benchmark/E2E-typecheck failures recorded explicitly. Frozen F018 reference: `75ca2a5cfd7e2e03f05d0540eed51c96c2275bf3`; relevant V1 settings and English copy were inspected through Git objects, not executed.
 
 V1 and V2 both persist `settings.v3` with `general.enterNewline`. B07 declares the missing Boolean in V2's existing schema, defaults it to false, and adds native accessors and a localized General switch. This retains a prior stored true without a second store or key migration. The production Composer passes the reactive preference into its existing editor; primitive consumers retain their previous default. Both native session and draft composition use this path, without reviving V1 layout components.
 
@@ -285,9 +285,35 @@ Plain Enter/Shift+Enter swap only when enabled. Newlines use the browser's undoa
 
 Review pass 1: PASS, no actionable findings. The read-only reviewer did not rerun validation; real IME/mobile and the remaining acceptance matrix are still unverified, with the E2E-typecheck and benchmark limitations above retained. Stop after the clean review. No public Protocol/HttpApi surface or generated client changed. Browser validation used disposable HOME/XDG/profile data and two Chromium workers; no live browser preferences, provider accounts or services were touched.
 
+## B08: OAuth callback-state isolation
+
+Commit: prepared for an authorized local commit after selected validation and clean mandatory review. The verified SHA will be recorded in the next ledger update. Frozen F014 reference: `75ca2a5cfd7e2e03f05d0540eed51c96c2275bf3`. The reference callback handler was inspected through Git objects, not executed. The spec's older V2 comparison is not this checkout's released baseline.
+
+The native per-flow loopback listener rejected mismatched callback requests by failing its pending Deferred. An unrelated request with a code, or an error without the matching state, could therefore end a legitimate login before its valid callback arrived. B08 permits a rejected request to fail only the flow whose state matches, and checks state before accepting an authorization error. Unrelated requests still receive HTTP 400; the valid callback remains available. Matching-state errors/missing codes still fail their own flow, duplicate accepted callbacks remain HTTP 409, and browser success still waits for token exchange. No new credential store, callback listener or account policy was introduced.
+
+Native Integration creates separately identified, optionally labeled credentials and permits concurrent attempts. Its MCP reconnect guard skips disabled/replaced entries, but this does not certify credential-commit ownership. A global “newest login wins” change would also affect intentionally separate account creation. F014's durable-account scope and disconnect/replacement/commit ordering therefore remain explicit decisions and follow-on tests, not silently changed by this callback fix. No real credentials or account login were used.
+
+| Normalized candidates | Actual assertion / boundary | Result / limit |
+| --- | --- | --- |
+| F014/A13-A14, A18 supporting callback evidence | Missing, empty or unknown state with a code/error, followed by a valid callback | PASS: unrelated requests cause no exchange, and the valid callback succeeds. Replacement Integration ownership is not exercised. |
+| F014/A15-A17 | Matching-state missing code or authorization error while another flow waits; matching success | PASS: only the matching flow fails, the other succeeds, and exact exchanged codes identify the correct flow. |
+| F014/A05, A16, A31-A32 supporting native adaptation | Two simultaneous same-endpoint flows have distinct state/listener origins; cross-listener state is rejected; one accepted callback is duplicated before the other completes | PASS for per-flow loopback isolation and duplicate handling, not two-directory lifecycle finalization or fixed-port concurrency. |
+| F014/A07 supporting evidence | Prior synthetic credential row survives rejected requests and successful helper completion | PASS for the helper's in-memory credential service. Durable Integration commit/cancellation, canonical account selection and filesystem access controls are not certified. |
+| F014/A01-A04, A06-A12, A19-A30, A33-A40 remaining | Discovery/lazy activation, cancellation/replacement, durable commit, account mapping, timeout/finalization and credential migration matrix | OPEN; full F014 remains partial. No old credential files, temporary keys or production state were migrated. |
+
+| Result | Exact command / directory | Evidence |
+| --- | --- | --- |
+| EXPECTED FAIL | `packages/core`: `bun run script/test.ts test/mcp-oauth.test.ts --test-name-pattern 'valid OAuth callback\|concurrent OAuth callbacks\|matching OAuth flow'`, before production correction | One pass, five fail, 25 assertions across six tests. Later valid callbacks received 409 after an unrelated request consumed the flow. Empty-state and matching-missing-code variants were added afterward. |
+| PASS | `packages/core`: `bun run script/test.ts test/mcp-oauth.test.ts test/integration.test.ts test/credential.test.ts test/mcp.test.ts` | 128 pass, zero fail; 537 assertions across four files, with synthetic credentials and owned loopback endpoints. |
+| PASS | `packages/core`: `bun typecheck` | 1,862 files across two projects, no errors. |
+| PASS | `packages/core`: same focused selection with `--rerun-each 10 --randomize --seed=1405` | 80 pass, zero fail; 550 assertions. All suites ran serially through the disposable repository runner. |
+| PASS | Root: isolated `bun run check` | All 35 typecheck tasks pass (29 cached), lint/SDK docs pass; baseline 1,347 warnings/zero errors and no changed-file diagnostics. No heavy suite overlap. |
+
+Review pass 1: PASS, no actionable findings; stop after this clean pass. Static review did not rerun validation. No public Protocol/HttpApi surface, generated client or dependency changed. Real provider accounts, live services and user credential stores remain untouched; Integration ownership/lifecycle, cross-runtime/Windows and fixed callback-port behavior are not certified.
+
 ## Next work and nonproduction migration plan
 
-1. Finish B07 review and its authorized local commit, then record its verified SHA in the next ledger update. F018's unexecuted matrix, F022 diagnostics/UI, F032 diagnostics and the broader F033 lifecycle/output matrix remain open, not completed specifications.
+1. Record B08's verified SHA in the next ledger update, then exercise F019's native workspace selector, including stale destinations and remembered selection. Resolve F014's native account/commit ownership semantics before changing concurrent authorization policy. F018's unexecuted matrix, F022 diagnostics/UI, F032 diagnostics and the broader F033 lifecycle/output matrix remain open, not completed specifications.
 2. Continue independent specifications without inventing F034's blocked event mapping or managed security authority. Keep source fixture bytes/checksums and schema/journal provenance. Read-only admission and a successful build are not migration authorization.
 3. Build disposable synthetic/copied-and-redacted V1 fixtures for selected historical stages. Verify bookmarks, event payload decoding, retained history/relationships/order and V2 projections independently. Refuse unsupported shapes; never modify the source copy.
 4. Exercise the feasible P0/P1 dependency graph with synthetic providers, loopback servers and fake clocks. No account-backed quota testing or real WorkQueue dispatch.
