@@ -11,6 +11,10 @@ export class NotFoundError extends Schema.TaggedError<NotFoundError>()("Session.
   sessionID: SessionSchema.ID,
 }) {}
 
+export class BookmarkChildError extends Schema.TaggedError<BookmarkChildError>()("Session.BookmarkChildError", {
+  sessionID: SessionSchema.ID,
+}) {}
+
 export class InvalidListCursorError extends Schema.TaggedError<InvalidListCursorError>()(
   "Session.InvalidListCursorError",
   {},

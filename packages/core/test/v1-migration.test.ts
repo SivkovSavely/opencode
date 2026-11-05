@@ -42,6 +42,7 @@ const session = (
   project_id: Project.ID.global,
   workspace_id: null,
   parent_id: null,
+  bookmarked: false,
   fork_session_id: null,
   fork_boundary: null,
   slug: "test",
@@ -966,6 +967,37 @@ describe("V1Migration database workflow", () => {
     )
   })
 
+  test.each([true, false])(
+    "preserves legacy bookmark flags with optional source column %s and keeps V2 choices on rerun",
+    async (column) => {
+      await database(
+        Effect.gen(function* () {
+          const database = yield* Database.Service
+          if (column) yield* database.db.run(sql`ALTER TABLE session ADD COLUMN bookmarked INTEGER NOT NULL DEFAULT 0`)
+          yield* database.db
+            .run(sql`INSERT INTO session (id, project_id, slug, directory, title, version, time_created, time_updated, time_archived) VALUES
+        ('ses_saved', 'global', 'saved', '/closed/old-project', 'Saved', '1', 1, 2, NULL),
+        ('ses_archived', 'global', 'archived', '/closed/old-project', 'Archived', '1', 1, 2, 3),
+        ('ses_plain', 'global', 'plain', '/closed/old-project', 'Plain', '1', 1, 2, NULL)`)
+          if (column) yield* database.db.run(sql`UPDATE session SET bookmarked = 1 WHERE id != 'ses_plain'`)
+          expect(yield* V1Migration.run()).toEqual({ status: "completed" })
+          expect(
+            yield* database.db.all(sql`SELECT id, bookmarked, time_updated, time_archived FROM session_v2 ORDER BY id`),
+          ).toEqual([
+            { id: "ses_archived", bookmarked: column ? 1 : 0, time_updated: 2, time_archived: 3 },
+            { id: "ses_plain", bookmarked: 0, time_updated: 2, time_archived: null },
+            { id: "ses_saved", bookmarked: column ? 1 : 0, time_updated: 2, time_archived: null },
+          ])
+          yield* database.db.run(sql`UPDATE session_v2 SET bookmarked = ${column ? 0 : 1} WHERE id = 'ses_saved'`)
+          expect(yield* V1Migration.run()).toEqual({ status: "completed" })
+          expect(yield* database.db.get(sql`SELECT bookmarked FROM session_v2 WHERE id = 'ses_saved'`)).toEqual({
+            bookmarked: column ? 0 : 1,
+          })
+        }),
+      )
+    },
+  )
+
   test("yields while clearing stale events in batches", async () => {
     await database(
       Effect.gen(function* () {
@@ -1143,6 +1175,9 @@ describe("V1Migration database workflow", () => {
         ('msg_orphan', 'ses_orphan', 'user', 0, 12, 13, '{"text":"orphan","time":{"created":12}}');
       INSERT INTO event VALUES ('evt_text', 'ses_next', 0, 'test.encoded.1', '{"text":"legacy"}');
     `)
+    source.run("ALTER TABLE session ADD COLUMN bookmarked INTEGER NOT NULL DEFAULT 0")
+    source.run("UPDATE session SET bookmarked = 1, time_archived = 4 WHERE id = 'ses_next'")
+    source.run("UPDATE session SET bookmarked = 1 WHERE id = 'ses_existing'")
     source.close()
     const before = await Bun.file(filename).bytes()
 
@@ -1166,6 +1201,17 @@ describe("V1Migration database workflow", () => {
           status: "required",
         })
         expect(yield* V1Migration.run({ nextDatabasePath: filename })).toEqual({ status: "completed" })
+        expect(yield* db.get(sql`SELECT bookmarked, time_archived FROM session_v2 WHERE id = 'ses_next'`)).toEqual({
+          bookmarked: 1,
+          time_archived: 4,
+        })
+        expect(yield* db.get(sql`SELECT bookmarked FROM session_v2 WHERE id = 'ses_existing'`)).toEqual({
+          bookmarked: 0,
+        })
+        expect(yield* db.get(sql`SELECT bookmarked FROM session_v2 WHERE id = 'ses_orphan'`)).toEqual({ bookmarked: 0 })
+        yield* db.run(sql`UPDATE session_v2 SET bookmarked = 0 WHERE id = 'ses_next'`)
+        expect(yield* V1Migration.run({ nextDatabasePath: filename })).toEqual({ status: "completed" })
+        expect(yield* db.get(sql`SELECT bookmarked FROM session_v2 WHERE id = 'ses_next'`)).toEqual({ bookmarked: 0 })
         expect(yield* V1Migration.status()).toEqual({
           status: "completed",
         })
@@ -1265,6 +1311,9 @@ describe("V1Migration database workflow", () => {
         expect(
           yield* database.db.get(sql`SELECT fork_boundary, time_suspended FROM session_v2 WHERE id = 'ses_next'`),
         ).toEqual({ fork_boundary: null, time_suspended: null })
+        expect(yield* database.db.get(sql`SELECT bookmarked FROM session_v2 WHERE id = 'ses_next'`)).toEqual({
+          bookmarked: 0,
+        })
         expect(
           yield* database.db.get(
             sql`SELECT icon_url, icon_url_override, icon_color, commands FROM project WHERE id = 'next-project'`,

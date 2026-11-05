@@ -1,6 +1,6 @@
 import type { OpenCodeEvent } from "@opencode/client/promise"
 import { expect, test, type Page } from "@playwright/test"
-import { expectPath, holdRoute, NO_PROVIDER, project, REMOTE_SERVER, seed, sessionHref, T0 } from "../utils/app"
+import { expectPath, holdRoute, NO_PROVIDER, project, REMOTE_SERVER, SERVER, seed, session, sessionHref, T0 } from "../utils/app"
 import { mockOpenCodeServer } from "../utils/mock-server"
 import { fixture, mockStressTimeline } from "../utils/session-fixture"
 import { mockRemoteServer, mockWorkspace, newSessionLocation } from "../utils/workspace"
@@ -15,6 +15,311 @@ async function openHome(page: Page, input: Parameters<typeof mockStressTimeline>
   await mockStressTimeline(page, input)
   await seed(page, { usedProjects: { local: [fixture.project.id] } })
   await page.goto("/")
+}
+
+for (const away of ["another server", "session"]) {
+  test(`Home Bookmarks refreshes an inactive origin after its unknown-session bookmark event (${away})`, async ({ page }) => {
+    let bookmarkReads = 0
+    const workspace = await mockWorkspace(page, {
+      name: "InactiveOwner",
+      sessions: [{ id: "ses_inactive_existing", title: "Existing A", experimental: { bookmarked: true } }],
+      seed: { tabs: ["ses_inactive_existing"] },
+      beforeSessionsResponse: async ({ bookmarked }) => {
+        if (bookmarked) bookmarkReads++
+      },
+    })
+    await mockRemoteServer(page, { name: "Owner B" })
+    await seed(page, {
+      servers: [{ url: SERVER, name: "Owner A" }, { url: REMOTE_SERVER, name: "Owner B" }],
+    })
+    await page.goto("/")
+    await page.getByRole("button", { name: "Bookmarks · Owner A", exact: true }).press("Enter")
+    await expect(row(page, "Existing A")).toBeVisible()
+    if (away === "another server")
+      await page.getByRole("button", { name: "Bookmarks · Owner B", exact: true }).press("Enter")
+    if (away === "session") {
+      await page.locator('[data-slot="titlebar-tabs"] a').filter({ hasText: "Existing A" }).click()
+      await expectPath(page, sessionHref("ses_inactive_existing"))
+    }
+    const added = session({
+      id: "ses_inactive_unknown_bookmark",
+      title: "Previously unloaded A bookmark",
+      directory: workspace.directory,
+      projectID: workspace.projectID,
+      experimental: { bookmarked: true },
+    })
+    workspace.sessions.push(added)
+    workspace.sessions[0].title = "A event processed"
+    await workspace.push([
+      {
+        id: "evt_inactive_bookmark",
+        created: T0 + 1,
+        type: "session.bookmark.changed",
+        durable: { aggregateID: added.id, seq: 1, version: 1 },
+        data: { sessionID: added.id, bookmarked: true },
+      },
+      {
+        id: "evt_inactive_rename",
+        created: T0 + 2,
+        type: "session.renamed",
+        durable: { aggregateID: "ses_inactive_existing", seq: 1, version: 1 },
+        data: { sessionID: "ses_inactive_existing", title: "A event processed" },
+      },
+    ])
+    await expect(page.locator('[data-slot="titlebar-tabs"] a').filter({ hasText: "A event processed" })).toBeVisible()
+    if (away === "session") await page.getByRole("button", { name: "Home", exact: true }).click()
+    await page.getByRole("button", { name: "Bookmarks · Owner A", exact: true }).press("Enter")
+    await expect(row(page, "Previously unloaded A bookmark")).toBeVisible()
+    expect(bookmarkReads).toBeGreaterThan(1)
+  })
+}
+
+for (const pending of [false, true]) {
+  test(`Home exact-ID search stays with its server across keyboard switching (${pending ? "pending" : "completed"})`, async ({ page }) => {
+    const id = "ses_bookmark_shared_owner_12345"
+    const arrived = Promise.withResolvers<void>()
+    const release = Promise.withResolvers<void>()
+    let hold = false
+    await mockWorkspace(page, {
+      name: "OwnerA",
+      sessions: [{ id, title: "Local exact bookmark", experimental: { bookmarked: true } }],
+      seed: { tabs: [] },
+      beforeSessionResponse: async (sessionID) => {
+        if (!hold || sessionID !== id) return
+        arrived.resolve()
+        await release.promise
+      },
+    })
+    await mockRemoteServer(page, {
+      name: "Owner B",
+      sessions: [session({
+        id: pending ? id : "ses_remote_other_bookmark",
+        title: "Remote exact bookmark",
+        directory: "/remote/project",
+        projectID: "proj_remote",
+        experimental: { bookmarked: true },
+      })],
+    })
+    await seed(page, {
+      servers: [{ url: SERVER, name: "Owner A" }, { url: REMOTE_SERVER, name: "Owner B" }],
+    })
+    await page.goto("/")
+    await page.getByRole("button", { name: "Bookmarks · Owner A", exact: true }).press("Enter")
+    await expect(row(page, "Local exact bookmark")).toBeVisible()
+    const search = page.getByRole("textbox", { name: /Search sessions/ })
+    hold = pending
+    await search.fill(id)
+    if (pending) await arrived.promise
+    if (!pending) await expect(page.getByRole("option").filter({ hasText: "Local exact bookmark" })).toBeVisible()
+    await page.getByRole("button", { name: "Bookmarks · Owner B", exact: true }).press("Enter")
+    await search.focus()
+    await expect(search).toHaveValue(id)
+    if (!pending) {
+      await expect(page.getByText(/No sessions found/)).toBeVisible()
+      await expect(page.getByRole("option")).toHaveCount(0)
+      await expect(page.locator('[data-slot="titlebar-tabs"] a').filter({ hasText: "Local exact bookmark" })).toHaveCount(0)
+      return
+    }
+    const remote = page.getByRole("option").filter({ hasText: "Remote exact bookmark" })
+    // The new owner's lookup must finish even while the old owner's request is held.
+    await expect(remote).toBeVisible()
+    const completed = page.waitForResponse((response) =>
+      response.url() === `${SERVER}/api/session/${id}`,
+    ).then((response) => response.finished())
+    release.resolve()
+    await completed
+    await remote.click({ modifiers: ["Control"] })
+    await expect(page).toHaveURL(/\/$/)
+    await expect(page.locator('[data-slot="titlebar-tabs"] a').filter({ hasText: "Remote exact bookmark" })).toHaveAttribute(
+      "href", sessionHref(id, REMOTE_SERVER),
+    )
+    await expect(page.locator('[data-slot="titlebar-tabs"] a').filter({ hasText: "Local exact bookmark" })).toHaveCount(0)
+  })
+}
+
+test("Home Bookmarks refetches an initial uncached snapshot invalidated by an unloaded session event", async ({ page }) => {
+  const arrived = Promise.withResolvers<void>()
+  const release = Promise.withResolvers<void>()
+  let reads = 0
+  const workspace = await mockWorkspace(page, {
+    name: "BookmarkOverlap",
+    sessions: [{ id: "ses_overlap_existing_root", title: "Existing root" }],
+    beforeSessionsResponse: async ({ bookmarked }) => {
+      if (!bookmarked || ++reads !== 1) return
+      arrived.resolve()
+      await release.promise
+    },
+  })
+  await seed(page, { tabs: ["ses_overlap_existing_root"] })
+  await page.goto("/")
+  await expect(row(page, "Existing root")).toBeVisible()
+  await page.getByRole("button", { name: "Bookmarks", exact: true }).click()
+  await arrived.promise
+  const added = session({
+    id: "ses_overlap_previously_unloaded",
+    title: "New remote bookmark",
+    directory: workspace.directory,
+    projectID: workspace.projectID,
+    experimental: { bookmarked: true },
+  })
+  workspace.sessions.push(added)
+  await workspace.push([
+    {
+      id: "evt_overlap_bookmark",
+      created: T0 + 1,
+      type: "session.bookmark.changed",
+      durable: { aggregateID: added.id, seq: 1, version: 1 },
+      data: { sessionID: added.id, bookmarked: true },
+    },
+    {
+      id: "evt_overlap_sentinel",
+      created: T0 + 2,
+      type: "session.renamed",
+      durable: { aggregateID: "ses_overlap_existing_root", seq: 1, version: 1 },
+      data: { sessionID: "ses_overlap_existing_root", title: "Overlap event handled" },
+    },
+  ])
+  // The tab stays visible during Home's initial load and proves the preceding event was handled.
+  await expect(page.locator('[data-slot="titlebar-tabs"] a').filter({ hasText: "Overlap event handled" })).toBeVisible()
+  release.resolve()
+  await expect(row(page, added.title!)).toBeVisible()
+  expect(reads).toBeGreaterThanOrEqual(2)
+})
+
+test("Home Bookmarks exact-ID search excludes unmarked roots and children across collection changes", async ({ page }) => {
+  const marked = { id: "ses_exact_marked_root_12345", title: "Exact marked root", experimental: { bookmarked: true } }
+  const plain = { id: "ses_exact_unmarked_root_12345", title: "Exact unmarked root" }
+  const child = {
+    id: "ses_exact_marked_child_12345",
+    title: "Exact marked child",
+    parentID: marked.id,
+    experimental: { bookmarked: true },
+  }
+  const arrived = Promise.withResolvers<void>()
+  const release = Promise.withResolvers<void>()
+  let hold = false
+  await mockWorkspace(page, {
+    name: "BookmarkExact",
+    sessions: [marked, plain, child],
+    beforeSessionResponse: async (id) => {
+      if (!hold || id !== plain.id) return
+      arrived.resolve()
+      await release.promise
+    },
+  })
+  await page.goto("/")
+  const search = page.getByRole("textbox", { name: /Search sessions/ })
+  await expect(search).toBeEditable()
+  hold = true
+  await search.fill(plain.id)
+  await arrived.promise
+  await page.getByRole("button", { name: "Bookmarks", exact: true }).press("Enter")
+  release.resolve()
+  await search.focus()
+  await expect(page.getByText(/No sessions found/)).toBeVisible()
+  await expect(page.getByRole("option")).toHaveCount(0)
+  await page.getByRole("button", { name: "B BookmarkExact", exact: true }).press("Enter")
+  await search.fill("")
+  await search.fill(plain.id)
+  await expect(page.getByRole("option").filter({ hasText: plain.title })).toBeVisible()
+  // A completed exact result must also disappear when the selected collection changes.
+  await page.getByRole("button", { name: "Bookmarks", exact: true }).press("Enter")
+  await search.focus()
+  await expect(page.getByText(/No sessions found/)).toBeVisible()
+  await expect(page.getByRole("option")).toHaveCount(0)
+  await search.fill(child.id)
+  await expect(page.getByText(/No sessions found/)).toBeVisible()
+  await expect(page.getByRole("option")).toHaveCount(0)
+  await search.fill(marked.id)
+  await expect(page.getByRole("option").filter({ hasText: marked.title })).toBeVisible()
+  await page.getByRole("option").filter({ hasText: marked.title }).click({ modifiers: ["Control"] })
+  await expect(page).toHaveURL(/\/$/)
+  await expect(page.getByRole("region", { name: "Bookmarks", exact: true })).toBeVisible()
+})
+
+for (const viewport of [
+  { width: 1440, height: 900 },
+  { width: 600, height: 800 },
+]) {
+  test(`Home Bookmarks opens old roots and removes them through the session command (${viewport.width})`, async ({
+    page,
+  }) => {
+    await page.setViewportSize(viewport)
+    const keeper = {
+      id: "ses_bookmark_keeper",
+      title: "Old bookmark keeper",
+      created: 1,
+      directory: "C:/Closed/Unlisted",
+      projectID: "proj_closed",
+      experimental: { bookmarked: true },
+    }
+    await mockWorkspace(page, {
+      name: "Bookmarks",
+      sessions: [
+        keeper,
+        { id: "ses_recent_plain", title: "Recent plain" },
+        {
+          id: "ses_bookmark_archived",
+          title: "Archived bookmark",
+          experimental: { bookmarked: true },
+          time: { created: 1, updated: 1, archived: 2 },
+        },
+      ],
+    })
+    await page.goto("/")
+    await expect(page.getByRole("textbox", { name: /Search sessions/ })).toBeEditable()
+    if (viewport.width < 1024) await page.getByRole("button", { name: "Projects", exact: true }).click()
+    await page.getByRole("button", { name: "Bookmarks", exact: true }).click()
+    await expect(page.getByRole("region", { name: "Bookmarks", exact: true })).toBeVisible()
+    await expect(row(page, keeper.title)).toBeVisible()
+    await expect(row(page, "Recent plain")).toHaveCount(0)
+    await expect(row(page, "Archived bookmark")).toHaveCount(0)
+    const search = page.getByRole("textbox", { name: /Search sessions/ })
+    await search.fill("Old bookmark keeper")
+    await page
+      .getByRole("option")
+      .filter({ hasText: keeper.title })
+      .click({ modifiers: ["Control"] })
+    await expect(page).toHaveURL(/\/$/)
+    await expect(page.getByRole("region", { name: "Bookmarks", exact: true })).toBeVisible()
+    await page.getByRole("option").filter({ hasText: keeper.title }).click()
+    await expect(page).toHaveURL(new RegExp(`/session/${keeper.id}$`))
+    await expect(page.locator('[data-component="composer-editor"]')).toBeEditable()
+    await page.keyboard.press("Control+Shift+P")
+    const palette = page.getByRole("dialog")
+    await palette.getByRole("combobox").fill("Remove bookmark")
+    const removed = page.waitForResponse(
+      (response) => response.request().method() === "PATCH" && response.url().includes(`/session/${keeper.id}`),
+    )
+    await palette.getByRole("option", { name: /Remove bookmark/ }).click()
+    expect((await removed).ok()).toBe(true)
+    await expect(palette).toBeHidden()
+    await page.keyboard.press("Control+Shift+P")
+    await palette.getByRole("combobox").fill("bookmark")
+    await expect(palette.getByRole("option", { name: "Bookmark session", exact: true })).toBeVisible()
+    const added = page.waitForResponse(
+      (response) => response.request().method() === "PATCH" && response.url().includes(`/session/${keeper.id}`),
+    )
+    await palette.getByRole("option", { name: "Bookmark session", exact: true }).click()
+    expect((await added).ok()).toBe(true)
+    await expect(palette).toBeHidden()
+    if (viewport.width >= 1024) {
+      await page.reload()
+      await expect(page.locator('[data-component="composer-editor"]')).toBeEditable()
+    }
+    await page.keyboard.press("Control+Shift+P")
+    await palette.getByRole("combobox").fill("Remove bookmark")
+    await palette.getByRole("option", { name: /Remove bookmark/ }).click()
+    if (viewport.width < 1024) await page.getByRole("button", { name: "Tabs", exact: true }).click()
+    await page.getByRole("button", { name: "Home", exact: true }).click()
+    await expect(page.getByText("No bookmarked sessions", { exact: true })).toBeVisible()
+    await expect(row(page, keeper.title)).toHaveCount(0)
+    await expect(
+      page
+        .getByRole("region", { name: "Bookmarks", exact: true })
+        .getByRole("button", { name: "New session", exact: true }),
+    ).toHaveCount(0)
+  })
 }
 
 test("Home keeps the session list in every interface mode", async ({ page }) => {

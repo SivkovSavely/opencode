@@ -6,6 +6,7 @@ import {
   HOME_SESSION_LIMIT,
   HOME_V2_SESSION_PAGE_LIMIT,
   loadHomeSessionIndex,
+  loadHomeBookmarks,
   mergeHomeSessionIndex,
   parseHomeSessionIndex,
   retainHomeSessions,
@@ -39,6 +40,25 @@ const history = (directory: string, count: number) =>
 const ids = (sessions: SessionInfo[]) => sessions.map((item) => item.id)
 
 describe("Home session index", () => {
+  test("loads complete filtered bookmark pages without recent or project cutoffs", async () => {
+    const all = history("/closed-project", HOME_V2_SESSION_PAGE_LIMIT + 2).map((item) => ({
+      ...item,
+      experimental: { bookmarked: true },
+      time: { created: 1, updated: 1 },
+    }))
+    const calls: string[] = []
+    const result = await loadHomeBookmarks(async (input) => {
+      expect(input["experimental.bookmarked"]).toBe(true)
+      expect(input.parentID).toBeNull()
+      expect(input.archived).toBe(false)
+      calls.push(input.cursor ?? "first")
+      return input.cursor
+        ? { data: all.slice(HOME_V2_SESSION_PAGE_LIMIT), cursor: {} }
+        : { data: all.slice(0, HOME_V2_SESSION_PAGE_LIMIT), cursor: { next: "second" } }
+    })
+    expect(calls).toEqual(["first", "second"])
+    expect(ids(result)).toEqual(ids(all))
+  })
   test("follows cursors across pages and bounds the result per directory", async () => {
     const all = history("/repo", HOME_V2_SESSION_PAGE_LIMIT + 1)
     const calls: Array<{ cursor?: string; parentID: null }> = []

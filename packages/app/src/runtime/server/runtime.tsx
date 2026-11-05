@@ -1,5 +1,6 @@
 import { createSimpleContext } from "@opencode/ui/context"
-import { Accessor, batch, createEffect, createMemo, createResource, createRoot, getOwner, untrack } from "solid-js"
+import { Accessor, batch, createEffect, createMemo, createResource, createRoot, getOwner, onCleanup, untrack } from "solid-js"
+import { useQueryClient } from "@tanstack/solid-query"
 import { createServerProjects, ServerConnection, useServers } from "./registry"
 import { pathKey } from "@/workspaces/path-key"
 import { useServerHealth } from "@/runtime/server/health"
@@ -225,7 +226,24 @@ function createServerController(
   const data = createDesktopData({
     data: source,
     remove: (sessionID) => sdk.api.session.remove({ sessionID }),
+    bookmark: {
+      update: (sessionID, bookmarked) => sdk.api.session.update({ sessionID, experimental: { bookmarked } }),
+      get: (sessionID) => sdk.api.session.get({ sessionID }),
+    },
   })
+
+  const queryClient = useQueryClient()
+  const bookmarkQuery = { queryKey: ["home-bookmarks", conn], exact: true }
+  const refreshBookmarks = () => {
+    // Cancel first: invalidating an initial uncached fetch alone reuses its obsolete request.
+    void queryClient.cancelQueries(bookmarkQuery).then(() => queryClient.invalidateQueries(bookmarkQuery))
+  }
+  onCleanup(data.on("session.bookmark.changed", refreshBookmarks))
+  onCleanup(data.on("session.archived", refreshBookmarks))
+  onCleanup(data.on("session.unarchived", refreshBookmarks))
+  onCleanup(data.on("session.deleted", refreshBookmarks))
+  // A recreated context may have missed events while its query cache survived.
+  refreshBookmarks()
 
   // Transcripts otherwise stay loaded for every session this window ever opened. Open tabs and the three most
   // recently viewed sessions keep theirs; any other session reloads its transcript when it is opened again.

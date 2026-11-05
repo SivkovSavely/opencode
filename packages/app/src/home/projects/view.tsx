@@ -53,6 +53,7 @@ export type HomeProjectsViewProps = {
   onWheel: (event: WheelEvent) => void
   onChooseProject: (server: ServerConnection.Any) => void
   onFocusServer: (server: ServerConnection.Any) => void
+  onSelectBookmarks: (server: ServerConnection.Any) => void
   onAuthenticateServer?: (server: ServerConnection.Any) => void
   onToggleCollapsed: (server: ServerConnection.Any) => void
   onEditServer: (server: ServerConnection.Http) => void
@@ -99,7 +100,10 @@ export function HomeProjectsView(props: HomeProjectsViewProps) {
           </Show>
           <span class="flex min-w-0 flex-1 flex-col leading-[var(--line-height-compact)]">
             <bdi class="truncate">
-              <Show when={selected()} fallback={props.language.t("home.projects.all")}>
+              <Show
+                when={selected()}
+                fallback={props.language.t(props.selection.bookmarks ? "home.bookmarks" : "home.projects.all")}
+              >
                 {(project) => displayName(project())}
               </Show>
             </bdi>
@@ -121,6 +125,10 @@ export function HomeProjectsView(props: HomeProjectsViewProps) {
           >
             <HomeProjectsPanel
               {...props}
+              onSelectBookmarks={(server) => {
+                props.onSelectBookmarks(server)
+                setState("open", false)
+              }}
               onSelectProject={(server, directory) => {
                 props.onSelectProject(server, directory)
                 setState("open", false)
@@ -221,11 +229,28 @@ function HomeProjectsPanel(props: HomeProjectsViewProps) {
           }}
           onScroll={(event) => updateFades(event.currentTarget)}
         >
+          <For each={props.servers}>
+            {(server) => (
+              <HomeProjectNavButton
+                type="button"
+                data-selected={
+                  props.selection.bookmarks && props.selection.server === ServerConnection.key(server) ? "" : undefined
+                }
+                onClick={() => props.onSelectBookmarks(server)}
+              >
+                <Icon name="bookmark" size="small" />
+                <span class={HOME_PROJECT_NAV_LABEL}>
+                  {props.language.t("home.bookmarks")}
+                  {props.servers.length > 1 ? ` · ${props.serverLabel(server)}` : ""}
+                </span>
+              </HomeProjectNavButton>
+            )}
+          </For>
           <Show when={props.dropdown && props.servers.length === 1}>
             <HomeProjectNavButton
               type="button"
               class="mb-1"
-              data-selected={!props.selection.directory ? "" : undefined}
+              data-selected={!props.selection.directory && !props.selection.bookmarks ? "" : undefined}
               onClick={() => props.onFocusServer(props.servers[0])}
             >
               <Icon name="folder" size="small" />

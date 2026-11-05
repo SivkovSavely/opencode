@@ -28,6 +28,29 @@ const project = Location.Ref.make({ directory: AbsolutePath.make("/project") })
 const other = Location.Ref.make({ directory: AbsolutePath.make("/other") })
 
 describe("Session.list", () => {
+  it.effect("preserves the bookmark filter in forward and backward cursors", () =>
+    Effect.gen(function* () {
+      const session = yield* Session.Service
+      const roots = yield* Effect.forEach(["old", "new", "elsewhere"], (title) =>
+        session.create({ location: title === "elsewhere" ? other : project, title }),
+      )
+      yield* Effect.forEach(roots, (root) => session.setBookmarked({ sessionID: root.id, bookmarked: true }))
+      yield* session.create({ location: project, title: "not bookmarked" })
+      const first = yield* session.list({
+        experimental: { bookmarked: true },
+        parentID: null,
+        archived: false,
+        limit: 2,
+        order: "asc",
+      })
+      const next = yield* session.list({ cursor: first.cursor.next, limit: 2 })
+      const back = yield* session.list({ cursor: next.cursor.previous, limit: 2 })
+      expect([...first.data, ...next.data].map((item) => item.id).toSorted()).toEqual(
+        roots.map((item) => item.id).toSorted(),
+      )
+      expect(back.data.map((item) => item.id)).toEqual(first.data.map((item) => item.id))
+    }),
+  )
   it.effect("pages through the filtered store results in both directions", () =>
     Effect.gen(function* () {
       const session = yield* Session.Service

@@ -61,6 +61,16 @@ export const useSessionCommands = (actions: SessionCommandContext) => {
   const platform = usePlatform()
   const pluginScoped = usePluginScoped()
   const pluginClaims = usePluginClaims()
+  const toggleBookmark = async () => {
+    const sessionID = actions.session.identity.params.id
+    const info = sessionID ? data.session.get(sessionID) : undefined
+    if (!info) return
+    try {
+      await data.session.bookmark.toggle(info)
+    } catch (error) {
+      showToast({ variant: "error", title: language.t("common.requestFailed"), description: formatServerError(error) })
+    }
+  }
 
   const openDialog = async <T,>(load: () => Promise<T>, show: (value: T) => void) => {
     const owner = actions.session.ownership.capture()
@@ -418,6 +428,19 @@ export const useSessionCommands = (actions: SessionCommandContext) => {
       slash: "export",
       disabled: !actions.session.identity.params.id,
       onSelect: exportSession,
+    }),
+    sessionCommand({
+      id: "session.bookmark",
+      title: language.t(
+        actions.session.data.info()?.experimental?.bookmarked
+          ? "command.session.bookmark.remove"
+          : "command.session.bookmark.add",
+      ),
+      disabled:
+        !actions.session.identity.params.id ||
+        !!actions.session.data.info()?.parentID ||
+        data.session.bookmark.pending(actions.session.identity.params.id ?? ""),
+      onSelect: toggleBookmark,
     }),
     sessionCommand({
       id: "session.copyID",

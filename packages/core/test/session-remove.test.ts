@@ -64,6 +64,7 @@ describe("Session.remove", () => {
       const session = yield* Session.Service
       const parent = yield* session.create({ location })
       const child = yield* session.create({ parentID: parent.id })
+      yield* session.setBookmarked({ sessionID: parent.id, bookmarked: true })
       yield* session.environment({ sessionID: parent.id, variables: { SESSION_ENV: "parent" } })
       yield* session.environment({ sessionID: child.id, variables: { SESSION_ENV: "child" } })
       const locations = yield* LocationServiceMap.Service

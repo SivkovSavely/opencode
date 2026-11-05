@@ -12,6 +12,7 @@ import { Instance } from "../instance/service.js"
 import { ShellResult } from "../shell/result.js"
 import type { Skill } from "../skill.js"
 import {
+  BookmarkChildError,
   BusyError,
   CompactionConflictError,
   InboxConflictError,
@@ -29,6 +30,9 @@ import { SessionShell } from "./shell.js"
 import { SessionSkill } from "./skill.js"
 import { SessionSchema } from "./schema.js"
 import { SessionStore } from "./store.js"
+import { KeyedMutex } from "../effect/keyed-mutex.js"
+
+const bookmarkLocks = KeyedMutex.makeUnsafe<SessionSchema.ID>()
 
 type PromptRequest = SessionPrompt.Input & {
   id?: SessionMessage.ID
@@ -72,6 +76,15 @@ export const make = Effect.fn("Session.make")(function* () {
     yield* get(sessionID)
     yield* bus.publish(SessionEvent.Renamed, { sessionID, title: input.title })
   })
+  const setBookmarked = Effect.fn("Session.setBookmarked")(
+    (sessionID: SessionSchema.ID, input: { bookmarked: boolean }) =>
+      Effect.gen(function* () {
+        const session = yield* get(sessionID)
+        if (input.bookmarked && session.parentID) return yield* new BookmarkChildError({ sessionID })
+        if ((session.experimental?.bookmarked ?? false) === input.bookmarked) return
+        yield* bus.publish(SessionEvent.BookmarkChanged, { sessionID, bookmarked: input.bookmarked })
+      }).pipe(bookmarkLocks.withLock(sessionID), Effect.uninterruptible),
+  )
   const archive = Effect.fn("Session.archive")(function* (sessionID: SessionSchema.ID) {
     const session = yield* get(sessionID)
     if (session.time.archived) return
@@ -357,6 +370,7 @@ export const make = Effect.fn("Session.make")(function* () {
   })
   const revert = { stage, clear, commit }
   const operations = {
+    setBookmarked,
     get,
     message,
     view,
@@ -387,6 +401,7 @@ export const make = Effect.fn("Session.make")(function* () {
     const message = operations.message.bind(undefined, sessionID)
     const view = operations.view.bind(undefined, sessionID)
     const rename = operations.rename.bind(undefined, sessionID)
+    const setBookmarked = operations.setBookmarked.bind(undefined, sessionID)
     const archive = operations.archive.bind(undefined, sessionID)
     const unarchive = operations.unarchive.bind(undefined, sessionID)
     const setMetadata = operations.setMetadata.bind(undefined, sessionID)
@@ -416,6 +431,7 @@ export const make = Effect.fn("Session.make")(function* () {
       message,
       view,
       rename,
+      setBookmarked,
       archive,
       unarchive,
       setMetadata,

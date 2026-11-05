@@ -1163,6 +1163,16 @@ export type SessionRenamed = {
   data: { sessionID: SessionID; title: string }
 }
 
+export type SessionBookmarkChanged = {
+  id: EventID
+  created: number
+  metadata?: { [x: string]: any }
+  type: "session.bookmark.changed"
+  durable: { aggregateID: string; seq: EventSeq; version: 1 }
+  location?: LocationRef
+  data: { sessionID: SessionID; bookmarked: boolean }
+}
+
 export type SessionMetadataUpdated = {
   id: EventID
   created: number
@@ -2272,6 +2282,7 @@ export type ModelInfo = {
 export type SessionInfo = {
   id: SessionID
   parentID?: SessionID
+  experimental?: { bookmarked?: boolean }
   fork?: { sessionID: SessionID; boundary: SessionForkBoundary }
   projectID: ProjectID
   agent?: AgentID
@@ -2749,6 +2760,7 @@ export type SessionEventDurable =
   | SessionModelSelected
   | SessionMoved
   | SessionRenamed
+  | SessionBookmarkChanged
   | SessionMetadataUpdated
   | SessionPermissions
   | SessionViewed
@@ -2806,6 +2818,7 @@ export type V2Event =
   | SessionModelSelected
   | SessionMoved
   | SessionRenamed
+  | SessionBookmarkChanged
   | SessionMetadataUpdated
   | SessionPermissions
   | SessionViewed
@@ -3269,6 +3282,7 @@ export type SessionListInput = {
   readonly directory?: string | undefined
   readonly project?: string | undefined
   readonly subpath?: string | undefined
+  readonly "experimental.bookmarked"?: boolean | undefined
   readonly cursor?: string | undefined
 }
 
@@ -3318,6 +3332,7 @@ export type SessionSwitchModelOutput = void
 export type SessionUpdateInput = {
   readonly sessionID: string
   readonly title?: string | undefined
+  readonly experimental?: { readonly bookmarked?: boolean | undefined } | undefined
   readonly metadata?: { readonly [x: string]: JsonValue } | undefined
   readonly permissions?:
     | ReadonlyArray<{ readonly action: string; readonly resource: string; readonly effect: "allow" | "deny" | "ask" }>
@@ -3750,6 +3765,7 @@ export type ExperimentalSessionImportInput = {
   readonly info: {
     readonly id: string
     readonly parentID?: string
+    readonly experimental?: { readonly bookmarked?: boolean }
     readonly fork?: {
       readonly sessionID: string
       readonly boundary:
@@ -4296,6 +4312,7 @@ export type EventSubscribeInput = {
         | "session.model.selected"
         | "session.moved"
         | "session.renamed"
+        | "session.bookmark.changed"
         | "session.metadata.updated"
         | "session.permissions"
         | "session.viewed"

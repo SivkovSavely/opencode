@@ -32,6 +32,7 @@ export interface Info extends Schema.Schema.Type<typeof Info> {}
 export const Info = Schema.Struct({
   id: ID,
   parentID: ID.pipe(optional),
+  experimental: Schema.Struct({ bookmarked: Schema.Boolean.pipe(optional) }).pipe(optional),
   fork: Schema.Struct({
     sessionID: ID,
     boundary: ForkBoundary,
@@ -72,6 +73,15 @@ export interface ListAnchor extends Schema.Schema.Type<typeof ListAnchor> {}
 // These fields are also the session.list HTTP query parameters. Raw Schema.optional keeps that
 // endpoint's OpenAPI parameters unchanged.
 const ListFilterFields = {
+  experimental: Schema.Struct({
+    bookmarked: Schema.Literals(["true", "false"]).pipe(
+      Schema.decodeTo(Schema.Boolean, {
+        decode: SchemaGetter.transform((value) => value === "true"),
+        encode: SchemaGetter.transform((value): "true" | "false" => (value ? "true" : "false")),
+      }),
+      optional,
+    ),
+  }).pipe(optional),
   order: Schema.Literals(["asc", "desc"]).pipe(Schema.optional).annotate({
     description: "Session order for the first page. Use desc for newest first or asc for oldest first.",
   }),

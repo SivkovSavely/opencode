@@ -6,6 +6,42 @@ export const HOME_V2_SESSION_PAGE_LIMIT = 5_000
 
 export const HOME_SESSION_LIMIT = 64
 
+export async function loadHomeBookmarks(
+  list: (
+    input: {
+      limit: number
+      order: "desc"
+      parentID: null
+      archived: false
+      "experimental.bookmarked": true
+      cursor?: string
+    },
+    options: { signal?: AbortSignal },
+  ) => Promise<SessionsResponse>,
+  signal?: AbortSignal,
+) {
+  const sessions = new Map<string, SessionInfo>()
+  let cursor: string | undefined
+  for (;;) {
+    const response = await list(
+      {
+        limit: HOME_V2_SESSION_PAGE_LIMIT,
+        order: "desc",
+        parentID: null,
+        archived: false,
+        "experimental.bookmarked": true,
+        ...(cursor ? { cursor } : {}),
+      },
+      { signal },
+    )
+    parseHomeSessionIndex(response.data)
+      .filter((session) => session.experimental?.bookmarked)
+      .forEach((session) => sessions.set(session.id, session))
+    if (response.data.length < HOME_V2_SESSION_PAGE_LIMIT || !response.cursor.next) return [...sessions.values()]
+    cursor = response.cursor.next
+  }
+}
+
 // Rows kept per directory from the fetched index: the visible limit plus the
 // recent-window search bucket. Merging locally known sessions and pending
 // removals into this subset resolves exactly like merging into the complete

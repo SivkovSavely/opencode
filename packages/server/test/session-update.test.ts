@@ -14,7 +14,7 @@ const makeRequest = Effect.fn(function* () {
     fs: { filewatcher: false },
     models: { fetch: false },
   })
-  return (path: string, method: string, body?: unknown) =>
+  return (path: string, method: string, body?: unknown, status = method === "PATCH" ? 204 : 200) =>
     Effect.promise(async () => {
       const response = await handler(
         new Request(`http://opencode.local${path}`, {
@@ -23,10 +23,44 @@ const makeRequest = Effect.fn(function* () {
           body: body === undefined ? undefined : JSON.stringify(body),
         }),
       )
-      expect(response.status).toBe(method === "PATCH" ? 204 : 200)
+      expect(response.status).toBe(status)
       return response.status === 204 ? undefined : response.json()
     })
 })
+
+it.live("bookmarks roots without activity changes and rejects combined child mutations atomically", () =>
+  Effect.gen(function* () {
+    const request = yield* makeRequest()
+    const root = Schema.decodeUnknownSync(SessionResponse)(
+      yield* request("/api/session", "POST", { title: "Root" }),
+    ).data
+    const child = Schema.decodeUnknownSync(SessionResponse)(
+      yield* request("/api/session", "POST", { parentID: root.id, title: "Child" }),
+    ).data
+    yield* request("/api/session", "POST", { title: "Not bookmarked" })
+    yield* request(`/api/session/${root.id}`, "PATCH", { experimental: { bookmarked: true } })
+    yield* request(`/api/session/${root.id}`, "PATCH", { experimental: { bookmarked: true } })
+    const saved = Schema.decodeUnknownSync(SessionResponse)(yield* request(`/api/session/${root.id}`, "GET")).data
+    expect(saved.experimental?.bookmarked).toBe(true)
+    expect(saved.time.updated).toBe(root.time.updated)
+    const listed = Schema.decodeUnknownSync(SessionsResponse)(
+      yield* request("/api/session?experimental.bookmarked=true&parentID=null&archived=false", "GET"),
+    )
+    expect(listed.data.map((item) => item.id)).toEqual([root.id])
+    yield* request(
+      `/api/session/${child.id}`,
+      "PATCH",
+      { title: "Wrong", metadata: { wrong: true }, archived: true, experimental: { bookmarked: true } },
+      400,
+    )
+    const unchanged = Schema.decodeUnknownSync(SessionResponse)(yield* request(`/api/session/${child.id}`, "GET")).data
+    expect(unchanged.title).toBe("Child")
+    expect(unchanged.metadata).toBeUndefined()
+    expect(unchanged.time.archived).toBeUndefined()
+    expect(unchanged.experimental?.bookmarked).toBe(false)
+    yield* request(`/api/session/${child.id}`, "PATCH", { experimental: { bookmarked: false } })
+  }).pipe(Effect.scoped),
+)
 
 it.live("updates session metadata through PATCH", () =>
   Effect.gen(function* () {

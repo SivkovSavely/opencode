@@ -41,6 +41,7 @@ export const SessionTable = sqliteTable(
     directory: directoryColumn().notNull(),
     path: pathColumn(),
     title: text(),
+    bookmarked: integer({ mode: "boolean" }).notNull().default(false),
     version: text().notNull(),
     share_url: text(),
     summary_additions: integer(),
@@ -77,6 +78,13 @@ export const SessionTable = sqliteTable(
     index("session_v2_project_idx").on(table.project_id),
     index("session_v2_workspace_idx").on(table.workspace_id),
     index("session_v2_parent_idx").on(table.parent_id),
+    index("session_v2_bookmarked_idx").on(
+      table.bookmarked,
+      table.time_archived,
+      table.parent_id,
+      table.time_updated,
+      table.id,
+    ),
     index("session_v2_time_suspended_idx")
       .on(table.time_suspended)
       .where(sql`${table.time_suspended} is not null`),

@@ -1,11 +1,11 @@
 import { useCommand } from "@/shell/commands/command"
 import { useLayout } from "@/shell/state/layout"
 import { useLanguage } from "@/runtime/i18n/language"
-import { useServers } from "@/runtime/server/registry"
+import { ServerConnection, useServers } from "@/runtime/server/registry"
 import { displayName } from "@opencode/ui/project-avatar"
 import { sessionLabel } from "@/session/title"
 import { makeEventListener } from "@solid-primitives/event-listener"
-import { createMemo, onCleanup, onMount } from "solid-js"
+import { createEffect, createMemo, on, onCleanup, onMount } from "solid-js"
 import { createStore } from "solid-js/store"
 import type { HomeController } from "../model"
 import { homeSessionSearchKey, type HomeSessionRecord, type HomeSessionsController } from "./controller"
@@ -24,12 +24,14 @@ export function createHomeSessionSearchController(home: HomeController, sessions
     focused: boolean
     highlighted: string
     exact: HomeSessionRecord | undefined
+    exactServer: ServerConnection.Key | undefined
     lookingUp: boolean
   }>({
     value: "",
     focused: false,
     highlighted: "",
     exact: undefined,
+    exactServer: undefined,
     lookingUp: false,
   })
 
@@ -38,6 +40,11 @@ export function createHomeSessionSearchController(home: HomeController, sessions
   let input: HTMLInputElement | undefined
   let list: HTMLDivElement | undefined
   const query = createMemo(() => state.value.trim())
+  const server = createMemo(() => {
+    const conn = home.server.focused()
+    return conn ? ServerConnection.key(conn) : undefined
+  })
+  createEffect(on(server, () => update(state.value), { defer: true }))
 
   const results = createMemo(() => {
     const value = query().toLowerCase()
@@ -48,7 +55,13 @@ export function createHomeSessionSearchController(home: HomeController, sessions
       .searchRecords()
       .filter((record) => `${sessionLabel(record.session)} ${record.projectName}`.toLowerCase().includes(value))
 
-    if (!state.exact || records.some((record) => record.session.id === state.exact?.session.id)) return records
+    if (
+      !state.exact ||
+      state.exactServer !== server() ||
+      !sessions.session.eligible(state.exact.session) ||
+      records.some((record) => record.session.id === state.exact?.session.id)
+    )
+      return records
 
     return [state.exact, ...records]
   })
@@ -114,6 +127,7 @@ export function createHomeSessionSearchController(home: HomeController, sessions
 
   function update(value: string) {
     const current = ++lookup
+    const owner = server()
     const sessionID = value.trim()
     setState({ value, highlighted: "", exact: undefined, lookingUp: false })
 
@@ -121,11 +135,11 @@ export function createHomeSessionSearchController(home: HomeController, sessions
     setState("lookingUp", true)
     void sessions.session.lookup(sessionID).then(
       (record) => {
-        if (current !== lookup) return
-        setState({ exact: record, lookingUp: false })
+        if (current !== lookup || owner !== server()) return
+        setState({ exact: record, exactServer: owner, lookingUp: false })
       },
       () => {
-        if (current !== lookup) return
+        if (current !== lookup || owner !== server()) return
         setState("lookingUp", false)
       },
     )

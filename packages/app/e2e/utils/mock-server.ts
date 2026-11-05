@@ -98,6 +98,8 @@ export interface MockServerConfig {
   onMessage?: (input: { sessionID: string; messageID: string }) => void
   onRevertStage?: (input: { sessionID: string; messageID: string }) => void
   onSession?: (sessionID: string) => void
+  beforeSessionsResponse?: (input: { bookmarked: boolean }) => Promise<void>
+  beforeSessionResponse?: (sessionID: string) => Promise<void>
   events?: () => OpenCodeEvent[]
   eventRetry?: number
   // Idle event streams send a comment every 15 s like the real server. Set false only to test the client's stall watchdog.
@@ -1100,6 +1102,16 @@ function mockHandlers(
           ),
         sessionList: (ctx) => {
           const sessions = config.sessions
+            .filter((session) => {
+              const bookmark = ctx.query["experimental.bookmarked"]
+              const archived = Predicate.isObject(session.time) && session.time.archived !== undefined
+              return (
+                (ctx.query.archived === undefined || archived === (ctx.query.archived === "true")) &&
+                (bookmark === undefined ||
+                  (Predicate.isObject(session.experimental) && session.experimental.bookmarked === true) ===
+                    (bookmark === "true"))
+              )
+            })
             .filter(
               (session) =>
                 !ctx.query.directory ||
@@ -1126,9 +1138,13 @@ function mockHandlers(
           const limit = ctx.query.limit ?? 50
           const data = ordered.slice(offset, offset + limit)
 
-          return Effect.succeed({
+          const response = {
             data: data.map((session) => currentSession(session, config.directory)),
             cursor: { next: offset + limit < ordered.length ? String(offset + limit) : undefined },
+          }
+          return Effect.promise(async () => {
+            await config.beforeSessionsResponse?.({ bookmarked: ctx.query["experimental.bookmarked"] === "true" })
+            return response
           })
         },
         // The goal plugin's pill reads each routed session's goal; no scenario sets one.
@@ -1167,7 +1183,11 @@ function mockHandlers(
             const session = config.sessions.find((item) => item.id === ctx.params.sessionID)
 
             return session
-              ? Effect.succeed({ data: currentSession(session, config.directory) })
+              ? Effect.promise(async () => {
+                  const data = currentSession(session, config.directory)
+                  await config.beforeSessionResponse?.(ctx.params.sessionID)
+                  return { data }
+                })
               : Effect.fail(new MockNotFound({ message: "Session not found" }))
           }),
         sessionRemove: () => noContent,
@@ -1290,6 +1310,22 @@ function mockHandlers(
             const session = config.sessions.find((item) => item.id === ctx.params.sessionID)
 
             if (session && title !== undefined) session.title = title
+            const bookmark = Option.getOrUndefined(decodeSessionBookmark(ctx.payload))?.experimental.bookmarked
+            if (session && bookmark !== undefined) {
+              session.experimental = {
+                ...(Predicate.isObject(session.experimental) ? session.experimental : {}),
+                bookmarked: bookmark,
+              }
+              state.emit([
+                {
+                  id: `evt_bookmark_${ctx.params.sessionID}_${Date.now()}`,
+                  created: Date.now(),
+                  type: "session.bookmark.changed",
+                  durable: { aggregateID: ctx.params.sessionID, seq: Date.now(), version: 1 },
+                  data: { sessionID: ctx.params.sessionID, bookmarked: bookmark },
+                },
+              ])
+            }
           }).pipe(Effect.andThen(noContent)),
         sessionCommand: (ctx) => {
           const recordCommand = config.onCommand
@@ -1483,6 +1519,7 @@ export function currentSession(session: MockSession, fallbackDirectory?: string)
     location: { directory: seed.location?.directory ?? seed.directory ?? fallbackDirectory },
     subpath: session.subpath ?? session.path,
     revert: session.revert,
+    experimental: Option.getOrUndefined(decodeSessionBookmark(session))?.experimental,
   }
 }
 
@@ -1513,6 +1550,9 @@ const decodeSessionCreate = Schema.decodeUnknownOption(
 )
 
 const decodeSessionRename = Schema.decodeUnknownOption(Schema.Struct({ title: Schema.String }))
+const decodeSessionBookmark = Schema.decodeUnknownOption(
+  Schema.Struct({ experimental: Schema.Struct({ bookmarked: Schema.Boolean }) }),
+)
 
 const decodeRevertStage = Schema.decodeUnknownOption(Schema.Struct({ messageID: Schema.String }))
 

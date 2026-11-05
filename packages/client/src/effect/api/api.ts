@@ -138,6 +138,7 @@ export type SessionListInput = {
   readonly directory?: AbsolutePath | undefined
   readonly project?: Project.ID | undefined
   readonly subpath?: RelativePath | undefined
+  readonly "experimental.bookmarked"?: boolean | undefined
   readonly cursor?: Session.ListCursor | undefined
 }
 export type SessionListOutput = {
@@ -192,6 +193,7 @@ export type SessionSwitchModelOperation<E = never> = (
 export type SessionUpdateInput = {
   readonly sessionID: Session.ID
   readonly title?: string | undefined
+  readonly experimental?: { readonly bookmarked?: boolean | undefined } | undefined
   readonly metadata?: Session.Metadata | undefined
   readonly permissions?: Permission.Ruleset | undefined
   readonly archived?: boolean | undefined
@@ -689,6 +691,17 @@ export type ExperimentalSessionLogOutput =
             | { readonly directory: AbsolutePath; readonly workspaceID?: Workspace.ID | undefined }
             | undefined
           readonly data: { readonly sessionID: Session.ID; readonly title: string }
+        }
+      | {
+          readonly id: Event.ID
+          readonly created: number
+          readonly metadata?: { readonly [x: string]: unknown } | undefined
+          readonly type: "session.bookmark.changed"
+          readonly durable: { readonly aggregateID: string; readonly seq: Event.Seq; readonly version: Event.Version }
+          readonly location?:
+            | { readonly directory: AbsolutePath; readonly workspaceID?: Workspace.ID | undefined }
+            | undefined
+          readonly data: { readonly sessionID: Session.ID; readonly bookmarked: boolean }
         }
       | {
           readonly id: Event.ID
@@ -2060,6 +2073,7 @@ export type EventSubscribeInput = {
         | "session.model.selected"
         | "session.moved"
         | "session.renamed"
+        | "session.bookmark.changed"
         | "session.metadata.updated"
         | "session.permissions"
         | "session.viewed"

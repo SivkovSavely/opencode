@@ -612,6 +612,7 @@ export function make(options: ClientOptions) {
               directory: input?.["directory"],
               project: input?.["project"],
               subpath: input?.["subpath"],
+              "experimental.bookmarked": input?.["experimental.bookmarked"],
               cursor: input?.["cursor"],
             },
             successStatus: 200,
@@ -717,6 +718,7 @@ export function make(options: ClientOptions) {
             path: `/api/session/${encodeURIComponent(input.sessionID)}`,
             body: {
               title: input["title"],
+              experimental: input["experimental"],
               metadata: input["metadata"],
               permissions: input["permissions"],
               archived: input["archived"],

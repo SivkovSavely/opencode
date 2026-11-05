@@ -437,6 +437,7 @@ const EndpointSessionList = (raw: RawClient["server.session"]) => (input?: Sessi
         directory: input?.["directory"],
         project: input?.["project"],
         subpath: input?.["subpath"],
+        "experimental.bookmarked": input?.["experimental.bookmarked"],
         cursor: input?.["cursor"],
       },
     }).pipe(Effect.mapError(mapClientError)),
@@ -510,6 +511,7 @@ const EndpointSessionUpdate = (raw: RawClient["server.session"]) => (input: Sess
       params: { sessionID: input["sessionID"] },
       payload: {
         title: input["title"],
+        experimental: input["experimental"],
         metadata: input["metadata"],
         permissions: input["permissions"],
         archived: input["archived"],

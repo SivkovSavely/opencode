@@ -92,6 +92,7 @@ export function update(adapter: Adapter, event: SessionEvent.DurableEvent) {
       "session.viewed": () => Effect.void,
       "session.archived": () => Effect.void,
       "session.unarchived": () => Effect.void,
+      "session.bookmark.changed": () => Effect.void,
       "session.message.content.updated": (event) =>
         updateOwnedAssistant(event.data.messageID, (draft) => {
           draft.content = castDraft(decodeAssistantContent(event.data.content))

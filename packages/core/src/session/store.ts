@@ -21,6 +21,7 @@ const ListInputBase = {
   order: Schema.Literals(["asc", "desc"]).pipe(Schema.optional),
   parentID: Schema.NullOr(Session.ID).pipe(Schema.optional),
   archived: Schema.Boolean.pipe(Schema.optional),
+  experimental: Session.ListFilter.fields.experimental,
   anchor: Session.ListAnchor.pipe(Schema.optional),
 }
 
@@ -159,6 +160,8 @@ const layer = Layer.effect(
           )
         if (input.archived !== undefined)
           conditions.push(input.archived ? isNotNull(SessionTable.time_archived) : isNull(SessionTable.time_archived))
+        if (input.experimental?.bookmarked !== undefined)
+          conditions.push(eq(SessionTable.bookmarked, input.experimental.bookmarked))
         if (input.anchor) {
           conditions.push(
             order === "asc"

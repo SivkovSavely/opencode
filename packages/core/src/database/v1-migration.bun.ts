@@ -137,6 +137,7 @@ const NEXT_PROJECT_COLUMNS = {
 } satisfies NextColumns<NextProject>
 
 type NextSession = {
+  readonly bookmarked: number | null
   readonly id: string
   readonly project_id: string
   readonly workspace_id: string | null
@@ -172,6 +173,7 @@ type NextSession = {
 }
 
 const NEXT_SESSION_COLUMNS = {
+  bookmarked: "nullable",
   id: "required",
   project_id: "required",
   workspace_id: "nullable",
@@ -582,6 +584,9 @@ export function run(
           )
           .pipe(Effect.orDie)
       const legacyTotal = (yield* db.get<{ value: number }>(sql`SELECT COUNT(*) AS value FROM session`))?.value ?? 0
+      const bookmarkColumn = yield* db.get<{ name: string }>(
+        sql`SELECT name FROM pragma_table_info('session') WHERE name = 'bookmarked'`,
+      )
       const cursor = state?.phase === "sessions" ? state.cursor : undefined
       const migrated =
         cursor !== undefined
@@ -613,14 +618,19 @@ export function run(
           path: string | null
           time_updated: number
           imported: number
+          parent_id: string | null
+          bookmarked: number
         }>(sql`
-          SELECT id, project_id, workspace_id, directory, path, time_updated,
+          SELECT id, project_id, workspace_id, directory, path, time_updated, parent_id,
+            ${bookmarkColumn ? sql`bookmarked` : sql`0`} AS bookmarked,
             EXISTS (SELECT 1 FROM session_v2 WHERE session_v2.id = session.id) AS imported
           FROM session
           ${cursorValue === undefined ? sql`` : sql`WHERE id < ${cursorValue}`}
           ORDER BY id DESC LIMIT 1
         `)
         if (!nextID) break
+        if (nextID.parent_id && nextID.bookmarked)
+          yield* Effect.logWarning("Preserved invalid bookmarked V1 child session", { sessionID: nextID.id })
         const projectID = projects.has(nextID.project_id) ? nextID.project_id : Project.ID.global
         // Legacy ACP sessions can store a cwd relative to an unknown process directory.
         // Use the project worktree instead, and leave the original V1 row intact.
@@ -682,13 +692,13 @@ export function run(
                     id, project_id, workspace_id, parent_id, slug, directory, path, title, version, share_url,
                     summary_additions, summary_deletions, summary_files, summary_diffs, metadata, cost,
                     tokens_input, tokens_output, tokens_reasoning, tokens_cache_read, tokens_cache_write,
-                    revert, permission, agent, model, time_created, time_updated, time_compacting, time_archived
+                    revert, permission, agent, model, time_created, time_updated, time_compacting, time_archived, bookmarked
                   )
                   SELECT
                     id, ${owner?.project.id ?? projectID}, workspace_id, parent_id, slug, ${directory}, ${owner?.path ?? nextID.path}, title, version, share_url,
                     summary_additions, summary_deletions, summary_files, summary_diffs, metadata, cost,
                     tokens_input, tokens_output, tokens_reasoning, tokens_cache_read, tokens_cache_write,
-                    revert, NULL, agent, model, time_created, time_updated, time_compacting, time_archived
+                    revert, NULL, agent, model, time_created, time_updated, time_compacting, time_archived, ${bookmarkColumn ? sql`bookmarked` : sql`0`}
                   FROM session
                   WHERE id = ${nextID.id}
                 `)
@@ -856,6 +866,8 @@ function importNextDatabase(
       )
       const sessions = selectNextRows<NextSession>(source, "session", NEXT_SESSION_COLUMNS)
       for (const [index, session] of sessions.entries()) {
+        if (session.parent_id && session.bookmarked)
+          yield* Effect.logWarning("Preserved invalid bookmarked previous V2 child session", { sessionID: session.id })
         const project = projects.get(session.project_id)
         const projectID = project ? session.project_id : Project.ID.global
         if (!project) {
@@ -896,7 +908,7 @@ function importNextDatabase(
                   path, title, version, share_url, summary_additions, summary_deletions, summary_files,
                   summary_diffs, metadata, cost, tokens_input, tokens_output, tokens_reasoning, tokens_cache_read,
                   tokens_cache_write, revert, permission, agent, model, time_created, time_updated, time_compacting,
-                  time_archived, time_suspended
+                  time_archived, time_suspended, bookmarked
                 ) VALUES (
                   ${session.id}, ${projectID}, ${session.workspace_id}, ${session.parent_id},
                   ${session.fork_session_id}, ${session.fork_boundary}, ${session.slug}, ${session.directory},
@@ -906,7 +918,7 @@ function importNextDatabase(
                   ${session.tokens_output}, ${session.tokens_reasoning}, ${session.tokens_cache_read},
                   ${session.tokens_cache_write}, ${session.revert}, ${session.permission}, ${session.agent},
                   ${session.model}, ${session.time_created}, ${session.time_updated}, ${session.time_compacting},
-                  ${session.time_archived}, ${session.time_suspended}
+                  ${session.time_archived}, ${session.time_suspended}, ${session.bookmarked ?? 0}
                 )
               `)
               yield* Effect.forEach(messages, (message) =>

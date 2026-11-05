@@ -679,6 +679,15 @@ const layer = Layer.effectDiscard(
         .run()
         .pipe(Effect.orDie),
     )
+    yield* bus.project(SessionEvent.BookmarkChanged, (event) =>
+      db
+        .update(SessionTable)
+        // Organization is not activity; explicitly bypass the column's onUpdate clock.
+        .set({ bookmarked: event.data.bookmarked, time_updated: sql`${SessionTable.time_updated}` })
+        .where(eq(SessionTable.id, event.data.sessionID))
+        .run()
+        .pipe(Effect.orDie),
+    )
     yield* bus.project(SessionEvent.MetadataUpdated, (event) =>
       db
         .update(SessionTable)

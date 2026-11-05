@@ -1,6 +1,11 @@
 import { DESKTOP_NATIVE_ENGLISH } from "./desktop-native"
 
 export const dict = {
+  "home.bookmarks": "Bookmarks",
+  "home.bookmarks.empty": "No bookmarked sessions",
+  "home.bookmarks.empty.description": "Bookmark a session from its menu to find it here.",
+  "command.session.bookmark.add": "Bookmark session",
+  "command.session.bookmark.remove": "Remove bookmark",
   "experiment.voiceCalls": "Voice calls",
   "voice.call": "Call",
   "voice.mute": "Mute",

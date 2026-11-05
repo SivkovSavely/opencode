@@ -423,8 +423,11 @@ describe("Session.create", () => {
 
       yield* session.prompt({ sessionID: created.id, text: "Fork context", resume: false })
       yield* SessionInbox.promote(db, bus, created.id, "steer")
+      yield* session.setBookmarked({ sessionID: created.id, bookmarked: true })
       const forked = yield* session.fork({ sessionID: created.id })
       expect(forked.metadata).toEqual(metadata)
+      expect(forked.experimental?.bookmarked).toBe(false)
+      expect((yield* session.get(created.id)).experimental?.bookmarked).toBe(true)
 
       // Absent stays absent: no empty-object normalization.
       expect((yield* session.create({ location })).metadata).toBeUndefined()

@@ -41,9 +41,10 @@ export function createHomeSessionsController(home: HomeController) {
   const language = useLanguage()
   const platform = usePlatform()
   const queryClient = useQueryClient()
+  const bookmarks = () => !!home.selection.value().bookmarks
 
   const projectDirectories = createMemo(() => {
-    const selected = home.selection.value().directory
+    const selected = bookmarks() ? undefined : home.selection.value().directory
 
     if (!selected) return
     const project = home.project.selected()
@@ -56,7 +57,7 @@ export function createHomeSessionsController(home: HomeController) {
     const conn = home.server.focused()
 
     return {
-      ...homeSessionsQuery(conn, ctx),
+      ...homeSessionsQuery(conn, ctx, bookmarks()),
       enabled: !!ctx && ctx.sdk.connection.status() === "connected",
     }
   })
@@ -67,13 +68,18 @@ export function createHomeSessionsController(home: HomeController) {
 
     if (!ctx || !conn) return []
 
-    return retainHomeSessions(
-      ctx.data.session.apply(
-        mergeHomeSessionIndex(sessionLoad.isPending ? [] : (sessionLoad.data?.() ?? []), ctx.data.session.list()),
-      ),
-      HOME_SESSION_LIMIT,
-      Date.now(),
+    const fetched = sessionLoad.isPending ? [] : (sessionLoad.data?.() ?? [])
+    const known = ctx.data.session.list()
+    const sessions = ctx.data.session.apply(
+      bookmarks()
+        ? [...new Map([...fetched, ...known].map((session) => [session.id, session])).values()]
+        : mergeHomeSessionIndex(fetched, known),
     )
+    if (bookmarks())
+      return sessions.filter(
+        (session) => session.experimental?.bookmarked && !session.parentID && session.time.archived === undefined,
+      )
+    return retainHomeSessions(sessions, HOME_SESSION_LIMIT, Date.now())
   })
 
   const allRecords = createMemo(() =>
@@ -85,7 +91,7 @@ export function createHomeSessionsController(home: HomeController) {
     }),
   )
 
-  const records = createMemo(() => allRecords().slice(0, HOME_SESSION_LIMIT))
+  const records = createMemo(() => (bookmarks() ? allRecords() : allRecords().slice(0, HOME_SESSION_LIMIT)))
   const groups = createMemo(() => groupSessions(records(), language))
   const prefetched = new Set<string>()
 
@@ -291,6 +297,15 @@ export function createHomeSessionsController(home: HomeController) {
     )
   }
 
+  function eligible(session: SessionInfo) {
+    const current = home.server.focusedContext()?.data.session.apply([session])[0]
+    return (
+      !!current &&
+      !current.time.archived &&
+      (!bookmarks() || (!current.parentID && !!current.experimental?.bookmarked))
+    )
+  }
+
   return {
     copy: {
       language,
@@ -298,6 +313,7 @@ export function createHomeSessionsController(home: HomeController) {
     data: {
       records,
       groups,
+      bookmarks,
       loading: () => sessionLoad.isPending,
       searchRecords: allRecords,
     },
@@ -309,16 +325,17 @@ export function createHomeSessionsController(home: HomeController) {
       sync: syncLocations,
     },
     session: {
+      eligible,
       showProjectName: () => !home.project.selected(),
       server: () => home.selection.value().server,
-      canCreate: () => !!home.project.newSession(),
+      canCreate: () => !bookmarks() && !!home.project.newSession(),
       lookup: async (sessionID: string) => {
         const ctx = home.server.focusedContext()
 
         if (!ctx) return
         const result = await ctx.sdk.api.session.get({ sessionID })
 
-        if (result.time.archived) return
+        if (ctx !== home.server.focusedContext() || !eligible(result)) return
 
         return buildHomeSessionRecords({
           sessions: () => [result],

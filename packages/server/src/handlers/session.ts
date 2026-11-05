@@ -68,7 +68,13 @@ export const SessionHandler = HttpApiBuilder.group(Api, "server.session", (handl
         "session.list",
         Effect.fn(function* (ctx) {
           return yield* session
-            .list(ctx.query)
+            .list({
+              ...ctx.query,
+              experimental:
+                ctx.query["experimental.bookmarked"] === undefined
+                  ? undefined
+                  : { bookmarked: ctx.query["experimental.bookmarked"] },
+            })
             .pipe(
               Effect.catchTag(
                 "Session.InvalidListCursorError",
@@ -235,6 +241,17 @@ export const SessionHandler = HttpApiBuilder.group(Api, "server.session", (handl
         "session.update",
         Effect.fn(function* (ctx) {
           const info = yield* requireSession(ctx.params.sessionID)
+          if (ctx.payload.experimental?.bookmarked && info.parentID)
+            return yield* new InvalidRequestError({ message: "Only root sessions can be bookmarked" })
+          if (ctx.payload.experimental?.bookmarked !== undefined)
+            yield* session
+              .setBookmarked({ sessionID: ctx.params.sessionID, bookmarked: ctx.payload.experimental.bookmarked })
+              .pipe(
+                Effect.catchTag("Session.NotFoundError", missingSession),
+                Effect.catchTag("Session.BookmarkChildError", () =>
+                  Effect.fail(new InvalidRequestError({ message: "Only root sessions can be bookmarked" })),
+                ),
+              )
           if (ctx.payload.title !== undefined) {
             if (ctx.payload.title) {
               yield* session

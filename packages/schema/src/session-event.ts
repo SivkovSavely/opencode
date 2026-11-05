@@ -99,6 +99,13 @@ export const Renamed = Event.durable({
 })
 export type Renamed = typeof Renamed.Type
 
+export const BookmarkChanged = Event.durable({
+  type: "session.bookmark.changed",
+  ...options,
+  schema: { ...Base, bookmarked: Schema.Boolean },
+})
+export type BookmarkChanged = typeof BookmarkChanged.Type
+
 export const MetadataUpdated = Event.durable({
   type: "session.metadata.updated",
   ...options,
@@ -657,6 +664,7 @@ export const Definitions = Event.inventory(
   ModelSelected,
   Moved,
   Renamed,
+  BookmarkChanged,
   MetadataUpdated,
   Permissions,
   Viewed,

@@ -77,6 +77,8 @@ export function createHomeProjectsController(home: HomeController) {
       value: home.selection.value,
     },
     server: {
+      bookmarks: (conn: ServerConnection.Any) =>
+        home.selection.set({ server: ServerConnection.key(conn), bookmarks: true }),
       list: home.server.list,
       health: home.server.health,
       label: home.server.label,

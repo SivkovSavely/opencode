@@ -678,6 +678,13 @@ function MessageTimelineView(
                         <Menu.Item onSelect={() => void props.action.export(id)}>
                           {language.t("common.export")}…
                         </Menu.Item>
+                        <Menu.Item onSelect={() => command.trigger("session.bookmark")}>
+                          {language.t(
+                            data.session.get(id)?.experimental?.bookmarked
+                              ? "command.session.bookmark.remove"
+                              : "command.session.bookmark.add",
+                          )}
+                        </Menu.Item>
                         <Menu.Separator />
                         <Menu.Item onSelect={() => props.action.showDelete(id)}>
                           {language.t("common.delete")}…

@@ -56,6 +56,7 @@ function isBackgroundOpen(event: MouseEvent) {
 }
 
 export type HomeSessionsViewProps = {
+  bookmarks?: boolean
   language: ReturnType<typeof useLanguage>
   groups: HomeSessionGroup[]
   loading: boolean
@@ -125,7 +126,7 @@ export function HomeSessionsView(props: HomeSessionsViewProps) {
     <section
       ref={props.onSetHoverTarget}
       class="min-h-0 min-w-0 flex-1 flex flex-col"
-      aria-label={props.language.t("sidebar.project.recentSessions")}
+      aria-label={props.language.t(props.bookmarks ? "home.bookmarks" : "sidebar.project.recentSessions")}
     >
       <div
         class="sticky top-0 z-30 shrink-0 bg-v2-background-bg-base pb-1 pt-6 md:pb-3 lg:pt-12"
@@ -177,6 +178,7 @@ export function HomeSessionsView(props: HomeSessionsViewProps) {
             when={props.groups.length > 0}
             fallback={
               <HomeSessionsEmpty
+                bookmarks={props.bookmarks}
                 onNewSession={props.canCreateSession ? props.onCreateSession : undefined}
                 language={props.language}
               />
@@ -478,6 +480,9 @@ function HomeSessionSearchResultRow(
     >
       <HomeSessionIndicators server={props.server} isOpenTab={props.isOpenTab} record={props.record} />
       <div data-slot="home-session-labels" class="flex min-w-0 flex-1 items-center gap-1.5">
+        <Show when={props.record.session.experimental?.bookmarked}>
+          <Icon name="bookmark" size="small" aria-label={props.language.t("home.bookmarks")} />
+        </Show>
         <HomeSessionTitle title={title()} showProjectName={!!showProjectName()} search />
         <Show when={showProjectName()}>
           <HomeSessionProjectName name={props.record.projectName} trailing={props.desktop} search />
@@ -755,6 +760,9 @@ function HomeSessionRow(
             class="min-w-0 flex-1 items-center gap-1.5"
             classList={{ flex: props.desktop, contents: !props.desktop }}
           >
+            <Show when={props.record.session.experimental?.bookmarked}>
+              <Icon name="bookmark" size="small" aria-label={props.language.t("home.bookmarks")} />
+            </Show>
             <HomeSessionTitle title={title()} showProjectName={!!showProjectName()} />
             <Show when={showProjectName()}>
               <HomeSessionProjectName name={props.record.projectName} trailing={props.desktop} />
@@ -913,7 +921,11 @@ function HomeSessionProjectName(props: { name: string; search?: boolean; trailin
   )
 }
 
-function HomeSessionsEmpty(props: { onNewSession?: () => void; language: ReturnType<typeof useLanguage> }) {
+function HomeSessionsEmpty(props: {
+  bookmarks?: boolean
+  onNewSession?: () => void
+  language: ReturnType<typeof useLanguage>
+}) {
   return (
     <div class="flex min-h-full flex-col items-center gap-4 px-6 pt-[52px] text-center">
       <div
@@ -922,7 +934,7 @@ function HomeSessionsEmpty(props: { onNewSession?: () => void; language: ReturnT
           text-v2-text-text-base [font-weight:530]
         `}
       >
-        {props.language.t("home.sessions.empty")}
+        {props.language.t(props.bookmarks ? "home.bookmarks.empty" : "home.sessions.empty")}
       </div>
       <p
         class={`
@@ -930,7 +942,7 @@ function HomeSessionsEmpty(props: { onNewSession?: () => void; language: ReturnT
           text-v2-text-text-muted [font-weight:440]
         `}
       >
-        {props.language.t("home.sessions.empty.description")}
+        {props.language.t(props.bookmarks ? "home.bookmarks.empty.description" : "home.sessions.empty.description")}
       </p>
       <Show when={props.onNewSession}>
         {(onNewSession) => (

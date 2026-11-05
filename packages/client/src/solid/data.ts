@@ -354,6 +354,7 @@ export function createData(config: CreateDataInput) {
   const messageIndex = new Map<string, Map<string, number>>()
   const stored = (message: SessionMessageInfo) => (config.omitToolFileData ? omitMessageFileData(message) : message)
   const sync = createSync()
+  const sessionReads = new Set<() => (sessions: readonly SessionInfo[]) => void>()
   let activeUpdates: Map<string, DataSessionStatus | undefined> | undefined
   const pendingUpdates = new Map<string, Map<string, SessionInboxInfo | SessionInbox.Delivery | undefined>>()
 
@@ -853,6 +854,13 @@ export function createData(config: CreateDataInput) {
       case "session.permissions":
         if (store.session.info[event.data.sessionID])
           setStore("session", "info", event.data.sessionID, "permissions", event.data.permissions)
+        return
+      case "session.bookmark.changed":
+        if (store.session.info[event.data.sessionID])
+          setStore("session", "info", event.data.sessionID, "experimental", (current) => ({
+            ...current,
+            bookmarked: event.data.bookmarked,
+          }))
         return
       case "session.metadata.updated":
         // The event carries the whole record, so keys it drops must go too.
@@ -1536,6 +1544,13 @@ export function createData(config: CreateDataInput) {
     on: config.event.on,
     listen: config.event.listen,
     session: {
+      // Observe actual server reads, not local remember() calls or deduplicated sync requests.
+      onRead(start: () => (sessions: readonly SessionInfo[]) => void) {
+        sessionReads.add(start)
+        return () => {
+          sessionReads.delete(start)
+        }
+      },
       list() {
         return sessions()
       },
@@ -1823,6 +1838,7 @@ export function createData(config: CreateDataInput) {
       sync(sessionID: string, options?: { children?: boolean }) {
         return sync.run(options?.children ? `session.family:${sessionID}` : `session:${sessionID}`, async () => {
           const started = deletionEpoch
+          const complete = [...sessionReads].map((start) => start())
           const [info, children] = await Promise.all([
             api().session.get({ sessionID }).catch(evictMissing),
             options?.children ? listChildren({ parentID: sessionID, order: "desc", limit: CHILD_PAGE }) : [],
@@ -1841,6 +1857,7 @@ export function createData(config: CreateDataInput) {
               sync.complete(`session:${session.id}`)
               registerSession(session.id)
             }
+            complete.forEach((commit) => commit(sessions))
           })
         })
       },

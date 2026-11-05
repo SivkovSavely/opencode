@@ -113,7 +113,8 @@ export const SessionsQuery = Schema.Struct({
   limit: Schema.NumberFromString.pipe(Schema.decodeTo(PositiveInt), Schema.optional).annotate({
     description: "Maximum number of sessions to return. Defaults to the newest 50 sessions.",
   }),
-  ...Session.ListFilter.fields,
+  ...Struct.omit(Session.ListFilter.fields, ["experimental"]),
+  "experimental.bookmarked": BooleanFromString.pipe(Schema.optional),
   cursor: Session.ListCursor.pipe(Schema.optional),
 }).annotate({ identifier: "SessionsQuery" })
 
@@ -302,6 +303,7 @@ export const makeSessionGroup = <I extends HttpApiMiddleware.AnyId, S, FormI ext
         params: { sessionID: Session.ID },
         payload: Schema.Struct({
           title: Schema.String.pipe(Schema.optional),
+          experimental: Schema.Struct({ bookmarked: Schema.Boolean.pipe(Schema.optional) }).pipe(Schema.optional),
           metadata: Session.Metadata.pipe(Schema.optional),
           permissions: Permission.Ruleset.pipe(Schema.optional),
           archived: Schema.Boolean.pipe(Schema.optional).annotate({
@@ -310,7 +312,7 @@ export const makeSessionGroup = <I extends HttpApiMiddleware.AnyId, S, FormI ext
           }),
         }),
         success: HttpApiSchema.NoContent,
-        error: [SessionNotFoundError, LocationNotFoundError],
+        error: [SessionNotFoundError, LocationNotFoundError, InvalidRequestError],
       }).annotateMerge(
         OpenApi.annotations({
           identifier: "session.update",
