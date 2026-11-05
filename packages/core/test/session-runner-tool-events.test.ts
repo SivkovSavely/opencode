@@ -22,6 +22,7 @@ import { AbsolutePath, RelativePath } from "@opencode/core/schema"
 import { Snapshot } from "@opencode/core/snapshot"
 import { createLLMEventPublisher } from "@opencode/core/session/runner/publish-llm-event"
 import { SessionUsage } from "@opencode/core/session/usage"
+import { SessionHistory } from "@opencode/core/session/history"
 import { LayerNode } from "@opencode/util/effect/layer-node"
 import { it, testEffect } from "./lib/effect"
 import { TestClock } from "effect/testing"
@@ -85,32 +86,77 @@ const hostedResult = LLMEvent.toolResult({
   },
 })
 
-test("local tool success serializes media base64 once through canonical content", async () => {
-  const { published, publisher } = capture()
-  await Effect.runPromise(publisher.publish(call))
-  await Effect.runPromise(
-    publisher.toolExecution(call.id, call.name, {
-      output: { type: "media", mime: "image/png" },
+test.each(["image/png", "application/pdf"])(
+  "local tool success serializes %s base64 once through canonical content",
+  async (mime) => {
+    const { published, publisher } = capture()
+    await Effect.runPromise(publisher.publish(call))
+    await Effect.runPromise(
+      publisher.toolExecution(call.id, call.name, {
+        output: {
+          type: "file",
+          uri: "file:///pixel.png",
+          name: "pixel.png",
+          encoding: "base64",
+          content: base64,
+          mime,
+        },
+        content: [
+          { type: "text", text: "Image read successfully" },
+          { type: "file", uri: `data:${mime};base64,${base64}`, mime, name: "pixel.png" },
+        ],
+      }),
+    )
+
+    const success = published.find((event) => event.type === "session.tool.success.2")
+    expect(success).toBeDefined()
+    const serialized = JSON.stringify(success)
+    expect(serialized.split(base64)).toHaveLength(2)
+    expect(success?.data).toHaveProperty("metadata.__opencode_raw_tool_details.structured", {
+      type: "file",
+      name: "pixel.png",
+      mime,
+    })
+    expect(success?.data).not.toHaveProperty("result")
+    expect(success?.data).not.toHaveProperty("output")
+
+    expect(success?.data).toMatchObject({
       content: [
         { type: "text", text: "Image read successfully" },
-        { type: "file", uri: `data:image/png;base64,${base64}`, mime: "image/png", name: "pixel.png" },
+        { type: "file", uri: `data:${mime};base64,${base64}`, mime },
       ],
-    }),
-  )
+      metadata: {
+        __opencode_raw_tool_details: { hasStructured: true, structured: { type: "file", name: "pixel.png", mime } },
+      },
+    })
+  },
+)
 
-  const success = published.find((event) => event.type === "session.tool.success.2")
-  expect(success).toBeDefined()
-  const serialized = JSON.stringify(success)
-  expect(serialized.split(base64)).toHaveLength(2)
-  expect(success?.data).not.toHaveProperty("result")
-  expect(success?.data).not.toHaveProperty("output")
-
-  expect(success?.data).toMatchObject({
-    content: [
-      { type: "text", text: "Image read successfully" },
-      { type: "file", uri: `data:image/png;base64,${base64}`, mime: "image/png" },
-    ],
-  })
+test("retains original non-record arguments in progress and terminal events before normalization", async () => {
+  for (const input of [null, false, 0, "", "original", [false, null, { nested: true }]]) {
+    for (const failure of [false, true]) {
+      const { published, publisher } = capture()
+      await Effect.runPromise(publisher.publish(LLMEvent.toolCall({ ...call, input })))
+      await Effect.runPromise(publisher.progress(call.id, { phase: "running" }))
+      if (failure)
+        await Effect.runPromise(
+          publisher.publish(LLMEvent.toolError({ id: call.id, name: call.name, message: "Denied" })),
+        )
+      if (!failure)
+        await Effect.runPromise(
+          publisher.toolExecution(call.id, call.name, { output: false, content: [{ type: "text", text: "done" }] }),
+        )
+      expect(published.find((event) => event.type === "session.tool.input.ended.1")?.data).toMatchObject({
+        text: JSON.stringify(input),
+      })
+      expect(published.find((event) => event.type === "session.tool.progress")?.data).toMatchObject({
+        metadata: { __opencode_raw_tool_details: { input } },
+      })
+      expect(
+        published.find((event) => event.type === (failure ? "session.tool.failed.2" : "session.tool.success.2"))?.data,
+      ).toMatchObject({ metadata: { __opencode_raw_tool_details: { input } } })
+    }
+  }
 })
 
 test("provider-executed success derives content and retains provider result state", async () => {
@@ -134,14 +180,127 @@ test("provider-executed success derives content and retains provider result stat
       { type: "file", uri: `data:image/png;base64,${base64}`, mime: "image/png" },
     ],
     native: { result: { type: "content" } },
+    metadata: {
+      __opencode_raw_tool_details: {
+        providerExecuted: true,
+        hasResult: true,
+        result: {
+          type: "content",
+          value: [
+            { type: "text", text: "Image read successfully" },
+            { type: "file", mime: "image/png", name: "pixel.png" },
+          ],
+        },
+      },
+    },
   })
+  expect(JSON.stringify(success).split(base64)).toHaveLength(2)
 })
 
-testEffect(
+test("retains falsey structured results, text-file output and arbitrary JSON alongside existing local metadata", async () => {
+  for (const output of [
+    null,
+    false,
+    "",
+    0,
+    { type: "file", uri: "file:///text", encoding: "utf8", content: "  retain\n", mime: "text/plain" },
+    { uri: "synthetic-secret", content: "not a recognized file" },
+  ]) {
+    const { published, publisher } = capture()
+    await Effect.runPromise(publisher.publish(call))
+    await Effect.runPromise(
+      publisher.toolExecution(call.id, call.name, {
+        output,
+        content: [{ type: "text", text: "  original output\n" }],
+        metadata: { title: "Native", __opencode_raw_tool_details: { input: null, outputPaths: ["/not/read"] } },
+      }),
+    )
+    expect(published.find((event) => event.type === "session.tool.success.2")?.data).toMatchObject({
+      metadata: {
+        title: "Native",
+        __opencode_raw_tool_details: {
+          input: null,
+          outputPaths: ["/not/read"],
+          hasStructured: true,
+          structured: output,
+        },
+      },
+    })
+  }
+})
+
+const persisted = testEffect(
   AppNodeBuilder.build(LayerNode.group([Database.node, Bus.node, SessionProjector.node]), [
     Bus.node.replace(Bus.configured({ persist: true })),
   ]),
-).effect("commits a hosted tool result when cancellation races with the aggregate lock", () =>
+)
+
+persisted.effect("keeps original arguments through called, progress, terminal projection and serialized reload", () =>
+  Effect.gen(function* () {
+    const database = yield* Database.Service
+    const bus = yield* Bus.Service
+    yield* database.db
+      .insert(ProjectTable)
+      .values({ id: Project.ID.global, worktree: AbsolutePath.make("/project"), sandboxes: [] })
+      .run()
+    yield* database.db
+      .insert(SessionTable)
+      .values({
+        id: sessionID,
+        project_id: Project.ID.global,
+        slug: "arguments",
+        directory: "/project",
+        version: "test",
+      })
+      .run()
+    for (const input of [null, false, 0, "", "original", [null, false], { original: { nested: true } }]) {
+      for (const failure of [false, true]) {
+        const assistantMessageID = SessionMessage.ID.create()
+        const publisher = createLLMEventPublisher(bus, {
+          sessionID,
+          assistantMessageID,
+          agent: Agent.defaultID,
+          model: { id: Model.ID.make("test-model"), providerID: Provider.ID.opencode },
+          providerMetadataKey: "openai",
+          started: 0,
+        })
+        yield* publisher.publish(LLMEvent.toolInputStart({ id: call.id, name: call.name }))
+        yield* publisher.publish(LLMEvent.toolInputDelta({ id: call.id, name: call.name, text: JSON.stringify(input) }))
+        yield* publisher.publish(LLMEvent.toolInputEnd({ id: call.id, name: call.name }))
+        yield* publisher.publish(LLMEvent.toolCall({ ...call, input }))
+        const running = yield* database.db
+          .select()
+          .from(SessionMessageTable)
+          .where(eq(SessionMessageTable.id, assistantMessageID))
+          .get()
+        const expected =
+          input !== null && typeof input === "object" && !Array.isArray(input)
+            ? { input }
+            : { metadata: { __opencode_raw_tool_details: { input } } }
+        expect(running?.data).toMatchObject({ content: [{ state: { status: "running", ...expected } }] })
+        yield* publisher.progress(call.id, { phase: "running" })
+        if (failure) yield* publisher.publish(LLMEvent.toolError({ id: call.id, name: call.name, message: "Denied" }))
+        if (!failure)
+          yield* publisher.toolExecution(call.id, call.name, {
+            output: false,
+            content: [{ type: "text", text: "done" }],
+          })
+        const row = yield* database.db
+          .select()
+          .from(SessionMessageTable)
+          .where(eq(SessionMessageTable.id, assistantMessageID))
+          .get()
+        if (!row) return yield* Effect.die(new Error("missing projected assistant"))
+        const reloaded = SessionHistory.decodeMessageRowSync(JSON.parse(JSON.stringify(row)))
+        expect(reloaded).toMatchObject({
+          content: [{ id: call.id, name: call.name, state: { status: failure ? "error" : "completed", ...expected } }],
+        })
+      }
+    }
+  }),
+)
+
+persisted.effect("commits a hosted tool result when cancellation races with the aggregate lock", () =>
   Effect.gen(function* () {
     const database = yield* Database.Service
     const bus = yield* Bus.Service

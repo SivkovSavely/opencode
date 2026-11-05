@@ -4,24 +4,24 @@
 
 - Active checkout: `/home/savochek/ExternalProjects/opencode-v2.2.5`, branch `personal-v2.2.5`.
 - Released V2 base: `9bbb8ce18c80f099e0e448775f59d965ead40a21` (`v2.2.5`). No tracking of upstream `dev` during this port.
-- Audited V1 HEAD: `2931c950db2ac2c499ab10bf509239d1c6c69963`. V1 sources are read-only Git objects. Individual historical feature commits remain mapped in the archive's `commit-coverage.csv` and `source-delta-coverage.csv`.
+- Current V1 behavioral reference: `ae5dc5b5c106f841532446beb60e6bae6114f6c5` (`personal-v1.18.29`), verified on continuation. The original archive pin remains `2931c950db2ac2c499ab10bf509239d1c6c69963`; its four successors must also be assessed. V1 sources are read-only Git objects. Historical feature commits remain mapped in the archive's `commit-coverage.csv` and `source-delta-coverage.csv`.
 - Reference archive: `OpenCode-V2-Migration-Kickoff-2026-11-04.tar.gz`, SHA256 `a62745a12f378e77c0f8b33f1a714baebd8b2ccf5eaeb03c1109104b083b79ba`. Extracted reference files are read-only, outside this checkout.
-- `source-only` means selected production/test source was inspected, not that acceptance passed. `partial` is not parity. No feature is yet `verified` or `native-verified`.
+- `source-only` means selected production/test source was inspected, not that acceptance passed. `partial` is not parity. B11 verifies the supported F004/F005 baseline with the scoped execution evidence and clean final review below; this is not production cutover certification or universal provider/browser coverage.
 - Normalized acceptance IDs use `F026/A02`, including source spellings such as `A-02` and `AC-02`. Only the assertions listed below have execution evidence. All other acceptance candidates remain **NOT RUN**, not implicitly passed.
 - All runtime checks use disposable HOME/XDG/database fixtures. No installed binary replacement, user database migration, live service restart, model account, real WorkQueue, managed namespace, production Serve, push, rebase, merge or deployment has been performed.
 
 ## All-feature inventory
 
-Every row refers to the audited V1 HEAD above. `-` means no port commit, not native equivalence. Batch IDs resolve in the batch log below.
+Current V1 behavior is authoritative unless a specification identifies an intentional defect or the owner authorizes a change. Historical batch evidence retains its original source pin. `-` means no port commit, not native equivalence. Batch IDs resolve in the batch log below. Ordinary architecture and compatibility choices are implementation work, not owner blockers.
 
 | Spec | Status         | V2 port | Remaining contract / next dependency                                                                                                  |
 | ---- | -------------- | ------- | ------------------------------------------------------------------------------------------------------------------------------------- |
 | F001 | source-only    | -       | Durable bookmarks absent from inspected paths; session projection, API and Home collection needed.                                    |
 | F002 | source-only    | -       | Local transcript/title search is not a global persisted transcript index; indexing and exact-target integration needed.               |
 | F003 | source-only    | -       | Native search/hash navigation does not establish the chronological prompt-history picker.                                             |
-| F004 | source-only    | -       | Native tool disclosures do not establish complete retained raw request/response or reversible formatting.                             |
-| F005 | needs-decision | -       | Native relative time differs from second-precision creation/start clocks; presentation decision and tests needed.                     |
-| F006 | needs-decision | -       | Native first-admission-wins retries conflict with V1 changed-payload conflicts. Preserve native repository contract pending decision. |
+| F004 | verified       | B11     | Native raw request/response, retention and reversible JSON/XML formatting complete; scoped baseline evidence and diagnostics below.    |
+| F005 | verified       | B11     | Native message/grouped-tool clocks and raw-detail integration complete; locale, reload and ownership evidence below.                   |
+| F006 | planned        | -       | Implement V1-compatible admission/conflict behavior at the appropriate boundary while preserving native core invariants.             |
 | F007 | source-only    | -       | Web queue acknowledgment/draft ownership, stable identity/reorder and revision races depend on F006.                                  |
 | F008 | source-only    | -       | Full-screen queue manager, key consumption and owning-session destination need TUI validation.                                        |
 | F009 | source-only    | -       | Native recovery claims are not fenced external-effect ownership or uncertain-tool/child recovery parity.                              |
@@ -32,26 +32,37 @@ Every row refers to the audited V1 HEAD above. `-` means no port commit, not nat
 | F014 | partial        | B08     | Callback-state isolation fixed; replacement/commit ownership and account-scope decisions remain unverified.                            |
 | F015 | source-only    | -       | Worktree backend exists; external discovery, request capture and actual execution isolation need assertions.                          |
 | F016 | source-only    | -       | Deep child navigation, unavailable child model handling and explicit Default depend on F009/F036.                                     |
-| F017 | needs-decision | -       | Choose globally shared explicit project ordering versus native client-local visibility. Never copy V1 malformed-storage data loss.    |
+| F017 | planned        | -       | Preserve globally shared explicit project ordering; fix the documented malformed-storage data-loss defect.                           |
 | F018 | partial        | B07     | Persisted native Enter/newline preference implemented; real IME, interface switching and remaining command matrix unverified.         |
 | F019 | partial        | B09     | Native production destination recovery and remembered-kind assertions pass; loading/cache/session-retarget matrix remains open.      |
-| F020 | needs-decision | -       | V1 protocol support decision separate from isolated reconnect/draft/generation validation.                                            |
-| F021 | needs-decision | -       | Native raw/operation-ID API CLI is not an offline nested catalog; choose command shape before generation changes.                     |
+| F020 | planned        | -       | Preserve V1 protocol compatibility and native V2 operation; validate reconnect, draft and generation isolation.                        |
+| F021 | planned        | -       | Add the V1-compatible offline nested API catalog without removing native raw/operation-ID commands.                                  |
 | F022 | partial        | B03     | Native pre-patch input-size/churn guard implemented; opt-in diagnostics and explicit UI skip semantics remain unimplemented.          |
 | F023 | partial        | B05     | Linux x64 build/artifact staging implemented; running-ELF upgrade, fullstack and SDK cleanup matrices remain unverified.              |
-| F024 | needs-decision | -       | Permanent retirement is not Stop/Archive/Delete; managed threat model and ancestry barriers unresolved.                               |
-| F025 | needs-decision | -       | Opt-in Linux containment, durable start permits and independently confirmed descendant cleanup require security design.               |
+| F024 | planned        | -       | Implement permanent retirement, ancestry barriers and opt-in lifecycle policy using native V2 execution, independent of F027.        |
+| F025 | planned        | -       | Implement opt-in Linux containment, durable start permits and fail-closed descendant cleanup with disposable fixtures.                |
 | F026 | partial        | B01/B04 | Read-only V2 admission and encoded-event refusal implemented; historical-stage/FK/graph/upgrade matrix incomplete.                    |
-| F027 | needs-decision | -       | Managed model leases/provenance and capability gating are not native execution recovery claims.                                       |
-| F028 | needs-decision | -       | Requires trusted operator-pinned WorkQueue identity, directory binding and durable post-dispatch uncertainty.                         |
-| F029 | needs-decision | -       | Signed historical enrollment/pruning requires owner-provided signing authority; no invented cleanup evidence.                         |
-| F030 | needs-decision | -       | Managed child reservation/authority and same-runner compression depend on F024/F027.                                                  |
-| F031 | needs-decision | -       | Dedicated workspace route/tool/event boundary and independent read-only Git snapshot need security design.                            |
+| F027 | retired-by-owner | -     | Permanently excluded by final owner decision; no managed model leases, ownership accounting or provider restrictions.                |
+| F028 | planned        | -       | Implement pinned WorkQueue identity, directory binding and durable uncertainty with synthetic credentials and fake services.          |
+| F029 | planned        | -       | Implement signed enrollment/pruning with synthetic signing authority; production signing and protected workflows remain forbidden.  |
+| F030 | planned        | -       | Implement managed Task/child authority and same-runner compression using F024 and native V2 execution; no F027 prerequisite.           |
+| F031 | planned        | -       | Implement the dedicated workspace boundary and independent read-only Git snapshot with disposable security fixtures.                 |
 | F032 | partial        | B02     | Native connection/transaction handling and Bun/Node regressions implemented; bounded opt-in diagnostics remain unimplemented.         |
 | F033 | partial        | B06     | Initial shell-progress failure/interruption cleanup fixed; native timeout/TERM assertions pass; broader drain/stream matrix open.     |
 | F034 | partial        | B04     | Encoded-event admission/import refusal implemented; logical decoding, event mapping and replay parity remain unverified.              |
 | F035 | source-only    | -       | Reuse native Schedule; calendar/DST/catch-up/delivery/selection matrix depends on F006/F009/F036.                                     |
 | F036 | partial        | B10     | Native Web literal-control preservation asserted; typed chips, explicit Default, queued execution and TUI persistence remain open.    |
+| F037 | blocked        | -       | Specification definition missing from supplied archives/exports; owner must supply the current document.                             |
+| F038 | blocked        | -       | Specification definition missing from supplied archives/exports; owner must supply the current document.                             |
+| F039 | blocked        | -       | Specification definition missing from supplied archives/exports; owner must supply the current document.                             |
+
+## Owner-directed continuation
+
+The owner requires unattended completion of F001-F039, preserving V1 behavior by default. The previous checkpoint was not task completion. Difficult implementation, architectural differences and native non-equivalence are not reasons to request a decision or stop. Implement independent work while genuine blockers remain, revisit dependent partial batches, and keep runtime validation disposable and fail closed. No production cutover, real credentials/databases, protected historical workflow or remote Git mutation is authorized.
+
+F027 is **retired-by-owner**, permanently, not blocked, incomplete or verified. Its historical specification remains untouched for traceability, but its acceptance cases are excluded from required completion and its identifier must not be reused. F024/F030 and the other managed specifications remain in scope using native V2 model execution; no F027 managed model leases, ownership accounting or provider restrictions will be implemented.
+
+The available November 4 collection was revalidated, and the downloaded ZIP and both chat exports were inspected without loading a full transcript into context. None supplies F037-F039 definitions: the collection explicitly identifies F037 as the next unallocated ID. This missing-document blocker applies only to those three entries; implementation of the available specifications continues. Current V1 is four commits newer than the archive, covering TUI startup/shutdown races, bounded snapshots/session lifecycle and isolated optional custom tools. These changes are read-only references, not permission to modify V1 or invent successor specification IDs.
 
 ## Setup and baseline
 
@@ -363,11 +374,88 @@ Selection capture, active execution and durable persistence remain separate obse
 
 Review pass 1: PASS, no actionable findings; static-only, supplied validations were not rerun, and the documented F036 gaps and baseline E2E type failures remain open. No further review pass is needed. No production code, public Protocol/HttpApi surface, generated client, dependency or benchmark changed. The B07 session-entry benchmark remains blocked with no usable before/after comparison. No session/timeline production change or production-state authorization is implied by these browser fixtures.
 
+## B11: raw tool details and message/tool clocks
+
+Commit: mandatory review pass 2 passed after all six pass-1 findings were fixed and revalidated. Prepared for a new local commit; its exact SHA will be recorded in the next ledger update.
+
+Current V1 reference `ae5dc5b5c106f841532446beb60e6bae6114f6c5` was inspected via read-only Git objects; V1 tests were not run. The native message metadata uses creation clocks and non-streaming tool rows use `ran ?? created`. A tool's completion does not replace its start. Native read and skill aggregates keep their individual names and attach clocks to those identities; file aggregates attach clocks to the existing path row for the owning diff entries. Standalone cards, error cards and shell messages reserve a hover-only trailing column. The native full-date action-menu entry remains intact.
+
+Raw inspection is composed into native BasicTool/error disclosures, grouped context/read/file/skill calls and the independent Task details button. Specialized output, shell/error copy, Task links and hidden Todo/question policy remain intact. Each original grouped call gets its own inspector rather than inspecting a synthesized aggregate. Request/Response mount values only when both the outer disclosure and that inner section are open. The native working assistant body is no longer blanket `aria-hidden`: that previously made live inspection controls inaccessible, while the existing working-footer guards still apply.
+
+Data flow: `core/src/session/runner/publish-llm-event.ts` retains JSON-representable local structured output and hosted provider results in the existing `metadata.__opencode_raw_tool_details` carrier; canonical Tool.Content continues to own file payloads once. Core `message-updater.ts` and client `solid/data.ts` retain incomplete streaming input on failure without overwriting it with normalized `{}`. Native V1 tool migration already preserves the carrier. `session-ui/components/raw-tool-value.ts` selects presence-aware original input/terminal output, sanitizes recognized file descriptors and exposes string output paths without opening them. `raw-tool-details.tsx` renders inert exact text and independent source-bound format choices; `raw-tool-format.ts` validates whole JSON before whitespace-only lexical layout and conservatively formats XML with browser DOM APIs. No public Protocol/HttpApi, generated client, dependency or execution behavior changed.
+
+| Candidates | Actual executed assertion / limit |
+| --- | --- |
+| F004/A01-A06 | PASS unit and browser independent initially collapsed sections, nested original input, exact command/incomplete text, no pending response/format, complete running string eligible for formatting. |
+| F004/A07-A08 | PASS browser live shell completion and generic running-source/result updates with sections open; specialized output/copy and outer disclosure remain available. |
+| F004/A09-A18 | PASS selection units for provider precedence, structured/content combinations, empty/null/false/undefined presence, failure/error/file descriptors, attachment deduplication and string-only output paths. Browser compares loaded/live rich provider values and rejects URI/file fetching. Core publisher/projector tests exercise durable retention and streaming failure composition, including falsey values. |
+| F004/A19-A22 | PASS browser native write/file accordion plus per-call raw read/file/skill/glob entries, WebSearch links, completed Question and unknown plugin tools, hidden Todo/pending/dismissed Question policy. Native edit/patch renderers use the same BasicTool integration; not every specialized renderer has a separate browser fixture. |
+| F004/A23-A27 | PASS browser Task parent details plus child navigation, no-child keyboard operation/no fake link, failed-child navigation, Enter/Space and touch details; existing cleaned error copy leaves disclosure open. |
+| F004/A28-A29 | PASS browser exact inert 500-line markup-looking response, bounded scrollable focusable regions; unit serialization failure returns a fallback signal, rendered through a localized marker. |
+| F004/A30-A33 | PASS browser independent JSON/XML toggles, exact raw restoration, inner-close format retention and changed-source invalidation. |
+| F004/A34-A36 | PASS units malformed/prose/scalar/already-formatted rejection; duplicate keys, large integer/exponent and escaped lexical tokens preserved; 1M input/output and depth-100 budgets reject without partial output. |
+| F004/A37-A41 | PASS Chromium element-only XML/declaration/doctype/comment/PI/xml:space preservation, mixed/whitespace/XHTML/SVG text rejection, authored parsererror validity and malformed collision fixtures. Other browser engines are not certified. |
+| F004/A42 | PASS unit absent XML facilities returns no formatter; parser/serializer exception fallback implemented in the production catch boundary, not fault-injected in a browser. Raw display does not depend on formatting success. |
+| F004/A43-A44 | PASS browser collapsed inspectors contain no raw pre subtrees, labeled Request/Response controls and keyboard-focusable raw regions. English keys only; existing locale fallback is used, not separately exercised for every locale. |
+| F004/A45 | PASS native V1 transform -> serialized reload -> native SessionMessage schema decode for representative synthetic legacy tool identity/input/output/raw metadata. Browser loaded/live equivalent values and durable native failure projection complement it; this is not a production DB/full-import/restart certification. |
+
+| Candidates | Actual executed assertion / limit |
+| --- | --- |
+| F005/A01-A08 | PASS formatter tests: English 19:44:37, midnight, fractional truncation, UTC/New York subprocesses at epoch zero, Arabic digits, missing/nonnumeric/nonfinite/out-of-range inputs. Locale selection is tested in the formatter, not an in-app live locale change. |
+| F005/A09-A13 | PASS browser historical user creation metadata and unchanged user copy, selected later assistant's creation clock, duration and response copy; working footer absent in the live case. |
+| F005/A14 | PASS tool-only running subagent and reasoning-only assistant have no invented text footer. |
+| F005/A15-A19 | PASS browser streaming-to-running-to-failed and live completed transitions plus historical completed/failed start clocks; distinct ran and created, and nonpending created fallback are asserted. |
+| F005/A20-A22 | PASS browser hover/unhover and stable card geometry, individual grouped read/file/skill values, expanded file and raw Request disclosures, and running subagent details/navigation. |
+| F005/A23 | PASS for repeated progress retaining the live start and a synthetic second `session.tool.called` event changing its `created` instant: the displayed start updates and remains after failure. This simulates corrected data; it is not evidence that a production server emits corrections. |
+| F005/A24 | PASS synthetic mock history reload for user creation/tool start and native V1 transform/reload identity/value coverage. No production database or complete historical import was used. |
+
+| Result | Command / evidence |
+| --- | --- |
+| PASS | `packages/session-ui`: `bun test src/components/raw-tool-value.test.ts src/message/timestamp.test.ts --rerun-each 10 --randomize --seed 1104`: 120 executions, 610 assertions, `/tmp/opencode/b11-raw/unit-final.log`. |
+| PASS | `packages/core`: `bun run script/test.ts test/session-runner-tool-events.test.ts test/session-projector.test.ts test/v1-migration.test.ts --rerun-each 10 --randomize --seed 1104`: 1,140 executions, 5,850 assertions, `/tmp/opencode/b11-raw/core-tests-final.log`. Final publisher simplification rerun: 114 tests/585 assertions, `core-tests-last.log`. |
+| PASS | `bun typecheck` from session-ui, app, client and core: 286/1,900/175/1,862 files; `/tmp/opencode/b11-raw/session-ui-typecheck-final.log`, `app-typecheck-final.log`, `client-typecheck.log`, `core-typecheck-final.log`. |
+| PASS | `packages/app`: `bun run test:e2e:built e2e/regression/session-timeline-tool-projection.spec.ts e2e/regression/subagent-child-navigation.spec.ts --project=chromium --workers=2 --retries=0 --repeat-each=2`: 60 passes, `/tmp/opencode/b11-raw/e2e-final.log`. Both complete keepers run against the optimized native frontend, mock API and private browser context; browser cache `/tmp/opencode/playwright-browsers`, owned port 4383. |
+| PASS with warnings | Targeted oxlint of 21 changed/new TS/TSX files: zero errors, 171 warnings (including style/unknown-value boundary rules); `/tmp/opencode/b11-raw/lint-final.log`. Warnings are not claimed unchanged or suppressed. |
+| FAIL, baseline | `packages/app`: `bun run typecheck:e2e` reports the same 13 previously audited diagnostics, none in these changed specs; `/tmp/opencode/b11-raw/e2e-typecheck-final.log`. |
+| PASS | Parent-owned isolated root `bun run check`: all 35 typecheck tasks pass (20 cached), lint/SDK docs pass. The 1,518 warnings/zero errors include 171 additional warnings versus the previous baseline; these warnings are not called unchanged or suppressed. Retained log: `/tmp/opencode/b11-root.qt4JSRjN/check-final.log`. |
+| PASS | Parent integration rerun after removing obsolete read-group overflow measurement: 120 helper/timestamp executions and 610 assertions, then both complete production-channel Chromium keepers, 30 passes, workers 2/retries 0. Logs: `/tmp/opencode/b11-root.qt4JSRjN/unit.log` and `browser.log`. Heavy checks ran serially. |
+
+All runtime commands use `env -i`, private HOME/XDG/TMPDIR under `/tmp/opencode/b11-raw` or `/tmp/opencode/b11-root.qt4JSRjN`, models fetch disabled and telemetry opt-outs. Validation ran serially for heavy suites, without a backend, provider account, user profile or live service restart. Failed intermediate browser runs exposed the native live-body accessibility defect (fixed) and fixture/interaction issues (corrected); final complete repeated run has no retries. The first parent integration check caught two imports made unused by removal of obsolete overflow measurement; they were removed. That failed Turbo invocation also ended with SIGSEGV; its effects and available resources were inspected before the final successful check. No staging or commit has occurred for B11.
+
+### Review pass 1 corrections
+
+The mandatory root reviewer reported six P2 findings without running tests. All six were accepted and fixed in the active checkout, preserving the parent's removal of the always-true read-group helper, obsolete measurement state/observer/effect/imports and unrelated formatting cleanup.
+
+| Finding | Fix and regression evidence |
+| --- | --- |
+| Native PNG/PDF structured output retained bytes/URI twice | `core/src/session/runner/publish-llm-event.ts` descriptor-normalizes the recognized native `ReadTool.FileContent` base64 shape before retention. Canonical content remains the payload owner. Real native output-owner source was inspected; tests use that shape for PNG/PDF, assert the exact retained descriptor and one persisted base64 occurrence, retain hosted content descriptors, and prove text-file/arbitrary JSON output is unchanged. Pre-fix local test failed with three split segments instead of two. |
+| Singleton Skill ignored rawDetails | Registered Skill now composes its existing loaded-skill trigger into native BasicTool and forwards the disclosure props. The keeper exercises loaded singleton success, running request/live completion and failed singleton request/response. Pre-fix browser could not find the disclosure control. |
+| Null/array/scalar arguments changed to normalized wrappers | Publisher captures JSON-representable non-record arguments before Called normalization and retains them in progress/terminal metadata. Implicit calls publish their real argument JSON through Input.Ended. Core and client Called projections retain non-record streamed values; client progress/terminal updates preserve original input without restoring cached response data. Real publisher -> durable projector -> native history row decode after JSON reload covers null, false, zero, empty/nonempty strings, arrays and original objects for success/failure. Browser exercises streamed -> Called -> progress -> success/failure without fabricated raw input metadata. Native executor input validation and protocol schemas are unchanged. Pre-fix publisher test saw empty Input.Ended text instead of `null`. |
+| Expanded read batch overflowed narrow timeline | Read group is a bounded vertical container; summary remains its own full-width header and original-call inspectors stack below. Eight actual read calls at a 540px viewport assert zero group overflow and no out-of-viewport right edge, then inspect the last call. Pre-fix measured overflow was 974px. |
+| Multiple successful no-diff writes lost all clocks | Each original file call without a matching native diff row gets its own reserved hover clock on its raw-entry header; calls with native file rows retain those owning clocks without duplicate fallback clocks. Keeper asserts two empty writes with distinct starts `12:00:01`/`12:00:02` and visible identity-owned hover clocks. Pre-fix clock elements were absent. |
+| Group enumeration raced history rendering | `openTools` now awaits the expected direct trigger count before `.all()`; the two-group policy fixture explicitly supplies count 2. No delay/retried state-changing action was added. This readiness race was not fault-injected or claimed reproduced. |
+
+Red logs: `/tmp/opencode/b11-raw/review1-core-red.log` (27 pass/2 fail) and `review1-browser-red.log` (all three focused cases failed). An intermediate new persistence assertion decoded an incomplete row payload instead of using the native row decoder; the fixture was corrected to `SessionHistory.decodeMessageRowSync`, not weakened to omit reload coverage.
+
+| Result | Post-fix command / evidence |
+| --- | --- |
+| PASS | `packages/core`: `bun run script/test.ts test/session-runner-tool-events.test.ts test/session-projector.test.ts test/v1-migration.test.ts --rerun-each 10 --randomize --seed 1104`: 1,170 executions, 6,580 assertions, `/tmp/opencode/b11-raw/review1-core-final.log`. |
+| PASS | `packages/session-ui`: `bun test src/components/raw-tool-value.test.ts src/message/timestamp.test.ts --rerun-each 10 --randomize --seed 1104`: 120 executions, 610 assertions, `/tmp/opencode/b11-raw/review1-helper-final.log`. |
+| PASS | `packages/app`: both complete tool-projection/subagent keepers with `bun run test:e2e:built ... --project=chromium --workers=2 --retries=0 --repeat-each=2`: 68 passes, `/tmp/opencode/b11-raw/review1-browser-final.log`. Focused four new browser regressions also passed first, `review1-browser-first.log`. |
+| PASS | Source `bun typecheck` from core/session-ui/client/app: 1,862/286/175/1,900 files, `/tmp/opencode/b11-raw/review1-core-typecheck.log`, `review1-session-ui-typecheck.log`, `review1-client-typecheck.log`, `review1-app-typecheck.log`. |
+| FAIL, baseline | `packages/app`: `bun run typecheck:e2e`, the same 13 audited diagnostics and none in changed specs; `/tmp/opencode/b11-raw/review1-e2e-typecheck.log`. |
+| PASS with warnings | Targeted oxlint on 21 changed/new TS/TSX files: zero errors, 181 unsuppressed warnings, `/tmp/opencode/b11-raw/review1-lint-final.log`. This is not an unchanged-warning claim or a canonical root check. |
+| PASS | Parent canonical root `bun run check` after all six corrections: all 35 typecheck tasks pass (none cached), lint/SDK docs pass, 1,528 warnings/zero errors. The 181 additional warnings versus the pre-B11 baseline remain unsuppressed and are not claimed unchanged. Log: `/tmp/opencode/b11-review-check.BNtVrJ0G/check.log`. |
+
+All post-review heavy checks ran serially in private `env -i` environments under `/tmp/opencode/b11-raw` and `/tmp/opencode/b11-review-check.BNtVrJ0G`, with `CI=1`, models fetch disabled and telemetry opt-outs; browser uses only the owned static server/mock API on port 4383 and the existing disposable browser cache. No new dependencies, Protocol/HttpApi changes, generated files, service restarts, real databases/accounts or V1 writes. Mandatory review pass 2: PASS, no actionable findings across all 25 intended paths; read-only review did not rerun validation, and no further pass is needed. Session-entry benchmark comparison remains blocked at its pre-change baseline; no timing comparison is claimed. Build emitted existing Vite/CSS optimizer warnings.
+
+Bounded diagnostics: the known streaming-failure overwrite and explicit-null precedence bugs are fixed rather than copied. Pending complete JSON retains the V1/native value-level contract, not a provider-wire recorder; lexical preservation is guaranteed by the optional formatter only for its retained source string. Formatting choices are ephemeral and may reset on outer unmount/virtualization or transition to a different native renderer. JSON formatting is budgeted; XML/object serialization and production-scale expansion still need performance diagnostics. Chromium XML examples do not establish universal browser diagnostics/DTD semantics. Inspection sanitizes recognized file blocks only, not arbitrary secrets. Complete production import/restart, every provider/third-party renderer, production cutover and unavailable F037-F039 definitions remain outside this evidence. These diagnostics do not leave a known required baseline feature unimplemented.
+
 ## Next work and nonproduction migration plan
 
-1. B02-B10 are reviewed local batches, not completed specifications. Continue F036 with selected-control materialization and queue/execution assertions, keeping prompt admission, active selection and durable persistence separate. Explicit Default and TUI persistence still need their own contract decisions and tests. Resolve F014's native account/commit ownership semantics before changing concurrent authorization policy. F018/F019's remaining matrices, F022 diagnostics/UI, F032 diagnostics and the broader F033 lifecycle/output matrix remain open.
-2. Continue independent specifications without inventing F034's blocked event mapping or managed security authority. Keep source fixture bytes/checksums and schema/journal provenance. Read-only admission and a successful build are not migration authorization.
-3. Build disposable synthetic/copied-and-redacted V1 fixtures for selected historical stages. Verify bookmarks, event payload decoding, retained history/relationships/order and V2 projections independently. Refuse unsupported shapes; never modify the source copy.
-4. Exercise the feasible P0/P1 dependency graph with synthetic providers, loopback servers and fake clocks. No account-backed quota testing or real WorkQueue dispatch.
-5. Resolve native-contract/product decisions and the managed security threat model before exposing new authority. Native overlap and source-only audits cannot close these gates.
-6. Only after those results, propose a separate owner-approved deployment/migration rehearsal. This run has no production authorization.
+1. Commit reviewed B11, then implement complete F001 durable, server-scoped bookmarks and the Home collection. Revisit all dependent partial batches rather than stopping at another progress checkpoint.
+2. Complete remaining available specifications using current V1 behavior and native V2 abstractions. Resolve ordinary compatibility, OAuth ownership, explicit Default, event mapping and persistence choices autonomously, with meaningful acceptance tests. Architectural differences are not owner blockers.
+3. Build disposable synthetic/copied-and-redacted V1 fixtures for historical stages. Verify bookmarks, event payload decoding, retained history/relationships/order and V2 projections independently. Refuse unsupported shapes and never modify the source copy. Read-only admission and a successful build are not production migration authorization.
+4. Implement the managed lifecycle, process, Task, enrollment and workspace contracts with safe opt-in behavior, synthetic signing/credentials and fake WorkQueue services. F027 is permanently retired and is not a dependency. No account-backed quota testing, production authority or real WorkQueue dispatch is authorized.
+5. F037-F039 require their missing definitions; continue independent available work meanwhile. Every other blocker must identify a concrete technical or owner-authorization boundary, not implementation difficulty.
+6. Production cutover, live database migration, real credentials and protected historical workflows remain forbidden. Any deployment rehearsal requires separate owner approval.

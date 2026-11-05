@@ -135,6 +135,58 @@ const transform = (messages: V1Migration.SourceMessage[], parts: V1Migration.Sou
 }
 
 describe("V1Migration.transformSession", () => {
+  test("reloads retained V1 raw details through the native message schema without changing identity or values", () => {
+    const parent = user("msg_000000000007aaaaaaaaaaaaaa")
+    const message = assistant("msg_000000000008aaaaaaaaaaaaaa", parent.id)
+    const raw = {
+      input: null,
+      providerExecuted: true,
+      hasResult: true,
+      result: false,
+      outputPaths: ["/not/read"],
+      attachments: [{ type: "file", mime: "text/plain", filename: "out.txt", url: "file:///not/read" }],
+    }
+    const result = transform(
+      [parent, message],
+      [
+        part("prt_raw", message.id, {
+          type: "tool",
+          callID: "call_original",
+          tool: "read",
+          metadata: { provider: true },
+          state: {
+            status: "completed",
+            input: { filePath: "/original" },
+            output: "  exact\n\toutput  ",
+            title: "Alias",
+            metadata: { __opencode_raw_tool_details: raw },
+            time: { start: 31, end: 32 },
+          },
+        }),
+      ],
+    )
+    const row = result.messages[1]
+    const reloaded = Schema.decodeUnknownSync(SessionMessage.Info)(
+      JSON.parse(JSON.stringify({ id: row.id, type: row.type, ...row.data })),
+    )
+    expect(reloaded).toMatchObject({
+      content: [
+        {
+          type: "tool",
+          id: "call_original",
+          name: "read",
+          native: { provider: true },
+          state: {
+            status: "completed",
+            input: { filePath: "/original" },
+            content: [{ type: "text", text: "  exact\n\toutput  " }],
+            metadata: { __opencode_raw_tool_details: raw },
+          },
+        },
+      ],
+    })
+  })
+
   test("maps ordinary user text, agents, ignored fields, order, and timestamps", () => {
     const message = user("msg_000000000001aaaaaaaaaaaaaa", {
       system: "discard",

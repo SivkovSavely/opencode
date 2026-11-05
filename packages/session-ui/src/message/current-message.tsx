@@ -1,5 +1,6 @@
 import type { SessionMessageAssistant, SessionMessageAssistantTool, SessionMessageUser } from "@opencode/client/promise"
 import { Match, Switch, type ComponentProps } from "solid-js"
+import { useI18n } from "@opencode/ui/context/i18n"
 import type { SessionUserActions, SessionUserAttachmentReference, SessionUserComment } from "../actions"
 import { AssistantReasoningContent, AssistantTextContent, CurrentUserMessageDisplay } from "./message-content"
 import {
@@ -7,6 +8,7 @@ import {
   CurrentFileToolGroup,
   CurrentReadToolGroup,
   ToolDisplay,
+  toolTimestamp,
 } from "../tools/tool-renderer"
 import { currentToolError, currentToolInput, currentToolMetadata, currentToolOutput } from "./current-tool-state"
 import type { UserRun } from "../timeline/user-runs"
@@ -69,6 +71,8 @@ export function SessionAssistantContent(props: {
   onToolOpenChange?: (open: boolean) => void
   onContentRendered?: () => void
 }) {
+  const i18n = useI18n()
+
   return (
     <Switch>
       <Match when={props.content.type === "text" ? props.content : undefined}>
@@ -102,10 +106,12 @@ export function SessionAssistantContent(props: {
           <ToolDisplay
             id={props.contentID}
             tool={tool().name}
+            rawTool={tool()}
             input={currentToolInput(tool())}
             metadata={currentToolMetadata(tool())}
             output={currentToolOutput(tool())}
             status={tool().state.status}
+            timestamp={toolTimestamp(tool(), i18n.locale())}
             error={currentToolError(tool())}
             defaultOpen={props.defaultOpen}
             open={props.toolOpen}

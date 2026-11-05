@@ -869,6 +869,26 @@ describe("SessionProjector", () => {
         error: { type: "tool.execution", message: "failed" },
         executed: true,
       })
+      yield* service.publish(SessionEvent.Tool.Input.Started, {
+        sessionID,
+        assistantMessageID,
+        id: "incomplete",
+        name: "read",
+      })
+      yield* service.publish(SessionEvent.Tool.Input.Ended, {
+        sessionID,
+        assistantMessageID,
+        id: "incomplete",
+        text: '  {"path":"unfinished ',
+      })
+      yield* service.publish(SessionEvent.Tool.Failed, {
+        sessionID,
+        assistantMessageID,
+        id: "incomplete",
+        executed: false,
+        error: { type: "tool.input-incomplete", message: "not executed" },
+        metadata: { __opencode_raw_tool_details: { providerExecuted: true, hasResult: true, result: false } },
+      })
 
       const row = yield* db
         .select()
@@ -880,6 +900,21 @@ describe("SessionProjector", () => {
         content: [
           { id: "succeeded", native: { call: "succeeded", result: "succeeded" }, state: { status: "completed" } },
           { id: "failed", native: { call: "failed" }, state: { status: "error" } },
+          {
+            id: "incomplete",
+            state: {
+              status: "error",
+              input: {},
+              metadata: {
+                __opencode_raw_tool_details: {
+                  input: '  {"path":"unfinished ',
+                  providerExecuted: true,
+                  hasResult: true,
+                  result: false,
+                },
+              },
+            },
+          },
         ],
       })
     }),

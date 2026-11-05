@@ -35,6 +35,7 @@ export interface BasicToolProps {
   icon: IconProps["name"]
   trigger: TriggerTitle | JSX.Element | ((open: Accessor<boolean>) => JSX.Element)
   children?: JSX.Element
+  rawDetails?: () => JSX.Element
   /** Declare known content without constructing lazy JSX to test its presence. */
   hasContent?: boolean
   status?: string
@@ -111,7 +112,8 @@ export function BasicTool(props: BasicToolProps) {
   const open = () => props.open ?? state.open
   const ready = () => state.ready
   const pending = () => props.status === "streaming" || props.status === "running"
-  const hasChildren = () => props.hasContent ?? (props.defer ? "children" in props : props.children)
+  const hasChildren = () =>
+    !!props.rawDetails || (props.hasContent ?? (props.defer ? "children" in props : props.children))
 
   const triggerContent = createMemo(() => {
     const value = props.trigger
@@ -186,7 +188,7 @@ export function BasicTool(props: BasicToolProps) {
   )
 
   const handleOpenChange = (value: boolean) => {
-    if (pending() && !props.allowOpenWhilePending) return
+    if (pending() && !props.allowOpenWhilePending && !props.rawDetails) return
 
     if (props.locked && !value) return
     setOpen(value)
@@ -257,7 +259,14 @@ export function BasicTool(props: BasicToolProps) {
           </Switch>
         </div>
       </div>
-      <Show when={hasChildren() && !props.hideDetails && !props.locked && (!pending() || props.allowOpenWhilePending)}>
+      <Show
+        when={
+          hasChildren() &&
+          !props.hideDetails &&
+          !props.locked &&
+          (!pending() || props.allowOpenWhilePending || props.rawDetails)
+        }
+      >
         <Collapsible.Arrow />
       </Show>
     </div>
@@ -314,12 +323,16 @@ export function BasicTool(props: BasicToolProps) {
           when={props.locked && open() && !props.defer}
           fallback={
             <Collapsible.Content>
-              <Show when={!props.defer || ready()}>{props.children}</Show>
+              <Show when={open() && (!props.defer || ready())}>
+                {props.children}
+                {props.rawDetails?.()}
+              </Show>
             </Collapsible.Content>
           }
         >
           <div data-slot="collapsible-content" data-expanded="">
             {props.children}
+            {props.rawDetails?.()}
           </div>
         </Show>
       </Show>
@@ -350,7 +363,15 @@ function args(input: GenericToolInput | undefined) {
     .slice(0, 3)
 }
 
-export function GenericTool(props: { tool: string; status?: string; hideDetails?: boolean; input?: GenericToolInput }) {
+export function GenericTool(props: {
+  tool: string
+  status?: string
+  hideDetails?: boolean
+  input?: GenericToolInput
+  rawDetails?: () => JSX.Element
+  open?: boolean
+  onOpenChange?: (open: boolean) => void
+}) {
   const i18n = useI18n()
 
   return (
@@ -363,6 +384,10 @@ export function GenericTool(props: { tool: string; status?: string; hideDetails?
         args: args(props.input),
       }}
       hideDetails={props.hideDetails}
+      rawDetails={props.rawDetails}
+      open={props.open}
+      onOpenChange={props.onOpenChange}
+      defer
     />
   )
 }

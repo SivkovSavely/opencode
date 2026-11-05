@@ -5,7 +5,7 @@ import type { Model } from "@opencode/schema/model"
 import type { RelativePath } from "@opencode/schema/schema"
 import type { Snapshot } from "@opencode/schema/snapshot"
 import type { TokenUsage } from "@opencode/schema/token-usage"
-import { Effect, Fiber, Iterable } from "effect"
+import { Effect, Fiber, Iterable, Option, Schema } from "effect"
 import { isReadonlyArrayNonEmpty } from "effect/Array"
 import { Bus } from "../../bus.js"
 import { SessionEvent } from "../event.js"
@@ -81,6 +81,52 @@ const hostedContent = (result: ToolResultValue): NonEmptyContent => {
   return [{ type: "text", text: stringify(result.value) }]
 }
 
+function retainedDetails(value: Record<string, unknown>) {
+  return Option.getOrElse(
+    Option.map(Schema.decodeUnknownOption(Schema.Json)(value), (details) => ({ __opencode_raw_tool_details: details })),
+    () => ({}),
+  )
+}
+
+function retainedResult(result: ToolResultValue) {
+  if (result.type !== "content") return { ...result, value: retainedOutput(result.value) }
+  // Canonical content owns file bytes. Raw inspection retains descriptors, not a second payload.
+  return {
+    ...result,
+    value: result.value.map((item) =>
+      item.type === "file"
+        ? { type: item.type, mime: item.mime, ...(item.name === undefined ? {} : { name: item.name }) }
+        : item,
+    ),
+  }
+}
+
+function retainedOutput(value: unknown) {
+  // Native ReadTool.FileContent media owns a second encoded copy of canonical Tool.Content.
+  // Text-file output and arbitrary structured JSON are not payload-redaction targets.
+  if (
+    !isRecord(value) ||
+    value.type !== "file" ||
+    value.encoding !== "base64" ||
+    typeof value.content !== "string" ||
+    typeof value.uri !== "string" ||
+    typeof value.mime !== "string"
+  )
+    return value
+  return { type: "file", mime: value.mime, ...(typeof value.name === "string" ? { name: value.name } : {}) }
+}
+
+function inspectionMetadata(tool: { readonly originalInput?: unknown }, metadata?: Tool.Metadata) {
+  if (tool.originalInput === undefined) return metadata
+  return {
+    ...metadata,
+    ...retainedDetails({
+      ...(isRecord(metadata?.__opencode_raw_tool_details) ? metadata.__opencode_raw_tool_details : {}),
+      input: tool.originalInput,
+    }),
+  }
+}
+
 /**
  * Persist one step without executing tools or starting a continuation step.
  *
@@ -103,13 +149,16 @@ export const createLLMEventPublisher = (bus: Pick<Bus.Interface, "publish">, inp
     providerExecuted: boolean
     progress?: Tool.Metadata
     input?: InputExcerpt
+    originalInput?: unknown
     malformed?: boolean
   }
   const tools = new Map<string, ToolState>()
-  const failureSnapshot = (tool: { readonly progress?: Tool.Metadata }, metadata?: Tool.Metadata) => {
-    if (tool.progress === undefined) return metadata === undefined ? {} : { metadata }
-    if (metadata === undefined) return { metadata: tool.progress }
-    return { metadata: { ...tool.progress, ...metadata } }
+  const failureSnapshot = (tool: ToolState, metadata?: Tool.Metadata) => {
+    const snapshot = inspectionMetadata(
+      tool,
+      metadata === undefined ? tool.progress : { ...tool.progress, ...metadata },
+    )
+    return snapshot === undefined ? {} : { metadata: snapshot }
   }
   const assistantMessageID = input.assistantMessageID
   let stepStarted = false
@@ -493,7 +542,11 @@ export const createLLMEventPublisher = (bus: Pick<Bus.Interface, "publish">, inp
       case "tool-call": {
         outputStarted = true
         const tool = tools.get(event.id) ?? (yield* startToolInput(event))
-        if (toolInput.has(event.id)) yield* endToolInput(event)
+        tool.originalInput = isRecord(event.input)
+          ? undefined
+          : Option.getOrUndefined(Schema.decodeUnknownOption(Schema.Json)(event.input))
+        if (toolInput.has(event.id))
+          yield* endToolInput(event, tool.originalInput === undefined ? undefined : JSON.stringify(tool.originalInput))
         if (tool.name !== event.name)
           return yield* Effect.die(new Error(`Tool call name changed for ${event.id}: ${tool.name} -> ${event.name}`))
         if (tool.called) return yield* Effect.die(new Error(`Duplicate tool call: ${event.id}`))
@@ -529,7 +582,10 @@ export const createLLMEventPublisher = (bus: Pick<Bus.Interface, "publish">, inp
             assistantMessageID,
             id: event.id,
             error: { type: "tool.execution", message: stringify(event.result.value) },
-            ...failureSnapshot(tool),
+            metadata: inspectionMetadata(tool, {
+              ...tool.progress,
+              ...retainedDetails({ providerExecuted: executed, hasResult: true, result: retainedResult(event.result) }),
+            }),
             executed,
             native: native(event.providerMetadata),
           })
@@ -540,6 +596,14 @@ export const createLLMEventPublisher = (bus: Pick<Bus.Interface, "publish">, inp
           assistantMessageID,
           id: event.id,
           content: hostedContent(event.result),
+          metadata: inspectionMetadata(
+            tool,
+            retainedDetails({
+              providerExecuted: executed,
+              hasResult: true,
+              result: retainedResult(event.result),
+            }),
+          ),
           executed,
           native: native(event.providerMetadata),
         })
@@ -595,12 +659,12 @@ export const createLLMEventPublisher = (bus: Pick<Bus.Interface, "publish">, inp
   const progress = Effect.fnUntraced(function* (id: string, update: Tool.Metadata) {
     const tool = tools.get(id)
     if (!tool?.called || tool.settled) return yield* Effect.die(new Error(`Tool progress outside running call: ${id}`))
-    tool.progress = update
+    tool.progress = inspectionMetadata(tool, update)
     yield* bus.publish(SessionEvent.Tool.Progress, {
       sessionID: input.sessionID,
       assistantMessageID,
       id,
-      metadata: update,
+      metadata: tool.progress!,
     })
   })
 
@@ -619,7 +683,18 @@ export const createLLMEventPublisher = (bus: Pick<Bus.Interface, "publish">, inp
       assistantMessageID,
       id,
       content,
-      ...(result.metadata === undefined ? {} : { metadata: result.metadata }),
+      metadata: inspectionMetadata(tool, {
+        ...result.metadata,
+        ...(result.output === undefined
+          ? {}
+          : retainedDetails({
+              ...(isRecord(result.metadata?.__opencode_raw_tool_details)
+                ? result.metadata.__opencode_raw_tool_details
+                : {}),
+              hasStructured: true,
+              structured: retainedOutput(result.output),
+            })),
+      }),
       executed: tool.providerExecuted,
     })
   })

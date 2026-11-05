@@ -208,11 +208,12 @@
 [data-component="collapsible"].tool-collapsible:hover > [data-slot="basic-tool-action"],
 [data-slot="collapsible-trigger"]:focus-visible + [data-slot="basic-tool-action"],
 [data-slot="basic-tool-action"]:hover,
+[data-slot="basic-tool-action"]:has([aria-expanded="true"]),
 [data-slot="basic-tool-action"]:focus-within {
   opacity: 1;
 }
 
-@media (hover: none) {
+@media (hover: none), (pointer: coarse) {
   [data-slot="basic-tool-action"] {
     opacity: 1;
   }

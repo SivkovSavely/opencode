@@ -4,6 +4,7 @@
 // active UI owners decide what to sync again.
 
 import type {
+  JsonValue,
   AgentInfo,
   CommandInfo,
   ConfigEntry,
@@ -55,6 +56,38 @@ import {
 import { createStore, produce, reconcile } from "solid-js/store"
 import type { SessionInbox } from "@opencode/schema/session-inbox"
 import { batch, createEffect, createMemo, createSignal, onCleanup } from "solid-js"
+
+function streamedToolInput(text: string) {
+  try {
+    const value: JsonValue = JSON.parse(text)
+    return value !== null && typeof value === "object" && !Array.isArray(value) ? undefined : { input: value }
+  } catch {
+    return undefined
+  }
+}
+
+function retainToolInput(
+  state: SessionMessageAssistantTool["state"],
+  metadata: Extract<SessionMessageAssistantTool["state"], { status: "running" }>["metadata"] | undefined,
+) {
+  const previous = state.status === "streaming" ? { input: state.input } : state.metadata?.__opencode_raw_tool_details
+  const raw = metadata?.__opencode_raw_tool_details
+  if (
+    !previous ||
+    typeof previous !== "object" ||
+    Array.isArray(previous) ||
+    !Object.hasOwn(previous, "input") ||
+    (raw && typeof raw === "object" && !Array.isArray(raw) && Object.hasOwn(raw, "input"))
+  )
+    return metadata
+  return {
+    ...metadata,
+    __opencode_raw_tool_details: {
+      ...(raw && typeof raw === "object" && !Array.isArray(raw) ? raw : {}),
+      input: previous.input,
+    },
+  }
+}
 
 export type DataSessionStatus = "idle" | "running"
 /**
@@ -1079,15 +1112,21 @@ export function createData(config: CreateDataInput) {
         return
       case "session.tool.called":
         message.editTool(event.data.sessionID, event.data.assistantMessageID, event.data.id, (tool) => {
+          const raw = tool.state.status === "streaming" ? streamedToolInput(tool.state.input) : undefined
           tool.time.ran = event.created
           tool.executed = event.data.executed
           tool.native = event.data.native
-          tool.state = { status: "running", input: event.data.input, metadata: {} }
+          tool.state = {
+            status: "running",
+            input: event.data.input,
+            metadata: raw === undefined ? {} : { __opencode_raw_tool_details: raw },
+          }
         })
         return
       case "session.tool.progress":
         message.editTool(event.data.sessionID, event.data.assistantMessageID, event.data.id, (tool) => {
-          if (tool.state.status === "running") tool.state.metadata = event.data.metadata
+          if (tool.state.status === "running")
+            tool.state.metadata = retainToolInput(tool.state, event.data.metadata) ?? {}
         })
         return
       case "session.tool.success":
@@ -1096,7 +1135,7 @@ export function createData(config: CreateDataInput) {
           tool.state = {
             status: "completed",
             input: tool.state.input,
-            metadata: event.data.metadata,
+            metadata: retainToolInput(tool.state, event.data.metadata),
             content: config.omitToolFileData ? omitFileData(event.data.content) : [...event.data.content],
           }
           tool.executed = event.data.executed || tool.executed === true
@@ -1111,7 +1150,7 @@ export function createData(config: CreateDataInput) {
             status: "error",
             error: event.data.error,
             input: typeof tool.state.input === "string" ? {} : tool.state.input,
-            metadata: event.data.metadata,
+            metadata: retainToolInput(tool.state, event.data.metadata),
             content:
               config.omitToolFileData && event.data.content ? omitFileData(event.data.content) : event.data.content,
           }

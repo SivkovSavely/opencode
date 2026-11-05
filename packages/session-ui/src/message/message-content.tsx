@@ -51,6 +51,7 @@ import type {
 } from "@opencode/client/promise"
 import type { SessionUserActions, SessionUserAttachmentReference, SessionUserComment } from "../actions"
 import { agentLabel } from "./agent-label"
+import { formatTimestamp } from "./timestamp"
 import { attached, imageAttachmentPlaceholderStyle, typeLabel } from "../components/message-file"
 
 export async function writeClipboard(text: string): Promise<boolean> {
@@ -378,13 +379,10 @@ export function CurrentUserMessageDisplay(props: {
     ]
   })
 
-  const metaLabels = createMemo(() => {
-    if (mobile()) return []
-
-    if (waiting()) return changedLabels()
-
-    return [...agentItems(), ...modelItems(data, props.model)]
-  })
+  const metaLabels = createMemo(() => [
+    ...(mobile() ? [] : waiting() ? changedLabels() : [...agentItems(), ...modelItems(data, props.model)]),
+    ...[formatTimestamp(props.message.time.created, i18n.locale())].flatMap((label) => (label ? [{ label }] : [])),
+  ])
 
   // In a run, only the last message keeps the meta line; the others offer their actions beside the bubble.
   // Bubble corners tighten where two bubbles meet, as in the iOS app's grouped corners.
@@ -1191,9 +1189,11 @@ export function AssistantTextContent(props: {
 
   const meta = createMemo<MetaItem[]>(() => [
     ...(mobile() ? [] : labels()),
-    ...[duration(), interrupted() ? i18n.t("ui.message.interrupted") : ""].flatMap((label) =>
-      label ? [{ label }] : [],
-    ),
+    ...[
+      formatTimestamp(props.message.time.created, i18n.locale()),
+      duration(),
+      interrupted() ? i18n.t("ui.message.interrupted") : "",
+    ].flatMap((label) => (label ? [{ label }] : [])),
   ])
 
   const [copied, setCopied] = createSignal(false)

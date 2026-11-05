@@ -1,4 +1,4 @@
-import { type ComponentProps, createMemo, onMount, Show, splitProps } from "solid-js"
+import { type ComponentProps, createMemo, onMount, Show, splitProps, type JSX } from "solid-js"
 import { createStore } from "solid-js/store"
 import { Card, CardDescription } from "@opencode/ui/card"
 import { Collapsible } from "@opencode/ui/collapsible"
@@ -17,6 +17,7 @@ export interface ToolErrorCardProps extends Omit<ComponentProps<typeof Card>, "c
   subtitle?: string
   href?: string
   onSubtitleClick?: (event: MouseEvent) => void
+  rawDetails?: () => JSX.Element
 }
 
 export function ToolErrorCard(props: ToolErrorCardProps) {
@@ -52,6 +53,7 @@ export function ToolErrorCard(props: ToolErrorCardProps) {
     "subtitle",
     "href",
     "onSubtitleClick",
+    "rawDetails",
   ])
 
   const setOpen = (value: boolean) => {
@@ -185,6 +187,7 @@ export function ToolErrorCard(props: ToolErrorCardProps) {
           </div>
         </Collapsible.Trigger>
         <Collapsible.Content>
+          <Show when={open()}>{split.rawDetails?.()}</Show>
           <div data-slot="tool-error-card-content">
             <Show when={open()}>
               <div data-slot="tool-error-card-copy">{copyButton()}</div>

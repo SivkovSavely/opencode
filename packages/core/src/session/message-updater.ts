@@ -1,7 +1,14 @@
 import { castDraft, produce, type WritableDraft } from "immer"
-import { DateTime, Effect, Match, pipe, Schema } from "effect"
+import { DateTime, Effect, Match, Option, pipe, Schema } from "effect"
 import { SessionEvent } from "./event.js"
 import { SessionMessage } from "./message.js"
+import { isRecord } from "@opencode/util/record"
+
+function originalToolInput(state: SessionMessage.AssistantTool["state"]) {
+  if (state.status !== "streaming") return state.metadata?.__opencode_raw_tool_details
+  const value = Option.getOrUndefined(Schema.decodeUnknownOption(Schema.fromJsonString(Schema.Json))(state.input))
+  return value === undefined || isRecord(value) ? undefined : { input: value }
+}
 
 export interface Adapter {
   readonly getAgent: () => Effect.Effect<SessionMessage.AgentSelected["agent"] | undefined>
@@ -327,6 +334,7 @@ export function update(adapter: Adapter, event: SessionEvent.DurableEvent) {
         return updateOwnedAssistant(event.data.assistantMessageID, (draft) => {
           const match = latestTool(draft, event.data.id)
           if (match) {
+            const raw = originalToolInput(match.state)
             match.executed = event.data.executed
             match.native = event.data.native
             match.time.ran = created
@@ -334,7 +342,7 @@ export function update(adapter: Adapter, event: SessionEvent.DurableEvent) {
               SessionMessage.ToolStateRunning.make({
                 status: "running",
                 input: event.data.input,
-                metadata: {},
+                metadata: raw === undefined ? {} : { __opencode_raw_tool_details: raw },
               }),
             )
           }
@@ -373,7 +381,21 @@ export function update(adapter: Adapter, event: SessionEvent.DurableEvent) {
                 error: event.data.error,
                 input: typeof match.state.input === "string" ? {} : match.state.input,
                 ...(event.data.content === undefined ? {} : { content: event.data.content }),
-                ...(event.data.metadata === undefined ? {} : { metadata: event.data.metadata }),
+                ...(typeof match.state.input === "string"
+                  ? {
+                      metadata: {
+                        ...event.data.metadata,
+                        __opencode_raw_tool_details: {
+                          ...(isRecord(event.data.metadata?.__opencode_raw_tool_details)
+                            ? event.data.metadata.__opencode_raw_tool_details
+                            : {}),
+                          input: match.state.input,
+                        },
+                      },
+                    }
+                  : event.data.metadata === undefined
+                    ? {}
+                    : { metadata: event.data.metadata }),
               }),
             )
           }

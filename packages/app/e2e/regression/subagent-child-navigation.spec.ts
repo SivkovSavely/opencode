@@ -3,7 +3,7 @@ import { timelinePresets } from "@opencode/session-ui/timeline/detail"
 import { expect, test, type Locator, type Page } from "@playwright/test"
 import { expectPath, SERVER, sessionHref } from "../utils/app"
 import { currentSession } from "../utils/mock-server"
-import { assistantMessage, session, sessionID, setupTimeline, textPart, userMessage } from "../utils/timeline"
+import { assistantMessage, session, sessionID, setupTimeline, textPart, toolPart, userMessage } from "../utils/timeline"
 import { expectSessionTitle } from "../utils/waits"
 import { mockWorkspace } from "../utils/workspace"
 
@@ -37,7 +37,19 @@ test.use({ viewport: { width: 1440, height: 900 } })
 
 test("navigates to a subagent child session missing from the session list", async ({ page }) => {
   await setup(page)
-  await openChildFromParent(page)
+  await page.goto(sessionHref(parentID))
+  const tool = page.locator('[data-timeline-part-id="call_subagent_0001"]')
+  await tool.getByRole("button", { name: "Tool details", exact: true }).focus()
+  await page.keyboard.press("Enter")
+  await expect(page).toHaveURL(sessionHref(parentID))
+  await tool.getByRole("button", { name: "Request", exact: true }).click()
+  await expect(tool.getByRole("region", { name: "Request", exact: true })).toContainText(
+    '"prompt": "Inspect the delegated work."',
+  )
+  await tool.getByRole("button", { name: "Response", exact: true }).click()
+  await expect(tool.getByRole("region", { name: "Response", exact: true })).toHaveText("Subagent finished")
+  await tool.getByRole("link").click()
+  await expect(page).toHaveURL(sessionHref(childID))
 
   await expectSessionTitle(page, taskDescription)
   await expect(page.getByRole("heading", { name: parentTitle })).toHaveCount(0)
@@ -110,9 +122,69 @@ test("navigates from a running subagent card and hides background controls in th
   })
   const hint = page.getByRole("button", { name: /move running work to the background/i })
   await expect(hint).toBeVisible()
+  const tool = page.locator('[data-timeline-part-id="call_subagent"]')
+  await tool.hover()
+  await expect(tool.locator('[data-slot="tool-timestamp"]')).toBeVisible()
+  await expect(tool.locator('[data-slot="tool-timestamp"]')).toHaveText(/^\d{2}:\d{2}:\d{2}$/)
+  await expect(page.locator('[data-slot="text-part-copy-wrapper"]')).toHaveCount(0)
+  await tool.getByRole("button", { name: "Tool details", exact: true }).click()
+  await tool.getByRole("button", { name: "Request", exact: true }).click()
+  await expect(tool.getByRole("region", { name: "Request", exact: true })).toContainText(
+    '"description": "Inspect code"',
+  )
+  await tool.hover()
+  await expect(tool.locator('[data-slot="tool-timestamp"]')).toBeVisible()
   await page.locator('[data-component="task-tool-card"]').click()
   await expect(page).toHaveURL(new RegExp(`/session/${runningChildID}$`))
   await expect(hint).toHaveCount(0)
+})
+
+test.describe("touch task inspection", () => {
+  test.use({ hasTouch: true, isMobile: true, viewport: { width: 390, height: 844 } })
+
+  test("opens details without a child link and keeps failed-child navigation independent", async ({ page }) => {
+    await setupTimeline(page, {
+      settings: { timelineDetail: { ...timelinePresets[2].value, subagents: { placement: "separate" } } },
+      sessions: [session(), session({ id: "ses_failed_child", parentID: sessionID, title: "Failed child" })],
+      messages: [
+        userMessage(),
+        assistantMessage([
+          toolPart("prt_task_no_child", "subagent", "completed", {
+            description: "No child fixture",
+            prompt: "Retained prompt",
+          }),
+          toolPart(
+            "prt_task_failed",
+            "subagent",
+            "error",
+            { description: "Failed child fixture", prompt: "Failed prompt" },
+            { error: "Task failed", metadata: { sessionID: "ses_failed_child" } },
+          ),
+        ]),
+      ],
+    })
+    expect(await page.evaluate(() => matchMedia("(hover: none)").matches)).toBe(true)
+    const noChild = page.locator('[data-timeline-part-id="prt_task_no_child"]')
+    await expect(noChild.getByRole("link")).toHaveCount(0)
+    const details = noChild.getByRole("button", { name: "Tool details", exact: true })
+    await expect(details).toBeVisible()
+    await details.tap()
+    await noChild.getByRole("button", { name: "Request", exact: true }).tap()
+    await expect(noChild.getByRole("region", { name: "Request", exact: true })).toContainText("Retained prompt")
+    await details.focus()
+    await page.keyboard.press("Space")
+    await expect(details).toHaveAttribute("aria-expanded", "false")
+    const failed = page.locator('[data-timeline-part-id="prt_task_failed"]')
+    await failed
+      .locator('[data-kind="tool-error-card"] > [data-component="collapsible"] > [data-slot="collapsible-trigger"]')
+      .tap()
+    await failed.getByRole("button", { name: "Request", exact: true }).tap()
+    await expect(failed.getByRole("region", { name: "Request", exact: true })).toContainText("Failed prompt")
+    await failed.getByRole("button", { name: "Response", exact: true }).tap()
+    await expect(failed.getByRole("region", { name: "Response", exact: true })).toContainText("Task failed")
+    await failed.getByRole("link").tap()
+    await expect(page).toHaveURL(sessionHref("ses_failed_child"))
+  })
 })
 
 test("opens a directly linked nested subagent in its root session tab", async ({ page }) => {

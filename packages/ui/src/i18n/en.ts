@@ -1,4 +1,12 @@
 const source = {
+  "ui.tool.rawDetails.request": "Request",
+  "ui.tool.rawDetails.response": "Response",
+  "ui.tool.rawDetails.noResponse": "No response yet",
+  "ui.tool.rawDetails.formatJSON": "Format JSON",
+  "ui.tool.rawDetails.formatXML": "Format XML",
+  "ui.tool.rawDetails.showRaw": "Show raw",
+  "ui.tool.rawDetails.details": "Tool details",
+  "ui.tool.rawDetails.unserializable": "[Unserializable value]",
   "ui.preview.controls": "Preview controls",
   "ui.preview.zoomIn": "Zoom in",
   "ui.preview.zoomOut": "Zoom out",

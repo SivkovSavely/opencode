@@ -13,11 +13,9 @@ import {
   Show,
   Switch,
   Index,
-  on,
   type JSX,
 } from "solid-js"
 import { createStore } from "solid-js/store"
-import { createResizeObserver } from "@solid-primitives/resize-observer"
 import { Effect, Option, Schema } from "effect"
 import { createTwoFilesPatch, diffLines } from "diff"
 import { Dynamic } from "solid-js/web"
@@ -66,6 +64,14 @@ import { AssistantReasoningContent, writeClipboard } from "../message/message-co
 import { stripAnsi } from "./ansi"
 import { followShellOutput } from "./shell-output"
 import { LinkedText } from "../components/linked-text"
+import { formatTimestamp } from "../message/timestamp"
+import { RawToolDetails } from "../components/raw-tool-details"
+
+export function toolTimestamp(tool: SessionMessageAssistantTool, locale: string) {
+  if (tool.state.status === "streaming") return ""
+
+  return formatTimestamp(tool.time.ran ?? tool.time.created, locale)
+}
 
 function ShellSubmessage(props: { text: string; animate?: boolean }) {
   let widthRef: HTMLSpanElement | undefined
@@ -686,6 +692,12 @@ export function CurrentContextToolGroup(props: {
                     const tool = createMemo(() => group()[0]!)
                     const trigger = createMemo(() => currentContextToolTrigger(tool(), i18n))
 
+                    const timestamp = createMemo(() =>
+                      ["glob", "grep", "list"].includes(tool().name) && tool().state.status !== "error"
+                        ? toolTimestamp(tool(), i18n.locale())
+                        : "",
+                    )
+
                     const skills = createMemo(() =>
                       group().flatMap((item) => {
                         const name = currentSkillName(item)
@@ -701,7 +713,7 @@ export function CurrentContextToolGroup(props: {
                     )
 
                     return (
-                      <div data-slot="context-tool-group-item">
+                      <div data-slot="context-tool-group-item" data-timestamped={timestamp() ? "true" : undefined}>
                         <Show
                           when={!currentToolGroupedRead(tool())}
                           fallback={
@@ -727,11 +739,13 @@ export function CurrentContextToolGroup(props: {
                                       <ToolDisplay
                                         id={tool().id}
                                         tool={tool().name}
+                                        rawTool={tool()}
                                         input={currentToolInput(tool())}
                                         metadata={currentToolMetadata(tool())}
                                         output={currentToolOutput(tool())}
                                         error={currentToolError(tool())}
                                         status={tool().state.status}
+                                        timestamp={toolTimestamp(tool(), i18n.locale())}
                                         defaultOpen={props.toolDefaultOpen?.(tool()) ?? false}
                                         open={props.toolOpen?.(tool().id) ?? props.toolDefaultOpen?.(tool())}
                                         onOpenChange={(open) => props.onToolOpenChange?.(tool().id, open)}
@@ -774,11 +788,16 @@ export function CurrentContextToolGroup(props: {
                                       {(name, index) => (
                                         <>
                                           <Show when={index() > 0}>, </Show>
-                                          <TextShimmer
-                                            as="span"
-                                            text={name}
-                                            active={["streaming", "running"].includes(group()[index()]!.state.status)}
-                                          />
+                                          <span data-slot="tool-inline-owner">
+                                            <TextShimmer
+                                              as="span"
+                                              text={name}
+                                              active={["streaming", "running"].includes(group()[index()]!.state.status)}
+                                            />
+                                            <Show when={toolTimestamp(group()[index()]!, i18n.locale())}>
+                                              {(value) => <span data-slot="tool-inline-timestamp">{value()}</span>}
+                                            </Show>
+                                          </span>
                                         </>
                                       )}
                                     </For>
@@ -791,6 +810,7 @@ export function CurrentContextToolGroup(props: {
                                     )}
                                   </Show>
                                 </div>
+                                <RawToolList tools={group()} />
                               </Show>
                             }
                           >
@@ -826,8 +846,10 @@ export function CurrentContextToolGroup(props: {
                                 </div>
                               </div>
                             </div>
+                            <RawToolList tools={group()} />
                           </Show>
                         </Show>
+                        <Show when={timestamp()}>{(value) => <span data-slot="tool-timestamp">{value()}</span>}</Show>
                       </div>
                     )
                   }}
@@ -848,9 +870,8 @@ export function CurrentReadToolGroup(props: {
   onSizeChange?: () => void
 }) {
   const i18n = useI18n()
-  const [state, setState] = createStore({ open: false, truncated: false })
+  const [state, setState] = createStore({ open: false })
   const open = () => props.open ?? state.open
-  const expandable = () => open() || state.truncated
 
   const pending = createMemo(() =>
     props.tools.some((tool) => tool.state.status === "streaming" || tool.state.status === "running"),
@@ -861,22 +882,11 @@ export function CurrentReadToolGroup(props: {
       const input = toolInput(currentToolInput(tool))
       const name = getFilename(input.path ?? "")
 
-      return name ? [{ id: tool.id, name, args: readArgs(input) }] : []
+      return name ? [{ id: tool.id, name, args: readArgs(input), timestamp: toolTimestamp(tool, i18n.locale()) }] : []
     }),
   )
 
-  let list: HTMLSpanElement | undefined
-
-  const measure = () => {
-    if (!list || open()) return
-    setState("truncated", list.scrollWidth > list.clientWidth)
-  }
-
-  createResizeObserver(() => list, measure)
-  createEffect(on(files, measure))
-
   const toggle = () => {
-    if (!expandable()) return
     const next = !open()
     setState("open", next)
     props.onOpenChange?.(next)
@@ -888,17 +898,19 @@ export function CurrentReadToolGroup(props: {
       data-component="read-tool-group"
       data-timeline-part-ids={props.tools.map((tool) => tool.id).join(",")}
       data-expanded={open() ? "true" : undefined}
-      role={expandable() ? "button" : undefined}
-      tabIndex={expandable() ? 0 : undefined}
-      aria-expanded={expandable() ? open() : undefined}
-      onClick={toggle}
-      onKeyDown={(event) => {
-        if (event.key !== "Enter" && event.key !== " ") return
-        event.preventDefault()
-        toggle()
-      }}
     >
-      <div data-component="tool-trigger">
+      <div
+        data-component="tool-trigger"
+        role="button"
+        tabIndex={0}
+        aria-expanded={open()}
+        onClick={toggle}
+        onKeyDown={(event) => {
+          if (event.key !== "Enter" && event.key !== " ") return
+          event.preventDefault()
+          toggle()
+        }}
+      >
         <div data-slot="basic-tool-tool-trigger-content">
           <div data-slot="basic-tool-tool-info">
             <div data-slot="basic-tool-tool-info-structured">
@@ -906,7 +918,7 @@ export function CurrentReadToolGroup(props: {
                 <span data-slot="basic-tool-tool-title">
                   <TextShimmer text={i18n.t("ui.tool.read")} active={pending()} />
                 </span>
-                <span ref={list} data-slot="basic-tool-tool-subtitle">
+                <span data-slot="basic-tool-tool-subtitle">
                   <Index each={files()}>
                     {(file, index) => (
                       <>
@@ -917,6 +929,9 @@ export function CurrentReadToolGroup(props: {
                             {(arg) => <span data-slot="basic-tool-tool-arg">{` ${arg}`}</span>}
                           </For>
                           <Show when={index < files().length - 1}>,</Show>
+                          <Show when={file().timestamp}>
+                            {(value) => <span data-slot="tool-inline-timestamp">{value()}</span>}
+                          </Show>
                         </span>
                       </>
                     )}
@@ -926,12 +941,13 @@ export function CurrentReadToolGroup(props: {
             </div>
           </div>
         </div>
-        <Show when={expandable()}>
-          <span data-slot="read-tool-group-arrow" aria-hidden="true">
-            <Icon name="fill-triangle-down" size="small" />
-          </span>
-        </Show>
+        <span data-slot="read-tool-group-arrow" aria-hidden="true">
+          <Icon name="fill-triangle-down" size="small" />
+        </span>
       </div>
+      <Show when={open()}>
+        <RawToolList tools={props.tools} />
+      </Show>
     </div>
   )
 }
@@ -942,6 +958,8 @@ export function CurrentFileToolGroup(props: {
   onFileOpenChange?: (path: string, open: boolean) => void
   onSizeChange?: () => void
 }) {
+  const i18n = useI18n()
+
   const files = createMemo((previous: { key: string; toolID: string; value: FileDiffInfo }[]) => {
     const next = props.tools.flatMap((tool) => {
       const files = toolMetadata(currentToolMetadata(tool)).files ?? []
@@ -1054,8 +1072,54 @@ export function CurrentFileToolGroup(props: {
         deferContent
         virtualizeDiff={false}
         onContentRendered={props.onSizeChange}
+        fileTimestamps={(path) =>
+          files().flatMap((file) => {
+            if (file.value.file !== path) return []
+            const owner = props.tools.find((tool) => tool.id === file.toolID)
+            const timestamp = owner ? toolTimestamp(owner, i18n.locale()) : ""
+
+            return timestamp ? [timestamp] : []
+          })
+        }
+      />
+      <RawToolList
+        tools={props.tools}
+        timestamp={(tool) =>
+          files().some((file) => file.toolID === tool.id) ? "" : toolTimestamp(tool, i18n.locale())
+        }
       />
     </div>
+  )
+}
+
+function RawToolList(props: {
+  tools: SessionMessageAssistantTool[]
+  timestamp?: (tool: SessionMessageAssistantTool) => string
+}) {
+  const i18n = useI18n()
+  return (
+    <For each={props.tools}>
+      {(tool) => (
+        <div data-component="raw-tool-entry" data-timestamped={props.timestamp?.(tool) ? "true" : undefined}>
+          <BasicTool
+            icon="mcp"
+            status={tool.state.status}
+            defer
+            trigger={{
+              title: toolTitle(tool, i18n),
+              subtitle:
+                toolInput(currentToolInput(tool)).path ??
+                toolInput(currentToolInput(tool)).name ??
+                toolInput(currentToolInput(tool)).pattern,
+            }}
+            rawDetails={() => <RawToolDetails tool={tool} />}
+          />
+          <Show when={props.timestamp?.(tool)}>
+            {(value) => <span data-slot="tool-timestamp">{value()}</span>}
+          </Show>
+        </div>
+      )}
+    </For>
   )
 }
 
@@ -1116,6 +1180,7 @@ function currentContextToolTrigger(tool: SessionMessageAssistantTool, i18n: Retu
 // SAFETY: tool input and metadata are open per-tool records. GenericTool shows arbitrary input keys, and
 // renderers decode the fields they read with `toolInput` and `toolMetadata`.
 export interface ToolProps {
+  rawDetails?: () => JSX.Element
   // oxlint-disable-next-line anti-slop/no-unsafe-dictionary-type -- see SAFETY above
   input: Record<string, unknown>
   error?: string
@@ -1138,6 +1203,7 @@ export interface ToolProps {
   pendingFiles?: readonly string[]
   forceOpen?: boolean
   locked?: boolean
+  fileTimestamps?: (path: string) => string[]
 }
 
 type ToolComponent = Component<ToolProps>
@@ -1341,12 +1407,20 @@ export function ToolDisplay(
   props: ToolProps & {
     id: string
     error?: string
+    timestamp?: string
+    rawTool?: SessionMessageAssistantTool
   },
 ) {
   const data = useData()
   const i18n = useI18n()
 
   if (props.tool === "todowrite") return null
+  const [state, setState] = createStore({ open: props.defaultOpen ?? false })
+  const open = () => props.open ?? state.open
+  const onOpenChange = (value: boolean) => {
+    setState("open", value)
+    props.onOpenChange?.(value)
+  }
   const hideQuestion = () => props.tool === "question" && (props.status === "streaming" || props.status === "running")
 
   const taskId = createMemo(() => {
@@ -1369,7 +1443,11 @@ export function ToolDisplay(
 
   return (
     <Show when={!hideQuestion()}>
-      <div data-component="tool-part-wrapper" data-timeline-part-id={props.id}>
+      <div
+        data-component="tool-part-wrapper"
+        data-timeline-part-id={props.id}
+        data-timestamped={props.timestamp ? "true" : undefined}
+      >
         <Switch>
           <Match when={error()}>
             {(error) => {
@@ -1395,10 +1473,13 @@ export function ToolDisplay(
                       : undefined
                   }
                   defaultOpen={props.defaultOpen}
-                  open={props.open}
-                  onOpenChange={props.onOpenChange}
+                  open={open()}
+                  onOpenChange={onOpenChange}
                   subtitle={taskSubtitle() ?? errorSubtitle()}
                   href={taskHref()}
+                  rawDetails={
+                    props.rawTool && !props.hideDetails ? () => <RawToolDetails tool={props.rawTool!} /> : undefined
+                  }
                   onSubtitleClick={(event) => {
                     if (!data.navigateToSession) return
 
@@ -1414,9 +1495,18 @@ export function ToolDisplay(
             }}
           </Match>
           <Match when={true}>
-            <Dynamic component={render()} {...props} />
+            <Dynamic
+              component={render()}
+              {...props}
+              open={open()}
+              onOpenChange={onOpenChange}
+              rawDetails={
+                props.rawTool && !props.hideDetails ? () => <RawToolDetails tool={props.rawTool!} /> : undefined
+              }
+            />
           </Match>
         </Switch>
+        <Show when={props.timestamp}>{(value) => <span data-slot="tool-timestamp">{value()}</span>}</Show>
       </div>
     </Show>
   )
@@ -1678,7 +1768,7 @@ ToolRegistry.register({
     return (
       <BasicTool
         {...props}
-        hideDetails
+        hideDetails={props.hideDetails}
         icon="window-cursor"
         trigger={
           <div data-slot="basic-tool-tool-info-structured">
@@ -1738,6 +1828,7 @@ ToolRegistry.register({
     const data = useData()
     const i18n = useI18n()
     const delegating = () => props.status === "streaming"
+    const [details, setDetails] = createStore({ open: false })
 
     const input = createMemo(() => toolInput(props.input))
     const metadata = createMemo(() => toolMetadata(props.metadata))
@@ -1828,8 +1919,23 @@ ToolRegistry.register({
             icon="task"
             status={props.status}
             trigger={trigger()}
-            hideDetails
-            triggerAsLink
+            open={details.open}
+            onOpenChange={() => {}}
+            rawDetails={props.rawDetails}
+            defer
+            action={
+              props.rawDetails ? (
+                <IconButton
+                  icon={<Icon name="code-lines" size="small" />}
+                  size="small"
+                  variant="ghost"
+                  aria-label={i18n.t("ui.tool.rawDetails.details")}
+                  aria-expanded={details.open}
+                  onClick={() => setDetails("open", !details.open)}
+                />
+              ) : undefined
+            }
+            triggerAsLink={clickable()}
             triggerHref={href()}
             clickable={clickable()}
             onTriggerClick={navigate}
@@ -1844,6 +1950,15 @@ ToolRegistry.register({
           <SessionProgressIndicatorV2 />
           <span class="min-w-0 truncate">{i18n.t("ui.tool.agent.delegating")}</span>
         </div>
+        <Show when={props.rawDetails}>
+          <BasicTool
+            icon="task"
+            trigger={{ title: i18n.t("ui.tool.rawDetails.details") }}
+            rawDetails={props.rawDetails}
+            status={props.status}
+            defer
+          />
+        </Show>
       </Show>
     )
   },
@@ -2349,7 +2464,11 @@ export function SessionShellMessage(props: {
   })
 
   return (
-    <div data-component="session-shell-message" data-timeline-part-id={props.message.id}>
+    <div
+      data-component="session-shell-message"
+      data-timeline-part-id={props.message.id}
+      data-timestamped={formatTimestamp(props.message.time.created, i18n.locale()) ? "true" : undefined}
+    >
       <Dynamic
         component={render}
         tool="shell"
@@ -2368,6 +2487,9 @@ export function SessionShellMessage(props: {
       />
       <Show when={error()}>
         {(error) => <ToolErrorCard tool="shell" error={error()} subtitle={props.message.command} />}
+      </Show>
+      <Show when={formatTimestamp(props.message.time.created, i18n.locale())}>
+        {(value) => <span data-slot="tool-timestamp">{value()}</span>}
       </Show>
     </div>
   )
@@ -2586,6 +2708,9 @@ ToolRegistry.register({
                           </div>
                         </div>
                         <div data-slot="apply-patch-trigger-actions">
+                          <For each={props.fileTimestamps?.(file().path)}>
+                            {(value) => <span data-slot="tool-inline-timestamp">{value}</span>}
+                          </For>
                           <Switch>
                             <Match when={file().type === "add"}>
                               <span data-slot="apply-patch-change" data-type="added">
@@ -2700,25 +2825,32 @@ ToolRegistry.register({
     const parts = createMemo(() => i18n.t("ui.tool.loadedSkill", { name: marker }).split(marker))
 
     return (
-      <Show when={name()} fallback={<TextShimmer text={i18n.t("ui.tool.skill")} active={running()} />}>
-        {(name) => (
-          <div data-component="tool-loaded-item" aria-label={i18n.t("ui.tool.loadedSkill", { name: name() })}>
-            <span data-slot="tool-loaded-label" aria-hidden="true">
-              {parts()[0].trim()}
-            </span>
-            <span data-slot="tool-loaded-value" aria-hidden="true">
-              <TextShimmer as="span" text={name()} active={running()} />
-            </span>
-            <Show when={parts()[1]?.trim()}>
-              {(suffix) => (
-                <span data-slot="tool-loaded-kind" aria-hidden="true">
-                  {suffix()}
+      <BasicTool
+        {...props}
+        icon="mcp"
+        defer={props.deferContent}
+        trigger={
+          <Show when={name()} fallback={<TextShimmer text={i18n.t("ui.tool.skill")} active={running()} />}>
+            {(name) => (
+              <div data-component="tool-loaded-item" aria-label={i18n.t("ui.tool.loadedSkill", { name: name() })}>
+                <span data-slot="tool-loaded-label" aria-hidden="true">
+                  {parts()[0].trim()}
                 </span>
-              )}
-            </Show>
-          </div>
-        )}
-      </Show>
+                <span data-slot="tool-loaded-value" aria-hidden="true">
+                  <TextShimmer as="span" text={name()} active={running()} />
+                </span>
+                <Show when={parts()[1]?.trim()}>
+                  {(suffix) => (
+                    <span data-slot="tool-loaded-kind" aria-hidden="true">
+                      {suffix()}
+                    </span>
+                  )}
+                </Show>
+              </div>
+            )}
+          </Show>
+        }
+      />
     )
   },
 })

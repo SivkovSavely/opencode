@@ -1,0 +1,27 @@
+[data-component="raw-tool-details"] {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+  padding-top: 8px;
+
+  [data-slot="collapsible-trigger"] {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 13px;
+    line-height: var(--line-height-compact);
+  }
+
+  [data-slot="raw-tool-details-body"] {
+    max-height: 320px;
+    overflow: auto;
+    white-space: pre;
+    user-select: text;
+    font-family: var(--font-family-mono);
+    font-size: 13px;
+    line-height: var(--line-height-base);
+    margin: 4px 0;
+    padding: 8px;
+  }
+}
