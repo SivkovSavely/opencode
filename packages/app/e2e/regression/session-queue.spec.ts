@@ -225,9 +225,35 @@ test("follow-up preference controls Enter while Mod+Enter uses the alternate del
   await view.input.press("Enter")
   await expect(view.rows.getByText("queue this follow-up", { exact: true })).toBeVisible()
 
+  await page.keyboard.press("Control+,")
+  const settings = page.getByTestId("settings-screen")
+  const toggle = settings.getByRole("switch", { name: "Enter adds a new line", exact: true })
+  await expect(toggle).not.toBeChecked()
+  await toggle.press("Space")
+  await expect(toggle).toBeChecked()
+  await settings.getByRole("button", { name: "Back to app", exact: true }).click()
+  await expect(view.input).toBeEditable()
+  await view.input.fill("queue with swapped Enter")
+  await view.input.press("Shift+Enter")
+  await expect(view.rows.getByText("queue with swapped Enter", { exact: true })).toBeVisible()
+
   await view.input.fill("steer this correction")
   await view.input.press("ControlOrMeta+Enter")
-  await expect.poll(() => mock.prompts.map((prompt) => prompt.delivery)).toEqual(["queue", "steer"])
+  await expect.poll(() => mock.prompts.map((prompt) => prompt.delivery)).toEqual(["queue", "queue", "steer"])
+  await view.input.fill("Alt keeps normal delivery")
+  await view.input.press("Alt+Enter")
+  await expect(view.rows.getByText("Alt keeps normal delivery", { exact: true })).toBeVisible()
+  await view.input.fill("Meta keeps alternate delivery")
+  await view.input.press("Meta+Enter")
+  await expect
+    .poll(() => mock.prompts.map((prompt) => ({ text: prompt.text, delivery: prompt.delivery })))
+    .toEqual([
+      { text: "queue this follow-up", delivery: "queue" },
+      { text: "queue with swapped Enter", delivery: "queue" },
+      { text: "steer this correction", delivery: "steer" },
+      { text: "Alt keeps normal delivery", delivery: "queue" },
+      { text: "Meta keeps alternate delivery", delivery: "steer" },
+    ])
   await expect(view.input).toHaveText("")
 })
 

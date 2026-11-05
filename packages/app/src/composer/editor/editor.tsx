@@ -73,6 +73,7 @@ export type ComposerEditorProps = {
   controller: ComposerEditorModel
   disabled?: boolean
   readOnly?: boolean
+  enterNewline?: boolean
   borderUnderlay?: boolean
   class?: string
   modelControl?: JSX.Element
@@ -338,7 +339,19 @@ export function ComposerEditor(props: ComposerEditorProps) {
                   return
                 }
 
-                if (event.key === "Enter" && !event.shiftKey && !event.isComposing) {
+                if (event.key === "Enter" && !event.isComposing) {
+                  const submit = mod || event.altKey ? !event.shiftKey : event.shiftKey === !!props.enterNewline
+
+                  if (!submit) {
+                    if (props.enterNewline && !mod && !event.altKey) {
+                      event.preventDefault()
+                      // Keep Enter undoable without splitting the contenteditable into blocks.
+                      document.execCommand("insertLineBreak")
+                    }
+
+                    return
+                  }
+
                   event.preventDefault()
 
                   if (event.repeat) return

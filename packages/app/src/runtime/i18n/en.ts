@@ -1020,6 +1020,8 @@ export const dict = {
     "Choose whether to queue follow-ups or steer the current turn. Use {{keybind}} to switch.",
   "settings.general.row.followUpBehavior.queue": "Queue",
   "settings.general.row.followUpBehavior.steer": "Steer",
+  "settings.general.row.enterNewline.title": "Enter adds a new line",
+  "settings.general.row.enterNewline.description": "Swap Enter and Shift+Enter so Enter adds a new line",
   "settings.general.row.pinchZoom.title": "Pinch to zoom",
   "settings.general.row.pinchZoom.description": "Allow trackpad pinch and Ctrl-scroll gestures to zoom",
   "settings.general.row.spellcheck.title": "Spellcheck",

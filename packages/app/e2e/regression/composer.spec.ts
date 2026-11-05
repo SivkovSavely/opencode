@@ -5,6 +5,60 @@ import { mockPluginsActivating, type MockServerConfig } from "../utils/mock-serv
 
 test.use({ permissions: ["clipboard-read", "clipboard-write"] })
 
+for (const row of [
+  { name: "default session", enterNewline: false, newline: "Shift+Enter", submit: "Enter" },
+  { name: "saved draft", enterNewline: true, newline: "Enter", submit: "Shift+Enter" },
+]) {
+  test(`Enter/newline preference uses undoable literal line breaks (${row.name})`, async ({ page }) => {
+    const prompts: Parameters<NonNullable<MockServerConfig["onPrompt"]>>[0]["body"][] = []
+
+    const view = await (row.enterNewline ? openDraft : openSession)(page, {
+      name: "EnterNewline",
+      seed: { settings: { general: { enterNewline: row.enterNewline } } },
+      onPrompt: (input) => void prompts.push(input.body),
+    })
+
+    const modifier = await page.evaluate(() => (/Mac/i.test(navigator.platform) ? "Meta" : "Control"))
+    await view.editor.press(row.newline)
+    await expect.poll(() => view.editor.innerText()).toMatch(/^\n+$/)
+    await view.editor.press(`${modifier}+z`)
+    await expect(view.editor).toBeEmpty()
+    await view.editor.fill("beforeafter")
+    await view.editor.dispatchEvent("keydown", { key: "Enter", code: "Enter", isComposing: true, keyCode: 229 })
+    await expect(view.editor).toHaveText("beforeafter")
+
+    for (const _ of "after") await view.editor.press("ArrowLeft")
+
+    await view.editor.press(row.newline)
+    await expect(view.editor).toHaveJSProperty("innerText", "before\nafter")
+    await view.editor.press(`${modifier}+z`)
+    await expect(view.editor).toHaveText("beforeafter")
+    await view.editor.press(row.newline)
+    await expect(view.editor).toHaveJSProperty("innerText", "before\nafter")
+
+    if (!row.enterNewline) await page.keyboard.down("Shift")
+
+    await page.keyboard.down("Enter")
+    await page.keyboard.down("Enter")
+    await page.keyboard.up("Enter")
+
+    if (!row.enterNewline) await page.keyboard.up("Shift")
+
+    await expect(view.editor).toHaveJSProperty("innerText", "before\n\n\nafter")
+    await view.editor.dispatchEvent("keydown", {
+      key: "Enter",
+      code: "Enter",
+      shiftKey: row.enterNewline,
+      repeat: true,
+    })
+    await expect(view.editor).toHaveJSProperty("innerText", "before\n\n\nafter")
+    await view.editor.press(row.submit)
+    await expect.poll(() => prompts.length).toBe(1)
+    expect(prompts[0]?.text).toBe("before\n\n\nafter")
+    await expect(view.editor).toBeEmpty()
+  })
+}
+
 test("mention a session by title, send its stable token, and open its own tab", async ({ page }) => {
   const target = "ses_0123456789abcdefghijklmnop"
   const prompts: Parameters<NonNullable<MockServerConfig["onPrompt"]>>[0]["body"][] = []
@@ -50,7 +104,7 @@ test("a bare @ lists sessions, and a multi-word title matches while file search 
       { id: "ses_0123456789homesessionabcde", title: "HOME" },
       { id: target, title: "OPENCODE CONSOLE" },
     ],
-    seed: { tabs: ["ses_mention_search_source"] },
+    seed: { tabs: ["ses_mention_search_source"], settings: { general: { enterNewline: true } } },
     onPrompt: (input) => void prompts.push(input.body),
   })
 
@@ -73,7 +127,7 @@ test("a bare @ lists sessions, and a multi-word title matches while file search 
   // Prose after a completed mention neither reopens the popover nor lets it take Enter.
   await view.editor.pressSequentially("on code")
   await expect(suggestions).toBeHidden()
-  await view.editor.press("Enter")
+  await view.editor.press("Shift+Enter")
   await expect.poll(() => prompts.length).toBe(1)
   expect(prompts[0]?.text).toBe(`Compare with @session:${target} on code`)
 
@@ -82,7 +136,7 @@ test("a bare @ lists sessions, and a multi-word title matches while file search 
   await expect(suggestions.getByRole("button", { name: /HOME/ })).toBeVisible()
   await view.editor.pressSequentially(" now")
   await expect(suggestions).toBeHidden()
-  await view.editor.press("Enter")
+  await view.editor.press("Shift+Enter")
   await expect.poll(() => prompts.length).toBe(2)
   expect(prompts[1]?.text).toBe("@home now")
 })

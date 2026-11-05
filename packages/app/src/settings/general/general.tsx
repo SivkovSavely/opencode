@@ -284,6 +284,19 @@ export const SettingsGeneral: Component = () => {
 
         <FollowUpBehaviorSetting />
 
+        <SettingsRow
+          title={language.t("settings.general.row.enterNewline.title")}
+          description={language.t("settings.general.row.enterNewline.description")}
+        >
+          <Switch
+            hideLabel
+            checked={settings.general.enterNewline()}
+            onChange={(checked) => settings.general.setEnterNewline(checked)}
+          >
+            {language.t("settings.general.row.enterNewline.title")}
+          </Switch>
+        </SettingsRow>
+
         <Show when={desktop()}>
           <SettingsRow
             title={language.t("settings.general.row.pinchZoom.title")}

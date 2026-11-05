@@ -37,6 +37,12 @@ describe("settings timeline detail migration", () => {
 })
 
 describe("settings schema", () => {
+  test.each([false, true])("retains the stored Enter/newline preference: %s", (enterNewline) => {
+    const settings = decode({ general: { enterNewline } })
+    expect(settings.general).toMatchObject({ enterNewline })
+    expect(decode(encode(settings))).toEqual(settings)
+  })
+
   test("keeps the values plugins copy out once and discards retired preferences", () => {
     const settings = decode({
       general: {
@@ -100,6 +106,7 @@ describe("settings schema", () => {
         newQuestionUI: false,
         mobileTitlebarPosition: "top",
         followUpBehavior: "steer",
+        enterNewline: false,
       },
       appearance: {
         fontSize: 14,
@@ -135,6 +142,7 @@ describe("settings schema", () => {
         releaseNotes: undefined,
         reasoningMode: 3,
         followUpBehavior: "invalid",
+        enterNewline: "invalid",
         backgroundActivity: "invalid",
         timelineWidth: "invalid",
         newQuestionUI: "invalid",
@@ -152,6 +160,7 @@ describe("settings schema", () => {
       autoSave: false,
       timelineDetail: timelinePresets[2].value,
       followUpBehavior: "steer",
+      enterNewline: false,
       backgroundActivity: "left",
       timelineWidth: "comfortable",
       newQuestionUI: false,

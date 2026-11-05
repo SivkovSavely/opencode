@@ -11,6 +11,7 @@ import { DialogSelectModel, ModelSelectorDrawer } from "@/providers/models/selec
 import { DialogSelectModelUnpaid } from "@/providers/models/unpaid"
 import { formatKeybind, useCommand } from "@/shell/commands/command"
 import { useLanguage } from "@/runtime/i18n/language"
+import { useSettings } from "@/settings/model"
 import type { ComposerModel } from "./model"
 import type { ComposerModelLabel } from "./model-label"
 
@@ -24,6 +25,7 @@ export function Composer(props: {
   const dialog = useDialog()
   const command = useCommand()
   const language = useLanguage()
+  const settings = useSettings()
 
   const modelName = () => {
     const preview = props.model.model.preview
@@ -53,6 +55,7 @@ export function Composer(props: {
     <div class="flex flex-col gap-3">
       <ComposerEditor
         controller={props.model}
+        enterNewline={settings.general.enterNewline()}
         borderUnderlay={props.borderUnderlay}
         readOnly={props.readOnly}
         class={props.class}

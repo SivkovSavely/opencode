@@ -96,6 +96,21 @@ test("a settings page survives refresh", async ({ page }) => {
   await expect(page).toHaveURL("/settings?tab=appearance")
 })
 
+test("Enter/newline preference defaults off and persists both switch states across reload", async ({ page }) => {
+  const { settings } = await open(page)
+  const toggle = settings.getByRole("switch", { name: "Enter adds a new line", exact: true })
+  await expect(toggle).not.toBeChecked()
+  await toggle.press("Space")
+  await expect(toggle).toBeChecked()
+  await page.reload()
+  await page.setViewportSize({ width: 390, height: 844 })
+  await expect(toggle).toBeChecked()
+  await toggle.press("Space")
+  await expect(toggle).not.toBeChecked()
+  await page.reload()
+  await expect(toggle).not.toBeChecked()
+})
+
 test("Questions settings default independently of old Permissions settings and survive reload", async ({ page }) => {
   const { settings } = await open(page, {
     seed: {

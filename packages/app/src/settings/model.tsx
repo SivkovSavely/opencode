@@ -137,6 +137,7 @@ const generalSchema = Persistence.struct({
   // Owned by the review plugin, which copies it out once; kept so settings rewrites cannot drop it first.
   mobileDiffWrap: Persistence.optional(Schema.Boolean),
   followUpBehavior: Schema.Literals(["queue", "steer"]),
+  enterNewline: Schema.Boolean,
 })
 
 const appearanceSchema = Persistence.struct({
@@ -308,6 +309,7 @@ export const defaultSettings: Settings = {
     newQuestionUI: false,
     mobileTitlebarPosition: "top",
     followUpBehavior: "steer",
+    enterNewline: false,
   },
   appearance: { fontSize: 14, mono: "", sans: "", terminal: "", tabLayout: "horizontal", reduceMotion: "system" },
   keybinds: {},
@@ -434,6 +436,10 @@ export const { use: useSettings, provider: SettingsProvider } = createSimpleCont
         followUpBehavior: withFallback(() => store.general?.followUpBehavior, defaultSettings.general.followUpBehavior),
         setFollowUpBehavior(value: FollowUpBehavior) {
           setStore("general", "followUpBehavior", value)
+        },
+        enterNewline: withFallback(() => store.general?.enterNewline, defaultSettings.general.enterNewline),
+        setEnterNewline(value: boolean) {
+          setStore("general", "enterNewline", value)
         },
       },
       visibility: {
