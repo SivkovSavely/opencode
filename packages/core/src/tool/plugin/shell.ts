@@ -211,7 +211,10 @@ export const Plugin = {
                     finalTimeout = yield* prepare(invocation, context)
                   }),
               )
-              yield* context.progress({ shellID: info.id })
+              // The job does not own the spawned shell until its initial progress has been published.
+              yield* Effect.suspend(() => context.progress({ shellID: info.id })).pipe(
+                Effect.onError(() => shell.remove(info.id).pipe(Effect.ignore)),
+              )
 
               const settled = yield* Deferred.make<Output>()
               const run = Effect.gen(function* () {

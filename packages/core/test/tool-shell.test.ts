@@ -188,6 +188,15 @@ const mixedOutputCommand = isWindows
   ? "[Console]::Out.Write('stdout'); Start-Sleep -Milliseconds 50; [Console]::Error.Write('stderr'); Start-Sleep -Milliseconds 100"
   : "printf stdout; sleep 0.05; printf stderr >&2"
 const idleCommand = isWindows ? "Start-Sleep -Seconds 60" : "sleep 60"
+const lifecycleCommand = `exec ${JSON.stringify(process.execPath)} -e ${JSON.stringify(
+  [
+    'const fs = require("node:fs")',
+    'process.on("SIGTERM", () => { process.stdout.write("final\\n"); fs.writeFileSync("terminated", ""); process.exit(0) })',
+    'process.stdout.write("ready\\n")',
+    'fs.writeFileSync("ready", "")',
+    "setInterval(() => {}, 60_000)",
+  ].join("; "),
+)}`
 const bodyExitCommand = isWindows
   ? "[Console]::Out.Write('body'); Start-Sleep -Milliseconds 100; exit 7"
   : "printf body && exit 7"
@@ -249,6 +258,22 @@ const withScanner = <A, E, R>(
       }),
     (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]().then(() => undefined)),
   )
+
+const watchCommand = (directory: string) =>
+  Effect.gen(function* () {
+    const ready = yield* Deferred.make<void>()
+    const terminated = yield* Deferred.make<void>()
+    yield* Effect.acquireRelease(
+      Effect.sync(() =>
+        watch(directory, (_event, filename) => {
+          if (filename === "ready") Deferred.doneUnsafe(ready, Exit.void)
+          if (filename === "terminated") Deferred.doneUnsafe(terminated, Exit.void)
+        }),
+      ),
+      (watcher) => Effect.sync(() => watcher.close()),
+    )
+    return { ready, terminated }
+  })
 
 // The timeout catches a hung permission flow, not slowness: PowerShell commands on loaded Windows runners have exceeded 5s.
 const runPermissionCommand = (
@@ -1610,6 +1635,116 @@ describe("ShellTool", () => {
   )
 
   const signalTest = isWindows ? it.live.skip : it.live
+  for (const background of [false, true]) {
+    for (const mode of ["defect", "throw", "interruption"] as const) {
+      signalTest(`cleans up ${background ? "background" : "foreground"} shell after initial progress ${mode}`, () =>
+        Effect.gen(function* () {
+          reset()
+          const tmp = yield* tmpdirScoped()
+          const signals = yield* watchCommand(tmp.path)
+          yield* withSession(tmp.path, (registry) =>
+            Effect.gen(function* () {
+              const shell = yield* Shell.Service
+              const selection = yield* ShellSelect.Service
+              yield* selection.transform((editor) => editor.configure("/bin/sh"))
+              const admitted = yield* Deferred.make<ID>()
+              const failure = new Error("initial shell progress failed")
+              const execution = yield* executeTool(registry, {
+                ...call({ command: lifecycleCommand, timeout: 0, background }),
+                progress: (update) => {
+                  if (typeof update.shellID !== "string") return Effect.die("Expected shell ID")
+                  const id = ID.make(update.shellID)
+                  if (mode === "throw") {
+                    Deferred.doneUnsafe(admitted, Exit.succeed(id))
+                    throw failure
+                  }
+                  return Effect.gen(function* () {
+                    yield* Deferred.succeed(admitted, id)
+                    yield* Deferred.await(signals.ready)
+                    if (mode === "defect") return yield* Effect.die(failure)
+                    yield* Effect.never
+                  })
+                },
+              }).pipe(Effect.forkScoped({ startImmediately: true }))
+
+              yield* Effect.acquireUseRelease(
+                Deferred.await(admitted).pipe(Effect.timeout("5 seconds")),
+                (id) =>
+                  Effect.gen(function* () {
+                    if (mode !== "throw") yield* Deferred.await(signals.ready).pipe(Effect.timeout("5 seconds"))
+                    if (mode === "interruption") yield* Fiber.interrupt(execution)
+                    const exit = yield* Fiber.await(execution)
+                    expect(Exit.isFailure(exit)).toBe(true)
+                    if (Exit.isFailure(exit) && mode !== "interruption") {
+                      expect(
+                        exit.cause.reasons.some((reason) => Cause.isDieReason(reason) && reason.defect === failure),
+                      ).toBe(true)
+                    }
+                    expect((yield* shell.list()).map((info) => info.id)).not.toContain(id)
+                    if (mode !== "throw") yield* Deferred.await(signals.terminated).pipe(Effect.timeout("5 seconds"))
+                    const jobs = yield* Job.Service
+                    expect(yield* jobs.get(id)).toBeUndefined()
+                  }),
+                (id) => shell.remove(id).pipe(Effect.ignore),
+              )
+            }),
+          )
+        }),
+      )
+    }
+  }
+
+  signalTest("times out independently of blocked initial progress and retains TERM-handler output", () =>
+    Effect.gen(function* () {
+      reset()
+      const tmp = yield* tmpdirScoped()
+      const signals = yield* watchCommand(tmp.path)
+      yield* withSession(tmp.path, (registry) =>
+        Effect.gen(function* () {
+          const shell = yield* Shell.Service
+          const selection = yield* ShellSelect.Service
+          yield* selection.transform((editor) => editor.configure("/bin/sh"))
+          const admitted = yield* Deferred.make<ID>()
+          const publishing = yield* Deferred.make<void>()
+          const release = yield* Deferred.make<void>()
+          const execution = yield* executeTool(registry, {
+            ...call({ command: lifecycleCommand, timeout: 0 }),
+            progress: (update) =>
+              Effect.gen(function* () {
+                if (typeof update.shellID !== "string") return yield* Effect.die("Expected shell ID")
+                yield* Deferred.succeed(admitted, ID.make(update.shellID))
+                yield* Deferred.await(signals.ready)
+                yield* Deferred.succeed(publishing, undefined).pipe(
+                  Effect.andThen(Deferred.await(release)),
+                  Effect.uninterruptible,
+                )
+              }),
+          }).pipe(Effect.forkScoped({ startImmediately: true }))
+
+          yield* Effect.acquireUseRelease(
+            Deferred.await(admitted).pipe(Effect.timeout("5 seconds")),
+            (id) =>
+              Effect.gen(function* () {
+                yield* Deferred.await(publishing).pipe(Effect.timeout("5 seconds"))
+                yield* shell.timeout(id, 1)
+                yield* Deferred.await(signals.terminated).pipe(Effect.timeout("5 seconds"))
+                expect((yield* shell.wait(id).pipe(Effect.timeout("5 seconds"))).status).toBe("timeout")
+                yield* Deferred.succeed(release, undefined)
+                const result = yield* Fiber.join(execution)
+                expect(result.status).toBe("completed")
+                expect(result.metadata).toMatchObject({ timeout: true })
+                expect(result.content?.[0]).toMatchObject({
+                  type: "text",
+                  text: expect.stringMatching(/ready\nfinal\n[\s\S]*exceeded timeout/),
+                })
+              }),
+            (id) => Deferred.succeed(release, undefined).pipe(Effect.andThen(shell.remove(id)), Effect.ignore),
+          )
+        }),
+      )
+    }),
+  )
+
   signalTest(
     "escalates a shell timeout when the ready process ignores SIGTERM",
     () =>
