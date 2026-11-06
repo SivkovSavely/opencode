@@ -2126,6 +2126,7 @@ export type EventSubscribeInput = {
         | "permission.replied"
         | "plugin.updated"
         | "project.updated"
+        | "server.projects.updated"
         | "worktree.updated"
         | "worktree.resolved"
         | "command.updated"
@@ -2608,6 +2609,21 @@ export type ExperimentalTranscriptFacetsOperation<E = never> = () => Effect.Effe
   E
 >
 
+export type ExperimentalProjectsListOutput = { readonly projects: ReadonlyArray<string>; readonly revision: number }
+export type ExperimentalProjectsListOperation<E = never> = () => Effect.Effect<ExperimentalProjectsListOutput, E>
+
+export type ExperimentalProjectsUpdateInput = {
+  readonly operation:
+    | { readonly type: "merge"; readonly projects: ReadonlyArray<string> }
+    | { readonly type: "add"; readonly directory: string }
+    | { readonly type: "remove"; readonly directory: string }
+    | { readonly type: "move"; readonly directory: string; readonly toIndex: number }
+}
+export type ExperimentalProjectsUpdateOutput = { readonly projects: ReadonlyArray<string>; readonly revision: number }
+export type ExperimentalProjectsUpdateOperation<E = never> = (
+  input: ExperimentalProjectsUpdateInput,
+) => Effect.Effect<ExperimentalProjectsUpdateOutput, E>
+
 export interface ExperimentalApi<E = never> {
   readonly persistentPty: {
     readonly read: ExperimentalPersistentPtyReadOperation<E>
@@ -2642,6 +2658,10 @@ export interface ExperimentalApi<E = never> {
     readonly status: ExperimentalTranscriptStatusOperation<E>
     readonly backfill: ExperimentalTranscriptBackfillOperation<E>
     readonly facets: ExperimentalTranscriptFacetsOperation<E>
+  }
+  readonly projects: {
+    readonly list: ExperimentalProjectsListOperation<E>
+    readonly update: ExperimentalProjectsUpdateOperation<E>
   }
 }
 

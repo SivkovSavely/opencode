@@ -1,6 +1,8 @@
 import { DESKTOP_NATIVE_ENGLISH } from "./desktop-native"
 
 export const dict = {
+  "sidebar.project.moveUp": "Move up",
+  "sidebar.project.moveDown": "Move down",
   "transcript.title": "Search transcripts",
   "transcript.query": "Search transcript content",
   "transcript.placeholder": "Find words, tool output, or /bounded regex/iu",

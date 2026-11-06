@@ -49,10 +49,9 @@ export function createPromptProjectController(input: { controls: Accessor<Prompt
     const projects = controls.available.filter((project) => !project.server || project.server.key === controls.server)
 
     return (
-      projects.find(
-        (project) =>
-          pathKey(project.worktree) === key || project.sandboxes?.some((sandbox) => pathKey(sandbox) === key),
-      ) ?? projects.find((project) => controls.projectID && project.id === controls.projectID)
+      projects.find((project) => pathKey(project.worktree) === key) ??
+      projects.find((project) => project.sandboxes?.some((sandbox) => pathKey(sandbox) === key)) ??
+      projects.find((project) => controls.projectID && project.id === controls.projectID)
     )
   }
 
@@ -61,7 +60,8 @@ export function createPromptProjectController(input: { controls: Accessor<Prompt
     input
       .controls()
       .available.toSorted(
-        (a, b) => Number(!!b.used) - Number(!!a.used) || (b.time?.active ?? 0) - (a.time?.active ?? 0),
+        (a, b) =>
+          Number(!!b.used) - Number(!!a.used) || (a.used && b.used ? 0 : (b.time?.active ?? 0) - (a.time?.active ?? 0)),
       ),
   )
 

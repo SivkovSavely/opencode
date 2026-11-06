@@ -7,6 +7,51 @@ mock.module("@/runtime/i18n/language", () => ({ useLanguage: () => ({ t: (key: s
 const { createPromptProjectController } = await import("./selector")
 
 describe("new session project selection", () => {
+  test.each([false, true])("exact directory wins over shared sandbox metadata (reversed: %s)", (reversed) => {
+    const metadata = { id: "shared", sandboxes: ["/repo/worktree"], worktrees: [{ directory: "/repo/worktree" }] }
+    const parent = { ...metadata, worktree: "/repo", used: true }
+    const worktree = { ...metadata, worktree: "/repo/worktree", used: true }
+    const selected: string[] = []
+    const controls: PromptProjectControls = {
+      available: reversed ? [worktree, parent] : [parent, worktree],
+      directory: "/repo/worktree/",
+      projectID: "shared",
+      select(directory) {
+        selected.push(directory)
+        controls.directory = directory
+      },
+      add() {},
+    }
+
+    createRoot((dispose) => {
+      const controller = createPromptProjectController({ controls: () => controls })
+      expect(controller.selected()).toBe(worktree)
+      controller.select(parent)
+      expect(selected).toEqual(["/repo"])
+      expect(controls.directory).toBe("/repo")
+      expect(controller.selected()).toBe(parent)
+      dispose()
+    })
+  })
+
+  test.each(["sandbox", "project ID"])("retains the %s fallback without an exact directory", (fallback) => {
+    const byID = { id: "shared", worktree: "/id" }
+    const sandbox = { id: "other", worktree: "/sandbox", sandboxes: ["C:/Repo/worktree/"] }
+    const controls: PromptProjectControls = {
+      available: fallback === "sandbox" ? [byID, sandbox] : [byID],
+      directory: "C:\\Repo\\worktree",
+      projectID: "shared",
+      select() {},
+      add() {},
+    }
+
+    createRoot((dispose) => {
+      const controller = createPromptProjectController({ controls: () => controls })
+      expect(controller.selected()).toBe(fallback === "sandbox" ? sandbox : byID)
+      dispose()
+    })
+  })
+
   test("shows the current project's appearance before its worktree inventory loads", () => {
     const generic = { id: "other", worktree: "/other" }
 
@@ -60,7 +105,7 @@ describe("new session project selection", () => {
     })
   })
 
-  test("lists every server's projects in one list: used first, then the rest, each by recent activity", () => {
+  test("lists added projects in explicit order before discoverable projects by recent activity", () => {
     const local = { key: "sidecar", name: "hailmary", kind: "current" as const }
     const apollo = { key: "http://apollo:4096", name: "apollo", kind: "remote" as const }
     const entry = (id: string, server: typeof local | typeof apollo, active: number, used: boolean) => ({
@@ -89,9 +134,9 @@ describe("new session project selection", () => {
     createRoot((dispose) => {
       const controller = createPromptProjectController({ controls: () => controls })
       expect(controller.projects().map((project) => `${project.server?.name}:${project.id}`)).toEqual([
-        "apollo:opencode",
         "hailmary:local-used",
         "hailmary:opencode",
+        "apollo:opencode",
         "hailmary:local-unused",
         "apollo:apollo-unused",
       ])

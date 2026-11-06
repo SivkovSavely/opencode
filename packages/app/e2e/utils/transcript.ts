@@ -106,7 +106,12 @@ export async function startTranscriptServer() {
   }
 
   try {
-    return { origin: await ready.promise, log: `${root}/server.log`, [Symbol.asyncDispose]: close }
+    return {
+      origin: await ready.promise,
+      directory: `${root}/home`,
+      log: `${root}/server.log`,
+      [Symbol.asyncDispose]: close,
+    }
   } catch (error) {
     await close()
     throw error

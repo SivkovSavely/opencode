@@ -1,13 +1,16 @@
 import { createSimpleContext } from "@opencode/ui/context"
 import { useLanguage } from "@/runtime/i18n/language"
-import { batch, createMemo } from "solid-js"
+import { batch, createMemo, getOwner, runWithOwner } from "solid-js"
 import { reconcile, type SetStoreFunction, type Store } from "solid-js/store"
 import { Persist, persisted } from "@/runtime/persistence/storage"
 import { ServerScope } from "@/runtime/server/scope"
 import type { ServerEntry } from "@opencode/plugin/gui"
 import { ServerHttp, ServerHttpBase, ServerKey, ServerState } from "./persistence"
+import { Schema } from "effect"
+import { usePlatform, type Platform } from "@/runtime/platform/platform"
 
 type StoredState = typeof ServerState.Type
+const ProjectListAcknowledgment = Schema.Struct({ acknowledged: Schema.optional(Schema.Literal(true)) })
 
 export function normalizeServerUrl(input: string) {
   const trimmed = input.trim()
@@ -52,7 +55,29 @@ export function createServerProjects(input: {
   scope: () => ServerScope
   store: Store<StoredState>
   setStore: SetStoreFunction<StoredState>
+  platform?: Platform
 }) {
+  const owner = getOwner()
+  const acknowledgments = new Map<string, ReturnType<typeof persisted<typeof ProjectListAcknowledgment>>>()
+  function acknowledgment(version: number) {
+    const target = Persist.serverGlobal(input.scope(), `project-list-migration.${version}`)
+    const existing = acknowledgments.get(target.key)
+    if (existing) return existing
+    const legacy = (input.store.projectListVersion?.[input.scope()] ?? 0) >= version
+    // Only a valid ACK (including an imported prior ACK) writes this independent key.
+    const state = runWithOwner(owner, () =>
+      persisted(
+        { ...target, sync: true },
+        ProjectListAcknowledgment,
+        { acknowledged: legacy ? true : undefined },
+        input.platform,
+      ),
+    )
+    if (!state) throw new Error("Project-list acknowledgment initialization failed")
+    if (legacy) state[1]({ acknowledged: true })
+    acknowledgments.set(target.key, state)
+    return state
+  }
   const used = () => input.store.usedProjectIDs[input.scope()] ?? []
 
   const use = (projectIDs: string[]) => {
@@ -63,6 +88,28 @@ export function createServerProjects(input: {
   }
 
   return {
+    directories() {
+      return input.store.projects[input.scope()]?.map((project) => project.worktree)
+    },
+    replace(directories: readonly string[]) {
+      input.setStore("projects", input.scope(), reconcile(directories.map((worktree) => ({ worktree }))))
+    },
+    migrated(version: number) {
+      return acknowledgment(version)[0].acknowledged === true
+    },
+    migrationReady(version: number) {
+      return acknowledgment(version)[3]()
+    },
+    markMigrated(version: number) {
+      Array.from({ length: version }, (_, index) => index + 1).forEach((version) => {
+        const state = acknowledgment(version)
+        state[1]({ acknowledged: true })
+      })
+      input.setStore("projectListVersion", (current) => ({
+        ...current,
+        [input.scope()]: Math.max(current?.[input.scope()] ?? 0, version),
+      }))
+    },
     last() {
       return input.store.lastProjectID[input.scope()]
     },
@@ -228,6 +275,7 @@ export const { use: useServers, provider: ServersProvider } = createSimpleContex
   name: "Server",
   gate: true,
   init: (props: { canonicalLocalServer?: ServerConnection.Key; servers?: Array<ServerConnection.Any> }) => {
+    const owner = getOwner()
     const [store, setStore, _, hydrated] = persisted(
       {
         ...Persist.global("server"),
@@ -239,6 +287,7 @@ export const { use: useServers, provider: ServersProvider } = createSimpleContex
     )
 
     const language = useLanguage()
+    const platform = usePlatform()
 
     const allServers = createMemo((): Array<ServerConnection.Any> => {
       return resolveServerList({ stored: store.list, props: props.servers })
@@ -301,7 +350,11 @@ export const { use: useServers, provider: ServersProvider } = createSimpleContex
       const existing = projectStores.get(key)
 
       if (existing) return existing
-      const next = createServerProjects({ scope: () => scope(key), store, setStore })
+      // Cached helpers and their lazy persistence resources outlive disposable server controllers.
+      const next = runWithOwner(owner, () =>
+        createServerProjects({ scope: () => scope(key), store, setStore, platform }),
+      )
+      if (!next) throw new Error("Server project cache initialization failed")
       projectStores.set(key, next)
 
       return next

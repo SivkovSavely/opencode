@@ -69,6 +69,7 @@ export type HomeProjectsViewProps = {
   onRevealProject: (server: ServerConnection.Any, project: LocalProject) => void
   onClearNotifications: (server: ServerConnection.Any, project: LocalProject) => void
   onHideProject: (server: ServerConnection.Any, project: LocalProject) => void
+  onMoveProject?: (server: ServerConnection.Any, project: LocalProject, offset: number) => void
   onOpenSettings: () => void
   onOpenHelp: () => void
 }
@@ -542,27 +543,10 @@ type HomeProjectListProps = HomeProjectsViewProps &
   }
 
 function HomeProjectList(props: HomeProjectListProps) {
-  const [hover, setHover] = createStore({ active: false })
-
-  // The server orders projects by recent activity. While the pointer is over the list, rows keep their places so
-  // nothing moves under the cursor; new projects join at the end and the server order returns on leave.
-  const worktrees = createMemo<string[]>((previous) => {
-    const next = props.items.map((project) => project.worktree)
-
-    if (!hover.active) return next
-    const present = new Set(next)
-    const kept = previous.filter((worktree) => present.has(worktree))
-    const known = new Set(kept)
-
-    return [...kept, ...next.filter((worktree) => !known.has(worktree))]
-  }, [])
+  const worktrees = createMemo(() => props.items.map((project) => project.worktree))
 
   return (
-    <div
-      class="flex min-w-0 flex-col gap-1"
-      onPointerEnter={() => setHover("active", true)}
-      onPointerLeave={() => setHover("active", false)}
-    >
+    <div class="flex min-w-0 flex-col gap-1">
       {/* Keyed on worktree strings: the project objects are recreated on every sync update, so iterating them
           directly would remount every row. */}
       <For each={worktrees()}>{(worktree) => <HomeProjectSlot {...props} worktree={worktree} />}</For>
@@ -705,6 +689,20 @@ function HomeProjectRow(
                 {props.language.t("sidebar.project.clearNotifications")}
               </Menu.Item>
               <Menu.Separator />
+              <Show when={props.onMoveProject}>
+                <Menu.Item
+                  disabled={props.projectsForServer(props.server)[0]?.worktree === props.project.worktree}
+                  onSelect={() => props.onMoveProject?.(props.server, props.project, -1)}
+                >
+                  {props.language.t("sidebar.project.moveUp")}
+                </Menu.Item>
+                <Menu.Item
+                  disabled={props.projectsForServer(props.server).at(-1)?.worktree === props.project.worktree}
+                  onSelect={() => props.onMoveProject?.(props.server, props.project, 1)}
+                >
+                  {props.language.t("sidebar.project.moveDown")}
+                </Menu.Item>
+              </Show>
               <Menu.Item onSelect={() => props.onHideProject(props.server, props.project)}>
                 {props.language.t("common.close")}
               </Menu.Item>

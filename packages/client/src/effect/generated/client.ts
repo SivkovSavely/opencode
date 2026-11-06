@@ -273,6 +273,9 @@ import type {
   ExperimentalTranscriptBackfillInput,
   ExperimentalTranscriptBackfillOutput,
   ExperimentalTranscriptFacetsOutput,
+  ExperimentalProjectsListOutput,
+  ExperimentalProjectsUpdateInput,
+  ExperimentalProjectsUpdateOutput,
   ShellListInput,
   ShellListOutput,
   ShellCreateInput,
@@ -1764,6 +1767,15 @@ const EndpointExperimentalTranscriptFacets = (raw: RawClient["server.experimenta
     ),
   )
 
+const EndpointExperimentalProjectsList = (raw: RawClient["server.experimental"]) => () =>
+  preserveEffect<ExperimentalProjectsListOutput>()(raw["projects.list"]({}).pipe(Effect.mapError(mapClientError)))
+
+const EndpointExperimentalProjectsUpdate =
+  (raw: RawClient["server.experimental"]) => (input: ExperimentalProjectsUpdateInput) =>
+    preserveEffect<ExperimentalProjectsUpdateOutput>()(
+      raw["projects.update"]({ payload: { operation: input["operation"] } }).pipe(Effect.mapError(mapClientError)),
+    )
+
 const adaptGroupExperimental = (raw: RawClient["server.experimental"]) => ({
   persistentPty: {
     read: EndpointExperimentalPersistentPtyRead(raw),
@@ -1799,6 +1811,7 @@ const adaptGroupExperimental = (raw: RawClient["server.experimental"]) => ({
     backfill: EndpointExperimentalTranscriptBackfill(raw),
     facets: EndpointExperimentalTranscriptFacets(raw),
   },
+  projects: { list: EndpointExperimentalProjectsList(raw), update: EndpointExperimentalProjectsUpdate(raw) },
 })
 
 const EndpointShellList = (raw: RawClient["server.shell"]) => (input?: ShellListInput) =>

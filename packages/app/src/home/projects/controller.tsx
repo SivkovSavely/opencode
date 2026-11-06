@@ -165,6 +165,13 @@ export function createHomeProjectsController(home: HomeController) {
         choose(conn)
       },
       hide: (conn: ServerConnection.Any, project: LocalProject) => home.server.context(conn).projects.hide(project),
+      move: (conn: ServerConnection.Any, project: LocalProject, offset: number) => {
+        const ctx = home.server.context(conn)
+        ctx.projects.move(
+          project.worktree,
+          ctx.projects.used().findIndex((item) => item.worktree === project.worktree) + offset,
+        )
+      },
       canReveal: revealProject.available,
       reveal: revealProject.reveal,
     },

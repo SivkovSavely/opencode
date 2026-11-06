@@ -205,6 +205,10 @@ const Group = HttpApiGroup.make("mock")
   )
   .add(HttpApiEndpoint.get("websearchProviders", "/api/websearch/provider", { success: Json }))
   .add(HttpApiEndpoint.get("usageLimits", "/api/experimental/usage/limits", { success: Json }))
+  .add(HttpApiEndpoint.get("explicitProjects", "/api/experimental/projects", { success: Json }))
+  .add(
+    HttpApiEndpoint.patch("projectListUpdate", "/api/experimental/projects", { payload: JsonPayload, success: Json }),
+  )
   .add(
     HttpApiEndpoint.post("transcriptSearch", "/api/experimental/transcript/search", {
       payload: TranscriptSearch.Request,

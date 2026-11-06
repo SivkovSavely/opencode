@@ -1,12 +1,41 @@
 # Personal V1 to V2 port status
 
+## Reboot handoff - 2026-11-06
+
+The owner requested a temporary stop for a system reboot that clears `/tmp`, then resumed the migration after reboot. The pause preserved the implementation without a new commit, staging, history change or shared-service operation. The migration is continuing, not complete; the reboot snapshot below remains historical recovery evidence.
+
+- Verified checkout: `/home/savochek/ExternalProjects/opencode-v2.2.5`, branch `personal-v2.2.5`, common Git directory `/home/savochek/ExternalProjects/opencode/.git`.
+- Last completed commit: `922aecb60bedb9924d2e9aa387607405753214a6`, `feat(app): add global transcript search`. Its separate trailers are F001/F002/F004/F005. The branch was four local commits ahead of its existing tracking ref; nothing was pushed.
+- Current work: B15/F017, **verified for the supported required baseline**, with exactly 39 intended changed/new paths. The intended staged review is complete; final `commit-work` checks and a new local commit remain. The ownership and final selector corrections are preserved, uncommitted. Do not reset, discard, automatically reapply patches, or start F017 again from scratch.
+- Durable reboot bundle: `/home/savochek/.local/state/opencode-migration/reboots/reboot-20261106T133342Z.ppj1ymsw`. The pointer `/home/savochek/.local/state/opencode-migration/LATEST-REBOOT.txt` identifies it. Read its `README.md` and verify `SHA256SUMS`; it contains the specifications used, complete latest F017 work artifacts, selected earlier evidence, and a recovery-only working-file snapshot.
+- The original kickoff archive and implementation prompt also remain in `/home/savochek/Downloads`. The bundle preserves the exact extracted specification collection used by this session, independently of those originals.
+
+### Exact F017 continuation state
+
+All three independent ROOT review passes have run, using reviewer task `ses_e4f8e58cdffeuFoe1tuI1nSpZp`. PASS1's reconnect, replicated-cache and metadata-completion findings, PASS2's replaceable migration-marker finding, and FINAL PASS3's exact-directory selection finding are corrected. The final correction is regression-tested and parent integration-validated, **not independently re-reviewed**. No fourth review was invoked or is allowed; do not restart the review budget.
+
+Before FINAL PASS3, parent integration found a separate cached-helper ownership defect. The implementation agent `ses_e4ff5a4daffeip2meIDKVDeI3A` reproduced `InvalidStateError: BroadcastChannel Channel is closed` with the actual provider/native persistence, and bound cached project helpers to the provider owner rather than disposable server controllers. Both initialized and lazy acknowledgment cases passed, including 20 repeated component cases, followed by 147 built browser keeper passes. The subsequent selector correction passes 149 complete keeper cases, 1,049 App unit cases, 304 browser-runtime cases, and App Bun/official typechecks. Exact commands and logs are in the saved `f017-work/IMPLEMENTATION-REPORT.md`, `f017-work/logs/owner-*` and `f017-work/logs/final-*`.
+
+**Post-reboot recovery and final parent integration validation have passed.** Recovery verified the active checkout, all 39 manifest paths, the exact tracked binary diff and all eight untracked file hashes against the durable bundle. Only missing temporary references and evidence were restored; no working-file snapshot or source patch was applied. The ownership-checkpoint canonical result was 35 passing tasks (33 cached), 2.034 seconds, 1,750 unsuppressed warnings and zero errors: `/tmp/opencode/f017-resumed-check.vCYhIZ1v/check.log`. After FINAL PASS3's selector correction, a fresh isolated canonical check passed all 35 tasks (33 cached), lint and SDK documentation in 2.17 seconds, with 1,755 unsuppressed warnings and zero errors: `/tmp/opencode/f017-final-check.m3l4h9gh/check.log`. The subsequent complete staged review restored unrelated formatting in eight files and proved their compiled JavaScript unchanged. The final post-cleanup canonical check passed all 35 tasks (33 cached) in 2.274 seconds, with 1,803 unsuppressed warnings and zero errors: `/tmp/opencode/f017-commit-check.7kfL1liI/check.log`. Commit integration must still verify `Behavior-Spec: F017`, committed paths, full body, SHA and clean status.
+
+All implementation agents were finished at the pause. Owned fixtures were reported stopped, and the parent process check found no matching native-backend/static-server/component fixture processes. No additional suite was started for reboot preparation. All 26 durable bundle checksums passed after reboot; recovery verification artifacts are in `/tmp/opencode/reboot-resume.fE16lwNs`. The 13 audited E2E type diagnostics and the blocked pre-change entry benchmark remain disclosed failures, not green checks. Actual Windows/device behavior is not certified.
+
+### Resumption constraints and next features
+
+- Preserve the current checkout, branch, Git history and all modifications. Runtime/source work remains in this active V2 checkout; the latest verified V1 read-only Git-object reference is `2d9d50abf1b542075c273a1753c1ca675531dabe`. Earlier `ae5dc5b5c106f841532446beb60e6bae6114f6c5` evidence remains historical; the new commit does not change F017 source paths.
+- F001-F005 and F017 are complete for their documented supported baselines. F001/F002/F003/F017 review budgets are exhausted and closed; do not request fourth reviews or reimplement those features.
+- F027 is permanently `retired-by-owner`, not blocked or verified. Do not implement managed model leases/provider restrictions or restore it as an F024/F030 prerequisite. Other managed specifications remain in scope with native model execution and disposable/synthetic authority fixtures.
+- F037-F039 definitions were not located in the latest available collection. Preserve that exact documentation gap without inventing IDs or stopping independent specifications.
+- The owner has resumed the session; continue unattended after F017 integration. F021 is the full HTTP API CLI/offline generated command catalog, not merely a model catalog; its full specification has been read. F006's complete durable queue/steer specification, including the A57/A58 schema-manifest refresh, has also been read. Its compatibility boundary must preserve native first-admission-wins invariants. F020 explicitly permits retiring legacy V1 protocol negotiation while preserving native reconnect/admission guarantees; read its full specification before implementing it.
+- Never perform production cutover, use real production databases/credentials, resume protected historical workflows, push, rebase, amend or rewrite history. The temporary reboot stop is over; it did not retire any specification or change the permanent F027 owner decision.
+
 ## Scope and evidence rules
 
 - Active checkout: `/home/savochek/ExternalProjects/opencode-v2.2.5`, branch `personal-v2.2.5`.
 - Released V2 base: `9bbb8ce18c80f099e0e448775f59d965ead40a21` (`v2.2.5`). No tracking of upstream `dev` during this port.
-- Current V1 behavioral reference: `ae5dc5b5c106f841532446beb60e6bae6114f6c5` (`personal-v1.18.29`), verified on continuation. The original archive pin remains `2931c950db2ac2c499ab10bf509239d1c6c69963`; its four successors must also be assessed. V1 sources are read-only Git objects. Historical feature commits remain mapped in the archive's `commit-coverage.csv` and `source-delta-coverage.csv`.
+- Current V1 behavioral reference: `2d9d50abf1b542075c273a1753c1ca675531dabe` (`personal-v1.18.29`), rechecked after reboot. The original archive pin remains `2931c950db2ac2c499ab10bf509239d1c6c69963`; its five successors are additional references. The latest delta makes successful structured output terminal while retaining admitted-input draining and schema-hydrates persisted user formats; its production changes were inspected and its F017 paths are unchanged. Carry it into remaining queue/runtime/import work. V1 sources are read-only Git objects. Historical feature commits remain mapped in the archive's `commit-coverage.csv` and `source-delta-coverage.csv`.
 - Reference archive: `OpenCode-V2-Migration-Kickoff-2026-11-04.tar.gz`, SHA256 `a62745a12f378e77c0f8b33f1a714baebd8b2ccf5eaeb03c1109104b083b79ba`. Extracted reference files are read-only, outside this checkout.
-- `source-only` means selected production/test source was inspected, not that acceptance passed. `partial` is not parity. B11 verifies F004/F005, B12 verifies F001, B13 verifies F003 and B14 verifies F002 for the supported required baselines with the scoped evidence below. F001/F003/F002 final corrections were integration-validated after their three-pass review limits, not independently re-reviewed. Verification is not production cutover certification or universal provider/browser coverage.
+- `source-only` means selected production/test source was inspected, not that acceptance passed. `partial` is not parity. B11 verifies F004/F005, B12 verifies F001, B13 verifies F003, B14 verifies F002 and B15 verifies F017 for the supported required baselines with the scoped evidence below. F001/F003/F002/F017 final corrections were integration-validated after their three-pass review limits, not independently re-reviewed. Verification is not production cutover certification or universal provider/browser coverage.
 - Normalized acceptance IDs use `F026/A02`, including source spellings such as `A-02` and `AC-02`. Only the assertions listed below have execution evidence. All other acceptance candidates remain **NOT RUN**, not implicitly passed.
 - All runtime checks use disposable HOME/XDG/database fixtures. No installed binary replacement, user database migration, live service restart, model account, real WorkQueue, managed namespace, production Serve, push, rebase, merge or deployment has been performed.
 
@@ -32,7 +61,7 @@ Current V1 behavior is authoritative unless a specification identifies an intent
 | F014 | partial        | B08     | Callback-state isolation fixed; replacement/commit ownership and account-scope decisions remain unverified.                            |
 | F015 | source-only    | -       | Worktree backend exists; external discovery, request capture and actual execution isolation need assertions.                          |
 | F016 | source-only    | -       | Deep child navigation, unavailable child model handling and explicit Default depend on F009/F036.                                     |
-| F017 | planned        | -       | Preserve globally shared explicit project ordering; fix the documented malformed-storage data-loss defect.                           |
+| F017 | verified       | B15     | Shared directory order, safe migration, revision/ACK/lifecycle guards and bounded sibling discovery verified; review limits below. |
 | F018 | partial        | B07     | Persisted native Enter/newline preference implemented; real IME, interface switching and remaining command matrix unverified.         |
 | F019 | partial        | B09     | Native production destination recovery and remembered-kind assertions pass; loading/cache/session-retarget matrix remains open.      |
 | F020 | planned        | -       | Preserve V1 protocol compatibility and native V2 operation; validate reconnect, draft and generation isolation.                        |
@@ -1098,9 +1127,357 @@ The staged review found that the native browser fixture used a Linux-only `/tmp/
 
 All checks ran serially in private environment/configuration profiles with model fetching and telemetry disabled. The pre-fix and both post-fix owned roots were inspected and retain only `server.log`, not database/profile directories. Unrelated formatting-only changes were restored without removing feature assertions or handlers. This parent integration correction is validated after the three-pass review limit; no fourth independent review or false clean-review claim is made. Existing benchmark, repeated draft-cache and E2E-typecheck limitations remain as recorded above.
 
+### B14 Commit Record
+
+Committed before B15 as `922aecb60bedb9924d2e9aa387607405753214a6`, `feat(app): add global transcript search`. Read-only Git inspection confirmed parsed feature trailers **F001, F002, F004, F005** and **52 changed paths**. The parent verified a clean worktree at B15 admission; the implementation agent independently verified the active checkout, branch, common Git directory and clean status. Existing B14 review, benchmark and diagnostic limitations remain unchanged.
+
+## B15 F017 Complete Shared Project List
+
+**Status: verified for the required supported baseline; local commit prepared.** The complete F017 implementation, causal-snapshot correction, ROOT PASS1/PASS2 findings, cached-helper ownership correction and FINAL PASS3 exact-directory selection finding are implemented, regression-tested and parent integration-validated. All three independent review passes are exhausted. The final correction was not independently re-reviewed; no fourth pass or clean-review claim is made. No supported contract is intentionally deferred. Active implementation checkout: `/home/savochek/ExternalProjects/opencode-v2.2.5`, common Git directory `/home/savochek/ExternalProjects/opencode/.git`, branch `personal-v2.2.5`, admission HEAD `922aecb60bedb9924d2e9aa387607405753214a6`. F017 reference `ae5dc5b5c106f841532446beb60e6bae6114f6c5` was inspected only through read-only Git objects; the newer `2d9d50abf1b542075c273a1753c1ca675531dabe` delta does not change these source paths. The exact local commit SHA will be recorded in the next ledger update.
+
+### Engineering Decisions
+
+- D07 is resolved by the latest owner instruction: explicit directory membership, close and user order are globally shared, not native client-local hide. Server inventory and client-local last navigation remain separate. Home/sidebar and new-session added/discoverable lists consume the explicit directory view, not an ID-deduplicated inventory surrogate.
+- Native global Core service serializes read/modify/persist/event publication under one semaphore. Persistence is native SQLite KV `global:projects`; valid historical `data/storage/global/projects.json` (`[global,projects]`, `{projects:string[]}`) is imported without changing its bytes. Missing original storage is fresh empty. Malformed/unreadable original or malformed KV fails closed with an actionable error and refuses unsafe writes. D06/A30 is fixed rather than copied.
+- Native experimental GET/PATCH `/api/experimental/projects`, identifiers `experimental.projects.list` and `experimental.projects.update`, use schema-owned snapshots/operations and the native global `server.projects.updated` event. PATCH wraps `{operation}` to preserve correct generated-client union typing. Client generation and OpenAPI generation are authoritative; generated files were not hand edited. No dependency or Changeset was added.
+- Directory identity follows the current V1 `comparablePath`: collapse trailing separators and drive/UNC slash spelling, retain the first spelling, reject empty entries, preserve distinct POSIX case. Membership deliberately does not add new Windows case folding absent from the V1 membership helper. Sibling search roots separately use case-insensitive Windows drive/UNC identity as V1 does.
+- Server-first additive migration is acknowledged only after a valid response, versioned per server scope. Cached paths render immediately. Pending intent is serialized behind bootstrap and replayed over newer events; stale acknowledgments do not overwrite them. Unsupported/failed/invalid bootstrap remains local-only for that controller lifecycle and retryable on a fresh lifecycle. Disposal and pending work are scoped to their server. Remote operations do not call local close/navigation bookkeeping.
+- Preserve original directories even when native metadata resolves several to one project ID, including non-Git/global directories and worktrees. Unresolved legacy entries remain directory-only view models without fabricated IDs and are enriched when inventory becomes available. Removing explicit membership never deletes inventory, directories or sessions. Native local used/last IDs remain navigation metadata, not shared-list authority.
+- Reorder is exposed through native localized Move up/Move down project menu actions, including keyboard and touch behavior. Removed the old hover-time activity-order freeze, which otherwise concealed remote/user reorder. New-session added projects retain shared order; discoverable inventory remains separate and activity-sorted.
+- All browser directory-picker entrypoints use the owning picker implementation. Ordinary nonempty relative fuzzy queries, including multi-segment input, use native `file.find` first and soft directory-list fallback over base plus at most six deduplicated immediate-parent roots. Explicit filesystem syntax bypasses extra roots. Existing bounded traversal, stale-result guard, final identity deduplication and 50-result cap remain enforced. Search does not mutate membership until selection/add.
+- D01 uses serialized server mutation order, with the last serialized move winning; no clustered ownership or independent-server synchronization is promised. D02 retains missing/moved path strings for user resolution. D04 migration is additive/idempotent, D05 an empty browser cache recovers server membership, and D08 search-root fan-out does not claim to bound total inventory.
+
+### Acceptance Crosswalk
+
+Evidence owners: **Core** is `packages/core/test/project-list.test.ts`; **Sync** is `packages/app/src/runtime/server/project-list.test.ts`; **Picker** is the existing `workspaces/selection/domain.test.ts`; **Home** and **Directory** are the owning production-built `e2e/regression/home.spec.ts` and `directory-picker.spec.ts`. Native Home uses an actual disposable ServerFetch backend with two isolated browser contexts, not the mock update fold.
+
+| Case | Implementation and actual assertion |
+| --- | --- |
+| A01 | Sync cached startup, empty-server additive bootstrap, marker held until acknowledgment; native Home seeds legacy Alpha/Beta into fresh server. |
+| A02 | Core server-first merge retains S1/S2 and appends local-only L1/L2; Sync verifies merge request and ordered acknowledgment. |
+| A03 | Core trailing-separator variants deduplicate and existing add does not reorder. |
+| A04 | Core Windows backslash/forward-slash identity keeps first spelling; graph reopen retains it. |
+| A05 | Core concurrent new additions occupy the front; actual Home picker add appears first on the other client. |
+| A06 | Core adding existing normalized directory leaves order unchanged. |
+| A07 | Native Home touch close on client B removes Alpha on client A; final server GET excludes it. |
+| A08 | Core negative move clamps to front. |
+| A09 | Core oversized move clamps to end and persists across graph reopen. |
+| A10 | Core missing-directory move is an exact no-op. |
+| A11 | Core concurrent service callers add A/B/C with no lost membership. |
+| A12 | Sync mutation during held bootstrap remains pending and survives acknowledgment. |
+| A13 | Sync newer events beat stale bootstrap and mutation responses without losing later intent. |
+| A14 | Sync 404 remains local-only for that lifecycle; Home unsupported-server case retains cached/unresolved paths. |
+| A15 | Sync network/invalid-response cases retain cache and edits, leave marker unset and retry next lifecycle. |
+| A16 | Sync successful migration reload calls list rather than re-merge; native Home reload restores durable membership. |
+| A17 | Native Home verifies remote close preserves local lastProjectID and does not create recentlyClosed state. |
+| A18 | Native Home keyboard Move down on client A changes visible order on client B. |
+| A19 | Sync independent server caches, revisions, pending work and disposal remain isolated; native mock keepers retain separate server groups. |
+| A20 | Picker immediate-parent dedup and Windows/UNC roots table; actual Directory sibling query searches the explicit parent once. |
+| A21 | Picker real search fallback and actual Directory sibling suggestion from the explicit parent. |
+| A22 | Picker ordinary `space/src` invokes native search then bounded traversal under base and sibling roots. |
+| A23 | Picker table covers absolute, tilde, drive, UNC, dot-relative, parent-relative, empty and dot inputs; actual Directory absolute-path change bypasses parent search. |
+| A24 | Picker 20-parent input caps output at six roots; search includes base plus bounded extra roots. |
+| A25 | Picker overlapping base/nested-root native search result is returned once; final result identity dedup and cap apply after fan-out. |
+| A26 | Actual Directory verifies membership unchanged while searching, then adds only after choosing/selecting the sibling. |
+| A27 | Home legacy migration retains nested-directory identity and unresolved gone entries; inventory enriches known entries without dropping paths or fabricating IDs. Native Home also persists two unresolved directories. |
+| A28 | Owner-preserved global close is verified through native cross-client touch close, not merely documented as local hide. |
+| A29 | Owner-preserved global reorder is verified through native keyboard menu action and cross-client order; shared order survives inventory activity changes. |
+| A30 | Core malformed JSON, wrong array elements, null, unreadable directory path and malformed native KV refuse mutations, retain original bytes/value and do not write an authoritative empty replacement. |
+
+P01-P06 map to native storage, identity and mutation tests; P07-P11 to scoped startup/migration/intent/event/UI tests; P12-P13 to the existing picker and actual selection keeper; P14 remains directory-list-only metadata, with no filesystem/project/session deletion or copying path introduced.
+
+### Commands And Results
+
+Logs and exact **35-path** manifest are under `/tmp/opencode/f017-work/changed-paths.txt`. Commands below ran from their package directories using `sh /tmp/opencode/f017-work/run`, which supplies private HOME, USERPROFILE, XDG data/config/cache/state, TMPDIR/TMP/TEMP, empty config, disabled model fetching and disabled telemetry. Heavy checks were serial. Browser tests used at most two workers and zero retries; no tests ran from repository root.
+
+| Command / scope | Actual result / log |
+| --- | --- |
+| Client `bun run generate` | Pass, including final regeneration; `logs/codegen-final.log`. |
+| Protocol `bun run generate`; `bun run script/generate-openapi.ts --check` | Generation and final freshness check pass; `logs/openapi-generate.log`, `logs/openapi-check-final.log`. |
+| Schema, Core, Protocol, Server, Client, App: serial `bun run typecheck`, then `bun run typecheck:tsc` | All 12 checks pass; `logs/<package>-typecheck.log` and `<package>-typecheck:tsc.log`. |
+| Core `bun run script/test.ts test/project-list.test.ts` | **2 pass, 0 fail, 30 assertions**; persistence, graph reopen, concurrency and unsafe-storage refusal. `logs/core-tests-final.log`. |
+| Protocol `bun test test/experimental-identifiers.test.ts` | **1 pass, 0 fail, 2 assertions**; `logs/protocol-tests.log`. |
+| App focused sync/registry/picker source unit tests | **56 pass, 0 fail, 172 assertions** after final overlapping-root dedup assertion; `logs/app-unit-manifest-final.log`. |
+| App complete `bun run test:unit` | **1,036 pass, 0 fail, 3,079 assertions**, 132 files; `logs/app-all-unit-corrected.log`. |
+| App `bun run test:browser` | **303 pass, 0 fail, 2,359 assertions**, 54 files; `logs/app-browser-unit.log`. |
+| App `VITE_OPENCODE_TEST_FIXTURES=1 bun run build`, private static fixture, production-built Playwright seven owning keepers with `--workers=2 --retries=0` | **143 pass, 0 fail**, 2 minutes; `logs/build-final.log`, `logs/browser-all-final.log`. Home, directory-picker, new-session, global-transcript-search, timeline-history, timeline-geometry and session-timeline-tool-projection preserve F001-F005. |
+| Native two-client Home case after final assertions/locator refinement, `--workers=1 --retries=0 -g F017` | **1 pass**, 4.4 seconds; desktop keyboard reorder, narrow touch close, picker add, reload, final native API and untouched local bookkeeping. `logs/browser-native-final.log`. |
+| App `bun run typecheck:e2e`, compared to `/tmp/opencode/f003/logs/pass3-e2e-types.log` | **Exit 2, same 13 audited diagnostics**, byte-identical comparison exit 0; `logs/e2e-types-final.log`. Not a green E2E typecheck. |
+| Scoped `bunx oxlint` on 33 changed TS/TSX paths; `git diff --check` | **25 unsuppressed warnings, 0 errors**; `logs/lint-final.log`. Warnings include unknown transport/error boundaries and existing fixture assertion/dictionary patterns; no warning-neutrality claim. Whitespace check passes. Parent canonical full lint/check is still pending. |
+
+The initial strengthened stale-bootstrap test produced a genuine product failure: an event delivered immediately after controller creation was replaced by the older bootstrap response because the receipt counter was captured inside the scheduled task. Capturing that counter before scheduling passed that assertion but did not solve causal ordering generally; the parent-reproduced inverse case below supersedes that incomplete fix with persisted server revisions. The initial red run was displayed but its log was overwritten by the green run, so no preserved initial red-log artifact is claimed. Other initial failures were fixture authoring/lifecycle issues (duplicate mock handler name, intentional unsupported response caught by the mock guard, combobox locator, mobile popover not opened, stale static-server index after rebuild), not product-red evidence. Existing activity-sorted assertions were changed to assert the owner-required explicit shared order, not weakened or skipped.
+
+The pre-change session-entry benchmark remains genuinely **BLOCKED** as previously recorded; no invented timing or weakened benchmark is claimed. No session/timeline production source was changed. Platform coverage is Linux Chromium with synthetic desktop/narrow touch contexts, not Windows execution, real mobile hardware or every provider. The complete historical V1/profile migration and production cutover remain forbidden and unperformed. No V1 write, branch/history change, staging, commit, push, reviewer invocation, production credential/database/model call or shared-service operation occurred. All owned browser/backend/static fixture processes are stopped at handoff. F027 retirement, the current V1 pin and missing F037-F039 definitions remain unchanged.
+
+### B15 Causal Snapshot Follow-up
+
+**Status remains implemented-unverified.** Parent full inspection and the pre-follow-up canonical check completed **35 tasks, no cache**, `/tmp/opencode/b15-root.5TIQAQqI/check.log`; its aggregate warning count has not been examined here. No reviewer pass has occurred for B15. The parent then reproduced a controlled helper reconciliation defect, `/tmp/opencode/f017-causal-probe.cygSXyiC/probe.log`: cached `/legacy`, an earlier `/server` snapshot before the bootstrap microtask, followed by a valid merge acknowledgment `/server,/legacy`, incorrectly left only `/server` while marking migration successful. This is not evidence of a production network outage.
+
+The owning regression was added and executed **red before the fix**, retaining `logs/causal-red.log` (**6 pass, 1 fail, 30 assertions**). The failed assertion is the missing acknowledged `/legacy` directory. The exact red command from `packages/app` was:
+
+```sh
+sh /tmp/opencode/f017-work/run bun test --conditions=solid --isolate --preload ../ui/test/solid-jsx.ts --preload ./happydom.ts src/runtime/server/project-list.test.ts > /tmp/opencode/f017-work/logs/causal-red.log 2>&1
+```
+
+Receipt counters cannot distinguish an older event delivered before a newer successful response from a genuinely newer event delivered before an older response; neither HTTP nor SSE delivery order alone establishes server causality. The native experimental snapshot/event contract therefore now includes a **persisted nonnegative integer revision**, stored with the list in the same KV value and incremented under the existing serialized mutation only when membership/order actually changes. No-op mutations retain the revision. A native graph/database reopen retains it. Existing directory-only KV records and the unchanged legacy file import start at revision zero; malformed revisions fail closed without overwriting the original, like other malformed storage. This is concrete persisted-data compatibility, not a second authority or clustered ownership mechanism.
+
+The client accepts only snapshots with a strictly greater server revision, regardless of arrival transport/order, then retires acknowledged pending intent and marks valid bootstrap acknowledgment. Pending later intent is still replayed over the latest accepted base. This preserves both directions of the race, ignores delayed pre-acknowledgment SSE after a newer acknowledgment, and still honors genuinely later remote removes/reorders. Transport/schema failures retain the optimistic cache and leave failed migration unmarked; disposal/server scope guards remain. A server/database replacement or restore that rewinds revisions requires a fresh controller lifecycle; monotonicity is scoped to the existing persisted server-list lineage, not arbitrary backup restoration or multiple independent servers sharing one identity. No speculative reset/recovery protocol was added.
+
+The prior newer-event/stale-bootstrap and stale-mutation assertions remain, now carrying explicit causal revisions. Added owning cases cover the exact parent merge regression; add/remove/move acknowledgment after an earlier event; delayed earlier snapshots after the acknowledgment; a genuinely later remote snapshot; queued later intent surviving older acknowledgment; and invalid unversioned/negative-revision responses preserving fallback/retry. Core tests additionally assert revisions across no-ops, concurrent changes, close/reopen, unversioned KV import and malformed-revision refusal. The actual native two-client browser case now also asserts the persisted final revision, not merely a mock result.
+
+All source edits remain within the same original **35-path manifest**, `/tmp/opencode/f017-work/changed-paths.txt`; no new source path was added. Schema, Core, runtime/helper, owning tests and E2E mock/native assertion were adjusted; client/OpenAPI output was regenerated, not hand edited. Existing UI/discovery, readonly legacy bytes, first spelling, malformed-storage safety, F001-F005 and all owner-ledger evidence are preserved.
+
+All following checks ran serially under the same disposable wrapper. Package-local commands, except the scoped formatter/lint, were used; no root tests or implementation-agent canonical root check ran.
+
+| Command / scope | Actual follow-up result |
+| --- | --- |
+| The red helper command above, rerun after the fix with `causal-green.log` as output | **13 pass, 0 fail, 53 assertions**, `logs/causal-green.log`. |
+| Core `bun run script/test.ts test/project-list.test.ts` | **2 pass, 0 fail, 38 assertions**, `logs/causal-core.log`. |
+| Client `bun run generate`; Protocol `bun run generate`, then `bun run script/generate-openapi.ts --check` | All pass, `logs/causal-codegen.log`, `logs/causal-openapi.log`, `logs/causal-openapi-check.log`. |
+| Protocol `bun test test/experimental-identifiers.test.ts` | **1 pass, 0 fail, 2 assertions**, `logs/causal-protocol.log`. |
+| Schema/Core/Protocol/Server/Client/App: `bun run typecheck` then `bun run typecheck:tsc` | **All 12 pass**, fresh `logs/<package>-typecheck.log` and `<package>-typecheck:tsc.log`. |
+| App `bun run test:unit` | **1,043 pass, 0 fail, 3,105 assertions**, 132 files, `logs/causal-app-unit.log`. |
+| App `bun run test:browser` | **303 pass, 0 fail, 2,359 assertions**, 54 files, `logs/causal-browser-unit.log`. |
+| App `PLAYWRIGHT_PORT=4428 PLAYWRIGHT_WORKERS=2 bun run test:e2e:built -- e2e/regression/home.spec.ts e2e/regression/directory-picker.spec.ts e2e/regression/new-session.spec.ts e2e/regression/global-transcript-search.spec.ts e2e/regression/timeline-history.spec.ts e2e/regression/timeline-geometry.spec.ts e2e/regression/session-timeline-tool-projection.spec.ts --project=chromium --workers=2 --retries=0` (private browser path supplied) | Build and **143 browser cases pass**, 2.3 minutes, `logs/causal-browser.log`. Includes complete affected keepers and the actual native two-client desktop keyboard/narrow touch synchronization. |
+| App `bun run typecheck:e2e`; `diff -u /tmp/opencode/f003/logs/pass3-e2e-types.log /tmp/opencode/f017-work/logs/causal-e2e-types.log` | **Exit 2, same 13 audited diagnostics**; byte-identical comparison exit 0, `logs/causal-e2e-types.log`. Not green. |
+| Scoped `bunx oxlint` over manifest TS/TSX paths | **38 warnings, 0 errors**, unsuppressed, `logs/causal-lint.log`; no neutrality claim versus the initial 25-warning scoped run. |
+
+No supported causal defect remains known after these checks. The session-entry benchmark remains baseline-blocked, and Linux Chromium/synthetic-touch and database-lineage limitations remain explicit. The implementation agent did not delegate, invoke a reviewer, stage, commit, mutate history or V1, operate shared services, or use real account/data/provider authority. Owned browser/static/native fixtures were stopped at handoff. Fresh parent canonical validation and independent review were still pending at that handoff; the completed parent result below, not the pre-follow-up root check, validates the correction.
+
+### Parent Integration Before ROOT PASS1
+
+The parent re-established the active checkout, common Git directory, branch and unchanged admission HEAD, confirmed exactly the **35 intended paths**, an empty index and a clean whitespace check, and inspected the corrected Core service, Schema snapshot, client synchronization helper and both complete owning test files. This included persisted/no-op/reopen revision behavior, both event/response orderings, pending intent, storage refusal and controller disposal. No functional source change followed the implementation validation.
+
+| Command / scope | Actual parent result |
+| --- | --- |
+| Root `bun run check`, after the causal correction and regenerated artifacts | **PASS: 35 tasks, none cached**, 17.265 seconds; lint and SDK documentation checks pass. **1,677 warnings, 0 errors**, unsuppressed, 19 fewer in aggregate than the committed B14 count; no individual diagnostic-neutrality claim. `/tmp/opencode/b15-causal-check.CVwpbgOQ/check.log`. |
+| Mandatory independent ROOT review | **Pending PASS1**, maximum three passes. No B15 review, staging or commit has occurred. |
+
+The parent check used a fresh private `env -i` HOME/USERPROFILE/XDG/TMPDIR/TMP/TEMP profile, empty configuration, disabled model fetching/project configuration and telemetry opt-outs. Heavy validation did not overlap other suites. Only documentary result/status updates followed this check. The audited 13 E2E type diagnostics, blocked pre-change benchmark and supported-platform/database-lineage limitations remain recorded rather than claimed fixed.
+
+### B15 ROOT PASS1 Corrections
+
+**Status remains implemented-unverified**, pending ROOT PASS2 of the maximum three independent passes and commit integration. Parent post-PASS1 canonical validation passed as recorded below. The preceding parent canonical result (35 tasks, no cache, 17.265 seconds, 1,677 warnings/0 errors) is retained as pre-PASS1-correction evidence, not validation of these new edits. The historical pending-PASS1 row above is superseded by the actual independent ROOT PASS1 session `ses_e4f8e58cdffeuFoe1tuI1nSpZp`, which reported three P2 defects. No additional reviewer was invoked by the implementation agent.
+
+1. **Missed membership events across reconnect.** Native inventory reconnect did not refresh the separate explicit membership list. The server controller now subscribes to the actual native `server.connected` signal and queues a shared-list GET through the same helper queue and persisted revision/pending-intent gate. This stays behind bootstrap/prior mutations, ignores stale responses, respects disposal and existing lifecycle fallback, and does not reset other server controllers. The owning browser regression uses a disposable native backend with real membership HTTP and a controlled native SSE connection: client B misses A's close, its stream disconnects/reconnects, the actual reconnect wiring issues GET and B repairs to authoritative membership. It does not manually call the helper refresh method to simulate runtime integration.
+2. **Replicated persisted cache bypassed accepted revisions.** Visible membership now belongs to a controller-private store once initialization begins; persisted directories remain immediate startup/fallback storage, not live authority after bootstrap. The helper folds optimistic changes over its own visible state, not reread replicated storage. Accepted base/visible arrays and persisted-store reconcile inputs are separate copies, so cross-tab reconciliation cannot mutate accepted state through aliasing. An owning unit uses real Solid store/reconcile to exercise this alias boundary. The owning browser regression uses two tabs in the **same browser context/storage scope**, fails A's actual PATCH before native backend delivery, observes native storage replication to B, verifies the backend still contains Alpha/Beta, and uses a DOM MutationObserver to assert B never transiently adopts A's unacknowledged removal. The isolated-context native test remains for genuine server/event synchronization; it is not substituted for this same-context trigger.
+3. **Async metadata completion resurrected a closed admission.** `add()` still submits membership immediately, and intentional explicit `touch()` opens still add. Home's async `addProjects()` completion now calls a navigation-only `remember()` boundary instead of repeating admission through `touch()`. A held native location resolution test adds the now-visible home directory, closes it while metadata remains pending, verifies the actual native revision/list, releases location discovery and observes completion through native last-project navigation state. The directory stays closed with no new revision/add. A genuinely later explicit picker open still adds it at the next revision. No inventory, filesystem or session deletion was introduced.
+
+The existing persisted causal revisions, both event/response orderings, no-op revision behavior, graph reopen, original-file bytes, malformed KV/file refusal, server-first migration marker acknowledgment, directory identities, pending operations, navigation/remote-close separation, sibling discovery and F001-F005 assertions remain. No public Schema/Protocol/HttpApi changed in this pass, so the prior native generation/freshness evidence remains applicable and no generated file was hand edited.
+
+**Scope:** five implementation/test paths changed for PASS1: `packages/app/src/runtime/server/project-list.ts`, its owning `project-list.test.ts`, `packages/app/src/runtime/server/runtime.tsx`, `packages/app/e2e/regression/home.spec.ts`, and the narrowly necessary new owning path `packages/app/src/home/projects/add.ts`. Including all preserved prior changes and this ledger, the exact manifest is now **36 paths**, `/tmp/opencode/f017-work/changed-paths.txt`.
+
+### PASS1 Red And Green Evidence
+
+The private wrapper `/tmp/opencode/f017-work/pass1-run` uses `env -i` with only PATH plus owned HOME/USERPROFILE/XDG/TMPDIR/TMP/TEMP, empty configuration, disabled project configuration/model fetching and telemetry opt-outs. All heavy checks ran serially, with browser maximum two workers and zero retries. Commands ran from their owning package directories; no root tests, canonical root check or reviewer invocation ran in this implementation follow-up.
+
+The browser red command from `packages/app` was:
+
+```sh
+sh /tmp/opencode/f017-work/pass1-run env PLAYWRIGHT_BROWSERS_PATH=/tmp/opencode/playwright-browsers PLAYWRIGHT_PORT=4428 PLAYWRIGHT_WORKERS=1 bun run test:e2e:built -- e2e/regression/home.spec.ts --project=chromium --workers=1 --retries=0 -g 'F017 (reconnect|replicated fallback|metadata completion)' > /tmp/opencode/f017-work/logs/pass1-browser-red.log 2>&1
+```
+
+Before corrections, **reconnect and replicated-fallback both genuinely failed**: reconnect never issued the required membership GET, and clean B rendered only Beta despite the unchanged native server list. The third initial failure was a fixture error: holding location resolution before the picker itself resolved its prerequisite prevented selection readiness. That initial metadata timeout is **not** product-red evidence. Moving the hold to after the picker Select folder action was enabled then running the same command with `-g 'F017 metadata completion'` and `pass1-metadata-red.log` produced a genuine product-red: metadata completion resurrected home instead of leaving Alpha/Beta. Both red logs are retained.
+
+The owning unit red command from `packages/app` was:
+
+```sh
+sh /tmp/opencode/f017-work/pass1-run bun test --conditions=solid --isolate --preload ../ui/test/solid-jsx.ts --preload ./happydom.ts src/runtime/server/project-list.test.ts > /tmp/opencode/f017-work/logs/pass1-unit-red.log 2>&1
+```
+
+It produced **13 pass, 1 fail, 55 assertions** before correction: after replicated reconcile, optimistic add yielded X/B rather than X/A/B. The final unit also covers reconnect GET queued behind held bootstrap, pending add, a newer revision event versus stale refresh response, and disposal. An intermediate Bun source typecheck exposed TS4104 in the new readonly-array test fixture (`logs/pass1-app-types.log`); correcting the store's declared readonly array type retained the intentional alias trigger without changing production behavior. Final official/Bun checks pass; neither intermediate fixture/type error is relabeled as a product regression.
+
+| Command / scope | Actual PASS1 result |
+| --- | --- |
+| Owning unit command above, with both `src/runtime/server/project-list.test.ts` and `src/runtime/server/registry.test.ts` | **21 pass, 0 fail, 96 assertions**, `logs/pass1-unit-green.log`. |
+| Corrected three-case native browser command above after fixes | **3 pass**, 18.7 seconds, `logs/pass1-browser-green.log`. |
+| App `bun typecheck`; `bun run typecheck:tsc` | Both pass, **1,915 source files** in Bun check; `logs/pass1-app-types-final.log`, `logs/pass1-app-tsc.log`. |
+| App `bun run test:unit` | **1,045 pass, 0 fail, 3,111 assertions**, 132 files, `logs/pass1-app-unit.log`. |
+| App `bun run test:browser` | **303 pass, 0 fail, 2,359 assertions**, 54 files, `logs/pass1-browser-unit.log`. |
+| Core `bun run script/test.ts test/project-list.test.ts` | **2 pass, 0 fail, 38 assertions**, `logs/pass1-core.log`. |
+| App production-built complete seven owning keepers below | Build and **146 pass**, 2.3 minutes, max two workers/no retries, `logs/pass1-keepers.log`. Includes all three new native cases, the prior desktop-keyboard/narrow-touch two-client case and preserved F001-F005 keepers. |
+| App `bun run typecheck:e2e`; `diff -u /tmp/opencode/f003/logs/pass3-e2e-types.log /tmp/opencode/f017-work/logs/pass1-e2e-types.log` | **Exit 2, same 13 audited diagnostics**; byte-identical comparison exit 0. Not a green E2E typecheck. |
+| Scoped `bunx oxlint` over manifest TS/TSX paths | **70 unsuppressed warnings, 0 errors** on 34 files, `logs/pass1-lint.log`; no warning-neutrality claim. |
+| Parent root `bun run check`, after all three PASS1 corrections | **PASS: 35 tasks, 33 cached**, 2.257 seconds; lint and SDK documentation checks pass. **1,709 warnings, 0 errors**, unsuppressed, 13 more in aggregate than committed B14; no individual diagnostic-neutrality claim. `/tmp/opencode/b15-review-check.gCsP7i3p/check.log`. |
+
+The exact complete keeper command from `packages/app` was:
+
+```sh
+sh /tmp/opencode/f017-work/pass1-run env PLAYWRIGHT_BROWSERS_PATH=/tmp/opencode/playwright-browsers PLAYWRIGHT_PORT=4428 PLAYWRIGHT_WORKERS=2 bun run test:e2e:built -- e2e/regression/home.spec.ts e2e/regression/directory-picker.spec.ts e2e/regression/new-session.spec.ts e2e/regression/global-transcript-search.spec.ts e2e/regression/timeline-history.spec.ts e2e/regression/timeline-geometry.spec.ts e2e/regression/session-timeline-tool-projection.spec.ts --project=chromium --workers=2 --retries=0 > /tmp/opencode/f017-work/logs/pass1-keepers.log 2>&1
+```
+
+No known supported defect from the three ROOT PASS1 findings remains after these checks. The benchmark remains genuinely baseline-blocked. Coverage remains Linux Chromium with synthetic desktop/narrow-touch contexts, not Windows or real-device certification. The reconnect fixture controls only its owned stream and never interrupts a real/shared service. All owned native/browser/static fixtures are stopped and disposed at handoff; no staging, commit, history/branch operation, V1 write, delegation, real credential/account/database/model use or production/shared-service operation occurred. The parent has now re-established the active checkout and unchanged admission HEAD, verified the exact 36-path manifest and empty index, inspected controller-private membership, copied reconciliation arrays, native reconnect refresh and navigation-only admission completion, and completed the canonical validation above. Only documentary updates followed; mandatory ROOT PASS2 and commit-work remain pending. F027 retirement, B14 SHA, the current V1 pin and missing F037-F039 definitions remain unchanged.
+
+### B15 ROOT PASS2 Migration Acknowledgment Correction
+
+**Status remains implemented-unverified**, pending parent canonical integration and **FINAL ROOT PASS3**, the last of the maximum three independent B15 passes. Two independent passes have occurred; this implementation agent invoked no reviewer. The preceding parent canonical result after PASS1 (35 tasks, 33 cached, 2.257 seconds, 1,709 warnings/0 errors, `/tmp/opencode/b15-review-check.gCsP7i3p/check.log`) and its documentary closure remain intact as historical evidence, not validation of this subsequent correction. Historical pending-PASS2 wording above is superseded by the completed PASS2 finding and this correction.
+
+ROOT PASS2 found one valid P2: an acknowledged per-server migration version lived inside the replaceable, replicated full project-cache document. A failed tab's dirty local cache could discard a held remote update and later hydrate a clean successfully migrated tab with a marker-less document. Reload then legitimately re-merged stale cached directories and globally reopened a closed directory. Controller-private membership and server revisions do not prevent that new valid merge operation.
+
+**Native solution:** `createServerProjects` now owns independent native `persisted` acknowledgment keys, `Persist.serverGlobal(scope, "project-list-migration.<version>")`, with schema `{acknowledged?: true}`. Each version has its own immutable-true acknowledgment, rather than an overwritable scope/version map shared with cache state. A successful bootstrap ACK writes true for its version and preceding versions; no unacknowledged instance writes an empty/false value. A prior valid full-cache marker is imported and durably written to the independent key, preserving already acknowledged stored data. The old cache field remains a monotonic compatibility mirror, not authoritative state. Late full-cache replication cannot clear these keys, and separate origin/scope/version keys prevent cross-server or cross-version overwrite. The native web/desktop persistence abstraction, message synchronization and owner cleanup remain responsible for storage and disposal; no raw global storage bypass, new persistence framework or public API was introduced.
+
+Runtime bootstrap now also waits for the native acknowledgment store's `migrationReady(version)` so asynchronous desktop storage loads before deciding between list and additive migration. The lazy acknowledgment stores use the captured controller owner for cleanup/flush. A failed or invalid/missing-endpoint bootstrap still does not produce an acknowledgment and remains local-only/retryable for its lifecycle; valid acknowledgment is the only new-marker source, apart from importing a prior acknowledged stored version. All previous causal/reconnect/pending-intent/private-state-copy/navigation-completion behavior remains unchanged.
+
+### PASS2 Red/Green Evidence
+
+The owning boundary regression was first written and run **red before production correction** in the registry test. It drives real `persistStore` dirty/held replication and real registry methods, not a fake marker setter: A becomes dirty, B acknowledges version 2 and flushes, then A's late flush removes B's successful marker. `logs/pass2-registry-red.log` retains **6 pass, 1 fail, 40 assertions**, failing at `migrated(2)` expected true/actual false. Exact command from `packages/app`:
+
+```sh
+sh /tmp/opencode/f017-work/pass1-run bun test --conditions=solid --isolate --preload ../ui/test/solid-jsx.ts --preload ./happydom.ts src/runtime/server/registry.test.ts > /tmp/opencode/f017-work/logs/pass2-registry-red.log 2>&1
+```
+
+After the fix required native resource-backed persistence, that regression's proper owner is the existing **browser persistence consumer suite**, `packages/app/test-browser/persisted-consumers.test.ts`; it was moved there, not deleted or weakened. It still exercises actual dirty/held hydration, verifies version 2 cannot regress after version 1 acknowledgment, disposes/recreates the registry, checks independent server isolation, and verifies a legacy full-cache version 3 is durably imported before the cache is replaced. Final focused boundary command:
+
+```sh
+sh /tmp/opencode/f017-work/pass1-run bun test --conditions=browser --isolate --preload ../ui/test/solid-jsx.ts --preload ./happydom.ts ./test-browser/persisted-consumers.test.ts > /tmp/opencode/f017-work/logs/pass2-boundary-green-final.log 2>&1
+```
+
+The actual same-browser-context native backend regression is in the existing Home keeper: A's real bootstrap PATCH fails before backend delivery; A's owned page clock holds its dirty fallback save; B successfully migrates and closes Alpha; B flushes, then A flushes its marker-less cache. The test observes the stale shared cache, reloads B and asserts authoritative Beta-only membership at unchanged revision 2. Before the fix it actually reopened Alpha globally, retained in **`logs/pass2-browser-red.log`**. After the fix it passes, **`logs/pass2-browser-green.log`**, 18.3 seconds. The exact command was identical apart from the red/green output filename:
+
+```sh
+sh /tmp/opencode/f017-work/pass1-run env PLAYWRIGHT_BROWSERS_PATH=/tmp/opencode/playwright-browsers PLAYWRIGHT_PORT=4428 PLAYWRIGHT_WORKERS=1 bun run test:e2e:built -- e2e/regression/home.spec.ts --project=chromium --workers=1 --retries=0 -g 'late cache write' > /tmp/opencode/f017-work/logs/pass2-browser-green.log 2>&1
+```
+
+Intermediate failures remain explicit. The first post-fix boundary run under the source suite's SSR `solid` condition failed native `createResource` with a non-hydrating context (`logs/pass2-unit-green.log`, 32 pass/1 fail); moving it to the existing browser owner uses the real native resource lifecycle. An initial browser test filter lacking `./` selected zero files (`logs/pass2-boundary-green.log`), and is not counted as passing evidence. Initial Bun/official checks found seven nullable-owner/readonly-Schema setter diagnostics (`logs/pass2-app-types.log`, `logs/pass2-app-tsc.log`); an explicit initialization guard and whole-object typed setter fixed them. A first complete keeper run had **146 pass/1 fail** (`logs/pass2-keepers.log`): the prior metadata test typed/pressed Enter before the picker's initial directory load was ready. It now asserts the existing Select folder readiness before typing at both initial and later explicit opens. The held metadata, close/non-resurrection, revision and later-open assertions are unchanged; no action retry, sleep, timeout or assertion weakening was added. The final complete run passes below. That intermediate readiness failure is not a marker-product regression.
+
+All commands used the existing private **env-i** wrapper with owned HOME/USERPROFILE/XDG/TMPDIR/TMP/TEMP, empty configuration, disabled project configuration/model fetching and telemetry opt-outs. Heavy suites ran serially, browser maximum two workers and zero retries. No root tests or implementation-agent canonical check ran.
+
+| Command / scope | Actual PASS2 result |
+| --- | --- |
+| Focused native browser persistence-consumer command above | **2 pass, 0 fail, 12 assertions**, `logs/pass2-boundary-green-final.log`. |
+| App source helper/registry/persistence: `bun test --conditions=solid --isolate --preload ../ui/test/solid-jsx.ts --preload ./happydom.ts src/runtime/server/project-list.test.ts src/runtime/server/registry.test.ts src/runtime/server/persistence.test.ts` | **24 pass, 0 fail, 107 assertions**, `logs/pass2-owning-unit.log`. |
+| App `bun typecheck`; `bun run typecheck:tsc` | Both pass, **1,915 source files** in Bun check; `logs/pass2-app-types-final.log`, `logs/pass2-app-tsc-final.log`. |
+| App `bun run test:unit` | **1,045 pass, 0 fail, 3,111 assertions**, 132 files, `logs/pass2-app-unit-final.log`. |
+| App `bun run test:browser` | **304 pass, 0 fail, 2,368 assertions**, 54 files, `logs/pass2-browser-unit-final.log`. |
+| Core `bun run script/test.ts test/project-list.test.ts` | **2 pass, 0 fail, 38 assertions**, `logs/pass2-core.log`. |
+| Complete production-built seven keepers, command below | Build and **147 pass**, 2.4 minutes, `logs/pass2-keepers-final.log`; preserves F001-F005, causal orderings and all three PASS1 regressions. |
+| App `bun run typecheck:e2e`; `diff -u /tmp/opencode/f003/logs/pass3-e2e-types.log /tmp/opencode/f017-work/logs/pass2-e2e-types.log` | **Exit 2, same 13 audited diagnostics**, byte-identical comparison exit 0. Not green. |
+| Scoped `bunx oxlint` on manifest TS/TSX paths | **96 warnings, 0 errors**, unsuppressed, 35 files; `logs/pass2-lint.log`. No warning-neutrality claim. |
+
+```sh
+sh /tmp/opencode/f017-work/pass1-run env PLAYWRIGHT_BROWSERS_PATH=/tmp/opencode/playwright-browsers PLAYWRIGHT_PORT=4428 PLAYWRIGHT_WORKERS=2 bun run test:e2e:built -- e2e/regression/home.spec.ts e2e/regression/directory-picker.spec.ts e2e/regression/new-session.spec.ts e2e/regression/global-transcript-search.spec.ts e2e/regression/timeline-history.spec.ts e2e/regression/timeline-geometry.spec.ts e2e/regression/session-timeline-tool-projection.spec.ts --project=chromium --workers=2 --retries=0 > /tmp/opencode/f017-work/logs/pass2-keepers-final.log 2>&1
+```
+
+**Scope is now 37 paths**, `/tmp/opencode/f017-work/changed-paths.txt`. PASS2 touched registry/runtime, the existing Home keeper, the existing browser persistence-consumer keeper (one added manifest path) and this ledger; no unrelated paths or generated artifacts changed. No public Schema/Protocol/HttpApi changed, so regeneration is not required for this pass. No known supported defect from PASS2 remains after these checks. The 13 E2E diagnostics, baseline-blocked entry benchmark and Linux Chromium/synthetic-touch/database-lineage limits remain honest. All owned native/browser/static fixtures are stopped/disposed; no staging, commit, history/branch change, reviewer/delegation, V1 write, shared/production service, real database/account/credential/model operation occurred. Parent owns fresh canonical validation, root compression and FINAL ROOT PASS3, then commit-work. B14 closure, F027 retirement, current V1 and missing F037-F039 evidence are preserved.
+
+### B15 Acknowledgment Resource Ownership Follow-up
+
+**Status remains implemented-unverified**, pending **FINAL ROOT PASS3** and commit integration. Parent canonical validation after this correction passed after reboot as recorded below. This is an implementation follow-up to the parent's concrete trace, not another independent review. Exactly two of the maximum three independent B15 passes have occurred; no reviewer was invoked by the implementation agent.
+
+The parent traced a reachable ownership mismatch after independent acknowledgment storage was added: the registry's project-helper map outlived the disposable controller root that first requested a helper. `createServerProjects` captured that caller root as the owner for acknowledgment stores. After a credential-driven controller replacement, reuse of an already initialized acknowledgment could post through a BroadcastChannel that the first controller's cleanup had closed; lazy stores created under the disposed owner could also lack correct cleanup ownership.
+
+**Minimal native correction:** `ServersProvider` captures its own Solid owner once, and constructs cached project helpers with `runWithOwner(providerOwner, ...)`. The cached helper and all its lazy native persistence resources now share the registry/provider lifetime rather than a caller controller's lifetime. Provider disposal still owns native persistence flush/channel cleanup. No generic lifecycle framework, production seam, new storage authority or public API/schema change was introduced. No generated file needed changing. All prior independent true-only migration keys, hydration gates, legacy ACK import, causal revisions, private membership/cache copies, reconnect refresh and navigation-only metadata completion remain intact.
+
+The owning regression uses the **real ServersProvider cache and native persisted/BroadcastChannel boundary**, not duplicated caching logic. The Vite component fixture creates an actual provider root, requests a helper from a first disposable controller root, disposes it, requests the helper from a second root and asserts identity reuse. It verifies successful acknowledgment and flush after replacement, later-version lazy acknowledgment after first-root disposal, and use after second-root disposal while the provider remains alive. All controller/provider roots are disposed in cleanup. Table cases cover initialized and lazy acknowledgment creation; no channel/global mocks, waits, action retries or production test seams were added.
+
+**Actual product red before correction:** `logs/owner-component-red-final.log` records **1 pass/1 fail**, with `InvalidStateError: Failed to execute 'postMessage' on 'BroadcastChannel': Channel is closed` in native `persist.ts` save/flush after the first controller was disposed. The lazy case already passed; the initialized case proved the parent's concrete failure. Command from `packages/app`:
+
+```sh
+sh /tmp/opencode/f017-work/pass1-run env PLAYWRIGHT_BROWSERS_PATH=/tmp/opencode/playwright-browsers PLAYWRIGHT_STORIES_PORT=4430 bun run test:components -- component-tests/server-projects.spec.ts --workers=1 --retries=0 > /tmp/opencode/f017-work/logs/owner-component-red-final.log 2>&1
+```
+
+The same owning component after the provider-owner correction passed **2/2** from a cold Vite cache with two workers, `logs/owner-component-green.log`, 3.8 seconds. The existing ignored Vite cache was preserved outside the checkout after verifying its canonical location, so the new literal fixture URL participated in a fresh prebundle scan. The cold and repeated logs contain **zero** `new dependencies optimized`/`optimized dependencies changed` messages. Final repetition command passed **20/20**, 14.1 seconds:
+
+```sh
+sh /tmp/opencode/f017-work/pass1-run env PLAYWRIGHT_BROWSERS_PATH=/tmp/opencode/playwright-browsers PLAYWRIGHT_STORIES_PORT=4430 bun run test:components -- component-tests/server-projects.spec.ts --workers=2 --retries=0 --repeat-each=10 > /tmp/opencode/f017-work/logs/owner-component-repeat.log 2>&1
+```
+
+Initial fixture/toolchain failures are not product-red claims. An attempted provider test in the Bun browser-unit loader failed with undefined generated `jsx_w77yafs4` before reaching the scenario (`logs/owner-red.log`, `owner-fixture.log`); the attempted block was removed without changing the admitted PASS2 test. The native provider regression therefore uses the existing Vite component harness, not a workaround to Bun's JSX loader. The first component launch lacked the installed headless-shell executable (`owner-component-red.log`); only the private Playwright browser cache was populated (`owner-browser-install.log`) before the retained actual red. No production service or browser profile was involved.
+
+All runtime checks used the same private **env-i** wrapper with empty configuration, model fetching/project configuration/telemetry disabled, private HOME/USERPROFILE/XDG/TMPDIR/TMP/TEMP, no shared service/account/provider and synthetic native fixtures only. Heavy checks were serial, browser maximum two workers and zero retries.
+
+| Command / scope | Actual owner-follow-up result |
+| --- | --- |
+| Actual provider/native-persistence component, initialized and lazy variants, repeated ten times | **20 pass**, no retries, `logs/owner-component-repeat.log`; cold **2 pass** in `logs/owner-component-green.log`. |
+| App `bun typecheck`; `bun run typecheck:tsc` | Both pass, **1,917 source/test files** in Bun check; `logs/owner-app-types.log`, `logs/owner-app-tsc.log`. |
+| App `bun run test:unit` | **1,045 pass, 0 fail, 3,111 assertions**, 132 files, `logs/owner-app-unit.log`. |
+| App `bun run test:browser` | **304 pass, 0 fail, 2,368 assertions**, 54 files, `logs/owner-browser-unit.log`. |
+| Seven complete production-built keepers, command below | Build and **147 pass**, 2.6 minutes, two workers/zero retries, `logs/owner-keepers.log`; preserves F001-F005 and the prior causal, reconnect, same-context late-cache and metadata regressions. |
+| App `bun run typecheck:e2e`; `diff -u /tmp/opencode/f003/logs/pass3-e2e-types.log /tmp/opencode/f017-work/logs/owner-e2e-types.log` | **Exit 2, same 13 audited diagnostics**, byte-identical comparison exit 0. Not a green E2E typecheck. |
+| Scoped `bunx oxlint` over manifest TS/TSX paths | **111 unsuppressed warnings, 0 errors**, 37 files, `logs/owner-lint.log`; no warning-neutrality claim. |
+
+```sh
+sh /tmp/opencode/f017-work/pass1-run env PLAYWRIGHT_BROWSERS_PATH=/tmp/opencode/playwright-browsers PLAYWRIGHT_PORT=4428 PLAYWRIGHT_WORKERS=2 bun run test:e2e:built -- e2e/regression/home.spec.ts e2e/regression/directory-picker.spec.ts e2e/regression/new-session.spec.ts e2e/regression/global-transcript-search.spec.ts e2e/regression/timeline-history.spec.ts e2e/regression/timeline-geometry.spec.ts e2e/regression/session-timeline-tool-projection.spec.ts --project=chromium --workers=2 --retries=0 > /tmp/opencode/f017-work/logs/owner-keepers.log 2>&1
+```
+
+**Exact scope is now 39 paths**, `/tmp/opencode/f017-work/changed-paths.txt`. This follow-up changes only `packages/app/src/runtime/server/registry.tsx`, adds the owning `packages/app/component-tests/server-projects.fixture.tsx` and `server-projects.spec.ts`, and appends this ledger evidence. All 37 admitted feature paths and owner decisions/evidence are preserved. No known supported gap from the ownership trace remains after the actual red/green tests. The entry benchmark remains genuinely blocked; Linux Chromium/synthetic-touch coverage does not certify Windows or physical devices. All owned native/browser/story/static fixture processes are stopped/disposed at handoff. Index is empty and HEAD remains `922aecb60bedb9924d2e9aa387607405753214a6`; no staging, commit, history/branch operation, reviewer/delegation, V1 checkout write, shared/production service/database/account/credential/provider or protected workflow operation occurred. Parent owns canonical validation, root compression and FINAL ROOT PASS3; no third review is claimed here. B14 closure, F027 retirement, latest V1 pin and missing F037-F039 evidence remain unchanged.
+
+### B15 Post-reboot Parent Integration
+
+The owner resumed the session after the temporary reboot stop. The parent verified the canonical active checkout/common Git directory, unchanged `922aecb60bedb9924d2e9aa387607405753214a6` HEAD, exactly 39 intended unstaged paths and empty index. All 26 durable backup checksums passed. The current tracked binary diff and all eight untracked file hashes match the recovery snapshot; only missing `/tmp` references/evidence were restored, with no source archive extraction or patch application. The provider-owner correction, actual initialized/lazy component fixture and retained report were read in full.
+
+| Parent command / scope | Actual post-reboot result |
+| --- | --- |
+| Root `bun run check`, fresh private `env -i` HOME/USERPROFILE/APPDATA/LOCALAPPDATA/XDG/TMPDIR/TMP/TEMP, empty config, model fetching/project config/telemetry disabled | **35 tasks pass, 33 cached**, lint and SDK documentation pass, **2.034 seconds**. **1,750 warnings, zero errors**, unsuppressed; `/tmp/opencode/f017-resumed-check.vCYhIZ1v/check.log`. |
+
+No heavy suites overlapped this check, and no functional source changed after validation. Only documentary recovery/results/status entries were updated. The retained worker component/browser/unit evidence and its platform limits remain as recorded above. ROOT compression followed validation; the remaining independent review is explicitly **FINAL PASS3 of three**, not a reset or fourth review. F001-F005 verification, F027 retirement, current V1 reference and missing F037-F039 definition gap remain unchanged.
+
+### B15 FINAL ROOT PASS3 Directory Selection Correction
+
+**All three independent B15 review passes are now exhausted. No fourth review was invoked or requested.** FINAL ROOT PASS3 identified one valid P2 in new-session project selection. This final correction is regression-tested but **not independently re-reviewed**. The implementation handoff remained unverified pending parent acceptance; that acceptance is now recorded below. The earlier post-reboot recovery canonical result remains pre-correction evidence, not proof for this later source edit.
+
+With ordered explicit directories `/repo` and `/repo/worktree`, both entries can carry the same native project metadata and loaded sandbox inventory. The previous combined predicate found the parent through its sandbox list before reaching the exact child entry. The resulting incorrect current selection caused choosing the parent to return early without changing draft destination. **Smallest correction:** `createPromptProjectController` now searches exact directory/worktree identity first, then sandbox membership, then native Project-ID fallback. All use the existing `pathKey` semantics and server scope filtering. No global path helper, shared order, directory identity, metadata schema or public API changed; codegen is not required.
+
+The existing owning selector unit table covers both explicit-list orders with identical Project ID/metadata and loaded sandbox/worktree inventory, including a trailing separator. It invokes the real controller's parent selection and asserts the selected directory actually changes, not merely picker closure. Separate table cases retain sandbox priority over a competing ID fallback and ID-only fallback with Windows separator identity. Before the production correction, the owning regression genuinely failed: expected the exact child entry but received the parent; the reverse order and fallbacks already passed. **Retained red:** `logs/final-selector-red.log`, **6 pass/1 fail/10 assertions**. **Green:** `logs/final-selector-green.log`, **7 pass/0 fail/13 assertions**. Package-local owning-test invocation under the fresh isolated wrapper:
+
+```sh
+sh /tmp/opencode/f017-work/final-run bun test --conditions=solid --isolate --preload ../ui/test/solid-jsx.ts --preload ./happydom.ts src/new-session/project/selector.test.tsx > /tmp/opencode/f017-work/logs/final-selector-green.log 2>&1
+```
+
+Two cases in the existing production-built new-session keeper cover parent-first and worktree-first order with the same project metadata and loaded inventory. They restore a real draft whose directory/worktree is the child, open the native worktree menu to observe loaded inventory, select the parent through the project picker, assert the actual draft destination changes, submit synthetic input and assert the native session-create request targets the parent directory. **Both pass**, 11.9 seconds, `logs/final-browser-green-native.log`:
+
+```sh
+sh /tmp/opencode/f017-work/final-run env PLAYWRIGHT_BROWSERS_PATH=/tmp/opencode/playwright-browsers PLAYWRIGHT_PORT=4428 PLAYWRIGHT_WORKERS=1 bun run test:e2e:built -- e2e/regression/new-session.spec.ts --project=chromium --workers=1 --retries=0 -g 'F017 exact added directory' > /tmp/opencode/f017-work/logs/final-browser-green-native.log 2>&1
+```
+
+Browser setup/fixture failures are not claimed as product reds. The first launch lacked the intentionally unpreserved post-reboot browser executable (`final-browser-red.log`). Initial browser fixtures confused default-local project choice, draft directory versus selected workspace, custom worktree option labels and canonical native project lookup; these failed before or after the intended interaction for fixture reasons (`final-browser-red-actual.log`, `final-browser-red-product.log`, `final-browser-green-first.log`, `final-browser-green.log`, `final-browser-green-complete.log`). They were corrected using existing draft seeding and the existing native project-inventory callback; no production test seam, action retry, sleep, timeout increase or weakened outcome assertion was introduced. The retained unit failure above is the actual pre-fix product-red evidence.
+
+Post-reboot browser download attempts through native Node/Bun failed on the environment's IPv6/TLS path (`final-browser-install*.log`); missing executables/download failures are setup evidence only. The repository's Playwright installer ultimately populated only `/tmp/opencode/playwright-browsers` using an owned temporary loopback archive mirror that fetched official HTTPS archives with IPv4 curl and normal TLS validation (`final-browser-install-mirror.log`). No dependency, source configuration, production service or browser profile changed. The temporary mirror was stopped before browser testing. Actual successful launches and the complete green run below verify the private executable setup.
+
+All runtime validation used a **fresh** private environment root `/tmp/opencode/f017-final.by5Wr7f5`, via `/tmp/opencode/f017-work/final-run`: `env -i`, owned HOME/USERPROFILE/APPDATA/LOCALAPPDATA/XDG/TMPDIR/TMP/TEMP, empty config, model fetching/project configuration/telemetry disabled. Heavy suites were serial; browser maximum two workers and zero retries. No root tests or implementation-agent canonical check ran.
+
+| Command / scope | Actual final-correction result |
+| --- | --- |
+| Owning selector unit above | **7 pass, 0 fail, 13 assertions**, `logs/final-selector-green.log`; retained genuine red above. |
+| Targeted production-built new-session cases above | **2 pass**, both list orders and actual parent destination/session-create location; `logs/final-browser-green-native.log`. |
+| App `bun typecheck`; `bun run typecheck:tsc` | Both pass, **1,917 files** in Bun check; `logs/final-app-types.log`, `logs/final-app-tsc.log`. |
+| App `bun run test:unit` | **1,049 pass, 0 fail, 3,121 assertions**, 132 files, `logs/final-app-unit.log`. |
+| App `bun run test:browser` | **304 pass, 0 fail, 2,368 assertions**, 54 files, `logs/final-browser-unit.log`. |
+| Seven complete production-built keepers below | Build and **149 pass**, 2.2 minutes, two workers/zero retries, `logs/final-keepers.log`; preserves F001-F005 and prior revision, reconnect, same-context cache/ACK, metadata and native two-client behavior. |
+| App `bun run typecheck:e2e`; `diff -u /tmp/opencode/f003/logs/pass3-e2e-types.log /tmp/opencode/f017-work/logs/final-e2e-types.log` | **Exit 2, same 13 audited diagnostics**, byte-identical comparison exit 0. Not a green E2E typecheck. |
+| Scoped `bunx oxlint` over the manifest TS/TSX paths; `git diff --check` | **116 warnings, 0 errors**, unsuppressed, 37 files, `logs/final-lint.log`; whitespace check passes. No warning-neutrality claim. |
+
+```sh
+sh /tmp/opencode/f017-work/final-run env PLAYWRIGHT_BROWSERS_PATH=/tmp/opencode/playwright-browsers PLAYWRIGHT_PORT=4428 PLAYWRIGHT_WORKERS=2 bun run test:e2e:built -- e2e/regression/home.spec.ts e2e/regression/directory-picker.spec.ts e2e/regression/new-session.spec.ts e2e/regression/global-transcript-search.spec.ts e2e/regression/timeline-history.spec.ts e2e/regression/timeline-geometry.spec.ts e2e/regression/session-timeline-tool-projection.spec.ts --project=chromium --workers=2 --retries=0 > /tmp/opencode/f017-work/logs/final-keepers.log 2>&1
+```
+
+The manifest remains exactly **39 intended paths**, `/tmp/opencode/f017-work/changed-paths.txt` (31 modified, eight new), unchanged in membership from the verified reboot bundle. This correction changes only `packages/app/src/new-session/project/selector.tsx`, its existing `selector.test.tsx`, the existing `e2e/regression/new-session.spec.ts`, and this ledger. No known supported gap from FINAL PASS3 remains after these tests. All previous persisted snapshot revisions, independent true-only migration ACKs/readiness/provider ownership, private membership copies, reconnect/pending guards, fail-closed storage, directory order/identity, navigation-only completion and bounded parent discovery remain intact. The benchmark is still genuinely baseline-blocked, and Linux Chromium synthetic coverage does not certify Windows or physical devices. All owned mirror/backend/browser/static fixtures are stopped/disposed at handoff, index empty and HEAD unchanged. No review/delegation, staging, commit, history change, V1 checkout access/write, production/shared-service/database/account/credential/provider or protected workflow operation occurred. B14 closure, F027 retirement, latest V1 pin, reboot evidence and missing F037-F039 gap are preserved. Parent owns final canonical integration and commit-work; this is tested implementation evidence after the three-pass limit, not a clean independent re-review.
+
+### Parent Acceptance After FINAL ROOT PASS3
+
+The parent freshly verified the same active checkout, admission HEAD, empty index and exact 39-path scope, inspected the actual selector/controller-unit/native destination-and-submission diffs, and read the latest implementation report. The final source preserves exact-directory precedence independently of shared order and retains sandbox and Project-ID fallbacks. No functional source changed during parent acceptance.
+
+| Parent command / boundary | Actual result |
+| --- | --- |
+| Fresh isolated root `bun run check` after the final selector fix | **PASS: 35 tasks, 33 cached, 2.17 seconds**, lint and SDK documentation pass; **1,755 unsuppressed warnings, zero errors**, `/tmp/opencode/f017-final-check.m3l4h9gh/check.log`. This is 59 more warnings in aggregate than the committed B14 count, not a claim of individual diagnostic neutrality. |
+| Read-only current V1 ref and production delta inspection | Current `personal-v1.18.29` is `2d9d50abf1b542075c273a1753c1ca675531dabe`; its structured-output completion/persisted-format changes are recorded above. F017 global-list, client-sync and directory-picker source paths are unchanged from the inspected `ae5dc5b5c106f841532446beb60e6bae6114f6c5`. |
+
+Together with the 30-case crosswalk, real storage/reopen/concurrency and malformed-data assertions, native two-client browser scenarios, acknowledgment/provider lifecycle components, seven complete final browser keepers and final selector regressions above, this completes the required supported F017 baseline. The final independent finding is integration-validated, not independently re-reviewed after the three-pass limit. The 13 audited E2E type diagnostics and baseline-blocked entry benchmark remain failures, not green checks; no production cutover, real credential/workflow execution or universal device/platform certification is claimed. Commit integration must still inspect all intended staged changes and verify the new local commit's full body, exact trailer, 39 paths, SHA and status.
+
+### Parent staged review and final cosmetic integration
+
+The parent completed actual cached review of all 39 intended paths, including the generated API artifacts, all owning tests and component/browser fixtures, and the full ledger delta. No additional supported functional defect was found. Unrelated formatter churn in eight existing files was restored without dropping F017 logic or assertions; two stale comments now distinguish shared membership from client-local navigation. The bounded restoration of the old F001 Home test region required token-equivalent formatting and identical compiled JavaScript, not a blind whitespace rewrite.
+
+| Result | Verification | Evidence |
+| --- | --- | --- |
+| PASS | All eight complete cleanup files compile to identical JavaScript against their staged versions with Bun 1.4.4, TS/TSX browser target and `minifyWhitespace: true`. | `/tmp/opencode/f017-commit-check.7kfL1liI/cosmetic-js-equivalence.log` |
+| PASS | Final isolated root `bun run check`: 35 successful tasks, 33 cached, 2.274 seconds; lint and SDK documentation passed, with 1,803 warnings and zero errors. | `/tmp/opencode/f017-commit-check.7kfL1liI/check.log` |
+
+The warning count is reported as observed after restoring old formatting; warnings are unsuppressed and no individual diagnostic-neutrality claim is made. This cosmetic/comment-only integration introduces no runtime change, does not repeat browser tests, and does not invoke a fourth independent review. The final selector correction retains its actual red/green and 149-keeper evidence above. The 13 audited E2E diagnostics, blocked entry benchmark and platform-certification limits remain disclosed rather than relabeled as green.
+
 ## Next work and nonproduction migration plan
 
-1. Locally commit verified B14/F002 through `commit-work`, record its exact SHA in the following ledger update, then implement full F017 and all remaining available features unattended. All three independent B14 passes are exhausted; the final correction is regression-tested and parent integration-validated but not independently re-reviewed, and no fourth review was performed. B13/F003 and B12/F001 are committed as recorded above; their three-pass limits remain closed. Revisit dependent partial batches rather than stopping at another progress checkpoint.
+1. Commit the parent-accepted B15/F017 through `commit-work` after intended staged review and record its exact SHA in the next ledger update. All three independent B15 passes are exhausted; the final correction is tested and integration-validated, not independently re-reviewed, and no fourth review is allowed. B14/F002, B13/F003 and B12/F001 review limits also remain closed. Continue full F021 offline HTTP API CLI and F006 durable queue/steer implementation, then the remaining available features and dependent partial batches without a checkpoint-only stop.
 2. Complete remaining available specifications using current V1 behavior and native V2 abstractions. Resolve ordinary compatibility, OAuth ownership, explicit Default, event mapping and persistence choices autonomously, with meaningful acceptance tests. Architectural differences are not owner blockers.
 3. Build disposable synthetic/copied-and-redacted V1 fixtures for historical stages. Verify bookmarks, event payload decoding, retained history/relationships/order and V2 projections independently. Refuse unsupported shapes and never modify the source copy. Read-only admission and a successful build are not production migration authorization.
 4. Implement the managed lifecycle, process, Task, enrollment and workspace contracts with safe opt-in behavior, synthetic signing/credentials and fake WorkQueue services. F027 is permanently retired and is not a dependency. No account-backed quota testing, production authority or real WorkQueue dispatch is authorized.

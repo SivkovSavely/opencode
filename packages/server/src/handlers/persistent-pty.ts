@@ -23,6 +23,7 @@ import { makeMediaGet } from "./media"
 import { type Outbound, runPtySocket } from "./pty-socket"
 import { makeSchedule } from "./schedule"
 import { TranscriptSearch } from "@opencode/core/session/transcript-search"
+import { ProjectList } from "@opencode/core/project-list"
 
 export const PersistentPtyHandler = HttpApiBuilder.group(Api, "server.experimental", (handlers) =>
   Effect.gen(function* () {
@@ -33,8 +34,17 @@ export const PersistentPtyHandler = HttpApiBuilder.group(Api, "server.experiment
     const mediaGet = yield* makeMediaGet
     const schedule = yield* makeSchedule
     const transcript = yield* TranscriptSearch.make
+    const projectList = yield* ProjectList.Service
 
     return handlers
+      .handle("projects.list", () =>
+        projectList.list().pipe(Effect.mapError((error) => new ServiceUnavailableError({ message: error.message }))),
+      )
+      .handle("projects.update", (ctx) =>
+        projectList
+          .apply(ctx.payload.operation)
+          .pipe(Effect.mapError((error) => new ServiceUnavailableError({ message: error.message }))),
+      )
       .handle("transcript.search", (ctx) =>
         transcript.search(ctx.payload).pipe(
           Effect.map((data) => ({ data })),

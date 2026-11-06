@@ -3,6 +3,7 @@ import type { OpenCodeEvent, SessionMessageInfo } from "@opencode/client/promise
 import { Permission } from "@opencode/schema/permission"
 import { Model } from "@opencode/schema/model"
 import { TranscriptSearch } from "@opencode/schema/transcript-search"
+import { ProjectList } from "@opencode/schema/project-list"
 import { Worktree } from "@opencode/schema/worktree"
 import { Duration, Effect, Layer, Option, Predicate, Schema } from "effect"
 import { HttpRouter, HttpServer, HttpServerResponse } from "effect/http"
@@ -22,6 +23,7 @@ import {
 } from "./mock-api"
 import { createPersistentPty, type MockPersistentPtyConfig, type MockServerEvent } from "./persistent-pty"
 import { installSseTransport } from "./sse-transport"
+import { applyProjectListOperation } from "../../src/runtime/server/project-list"
 
 type Resolvable<T> = T | (() => T)
 
@@ -74,6 +76,12 @@ export interface MockServerConfig {
   // Replaces the `/api/project` inventory, which defaults to `[project]`. A location inside a listed project
   // resolves to that project; any other location resolves to `project`.
   projects?: Resolvable<unknown[]>
+  projectList?:
+    | false
+    | {
+        list: () => unknown | Promise<unknown>
+        update: (operation: ProjectList.Operation) => unknown | Promise<unknown>
+      }
   // Runs on GET /api/location for a named directory before it answers, as the server registers the project of a
   // directory it resolves.
   onLocationGet?: (directory: string) => void
@@ -669,8 +677,48 @@ function mockHandlers(
       new MockUnsupported({ message: `The mock server does not ${operation}; configure ${handler} for this scenario` }),
     )
 
+  let explicitDirectories: string[] = []
+  let explicitRevision = 0
+
+  const projectList = config.projectList ?? {
+    list: () => ({ projects: explicitDirectories, revision: explicitRevision }),
+    update: (operation: ProjectList.Operation) => {
+      const next = applyProjectListOperation(explicitDirectories, operation)
+      if (JSON.stringify(next) !== JSON.stringify(explicitDirectories)) explicitRevision++
+      explicitDirectories = next
+
+      return { projects: explicitDirectories, revision: explicitRevision }
+    },
+  }
+
   return HttpApiBuilder.group(MockApi, "mock", (handlers) =>
     handlers
+      .handleRaw("explicitProjects", () =>
+        Effect.promise(async () =>
+          projectList
+            ? HttpServerResponse.jsonUnsafe(await projectList.list())
+            : HttpServerResponse.jsonUnsafe(
+                { _tag: "MockUnsupported", message: "Project list unsupported" },
+                { status: 404 },
+              ),
+        ),
+      )
+      .handleRaw("projectListUpdate", (ctx) =>
+        Effect.gen(function* () {
+          if (!projectList)
+            return HttpServerResponse.jsonUnsafe(
+              { _tag: "MockUnsupported", message: "Project list unsupported" },
+              { status: 404 },
+            )
+
+          const payload = yield* ctx.request.json.pipe(
+            Effect.flatMap(Schema.decodeUnknownEffect(Schema.Struct({ operation: ProjectList.Operation }))),
+            Effect.orDie,
+          )
+
+          return HttpServerResponse.jsonUnsafe(yield* Effect.promise(async () => projectList.update(payload.operation)))
+        }),
+      )
       .handleRaw("event", () => {
         const events = config.events?.()
         const retry = config.eventRetry === undefined ? "" : `retry: ${config.eventRetry}\n\n`

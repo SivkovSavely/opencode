@@ -380,6 +380,8 @@ export type TranscriptSearchFacets = {
   truncated: boolean
 }
 
+export type ProjectListSnapshot = { projects: Array<string>; revision: number }
+
 export type ReferenceGitSource = { type: "git"; repository: string; branch?: string }
 
 export type VcsBranch = { current?: string; default?: string }
@@ -1885,6 +1887,15 @@ export type ProjectUpdated = {
   }
 }
 
+export type ServerProjectsUpdated = {
+  id: EventID
+  created: number
+  metadata?: { [x: string]: any }
+  type: "server.projects.updated"
+  location?: LocationRef
+  data: { projects: Array<string>; revision: number }
+}
+
 export type WorktreeUpdated = {
   id: EventID
   created: number
@@ -2938,6 +2949,7 @@ export type V2Event =
   | PermissionReplied
   | PluginUpdated
   | ProjectUpdated
+  | ServerProjectsUpdated
   | WorktreeUpdated
   | WorktreeResolved
   | CommandUpdated
@@ -4432,6 +4444,7 @@ export type EventSubscribeInput = {
         | "permission.replied"
         | "plugin.updated"
         | "project.updated"
+        | "server.projects.updated"
         | "worktree.updated"
         | "worktree.resolved"
         | "command.updated"
@@ -4767,6 +4780,18 @@ export type ExperimentalTranscriptBackfillInput = { readonly rebuild?: boolean |
 export type ExperimentalTranscriptBackfillOutput = { data: TranscriptSearchStatus }["data"]
 
 export type ExperimentalTranscriptFacetsOutput = { data: TranscriptSearchFacets }["data"]
+
+export type ExperimentalProjectsListOutput = ProjectListSnapshot
+
+export type ExperimentalProjectsUpdateInput = {
+  readonly operation:
+    | { readonly type: "merge"; readonly projects: ReadonlyArray<string> }
+    | { readonly type: "add"; readonly directory: string }
+    | { readonly type: "remove"; readonly directory: string }
+    | { readonly type: "move"; readonly directory: string; readonly toIndex: number }
+}
+
+export type ExperimentalProjectsUpdateOutput = ProjectListSnapshot
 
 export type ShellListInput = { readonly location?: { readonly directory?: string | undefined } | undefined }
 

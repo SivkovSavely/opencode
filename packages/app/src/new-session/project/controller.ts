@@ -7,6 +7,7 @@ import { useWorkspaceLocation } from "@/workspaces/location"
 import { workspaceSelectionDestination } from "@/workspaces/paths"
 import { useTabs } from "@/shell/tabs/tabs"
 import type { PromptProjectControls, PromptServer } from "./selector"
+import { pathKey } from "@/workspaces/path-key"
 
 export function createComposerProjectControls(props: { draftId: string; worktree: () => string }) {
   const servers = useServers()
@@ -18,16 +19,16 @@ export function createComposerProjectControls(props: { draftId: string; worktree
   const projectServer = () => serverSDK.server
   const projectServerCtx = useServerCtx(projectServer)
 
-  // Every server project, one per directory, marked as used by this client or not; the selector orders them.
+  // Every server project, one per directory, marked by explicit shared membership; the selector orders them.
   const listed = (ctx: ServerCtx, server?: PromptServer) => {
     const used = ctx.projects.used()
-    const ids = new Set(used.map((project) => project.id))
+    const paths = new Set(used.map((project) => pathKey(project.worktree)))
 
     return [
       ...used.map((project) => ({ ...project, used: true, server })),
       ...ctx.projects
         .unique()
-        .filter((project) => !ids.has(project.id))
+        .filter((project) => !paths.has(pathKey(project.worktree)))
         .map((project) => ({ ...project, used: false, server })),
     ]
   }

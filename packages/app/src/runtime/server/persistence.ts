@@ -29,10 +29,8 @@ const StoredServer = Schema.Union([ServerHttp, ServerHttpBase, Schema.String]).p
   }),
 )
 
-// Project data comes from the server; per server scope, the client keeps only which projects it has used.
-// `projects` is the directory list older builds kept: each scope's entry is migrated to project IDs once the
-// server's list loads, then deleted. Stored `recentlyClosed` and directory-keyed `lastProject` fields are not part
-// of this schema, so decoding drops them.
+// Explicit directories are a startup cache of server membership, not the project inventory.
+// Navigation remains client-local. Legacy directory caches retain unresolved entries.
 export const ServerState = Persistence.struct({
   list: Persistence.array(StoredServer),
   hidden: Schema.Record(
@@ -50,6 +48,7 @@ export const ServerState = Persistence.struct({
     Schema.mutableKey(Schema.String.pipe(Schema.catchDecoding(() => Effect.succeed(Option.none())))),
   ),
   projects: Persistence.record(Persistence.array(Persistence.struct({ worktree: Schema.String }))),
+  projectListVersion: Schema.optional(Persistence.record(Schema.Number)),
 })
 
 export const ModelState = Persistence.struct({

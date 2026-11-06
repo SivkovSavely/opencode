@@ -5,11 +5,351 @@ import { mockOpenCodeServer } from "../utils/mock-server"
 import { fixture, mockStressTimeline } from "../utils/session-fixture"
 import { mockRemoteServer, mockWorkspace, newSessionLocation } from "../utils/workspace"
 import { APP_READY_TIMEOUT, expectAppVisible } from "../utils/waits"
+import { startTranscriptServer } from "../utils/transcript"
+import { installSseTransport } from "../utils/sse-transport"
 
 test.use({ serviceWorkers: "block" })
 
+test("F017 a failed tab's late cache write cannot erase another tab's migration acknowledgment on reload", async ({
+  page,
+  context,
+}) => {
+  await using backend = await startTranscriptServer()
+  const headers = { authorization: `Basic ${btoa("opencode:synthetic-f002")}` }
+  const second = await context.newPage()
+  try {
+    for (const client of [page, second]) {
+      await client.setExtraHTTPHeaders(headers)
+      await mockOpenCodeServer(client, {
+        directory: "C:/OpenCode/empty",
+        project: project({ id: "proj_marker_empty", directory: "C:/OpenCode/empty" }),
+        provider: NO_PROVIDER,
+        sessions: [],
+        pageMessages: () => ({ items: [] }),
+      })
+      await seed(client, {
+        servers: [{ url: backend.origin, name: "Shared F017" }],
+        legacyProjects: { [backend.origin]: [{ worktree: "/F017/Alpha" }, { worktree: "/F017/Beta" }] },
+      })
+    }
+    await page.route(`${backend.origin}/api/experimental/projects`, (route) =>
+      route.request().method() === "PATCH"
+        ? route.fulfill({
+            status: 503,
+            contentType: "application/json",
+            body: JSON.stringify({ message: "synthetic unavailable bootstrap" }),
+          })
+        : route.fallback(),
+    )
+    const failed = page.waitForResponse(
+      (r) => r.url() === `${backend.origin}/api/experimental/projects` && r.status() === 503,
+    )
+    await page.goto("/")
+    await failed
+    const rows = (client: Page) => client.locator('[data-component="home-project-row"] [data-slot="home-row-label"]')
+    await expect(rows(page)).toHaveText(["Alpha", "Beta"])
+    // Freeze only this owned tab's persistence save timer; pagehide deterministically flushes it later.
+    await page.clock.install({ time: new Date("2040-01-01T00:00:00Z") })
+    await page.clock.pauseAt(new Date("2040-01-01T00:00:01Z"))
+    const close = async (client: Page, name: string) => {
+      await client
+        .locator('[data-component="home-project-row"]')
+        .filter({ hasText: name })
+        .locator("..")
+        .getByRole("button", { name: "More options", exact: true })
+        .click()
+      await client.getByRole("menuitem", { name: "Close", exact: true }).click()
+    }
+    await close(page, "Beta")
+    await expect(rows(page)).toHaveText(["Alpha"])
+    const migrated = second.waitForResponse(
+      (r) => r.url() === `${backend.origin}/api/experimental/projects` && r.request().method() === "PATCH" && r.ok(),
+    )
+    await second.goto(page.url())
+    await migrated
+    await expect(rows(second)).toHaveText(["Alpha", "Beta"])
+    await close(second, "Alpha")
+    await expect(rows(second)).toHaveText(["Beta"])
+    await second.evaluate(() => window.dispatchEvent(new Event("pagehide")))
+    await expect
+      .poll(() =>
+        second.evaluate(
+          (origin) => JSON.parse(localStorage.getItem("opencode.global.dat:server") ?? "{}").projects?.[origin],
+          backend.origin,
+        ),
+      )
+      .toEqual([{ worktree: "/F017/Beta" }])
+    await page.evaluate(() => window.dispatchEvent(new Event("pagehide")))
+    await expect
+      .poll(() =>
+        second.evaluate(
+          (origin) => JSON.parse(localStorage.getItem("opencode.global.dat:server") ?? "{}").projects?.[origin],
+          backend.origin,
+        ),
+      )
+      .toEqual([{ worktree: "/F017/Alpha" }])
+    await second.reload()
+    await expect(rows(second)).toHaveText(["Beta"])
+    const authoritative = await second.request.get(`${backend.origin}/api/experimental/projects`, { headers })
+    expect(await authoritative.json()).toEqual({ projects: ["/F017/Beta"], revision: 2 })
+  } finally {
+    await second.close()
+  }
+})
+
+for (const scenario of ["reconnect", "replicated fallback", "metadata completion"]) {
+  test(`F017 ${scenario} cannot replace acknowledged native membership`, async ({ page, browser, context }) => {
+    await using backend = await startTranscriptServer()
+    const headers = { authorization: `Basic ${btoa("opencode:synthetic-f002")}` }
+    const otherContext = scenario === "reconnect" ? await browser.newContext({ serviceWorkers: "block" }) : undefined
+    const second = await (otherContext ?? context).newPage()
+    try {
+      for (const client of [page, second]) {
+        await client.setExtraHTTPHeaders(headers)
+        await mockOpenCodeServer(client, {
+          directory: "C:/OpenCode/empty",
+          project: project({ id: "proj_f017_empty", directory: "C:/OpenCode/empty" }),
+          provider: NO_PROVIDER,
+          sessions: [],
+          pageMessages: () => ({ items: [] }),
+        })
+        await seed(client, {
+          servers: [{ url: backend.origin, name: "Shared F017" }],
+          legacyProjects: { [backend.origin]: [{ worktree: "/F017/Alpha" }, { worktree: "/F017/Beta" }] },
+        })
+      }
+      const stream =
+        scenario === "reconnect" ? await installSseTransport(second, { server: backend.origin, retry: 1 }) : undefined
+      const rows = (client: Page) => client.locator('[data-component="home-project-row"] [data-slot="home-row-label"]')
+      const membership = () =>
+        page.request.get(`${backend.origin}/api/experimental/projects`, { headers }).then((r) => r.json())
+      const close = async (directory: string) => {
+        const item = page.locator('[data-component="home-project-row"]').filter({ hasText: directory })
+        await item.locator("..").getByRole("button", { name: "More options", exact: true }).click()
+        await page.getByRole("menuitem", { name: "Close", exact: true }).click()
+      }
+      await page.goto("/")
+      await expect(rows(page)).toHaveText(["Alpha", "Beta"])
+      await second.goto(page.url())
+      await expect(rows(second)).toHaveText(["Alpha", "Beta"])
+      // The GET acknowledgment is observable before inducing cross-tab persistence or transport races.
+      await expect
+        .poll(() =>
+          second.evaluate(
+            (origin) =>
+              JSON.parse(localStorage.getItem("opencode.global.dat:server") ?? "{}").projectListVersion?.[origin],
+            backend.origin,
+          ),
+        )
+        .toBe(1)
+
+      if (stream) {
+        const connected = await stream.waitForConnection()
+        await close("Alpha")
+        await expect.poll(membership).toMatchObject({ projects: ["/F017/Beta"] })
+        await expect(rows(second)).toHaveText(["Alpha", "Beta"])
+        const refreshed = second.waitForResponse(
+          (r) => r.url() === `${backend.origin}/api/experimental/projects` && r.request().method() === "GET",
+        )
+        await stream.disconnect()
+        await stream.waitForConnection({ after: connected.id })
+        await refreshed
+        await expect(rows(second)).toHaveText(["Beta"])
+        return
+      }
+
+      if (scenario === "replicated fallback") {
+        const observed = await second.evaluateHandle(() => {
+          const labels: string[] = []
+          const observer = new MutationObserver(() =>
+            labels.push(
+              Array.from(
+                document.querySelectorAll('[data-component="home-project-row"] [data-slot="home-row-label"]'),
+                (row) => row.textContent,
+              ).join(","),
+            ),
+          )
+          observer.observe(document.body, { childList: true, subtree: true, characterData: true })
+          return { labels, stop: () => observer.disconnect() }
+        })
+        const failed = Promise.withResolvers<void>()
+        await page.route(`${backend.origin}/api/experimental/projects`, async (route) => {
+          if (route.request().method() !== "PATCH") return route.fallback()
+          await route.fulfill({
+            status: 503,
+            contentType: "application/json",
+            body: JSON.stringify({ message: "synthetic unavailable update" }),
+          })
+          failed.resolve()
+        })
+        await close("Alpha")
+        await failed.promise
+        await expect(rows(page)).toHaveText(["Beta"])
+        await expect
+          .poll(() =>
+            second.evaluate(
+              (origin) => JSON.parse(localStorage.getItem("opencode.global.dat:server") ?? "{}").projects?.[origin],
+              backend.origin,
+            ),
+          )
+          .toEqual([{ worktree: "/F017/Beta" }])
+        expect(await membership()).toMatchObject({ projects: ["/F017/Alpha", "/F017/Beta"] })
+        await expect(rows(second)).toHaveText(["Alpha", "Beta"])
+        expect(
+          await observed.evaluate((state) => {
+            state.stop()
+            return state.labels.filter((label) => label !== "Alpha,Beta")
+          }),
+        ).toEqual([])
+        await observed.dispose()
+        return
+      }
+
+      await page
+        .locator("[data-home-row]")
+        .filter({ has: page.getByText("Shared F017", { exact: true }) })
+        .getByRole("button", { name: "Add project", exact: true })
+        .click()
+      const picker = page
+        .getByRole("dialog")
+        .filter({ has: page.getByRole("button", { name: "Select folder", exact: true }) })
+      await expect(picker.getByRole("button", { name: "Select folder", exact: true })).toBeEnabled()
+      await picker.getByRole("combobox").fill(backend.directory)
+      await picker.getByRole("combobox").press("Enter")
+      await expect(picker.getByRole("button", { name: "Select folder", exact: true })).toBeEnabled()
+      const location = await holdRoute(page, new RegExp(`${backend.origin}/api/location(?:\\?|$)`), { method: "GET" })
+      await picker.getByRole("button", { name: "Select folder", exact: true }).click()
+      await location.arrived
+      await expect(rows(page)).toHaveText(["home", "Alpha", "Beta"])
+      await close("home")
+      await expect.poll(membership).toMatchObject({ projects: ["/F017/Alpha", "/F017/Beta"], revision: 3 })
+      const completed = page.waitForResponse((r) => r.url().startsWith(`${backend.origin}/api/location?`))
+      location.release()
+      const resolved = await (await completed).json()
+      await expect
+        .poll(() =>
+          page.evaluate(
+            (origin) => JSON.parse(localStorage.getItem("opencode.global.dat:server") ?? "{}").lastProjectID?.[origin],
+            backend.origin,
+          ),
+        )
+        .toBe(resolved.project.id)
+      await expect(rows(page)).toHaveText(["Alpha", "Beta"])
+      await expect.poll(membership).toMatchObject({ projects: ["/F017/Alpha", "/F017/Beta"], revision: 3 })
+      // A genuinely later explicit open still admits the directory.
+      await page
+        .locator("[data-home-row]")
+        .filter({ has: page.getByText("Shared F017", { exact: true }) })
+        .getByRole("button", { name: "Add project", exact: true })
+        .click()
+      const reopened = page
+        .getByRole("dialog")
+        .filter({ has: page.getByRole("button", { name: "Select folder", exact: true }) })
+      await expect(reopened.getByRole("button", { name: "Select folder", exact: true })).toBeEnabled()
+      await reopened.getByRole("combobox").fill(backend.directory)
+      await reopened.getByRole("combobox").press("Enter")
+      await reopened.getByRole("button", { name: "Select folder", exact: true }).click()
+      await expect(rows(page)).toHaveText(["home", "Alpha", "Beta"])
+      await expect
+        .poll(membership)
+        .toMatchObject({ projects: [backend.directory, "/F017/Alpha", "/F017/Beta"], revision: 4 })
+    } finally {
+      await second.close()
+      await otherContext?.close()
+    }
+  })
+}
+
 const row = (page: Page, title: string) =>
   page.locator('[data-component="home-session-row"]').filter({ hasText: title })
+
+test("F017 two isolated browser clients share native durable close, keyboard reorder and picker add without losing unresolved directories", async ({
+  page,
+  browser,
+}) => {
+  await using backend = await startTranscriptServer()
+  const headers = { authorization: `Basic ${btoa("opencode:synthetic-f002")}` }
+
+  const secondContext = await browser.newContext({
+    extraHTTPHeaders: headers,
+    serviceWorkers: "block",
+    hasTouch: true,
+    isMobile: true,
+    viewport: { width: 390, height: 844 },
+  })
+
+  try {
+    const second = await secondContext.newPage()
+
+    for (const client of [page, second]) {
+      await client.setExtraHTTPHeaders(headers)
+      await mockOpenCodeServer(client, {
+        directory: "C:/OpenCode/empty",
+        project: project({ id: "proj_f017_empty", directory: "C:/OpenCode/empty" }),
+        provider: NO_PROVIDER,
+        sessions: [],
+        pageMessages: () => ({ items: [] }),
+      })
+      await seed(client, {
+        servers: [{ url: backend.origin, name: "Shared F017" }],
+        legacyProjects: {
+          [backend.origin]: client === page ? [{ worktree: "/F017/Alpha" }, { worktree: "/F017/Beta" }] : [],
+        },
+      })
+    }
+
+    const rows = (client: Page) => client.locator('[data-component="home-project-row"] [data-slot="home-row-label"]')
+    await page.goto("/")
+    await expect(rows(page)).toHaveText(["Alpha", "Beta"])
+    const navigation = await page.evaluate(
+      () => JSON.parse(localStorage.getItem("opencode.global.dat:server") ?? "{}").lastProjectID,
+    )
+    await second.goto(page.url())
+    await second.getByRole("button", { name: "Projects", exact: true }).tap()
+    await expect(rows(second)).toHaveText(["Alpha", "Beta"])
+    const alpha = page.locator('[data-component="home-project-row"]').filter({ hasText: "Alpha" })
+    await alpha.locator("..").getByRole("button", { name: "More options", exact: true }).press("Enter")
+    await page.getByRole("menuitem", { name: "Move down", exact: true }).press("Enter")
+    await expect(rows(page)).toHaveText(["Beta", "Alpha"])
+    await expect(rows(second)).toHaveText(["Beta", "Alpha"])
+    expect(await second.evaluate(() => matchMedia("(hover: none)").matches)).toBe(true)
+    const remoteAlpha = second.locator('[data-component="home-project-row"]').filter({ hasText: "Alpha" })
+    await remoteAlpha.locator("..").getByRole("button", { name: "More options", exact: true }).tap()
+    await second.getByRole("menuitem", { name: "Close", exact: true }).tap()
+    await expect(rows(page)).toHaveText(["Beta"])
+    expect(
+      await page.evaluate(() => {
+        const cache = JSON.parse(localStorage.getItem("opencode.global.dat:server") ?? "{}")
+        return { lastProjectID: cache.lastProjectID, recentlyClosed: cache.recentlyClosed }
+      }),
+    ).toEqual({ lastProjectID: navigation, recentlyClosed: undefined })
+    await second.getByRole("button", { name: "Projects", exact: true }).tap()
+    await expect(rows(second)).toHaveText(["Beta"])
+    await page
+      .locator("[data-home-row]")
+      .filter({ has: page.getByText("Shared F017", { exact: true }) })
+      .getByRole("button", { name: "Add project", exact: true })
+      .click()
+
+    const picker = page
+      .getByRole("dialog")
+      .filter({ has: page.getByRole("button", { name: "Select folder", exact: true }) })
+
+    const input = picker.getByRole("combobox")
+    await input.fill(backend.directory)
+    await input.press("Enter")
+    await picker.getByRole("button", { name: "Select folder", exact: true }).click()
+    await expect(rows(second)).toContainText(["home", "Beta"])
+    await second.reload()
+    await second.getByRole("button", { name: "Projects", exact: true }).tap()
+    await expect(rows(second)).toContainText(["home", "Beta"])
+    const response = await page.request.get(`${backend.origin}/api/experimental/projects`, { headers })
+    expect(response.ok()).toBe(true)
+    expect(await response.json()).toEqual({ projects: [backend.directory, "/F017/Beta"], revision: 4 })
+  } finally {
+    await secondContext.close()
+  }
+})
 
 async function openHome(page: Page, input: Parameters<typeof mockStressTimeline>[1] = {}) {
   await mockStressTimeline(page, input)
@@ -471,13 +811,14 @@ const entry = (name: string, active: number, id = `proj_${name}`) =>
     time: { created: T0, updated: T0, active: T0 + active },
   })
 
-async function homeProjects(page: Page, projects: unknown[]) {
+async function homeProjects(page: Page, projects: unknown[], projectList?: false) {
   const directory = "C:/OpenCode/home"
 
   const server = await mockOpenCodeServer(page, {
     directory,
     project: project({ id: "proj_home", directory }),
     projects: () => projects,
+    projectList,
     provider: NO_PROVIDER,
     sessions: [],
     pageMessages: () => ({ items: [] }),
@@ -486,7 +827,7 @@ async function homeProjects(page: Page, projects: unknown[]) {
   return { server, rows: page.locator('[data-component="home-project-row"] [data-slot="home-row-label"]') }
 }
 
-test("Home lists the used server projects by recent activity, hides them, and lists them again once used", async ({
+test("Home explicit membership keeps its order across inventory activity, closes entries, and adds them again once used", async ({
   page,
 }) => {
   // `recent` was first resolved under another ID, so one directory has two projects.
@@ -497,7 +838,7 @@ test("Home lists the used server projects by recent activity, hides them, and li
   await page.goto("/")
   await expect(view.rows).toHaveText(["recent", "older", "oldest"])
 
-  // Activity moves a project up and an archived project leaves; a project this client never used stays out.
+  // Inventory activity and archive do not rewrite explicit membership or order.
   const active = { ...listed[3]!, time: { ...listed[3]!.time, active: T0 + 5 } }
   const archived = { ...listed[2]!, time: { ...listed[2]!.time, archived: T0 + 6 } }
   const fresh = entry("fresh", 7)
@@ -512,12 +853,12 @@ test("Home lists the used server projects by recent activity, hides them, and li
       }),
     ),
   )
-  await expect(view.rows).toHaveText(["oldest", "recent"])
+  await expect(view.rows).toHaveText(["recent", "older", "oldest"])
 
   const recent = page.locator('[data-component="home-project-row"]').filter({ hasText: "recent" })
   await recent.locator("..").getByRole("button", { name: "More options", exact: true }).click()
   await page.getByRole("menuitem", { name: "Close", exact: true }).click()
-  await expect(view.rows).toHaveText(["oldest"])
+  await expect(view.rows).toHaveText(["older", "oldest"])
 
   // Closing a project moves it out of the added list, but it remains discoverable in the server inventory.
   await page
@@ -528,22 +869,34 @@ test("Home lists the used server projects by recent activity, hides them, and li
     .click()
   await newSessionLocation(page).click()
   const options = page.getByRole("dialog").getByRole("option")
-  await expect(options.locator(".command-palette-title")).toHaveText(["oldest", "Other projects", "Add project"])
+  await expect(options.locator(".command-palette-title")).toHaveText([
+    "older",
+    "oldest",
+    "Other projects",
+    "Add project",
+  ])
   await options.filter({ hasText: "Other projects" }).click()
   await expect(options.locator(".command-palette-title")).toHaveText(["fresh", "unused", "recent"])
   await options.filter({ hasText: "C:/OpenCode/recent" }).click()
   await expect(newSessionLocation(page)).toContainText("recent")
   await page.getByRole("button", { name: "Home", exact: true }).click()
-  await expect(view.rows).toHaveText(["oldest", "recent"])
+  await expect(view.rows).toHaveText(["recent", "older", "oldest"])
 })
 
-test("Home migrates the directories an older build listed to the server's current projects", async ({ page }) => {
-  const view = await homeProjects(page, [
-    entry("api", 3),
-    entry("web", 2),
-    entry("api", 1, "proj_api_before_remote"),
-    entry("docs", 0),
-  ])
+test("Home retains legacy directory identities and unresolved paths while enriching them from native inventory", async ({
+  page,
+}) => {
+  const unsupported = page.waitForResponse(
+    (response) => new URL(response.url()).pathname === "/api/experimental/projects" && response.status() === 404,
+  )
+
+  const view = await homeProjects(
+    page,
+    [entry("api", 3), entry("web", 2), entry("api", 1, "proj_api_before_remote"), entry("docs", 0)],
+    false,
+  )
+
+  const inventory = await holdRoute(page, /\/api\/project(?:\?|$)/)
 
   await seed(page, {
     legacyProjects: {
@@ -555,10 +908,26 @@ test("Home migrates the directories an older build listed to the server's curren
     },
   })
   await page.goto("/")
-  await expect(view.rows).toHaveText(["api", "web"])
+  await expect(view.rows).toHaveText(["api", "app", "gone"])
+  inventory.release()
+  await unsupported
+  await expect(view.rows).toHaveText(["api", "web", "gone"])
   await expect
     .poll(() => page.evaluate(() => JSON.parse(localStorage.getItem("opencode.global.dat:server") ?? "{}")))
-    .toMatchObject({ usedProjectIDs: { local: ["proj_api", "proj_web"] }, projects: {} })
+    .toMatchObject({
+      projects: {
+        local: [
+          { worktree: "C:/OpenCode/api" },
+          { worktree: "C:/OpenCode/web/packages/app" },
+          { worktree: "C:/OpenCode/gone" },
+        ],
+      },
+    })
+  expect(
+    await page.evaluate(
+      () => JSON.parse(localStorage.getItem("opencode.global.dat:server") ?? "{}").projectListVersion?.local,
+    ),
+  ).toBeUndefined()
 })
 
 test("Home shows loaded sessions before the location request resolves", async ({ page }) => {

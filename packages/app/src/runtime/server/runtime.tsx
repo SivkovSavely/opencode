@@ -1,6 +1,7 @@
 import { createSimpleContext } from "@opencode/ui/context"
 import { Accessor, batch, createEffect, createMemo, createResource, createRoot, getOwner, onCleanup, untrack } from "solid-js"
 import { useQueryClient } from "@tanstack/solid-query"
+import { createStore } from "solid-js/store"
 import { createServerProjects, ServerConnection, useServers } from "./registry"
 import { pathKey } from "@/workspaces/path-key"
 import { useServerHealth } from "@/runtime/server/health"
@@ -25,6 +26,8 @@ import type { SessionInfo } from "@opencode/client/promise"
 import { projectForSession } from "@/shell/layout/helpers"
 import { isProjectDirectory } from "@/workspaces/paths"
 import type { Project } from "@/runtime/server/types"
+import type { LocalProject } from "@/shell/state/layout"
+import { createProjectListSync, PROJECT_LIST_MIGRATION } from "./project-list"
 
 export const { use: useGlobal, provider: GlobalProvider } = createSimpleContext({
   name: "Global",
@@ -295,13 +298,12 @@ function createServerController(
     })
   })
 
-  // The projects this client has used, in server order. Using any ID of a path shows that path's current project.
-  const used = createMemo(() => {
+  const legacyUsed = () => {
     const ids = new Set(projects.used())
     const paths = new Set(list().flatMap((project) => (ids.has(project.id) ? [pathKey(project.worktree)] : [])))
 
     return unique().filter((project) => paths.has(pathKey(project.worktree)))
-  })
+  }
 
   const forDirectory = (directory: string): Project | undefined => {
     const key = pathKey(directory)
@@ -316,24 +318,68 @@ function createServerController(
     )
   }
 
-  // Older builds kept opened directories locally; once the server's list loads they become used project IDs.
-  createEffect(() => {
-    const legacy = projects.legacy()
-
-    if (!legacy || !sync.project.ready()) return
-    untrack(() => projects.migrate(legacy.flatMap((directory) => forDirectory(directory)?.id ?? [])))
+  // Directory identity is not Project identity: related worktrees and non-Git directories stay distinct.
+  const [membership, setMembership] = createStore<{ directories: readonly string[] | undefined }>({
+    directories: undefined,
   })
+  const directories = () => membership.directories ?? projects.directories() ?? legacyUsed().map((p) => p.worktree)
+  const used = createMemo<LocalProject[]>(() =>
+    directories().map((directory) => {
+      const project = forDirectory(directory)
+
+      return project ? { ...project, worktree: directory } : { worktree: directory }
+    }),
+  )
+
+  let projectList: ReturnType<typeof createProjectListSync> | undefined
+  const early: Parameters<ReturnType<typeof createProjectListSync>["send"]>[0][] = []
+
+  const send = (operation: Parameters<ReturnType<typeof createProjectListSync>["send"]>[0]) => {
+    if (projectList) return projectList.send(operation)
+    early.push(operation)
+  }
+
+  // Cache renders before inventory loads; native used IDs are imported only when their directory metadata is known.
+  createEffect(() => {
+    if (projectList || !sync.project.ready() || !projects.migrationReady(PROJECT_LIST_MIGRATION)) return
+    untrack(() => {
+      if (!projects.directories()) projects.replace(legacyUsed().map((project) => project.worktree))
+      setMembership("directories", [...(projects.directories() ?? [])])
+      projectList = createProjectListSync({
+        remote: {
+          list: () => sdk.api.experimental.projects.list(),
+          update: (operation) => sdk.api.experimental.projects.update({ operation }),
+        },
+        cache: () => projects.directories() ?? [],
+        replace: (directories) => {
+          setMembership("directories", [...directories])
+          projects.replace([...directories])
+        },
+        migrated: () => projects.migrated(PROJECT_LIST_MIGRATION),
+        markMigrated: () => projects.markMigrated(PROJECT_LIST_MIGRATION),
+        onError: (error) => console.warn("[project-list] keeping local directory cache", error),
+      })
+      early.splice(0).forEach((operation) => void projectList?.send(operation))
+    })
+  })
+  onCleanup(sdk.event.on("server.projects.updated", (event) => projectList?.snapshot(event.data)))
+  onCleanup(sdk.event.on("server.connected", () => void projectList?.refresh()))
+  onCleanup(() => projectList?.dispose())
 
   // Resolving a directory registers its project on the server; the list then reloads to include it, and the
   // project becomes this client's last used one.
   function add(directory: string) {
+    void send({ type: "add", directory })
+
     return sdk.api.location
       .get({ location: { directory } })
       .then(async (location) => {
         await sync.project.refresh()
         projects.touch(location.project.id)
 
-        return list().find((project) => project.id === location.project.id)
+        const project = list().find((project) => project.id === location.project.id)
+
+        return project ? { ...project, worktree: directory } : { worktree: directory }
       })
       .catch((error) => {
         showToast({
@@ -357,20 +403,29 @@ function createServerController(
       list,
       unique,
       used,
+      directories,
       add,
       forDirectory,
       forSession: (session: SessionInfo): Project | undefined => projectForSession(session, list()),
       last: () => list().find((project) => project.id === projects.last()),
-      // Marks the project of a directory as used from this client, and as the last one.
+      // Async admission completion remembers navigation without repeating the already submitted add.
+      remember(directory: string) {
+        const id = forDirectory(directory)?.id
+        if (id) projects.touch(id)
+      },
+      // Explicit opening admits shared membership and remembers this client's last project.
       touch(directory: string) {
+        void send({ type: "add", directory })
         const id = forDirectory(directory)?.id
 
         if (id) projects.touch(id)
       },
-      // Removes a project from this client's used projects until it is used again; the server keeps it.
+      move(directory: string, toIndex: number) {
+        void send({ type: "move", directory, toIndex })
+      },
+      // Only explicit membership changes; inventory, files and sessions remain untouched.
       hide(project: Pick<Project, "worktree">) {
-        const key = pathKey(project.worktree)
-        projects.hide(list().flatMap((item) => (pathKey(item.worktree) === key ? [item.id] : [])))
+        void send({ type: "remove", directory: project.worktree })
       },
     },
     notification,

@@ -32,6 +32,7 @@ import {
   cleanPickerInput,
   createPriorityTaskQueue,
   createDirectorySearch,
+  projectSearchRoots,
   currentPickerSuggestions,
   displayPickerPath,
   shortenPickerRecentPath,
@@ -157,7 +158,13 @@ export function DirectoryPickerDialog(props: DirectoryPickerDialogProps) {
       .slice(0, 5)
   })
 
-  const search = createDirectorySearch({ sdk, home, location, base: () => state.root || start() })
+  const search = createDirectorySearch({
+    sdk,
+    home,
+    location,
+    base: () => state.root || start(),
+    extraRoots: () => (policy.includeFiles ? [] : projectSearchRoots(serverCtx.projects.directories())),
+  })
 
   const [suggestions] = createResource(
     () => state.input,

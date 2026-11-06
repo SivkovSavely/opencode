@@ -17,9 +17,69 @@ import {
   pickerParent,
   pickerRoot,
   pickerAbsoluteInput,
+  projectSearchRoots,
 } from "./domain"
 
 type Sdk = Parameters<typeof listPickerDirectory>[0]
+
+test("sibling roots use immediate parents, Windows and UNC identity, distinct POSIX case and at most six roots", () => {
+  expect(
+    projectSearchRoots(["C:\\Code\\One", "c:/code/Two", "\\\\Host\\Share\\A", "//host/share/B", "/Case/A", "/case/B"]),
+  ).toEqual(["C:/Code", "//Host/Share", "/Case", "/case"])
+  expect(projectSearchRoots(Array.from({ length: 20 }, (_, i) => `/root${i}/project`))).toHaveLength(6)
+})
+
+test("ordinary sibling queries use native find before soft listing fallback and explicit input never fans out", async () => {
+  const calls: string[] = []
+
+  const api = sdk({
+    find: async (input: { location: { directory: string }; query: string }) => {
+      calls.push(`find:${input.location.directory}:${input.query}`)
+
+      if (input.query.endsWith("shared")) {
+        return { location: input.location, data: [{ path: "/base/nested/shared" }] }
+      }
+
+      return { location: input.location, data: [] }
+    },
+    list: async (input: { location: { directory: string }; path: string }) => {
+      calls.push(`list:${input.path}`)
+
+      if (input.path === "/broken") throw new Error("unavailable root")
+
+      const paths: Record<string, string[]> = {
+        "/base": ["space"],
+        "/siblings": ["space"],
+        "/base/space": ["src"],
+        "/siblings/space": ["src"],
+      }
+
+      return {
+        location: { directory: input.path },
+        data: (paths[input.path] ?? []).map((path) => ({ path, type: "directory" })),
+      }
+    },
+  })
+
+  const search = createDirectorySearch({
+    sdk: api,
+    location: () => ({ directory: "/base" }),
+    base: () => "/base",
+    home: () => "/home",
+    extraRoots: () => ["/siblings", "/broken", "/base", "/base/nested"],
+  })
+
+  expect(await search("space")).toEqual(["/base/space", "/siblings/space"])
+  expect(calls.indexOf("find:/siblings:space")).toBeLessThan(calls.indexOf("list:/siblings"))
+  expect(await search("space/src")).toEqual(["/base/space/src", "/siblings/space/src"])
+  expect(await search("shared")).toEqual(["/base/nested/shared"])
+
+  for (const query of ["/space", "~/space", "C:/space", "//host/share/space", "./space", "../space", "", ".", ".."]) {
+    calls.splice(0)
+    await search(query)
+    expect(calls.some((call) => call.includes("siblings") || call.includes("broken"))).toBe(false)
+  }
+})
 
 // The picker only reads `api.file.find` and `api.file.list`.
 const sdk = (file: { find?: (input: never) => Promise<unknown>; list?: (input: never) => Promise<unknown> }) =>
@@ -348,7 +408,7 @@ const fallbacks: {
     query: "",
     find: () => Promise.resolve({ data: [] }),
     list: () => Promise.resolve({ location: home, data: [...projects, { path: "README.md", type: "file" }] }),
-    expected: projects.map((item) => `/home/luke/${item.path.slice(0, -1)}`),
+    expected: projects.slice(0, 50).map((item) => `/home/luke/${item.path.slice(0, -1)}`),
     listed: ["/home/luke"],
   },
   {

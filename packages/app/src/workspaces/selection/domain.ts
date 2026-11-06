@@ -416,6 +416,7 @@ export function createDirectorySearch(args: {
   location: () => { directory: string; workspace?: string } | undefined
   base: () => string | undefined
   home: () => string
+  extraRoots?: () => readonly string[]
 }) {
   const cache = new Map<string, Promise<Array<{ name: string; absolute: string }>>>()
   let current = 0
@@ -465,11 +466,9 @@ export function createDirectorySearch(args: {
     return fuzzysort.go(query, items, { key: "name", limit }).map((item) => item.obj.absolute)
   }
 
-  return async (filter: string) => {
-    const token = ++current
-    const active = () => token === current
+  const search = async (filter: string, directory: string | undefined, active: () => boolean) => {
     const value = cleanPickerInput(filter)
-    const input = scoped(value)
+    const input = directory ? { directory, path: value } : scoped(value)
     const location = args.location()
 
     if (!input || !location) return [] as string[]
@@ -477,20 +476,31 @@ export function createDirectorySearch(args: {
     const pathInput = raw.startsWith("~") || !!pickerRoot(raw) || raw.includes("/")
     const query = normalizePickerDrive(input.path)
 
-    if (!pathInput) {
+    const fuzzy =
+      !!raw &&
+      !raw.startsWith("~") &&
+      !pickerRoot(raw) &&
+      !/^[A-Za-z]:/.test(raw) &&
+      raw !== "." &&
+      raw !== ".." &&
+      !/^\.\.?\//.test(raw)
+
+    if (!pathInput || fuzzy) {
       const relative = pickerRelativePath(location.directory, input.directory)
 
-      const results =
-        relative === undefined
-          ? []
-          : await args.sdk.api.file
-              .find({ location, query: joinPickerPath(relative, query), type: "directory", limit: 50 })
-              .then((result) =>
-                result.data
-                  .map((entry) => pickerAbsolutePath(entry.path, result.location.directory))
-                  .filter((path) => treePathWithin(input.directory, path)),
-              )
-              .catch(() => [])
+      const results = await args.sdk.api.file
+        .find({
+          location: relative === undefined ? { directory: input.directory } : location,
+          query: joinPickerPath(relative ?? "", query),
+          type: "directory",
+          limit: 50,
+        })
+        .then((result) =>
+          result.data
+            .map((entry) => pickerAbsolutePath(entry.path, result.location.directory))
+            .filter((path) => treePathWithin(input.directory, path)),
+        )
+        .catch(() => [])
 
       if (!active()) return []
 
@@ -498,13 +508,15 @@ export function createDirectorySearch(args: {
         return results.slice(0, 50)
       }
 
-      const fallback = query
-        ? await match(input.directory, query, 50)
-        : (await directories(input.directory)).map((item) => item.absolute)
+      if (!pathInput) {
+        const fallback = query
+          ? await match(input.directory, query, 50)
+          : (await directories(input.directory)).map((item) => item.absolute)
 
-      if (!active()) return []
+        if (!active()) return []
 
-      return fallback
+        return fallback
+      }
     }
 
     const segments = query.replace(/^\/+/, "").split("/")
@@ -540,4 +552,68 @@ export function createDirectorySearch(args: {
 
     return Array.from(new Set([base, ...matches, ...children].filter(Boolean))).slice(0, 50)
   }
+
+  return async (filter: string) => {
+    const token = ++current
+    const active = () => token === current
+    const value = normalizePickerDrive(cleanPickerInput(filter))
+
+    const relative =
+      !!value &&
+      !value.startsWith("~") &&
+      !pickerRoot(value) &&
+      !/^[A-Za-z]:/.test(value) &&
+      value !== "." &&
+      value !== ".." &&
+      !/^\.\.?\//.test(value)
+
+    const roots = relative ? (args.extraRoots?.() ?? []) : []
+
+    const result = (
+      await Promise.all([
+        search(filter, undefined, active),
+        ...roots
+          .filter((root) => pickerPathIdentity(root) !== pickerPathIdentity(args.base() ?? ""))
+          .slice(0, 6)
+          .map((root) => search(filter, root, active)),
+      ])
+    ).flat()
+
+    if (!active()) return []
+    const seen = new Set<string>()
+
+    return result
+      .filter((path) => {
+        const key = pickerPathIdentity(path)
+
+        if (seen.has(key)) return false
+        seen.add(key)
+
+        return true
+      })
+      .slice(0, 50)
+  }
+}
+
+function pickerPathIdentity(path: string) {
+  const value = canonicalPickerPath(path)
+
+  return /^[A-Za-z]:\//.test(value) || value.startsWith("//") ? value.toLowerCase() : value
+}
+
+export function projectSearchRoots(directories: readonly string[]) {
+  const seen = new Set<string>()
+
+  return directories
+    .map(pickerParent)
+    .filter((root) => {
+      if (!root) return false
+      const key = pickerPathIdentity(root)
+
+      if (seen.has(key)) return false
+      seen.add(key)
+
+      return true
+    })
+    .slice(0, 6)
 }

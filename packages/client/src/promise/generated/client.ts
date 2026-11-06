@@ -275,6 +275,9 @@ import type {
   ExperimentalTranscriptBackfillInput,
   ExperimentalTranscriptBackfillOutput,
   ExperimentalTranscriptFacetsOutput,
+  ExperimentalProjectsListOutput,
+  ExperimentalProjectsUpdateInput,
+  ExperimentalProjectsUpdateOutput,
   ShellListInput,
   ShellListOutput,
   ShellCreateInput,
@@ -1758,6 +1761,31 @@ export function make(options: ClientOptions) {
             },
             requestOptions,
           ).then((value) => value.data),
+      },
+      projects: {
+        list: (requestOptions?: RequestOptions) =>
+          request<ExperimentalProjectsListOutput>(
+            {
+              method: "GET",
+              path: `/api/experimental/projects`,
+              successStatus: 200,
+              declaredStatuses: [400, 401, 503],
+              empty: false,
+            },
+            requestOptions,
+          ),
+        update: (input: ExperimentalProjectsUpdateInput, requestOptions?: RequestOptions) =>
+          request<ExperimentalProjectsUpdateOutput>(
+            {
+              method: "PATCH",
+              path: `/api/experimental/projects`,
+              body: { operation: input["operation"] },
+              successStatus: 200,
+              declaredStatuses: [400, 401, 503],
+              empty: false,
+            },
+            requestOptions,
+          ),
       },
       migration: {
         v1: {
