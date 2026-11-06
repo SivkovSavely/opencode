@@ -2506,6 +2506,108 @@ export type ExperimentalArtifactsDeleteOperation<E = never> = (
   input: ExperimentalArtifactsDeleteInput,
 ) => Effect.Effect<ExperimentalArtifactsDeleteOutput, E>
 
+export type ExperimentalTranscriptSearchInput = {
+  readonly query: string
+  readonly mode?: "literal" | "regex" | undefined
+  readonly flags?: string | undefined
+  readonly caseSensitive?: boolean | undefined
+  readonly cursor?: string | undefined
+  readonly limit?: number | undefined
+  readonly projectIDs?: ReadonlyArray<string> | undefined
+  readonly sessionIDs?: ReadonlyArray<string> | undefined
+  readonly roles?: ReadonlyArray<"user" | "assistant"> | undefined
+  readonly categories?:
+    | ReadonlyArray<"text" | "file" | "tool-input" | "tool-output" | "tool-error" | "assistant-error">
+    | undefined
+  readonly content?:
+    | ReadonlyArray<{
+        readonly role: "user" | "assistant"
+        readonly category: "text" | "file" | "tool-input" | "tool-output" | "tool-error" | "assistant-error"
+      }>
+    | undefined
+  readonly agents?: ReadonlyArray<string> | undefined
+  readonly providerIDs?: ReadonlyArray<string> | undefined
+  readonly models?: ReadonlyArray<{ readonly providerID: string; readonly modelID: string }> | undefined
+  readonly toolNames?: ReadonlyArray<string> | undefined
+  readonly toolStatuses?: ReadonlyArray<"running" | "completed" | "error" | "interrupted"> | undefined
+  readonly dateFrom?: number | undefined
+  readonly dateTo?: number | undefined
+  readonly sessionKind?: "all" | "root" | "subagent" | undefined
+  readonly archived?: "all" | "active" | "archived" | undefined
+  readonly sort?: "newest" | "oldest" | "session-title" | undefined
+}
+export type ExperimentalTranscriptSearchOutput = {
+  readonly hits: ReadonlyArray<{
+    readonly documentID: string
+    readonly messageID: string
+    readonly partID?: string | undefined
+    readonly sessionID: string
+    readonly projectID: string
+    readonly projectPath: string
+    readonly directory: string
+    readonly title: string
+    readonly role: "user" | "assistant"
+    readonly category: "text" | "file" | "tool-input" | "tool-output" | "tool-error" | "assistant-error"
+    readonly agent?: string | undefined
+    readonly providerID?: string | undefined
+    readonly modelID?: string | undefined
+    readonly toolName?: string | undefined
+    readonly toolStatus?: string | undefined
+    readonly parentID?: string | undefined
+    readonly archived: boolean
+    readonly timeCreated: number
+    readonly excerpt: string
+    readonly excerptOffset: number
+    readonly offset: number
+    readonly matchLength: number
+    readonly truncated: boolean
+  }>
+  readonly nextCursor?: string | undefined
+  readonly scanned: number
+  readonly complete: boolean
+  readonly scanLimit: number
+  readonly contentLimit: number
+  readonly scanLimited: boolean
+  readonly truncatedDocuments: number
+  readonly status: { readonly ready: boolean; readonly backfillCursor: string; readonly generation: string }
+}
+export type ExperimentalTranscriptSearchOperation<E = never> = (
+  input: ExperimentalTranscriptSearchInput,
+) => Effect.Effect<ExperimentalTranscriptSearchOutput, E>
+
+export type ExperimentalTranscriptStatusOutput = {
+  readonly ready: boolean
+  readonly backfillCursor: string
+  readonly generation: string
+}
+export type ExperimentalTranscriptStatusOperation<E = never> = () => Effect.Effect<
+  ExperimentalTranscriptStatusOutput,
+  E
+>
+
+export type ExperimentalTranscriptBackfillInput = { readonly rebuild?: boolean | undefined }
+export type ExperimentalTranscriptBackfillOutput = {
+  readonly ready: boolean
+  readonly backfillCursor: string
+  readonly generation: string
+}
+export type ExperimentalTranscriptBackfillOperation<E = never> = (
+  input?: ExperimentalTranscriptBackfillInput,
+) => Effect.Effect<ExperimentalTranscriptBackfillOutput, E>
+
+export type ExperimentalTranscriptFacetsOutput = {
+  readonly projects: ReadonlyArray<{ readonly id: string; readonly path: string; readonly lastUsed: number }>
+  readonly agents: ReadonlyArray<{ readonly value: string; readonly lastUsed: number }>
+  readonly providers: ReadonlyArray<{ readonly value: string; readonly lastUsed: number }>
+  readonly models: ReadonlyArray<{ readonly providerID: string; readonly modelID: string; readonly lastUsed: number }>
+  readonly tools: ReadonlyArray<{ readonly value: string; readonly lastUsed: number }>
+  readonly truncated: boolean
+}
+export type ExperimentalTranscriptFacetsOperation<E = never> = () => Effect.Effect<
+  ExperimentalTranscriptFacetsOutput,
+  E
+>
+
 export interface ExperimentalApi<E = never> {
   readonly persistentPty: {
     readonly read: ExperimentalPersistentPtyReadOperation<E>
@@ -2534,6 +2636,12 @@ export interface ExperimentalApi<E = never> {
     readonly get: ExperimentalArtifactsGetOperation<E>
     readonly update: ExperimentalArtifactsUpdateOperation<E>
     readonly delete: ExperimentalArtifactsDeleteOperation<E>
+  }
+  readonly transcript: {
+    readonly search: ExperimentalTranscriptSearchOperation<E>
+    readonly status: ExperimentalTranscriptStatusOperation<E>
+    readonly backfill: ExperimentalTranscriptBackfillOperation<E>
+    readonly facets: ExperimentalTranscriptFacetsOperation<E>
   }
 }
 

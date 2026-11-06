@@ -343,6 +343,43 @@ export type ArtifactID = string
 
 export type ArtifactTime = { created: number; updated: number }
 
+export type TranscriptSearchHit = {
+  documentID: string
+  messageID: string
+  partID?: string
+  sessionID: string
+  projectID: string
+  projectPath: string
+  directory: string
+  title: string
+  role: "user" | "assistant"
+  category: "text" | "file" | "tool-input" | "tool-output" | "tool-error" | "assistant-error"
+  agent?: string
+  providerID?: string
+  modelID?: string
+  toolName?: string
+  toolStatus?: string
+  parentID?: string
+  archived: boolean
+  timeCreated: number
+  excerpt: string
+  excerptOffset: number
+  offset: number
+  matchLength: number
+  truncated: boolean
+}
+
+export type TranscriptSearchStatus = { ready: boolean; backfillCursor: string; generation: string }
+
+export type TranscriptSearchFacets = {
+  projects: Array<{ id: string; path: string; lastUsed: number }>
+  agents: Array<{ value: string; lastUsed: number }>
+  providers: Array<{ value: string; lastUsed: number }>
+  models: Array<{ providerID: string; modelID: string; lastUsed: number }>
+  tools: Array<{ value: string; lastUsed: number }>
+  truncated: boolean
+}
+
 export type ReferenceGitSource = { type: "git"; repository: string; branch?: string }
 
 export type VcsBranch = { current?: string; default?: string }
@@ -551,7 +588,12 @@ export type ShellInfo1 = {
   time: { started: number; completed?: number }
 }
 
-export type SessionMessageAssistantText = { type: "text"; text: string; native?: SessionMessageNative }
+export type SessionMessageAssistantText = {
+  type: "text"
+  text: string
+  native?: SessionMessageNative
+  experimental?: { sourcePartID: string; timeCreated: number; searchable: boolean }
+}
 
 export type SessionMessageAssistantReasoning = {
   type: "reasoning"
@@ -670,7 +712,12 @@ export type EventLogSynced = { type: "log.synced"; aggregateID: string; seq?: Ev
 
 export type LocationRef = { directory: AbsolutePath; workspaceID?: WorkspaceID }
 
-export type SessionMessageAssistantText1 = { type: "text"; text: string; native?: SessionMessageNative1 }
+export type SessionMessageAssistantText1 = {
+  type: "text"
+  text: string
+  native?: SessionMessageNative1
+  experimental?: { sourcePartID: string; timeCreated: number; searchable: boolean }
+}
 
 export type SessionMessageAssistantReasoning1 = {
   type: "reasoning"
@@ -934,6 +981,18 @@ export type ArtifactInfo = {
   time: ArtifactTime
 }
 
+export type TranscriptSearchResponse = {
+  hits: Array<TranscriptSearchHit>
+  nextCursor?: string
+  scanned: number
+  complete: boolean
+  scanLimit: number
+  contentLimit: number
+  scanLimited: boolean
+  truncatedDocuments: number
+  status: TranscriptSearchStatus
+}
+
 export type VcsInfo = { provider?: string; branch: VcsBranch }
 
 export type WebSearchProvider = { id: WebSearchID; name: string }
@@ -1084,6 +1143,11 @@ export type SessionMessageUser = {
   files?: Array<PromptFileAttachment>
   agents?: Array<PromptAgentAttachment>
   skills?: Array<PromptSkillAttachment>
+  experimental?: {
+    textParts?: Array<{ id: string; text: string; timeCreated: number }>
+    filePartIDs?: Array<string>
+    fileParts?: Array<{ id: string; name?: string; unavailable?: string; timeCreated?: number }>
+  }
   type: "user"
 }
 
@@ -2553,6 +2617,7 @@ export type SessionInboxUser = {
 }
 
 export type SessionMessageAssistantTool = {
+  experimental?: { sourcePartID: string; rawInput?: string; searchable?: boolean }
   type: "tool"
   id: string
   name: string
@@ -2575,6 +2640,7 @@ export type SessionInboxItem =
   | { type: "move"; payload: SessionInboxMovePayload1; delivery: SessionInboxDelivery }
 
 export type SessionMessageAssistantTool1 = {
+  experimental?: { sourcePartID: string; rawInput?: string; searchable?: boolean }
   type: "tool"
   id: string
   name: string
@@ -2651,6 +2717,7 @@ export type SessionMessageAssistant = {
   metadata?: { [x: string]: JsonValue }
   time: { created: number; streamed?: number; completed?: number }
   type: "assistant"
+  experimental?: { parentMessageID: string }
   agent: AgentID
   model: ModelRef
   content: Array<SessionMessageAssistantText | SessionMessageAssistantReasoning | SessionMessageAssistantTool>
@@ -4659,6 +4726,47 @@ export type ExperimentalArtifactsViewInput = {
 }
 
 export type ExperimentalArtifactsViewOutput = globalThis.Uint8Array
+
+export type ExperimentalTranscriptSearchInput = {
+  readonly query: string
+  readonly mode?: "literal" | "regex" | undefined
+  readonly flags?: string | undefined
+  readonly caseSensitive?: boolean | undefined
+  readonly cursor?: string | undefined
+  readonly limit?: number | undefined
+  readonly projectIDs?: ReadonlyArray<string> | undefined
+  readonly sessionIDs?: ReadonlyArray<string> | undefined
+  readonly roles?: ReadonlyArray<"user" | "assistant"> | undefined
+  readonly categories?:
+    | ReadonlyArray<"text" | "file" | "tool-input" | "tool-output" | "tool-error" | "assistant-error">
+    | undefined
+  readonly content?:
+    | ReadonlyArray<{
+        readonly role: "user" | "assistant"
+        readonly category: "text" | "file" | "tool-input" | "tool-output" | "tool-error" | "assistant-error"
+      }>
+    | undefined
+  readonly agents?: ReadonlyArray<string> | undefined
+  readonly providerIDs?: ReadonlyArray<string> | undefined
+  readonly models?: ReadonlyArray<{ readonly providerID: string; readonly modelID: string }> | undefined
+  readonly toolNames?: ReadonlyArray<string> | undefined
+  readonly toolStatuses?: ReadonlyArray<"running" | "completed" | "error" | "interrupted"> | undefined
+  readonly dateFrom?: number | undefined
+  readonly dateTo?: number | undefined
+  readonly sessionKind?: "all" | "root" | "subagent" | undefined
+  readonly archived?: "all" | "active" | "archived" | undefined
+  readonly sort?: "newest" | "oldest" | "session-title" | undefined
+}
+
+export type ExperimentalTranscriptSearchOutput = { data: TranscriptSearchResponse }["data"]
+
+export type ExperimentalTranscriptStatusOutput = { data: TranscriptSearchStatus }["data"]
+
+export type ExperimentalTranscriptBackfillInput = { readonly rebuild?: boolean | undefined }
+
+export type ExperimentalTranscriptBackfillOutput = { data: TranscriptSearchStatus }["data"]
+
+export type ExperimentalTranscriptFacetsOutput = { data: TranscriptSearchFacets }["data"]
 
 export type ShellListInput = { readonly location?: { readonly directory?: string | undefined } | undefined }
 

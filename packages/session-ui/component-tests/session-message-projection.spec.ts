@@ -1,8 +1,43 @@
 import { expect, story } from "../../stories/playwright/story"
 
-story.describe("message actions menu", () => {
-  story.use({ timezoneId: "UTC" })
+story.use({ timezoneId: "UTC" })
 
+story(
+  "multipart source identities preserve whitespace, matching references, comments, interactions and exact copy",
+  async ({ mount, page }) => {
+    await page.context().grantPermissions(["clipboard-read", "clipboard-write"])
+    const root = await mount("current-prompt-message--multipart")
+    const first = root.locator('[data-timeline-part-id="part_first"]')
+    const second = root.locator('[data-timeline-part-id="part_second"]')
+    const stale = root.locator('[data-timeline-part-id="part_stale"]')
+
+    for (const width of [1100, 390]) {
+      await page.setViewportSize({ width, height: 844 })
+      await expect(first).toBeVisible()
+      expect(await first.textContent()).toBe(" \t@notes.txt\n")
+      expect(await second.textContent()).toBe(" \t@notes.txt\n")
+      await expect(first.locator('[data-highlight="file"]')).toHaveText("@notes.txt")
+      await expect(second.locator('[data-highlight="file"]')).toHaveText("@notes.txt")
+      await expect(stale.locator('[data-highlight="file"]')).toHaveCount(0)
+      await expect(root.locator('[data-timeline-part-id="part_agent"] [data-highlight="agent"]')).toHaveText("@build")
+      await expect(root.getByText("Keep the original references", { exact: true })).toBeVisible()
+    }
+
+    await root.getByText("report.json", { exact: true }).click()
+    await expect(root.getByText("Opened report.json", { exact: true })).toBeVisible()
+    await root.getByRole("img", { name: "image.png", exact: true }).click()
+    await expect(page.getByRole("dialog").getByRole("img", { name: "image.png", exact: true })).toBeVisible()
+    await page.keyboard.press("Escape")
+    await root.locator('[data-component="user-message"]').hover()
+    await root.getByRole("button", { name: "More actions", exact: true }).click()
+    await page.getByRole("menuitem", { name: "Copy message", exact: true }).click()
+    await expect
+      .poll(() => page.evaluate(() => navigator.clipboard.readText()))
+      .toBe(" \t@notes.txt\n \t@notes.txt\n \tdifferent\n @build ")
+  },
+)
+
+story.describe("message actions menu", () => {
   story("shows the creation time and disables actions the message cannot take", async ({ mount, page }) => {
     const timeline = await mount("current-prompt-message--pending")
     const message = timeline.locator('[data-component="user-message"]')
@@ -10,7 +45,7 @@ story.describe("message actions menu", () => {
     const fork = page.getByRole("menuitem", { name: "Fork from here", exact: true })
     const copy = page.getByRole("menuitem", { name: "Copy message", exact: true })
 
-    // The meta line keeps agent and model; the time moved into the menu.
+    // The compact creation clock is plain metadata; the menu retains the full date/time.
     await expect(timeline.locator('[data-slot="user-message-meta"] time')).toHaveCount(0)
 
     await timeline.getByLabel("Delivery state").selectOption("delivered")
@@ -122,6 +157,9 @@ story("marks pending metadata without badging delivered, starting, or queued pro
   const timeline = await mount("current-prompt-message--pending")
   const indicator = timeline.locator('[data-slot="user-message-meta"] [data-slot="user-message-pending"]')
   const text = timeline.locator('[data-slot="user-message-text"]')
+  const items = timeline.locator('[data-slot="user-message-meta-item"]')
+  const clock = items.filter({ hasText: /^\d{2}:\d{2}:\d{2}$/ })
+  const metadata = items.filter({ hasNotText: /^\d{2}:\d{2}:\d{2}$/ })
 
   for (const status of ["steering", "stranded", "starting", "queued", "delivered"]) {
     await timeline.getByLabel("Delivery state").selectOption(status)
@@ -147,21 +185,22 @@ story("marks pending metadata without badging delivered, starting, or queued pro
   }
 
   await timeline.locator('[data-component="user-message"]').hover()
-  await expect(timeline.locator('[data-slot="user-message-meta-item"]')).toHaveText([
-    "Build",
-    "Claude Sonnet 4",
-    "Balanced",
-  ])
+  await expect(metadata).toHaveText(["Build", "Claude Sonnet 4", "Balanced"])
+  await expect(clock).toHaveText("00:00:00")
   const separator = timeline.locator('[data-slot="user-message-meta-label"] [data-slot="user-message-meta-separator"]')
-  await expect(separator).toHaveText("\u00B7")
+  await expect(separator).toHaveText(["\u00B7", "\u00B7"])
   await expect(timeline.locator('[data-slot="user-message-meta-label"]')).toHaveCSS("gap", "4px")
 
   // A steer with the previous prompt's agent and model joins the running turn unchanged, so it names neither.
   await timeline.getByLabel("Delivery state").selectOption("steering")
-  await expect(timeline.locator('[data-slot="user-message-meta"]')).toHaveText(/^Pending$/, { useInnerText: true })
-  await expect(timeline.locator('[data-slot="user-message-meta-item"]')).toHaveCount(0)
+  await expect(timeline.locator('[data-slot="user-message-meta"]')).toHaveText(/^Pending\s*\u00B7\s*00:00:00$/, {
+    useInnerText: true,
+  })
+  await expect(metadata).toHaveCount(0)
+  await expect(clock).toHaveText("00:00:00")
   await timeline.getByLabel("Changes model", { exact: true }).check()
-  await expect(timeline.locator('[data-slot="user-message-meta-item"]')).toHaveText(["Claude Sonnet 4", "Balanced"])
+  await expect(metadata).toHaveText(["Claude Sonnet 4", "Balanced"])
+  await expect(clock).toHaveText("00:00:00")
   await timeline.getByLabel("Voice message", { exact: true }).check()
   const voice = timeline.getByRole("img", { name: "Voice", exact: true })
   await expect(voice).toBeVisible()
@@ -186,7 +225,8 @@ story("marks pending metadata without badging delivered, starting, or queued pro
   await timeline.getByLabel("Grouped prompts", { exact: true }).uncheck()
   await page.setViewportSize({ width: 390, height: 844 })
   await expect(indicator).toBeVisible()
-  await expect(timeline.locator('[data-slot="user-message-meta-item"]')).toHaveCount(0)
+  await expect(metadata).toHaveCount(0)
+  await expect(clock).toHaveText("00:00:00")
   await timeline.getByLabel("Prompt text", { exact: true }).uncheck()
   await expect(timeline.getByText("notes.json", { exact: true })).toBeVisible()
   await expect(indicator).toBeVisible()

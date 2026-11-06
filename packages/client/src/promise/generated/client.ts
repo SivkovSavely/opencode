@@ -269,6 +269,12 @@ import type {
   ExperimentalArtifactsDeleteOutput,
   ExperimentalArtifactsViewInput,
   ExperimentalArtifactsViewOutput,
+  ExperimentalTranscriptSearchInput,
+  ExperimentalTranscriptSearchOutput,
+  ExperimentalTranscriptStatusOutput,
+  ExperimentalTranscriptBackfillInput,
+  ExperimentalTranscriptBackfillOutput,
+  ExperimentalTranscriptFacetsOutput,
   ShellListInput,
   ShellListOutput,
   ShellCreateInput,
@@ -1682,6 +1688,76 @@ export function make(options: ClientOptions) {
             },
             requestOptions,
           ),
+      },
+      transcript: {
+        search: (input: ExperimentalTranscriptSearchInput, requestOptions?: RequestOptions) =>
+          request<{ readonly data: ExperimentalTranscriptSearchOutput }>(
+            {
+              method: "POST",
+              path: `/api/experimental/transcript/search`,
+              body: {
+                query: input["query"],
+                mode: input["mode"],
+                flags: input["flags"],
+                caseSensitive: input["caseSensitive"],
+                cursor: input["cursor"],
+                limit: input["limit"],
+                projectIDs: input["projectIDs"],
+                sessionIDs: input["sessionIDs"],
+                roles: input["roles"],
+                categories: input["categories"],
+                content: input["content"],
+                agents: input["agents"],
+                providerIDs: input["providerIDs"],
+                models: input["models"],
+                toolNames: input["toolNames"],
+                toolStatuses: input["toolStatuses"],
+                dateFrom: input["dateFrom"],
+                dateTo: input["dateTo"],
+                sessionKind: input["sessionKind"],
+                archived: input["archived"],
+                sort: input["sort"],
+              },
+              successStatus: 200,
+              declaredStatuses: [400, 401],
+              empty: false,
+            },
+            requestOptions,
+          ).then((value) => value.data),
+        status: (requestOptions?: RequestOptions) =>
+          request<{ readonly data: ExperimentalTranscriptStatusOutput }>(
+            {
+              method: "GET",
+              path: `/api/experimental/transcript/status`,
+              successStatus: 200,
+              declaredStatuses: [400, 401],
+              empty: false,
+            },
+            requestOptions,
+          ).then((value) => value.data),
+        backfill: (input?: ExperimentalTranscriptBackfillInput, requestOptions?: RequestOptions) =>
+          request<{ readonly data: ExperimentalTranscriptBackfillOutput }>(
+            {
+              method: "POST",
+              path: `/api/experimental/transcript/backfill`,
+              body: { rebuild: input?.["rebuild"] },
+              successStatus: 200,
+              declaredStatuses: [400, 401],
+              empty: false,
+            },
+            requestOptions,
+          ).then((value) => value.data),
+        facets: (requestOptions?: RequestOptions) =>
+          request<{ readonly data: ExperimentalTranscriptFacetsOutput }>(
+            {
+              method: "GET",
+              path: `/api/experimental/transcript/facets`,
+              successStatus: 200,
+              declaredStatuses: [400, 401],
+              empty: false,
+            },
+            requestOptions,
+          ).then((value) => value.data),
       },
       migration: {
         v1: {

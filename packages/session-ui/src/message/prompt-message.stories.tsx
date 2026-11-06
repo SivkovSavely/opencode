@@ -148,3 +148,60 @@ export const Pending = {
     )
   },
 }
+
+export const Multipart = {
+  render: () => {
+    const [state, setState] = createStore({ action: "No local action" })
+
+    const parts = [
+      { id: "part_first", text: " \t@notes.txt\n", timeCreated: 1 },
+      { id: "part_second", text: " \t@notes.txt\n", timeCreated: 2 },
+      { id: "part_stale", text: " \tdifferent\n", timeCreated: 3 },
+      { id: "part_agent", text: " @build ", timeCreated: 4 },
+    ]
+
+    const message: SessionMessageUser = {
+      id: "msg_multipart_story",
+      type: "user",
+      text: parts.map((part) => part.text).join(""),
+      time: { created: STORY_TIME },
+      experimental: { textParts: parts, filePartIDs: ["file_reference", "file_report", "file_image"] },
+      agents: [{ name: "build", mention: { text: "@build", start: 1, end: 7 } }],
+      files: [
+        {
+          name: "notes.txt",
+          mime: "text/plain",
+          data: "bm90ZXM=",
+          source: { type: "inline" },
+          mention: { text: "@notes.txt", start: 2, end: 12 },
+        },
+        { name: "report.json", mime: "application/json", data: "e30=", source: { type: "inline" } },
+        {
+          name: "image.png",
+          mime: "image/png",
+          data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jGRsAAAAASUVORK5CYII=",
+          source: { type: "inline" },
+        },
+      ],
+    }
+
+    return (
+      <section class="mx-auto w-full max-w-[840px] p-6">
+        <CurrentSessionProviders
+          document={{ sessionID: CURRENT_SESSION_ID, messages: [message], status: { type: "idle" }, diffs: [] }}
+        >
+          <CurrentUserMessageDisplay
+            sessionID={CURRENT_SESSION_ID}
+            message={message}
+            text={message.text}
+            agent="build"
+            model={STORY_MODEL}
+            comments={[{ type: "note", label: "Local comment", comment: "Keep the original references", icon: "file" }]}
+            actions={{ openAttachment: (file) => setState("action", `Opened ${file.name}`) }}
+          />
+        </CurrentSessionProviders>
+        <output>{state.action}</output>
+      </section>
+    )
+  },
+}

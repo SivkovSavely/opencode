@@ -5,6 +5,30 @@ const schema: Omit<DatabaseMigration.Migration, "id"> = {
   up(tx) {
     return Effect.gen(function* () {
       yield* tx.run(`
+        CREATE TABLE \`transcript_document\` (
+          \`id\` text PRIMARY KEY,
+          \`message_id\` text NOT NULL,
+          \`source\` text NOT NULL,
+          \`part_id\` text,
+          \`category\` text NOT NULL,
+          \`time_created\` integer NOT NULL,
+          \`body\` text NOT NULL,
+          \`truncated\` integer NOT NULL,
+          \`tool_name\` text,
+          \`tool_status\` text,
+          CONSTRAINT \`fk_transcript_document_message_id_session_message_id_fk\` FOREIGN KEY (\`message_id\`) REFERENCES \`session_message\`(\`id\`) ON DELETE CASCADE
+        );
+      `)
+      yield* tx.run(`
+        CREATE TABLE \`transcript_state\` (
+          \`id\` integer PRIMARY KEY,
+          \`cursor\` text NOT NULL,
+          \`phase\` text NOT NULL,
+          \`ready\` integer NOT NULL,
+          \`generation\` text NOT NULL
+        );
+      `)
+      yield* tx.run(`
         CREATE TABLE \`account_state\` (
           \`id\` integer PRIMARY KEY,
           \`active_account_id\` text,
@@ -309,6 +333,10 @@ const schema: Omit<DatabaseMigration.Migration, "id"> = {
           CONSTRAINT \`fk_worktree_project_id_project_id_fk\` FOREIGN KEY (\`project_id\`) REFERENCES \`project\`(\`id\`) ON DELETE CASCADE
         );
       `)
+      yield* tx.run(`CREATE INDEX \`transcript_document_message_idx\` ON \`transcript_document\` (\`message_id\`);`)
+      yield* tx.run(
+        `CREATE INDEX \`transcript_document_time_idx\` ON \`transcript_document\` (\`time_created\`,\`message_id\`,\`id\`);`,
+      )
       yield* tx.run(`CREATE UNIQUE INDEX \`event_aggregate_seq_idx\` ON \`event\` (\`aggregate_id\`,\`seq\`);`)
       yield* tx.run(`CREATE INDEX \`event_aggregate_type_seq_idx\` ON \`event\` (\`aggregate_id\`,\`type\`,\`seq\`);`)
       yield* tx.run(`CREATE INDEX \`job_session_idx\` ON \`job\` (\`session_id\`);`)

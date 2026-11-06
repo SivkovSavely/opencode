@@ -401,8 +401,10 @@ function ExaOutput(props: { output?: string }) {
   )
 }
 
+export type NavigableTool = SessionMessageAssistantTool & { ownerMessageID?: string }
+
 export type ContextGroupPart =
-  | SessionMessageAssistantTool
+  | NavigableTool
   | (SessionMessageAssistantReasoning & { id: string; streaming?: boolean })
   | { type: "notice" | "shell" | "text"; id: string; render: () => JSX.Element }
 
@@ -513,7 +515,7 @@ export function CurrentContextToolGroup(props: {
 
   const items = createMemo(() =>
     (props.open ? props.parts : []).reduce<
-      (SessionMessageAssistantTool[] | Exclude<ContextGroupPart, SessionMessageAssistantTool>)[]
+      (NavigableTool[] | Exclude<ContextGroupPart, SessionMessageAssistantTool>)[]
     >((groups, tool) => {
       if (tool.type !== "tool") {
         groups.push(tool)
@@ -713,7 +715,13 @@ export function CurrentContextToolGroup(props: {
                     )
 
                     return (
-                      <div data-slot="context-tool-group-item" data-timestamped={timestamp() ? "true" : undefined}>
+                      <div
+                        data-slot="context-tool-group-item"
+                        data-transcript-targets={group()
+                          .map((tool) => JSON.stringify([tool.ownerMessageID, tool.id]))
+                          .join("\n")}
+                        data-timestamped={timestamp() ? "true" : undefined}
+                      >
                         <Show
                           when={!currentToolGroupedRead(tool())}
                           fallback={
@@ -738,6 +746,7 @@ export function CurrentContextToolGroup(props: {
                                     fallback={
                                       <ToolDisplay
                                         id={tool().id}
+                                        ownerMessageID={tool().ownerMessageID}
                                         tool={tool().name}
                                         rawTool={tool()}
                                         input={currentToolInput(tool())}
@@ -864,7 +873,7 @@ export function CurrentContextToolGroup(props: {
 }
 
 export function CurrentReadToolGroup(props: {
-  tools: SessionMessageAssistantTool[]
+  tools: NavigableTool[]
   open?: boolean
   onOpenChange?: (open: boolean) => void
   onSizeChange?: () => void
@@ -882,7 +891,17 @@ export function CurrentReadToolGroup(props: {
       const input = toolInput(currentToolInput(tool))
       const name = getFilename(input.path ?? "")
 
-      return name ? [{ id: tool.id, name, args: readArgs(input), timestamp: toolTimestamp(tool, i18n.locale()) }] : []
+      return name
+        ? [
+            {
+              id: tool.id,
+              ownerMessageID: tool.ownerMessageID,
+              name,
+              args: readArgs(input),
+              timestamp: toolTimestamp(tool, i18n.locale()),
+            },
+          ]
+        : []
     }),
   )
 
@@ -896,6 +915,7 @@ export function CurrentReadToolGroup(props: {
   return (
     <div
       data-component="read-tool-group"
+      data-transcript-targets={props.tools.map((tool) => JSON.stringify([tool.ownerMessageID, tool.id])).join("\n")}
       data-timeline-part-ids={props.tools.map((tool) => tool.id).join(",")}
       data-expanded={open() ? "true" : undefined}
     >
@@ -923,7 +943,11 @@ export function CurrentReadToolGroup(props: {
                     {(file, index) => (
                       <>
                         <Show when={index > 0}> </Show>
-                        <span data-slot="read-tool-group-file" data-timeline-part-id={file().id}>
+                        <span
+                          data-slot="read-tool-group-file"
+                          data-timeline-part-id={file().id}
+                          data-transcript-message-id={file().ownerMessageID}
+                        >
                           {file().name}
                           <For each={file().args}>
                             {(arg) => <span data-slot="basic-tool-tool-arg">{` ${arg}`}</span>}
@@ -953,7 +977,7 @@ export function CurrentReadToolGroup(props: {
 }
 
 export function CurrentFileToolGroup(props: {
-  tools: SessionMessageAssistantTool[]
+  tools: NavigableTool[]
   fileOpen?: (path: string) => boolean | undefined
   onFileOpenChange?: (path: string, open: boolean) => void
   onSizeChange?: () => void
@@ -1059,6 +1083,7 @@ export function CurrentFileToolGroup(props: {
     <div
       data-component="tool-part-wrapper"
       data-timeline-part-id={props.tools.length === 1 ? props.tools[0]?.id : undefined}
+      data-transcript-targets={props.tools.map((tool) => JSON.stringify([tool.ownerMessageID, tool.id])).join("\n")}
       data-timeline-part-ids={props.tools.length > 1 ? props.tools.map((tool) => tool.id).join(",") : undefined}
     >
       <Dynamic
@@ -1180,6 +1205,7 @@ function currentContextToolTrigger(tool: SessionMessageAssistantTool, i18n: Retu
 // SAFETY: tool input and metadata are open per-tool records. GenericTool shows arbitrary input keys, and
 // renderers decode the fields they read with `toolInput` and `toolMetadata`.
 export interface ToolProps {
+  ownerMessageID?: string
   rawDetails?: () => JSX.Element
   // oxlint-disable-next-line anti-slop/no-unsafe-dictionary-type -- see SAFETY above
   input: Record<string, unknown>
@@ -1446,6 +1472,7 @@ export function ToolDisplay(
       <div
         data-component="tool-part-wrapper"
         data-timeline-part-id={props.id}
+        data-transcript-message-id={props.ownerMessageID}
         data-timestamped={props.timestamp ? "true" : undefined}
       >
         <Switch>

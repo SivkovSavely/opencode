@@ -476,8 +476,8 @@ export function Titlebar(props: { verticalTabs?: { mount?: HTMLElement } }) {
                     placement="bottom"
                     value={
                       <>
-                        {language.t("command.session.search")}
-                        <Keybind keys={command.keybindParts("sessions.search")} variant="neutral" />
+                        {language.t("transcript.title")}
+                        <Keybind keys={command.keybindParts("transcripts.search")} variant="neutral" />
                       </>
                     }
                     class="shrink-0"
@@ -488,8 +488,8 @@ export function Titlebar(props: { verticalTabs?: { mount?: HTMLElement } }) {
                       size="large"
                       class="!w-9 shrink-0"
                       icon={<Icon name="magnifying-glass" />}
-                      onClick={() => command.trigger("sessions.search")}
-                      aria-label={language.t("command.session.search")}
+                      onClick={() => command.trigger("transcripts.search")}
+                      aria-label={language.t("transcript.title")}
                     />
                   </Tooltip>
                 }
@@ -499,15 +499,15 @@ export function Titlebar(props: { verticalTabs?: { mount?: HTMLElement } }) {
                   data-titlebar-tab-action
                   data-action="vertical-tabs-search"
                   class="group flex h-7 w-full shrink-0 items-center gap-1.5 rounded-[6px] ps-1.5 pe-2 text-[13px] leading-4 text-v2-text-text-faint"
-                  onClick={() => command.trigger("sessions.search")}
+                  onClick={() => command.trigger("transcripts.search")}
                 >
                   <Icon name="magnifying-glass" class="shrink-0" />
-                  <span class="min-w-0 truncate">{language.t("command.session.search")}</span>
+                  <span class="min-w-0 truncate">{language.t("transcript.title")}</span>
                   <span
                     class="ms-auto hidden min-w-0 truncate text-v2-text-text-faint group-hover:block group-focus-visible:block"
                     aria-hidden="true"
                   >
-                    <bdi dir="ltr">{command.keybind("sessions.search")}</bdi>
+                    <bdi dir="ltr">{command.keybind("transcripts.search")}</bdi>
                   </span>
                 </button>
               </Show>
@@ -529,10 +529,19 @@ export function Titlebar(props: { verticalTabs?: { mount?: HTMLElement } }) {
                 id: "sessions.search",
                 title: language.t("command.session.search"),
                 category: language.t("command.category.session"),
-                keybind: "mod+shift+f",
                 onSelect: async () => {
                   const { DialogSessionSearch } = await import("@/shell/commands/session-search")
                   void dialog.show(() => <DialogSessionSearch />)
+                },
+              },
+              {
+                id: "transcripts.search",
+                title: language.t("transcript.title"),
+                category: language.t("command.category.session"),
+                keybind: "mod+shift+f",
+                onSelect: async () => {
+                  const { DialogTranscriptSearch } = await import("@/shell/commands/dialog-transcript-search")
+                  void dialog.show(() => <DialogTranscriptSearch />)
                 },
               },
             ])
@@ -646,6 +655,7 @@ export function Titlebar(props: { verticalTabs?: { mount?: HTMLElement } }) {
                   </div>
                 </Show>
 
+                <Show when={mobile()}>{searchButton()}</Show>
                 <Show
                   when={!mobile()}
                   fallback={

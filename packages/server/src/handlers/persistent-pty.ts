@@ -22,6 +22,7 @@ import { makeArtifact } from "./artifact"
 import { makeMediaGet } from "./media"
 import { type Outbound, runPtySocket } from "./pty-socket"
 import { makeSchedule } from "./schedule"
+import { TranscriptSearch } from "@opencode/core/session/transcript-search"
 
 export const PersistentPtyHandler = HttpApiBuilder.group(Api, "server.experimental", (handlers) =>
   Effect.gen(function* () {
@@ -31,8 +32,23 @@ export const PersistentPtyHandler = HttpApiBuilder.group(Api, "server.experiment
     const artifact = yield* makeArtifact
     const mediaGet = yield* makeMediaGet
     const schedule = yield* makeSchedule
+    const transcript = yield* TranscriptSearch.make
 
     return handlers
+      .handle("transcript.search", (ctx) =>
+        transcript.search(ctx.payload).pipe(
+          Effect.map((data) => ({ data })),
+          Effect.catchTag(
+            "TranscriptSearch.InvalidQuery",
+            (error) => new InvalidRequestError({ message: error.message, kind: "transcript_query" }),
+          ),
+        ),
+      )
+      .handle("transcript.status", () => transcript.status().pipe(Effect.map((data) => ({ data }))))
+      .handle("transcript.backfill", ({ payload }) =>
+        transcript.advance(payload).pipe(Effect.map((data) => ({ data }))),
+      )
+      .handle("transcript.facets", () => transcript.facets().pipe(Effect.map((data) => ({ data }))))
       .handleRaw("media.get", (ctx) => mediaGet(ctx.params.hash, ctx.request))
       .handle("artifacts.providers", (ctx) => artifact.providers(ctx.query, ctx.request))
       .handle("artifacts.list", (ctx) => artifact.list(ctx.query, ctx.request))

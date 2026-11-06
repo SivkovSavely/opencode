@@ -1526,7 +1526,11 @@ describe("current session timeline rows", () => {
     const preStepRows = Timeline.constructSessionMessageRows(preStep, true, { type: "idle" }).rows
     expect(preStepRows.map((row) => row._tag)).toEqual(["UserMessage", "Error", "Notice"])
     expect(preStepRows[1]).toEqual(
-      new TimelineRow.Error({ userMessageID: "msg_user", text: "Model unavailable: opencode/gpt-5.2" }),
+      new TimelineRow.Error({
+        userMessageID: "msg_user",
+        messageID: "msg_idle",
+        text: "Model unavailable: opencode/gpt-5.2",
+      }),
     )
 
     const betweenSteps = [
@@ -1577,6 +1581,9 @@ describe("current session timeline rows", () => {
     expect(Timeline.constructSessionMessageRows(duplicate, true, { type: "idle" }).rows.map((row) => row._tag)).toEqual(
       ["UserMessage", "Error"],
     )
+    expect(Timeline.constructSessionMessageRows(duplicate, true, { type: "idle" }).rows.at(-1)).toMatchObject({
+      messageID: "msg_assistant",
+    })
 
     const exhausted = [
       { id: "msg_user", type: "user", text: "prompt", time: { created: 1 } },
@@ -1605,6 +1612,7 @@ describe("current session timeline rows", () => {
       new TimelineRow.Error({
         userMessageID: "msg_user",
         text: "Execution was interrupted repeatedly and will not be resumed automatically.",
+        messageID: "msg_idle",
       }),
     )
   })
@@ -1647,6 +1655,7 @@ describe("current session timeline rows", () => {
         text: "Free usage limit reached.",
         kind: "free-limit",
         resetAt: 61_000,
+        messageID: "msg_assistant",
       }),
     )
     expect(Timeline.constructSessionMessageRows(idle, true, { type: "idle" }).rows.at(-1)).toMatchObject({
@@ -1664,6 +1673,7 @@ describe("current session timeline rows", () => {
         userMessageID: "msg_user",
         text: "Free usage limit reached.",
         kind: "free-limit",
+        messageID: "msg_assistant",
       }),
     )
     expect(Timeline.constructSessionMessageRows(go, true, { type: "idle" }).rows.at(-1)).toEqual(
@@ -1671,11 +1681,12 @@ describe("current session timeline rows", () => {
         userMessageID: "msg_user",
         text: "Go usage limit reached.",
         kind: "go-limit",
+        messageID: "msg_assistant",
         resetAt: 121_000,
       }),
     )
     expect(Timeline.constructSessionMessageRows(quota, true, { type: "idle" }).rows.at(-1)).toEqual(
-      new TimelineRow.Error({ userMessageID: "msg_user", text: "Credit limit exceeded." }),
+      new TimelineRow.Error({ userMessageID: "msg_user", messageID: "msg_assistant", text: "Credit limit exceeded." }),
     )
   })
 
@@ -1711,6 +1722,7 @@ describe("current session timeline rows", () => {
         userMessageID: "msg_user",
         text: "Budget reached.",
         kind: "model-budget-limit",
+        messageID: "msg_assistant",
         resetAt: Date.UTC(2026, 10, 1),
       }),
     )
@@ -1721,7 +1733,12 @@ describe("current session timeline rows", () => {
       ),
     ).toMatchObject({ kind: "budget-limit", resetAt: Date.UTC(2026, 10, 1) })
     expect(refused("provider.budget-limit")).toEqual(
-      new TimelineRow.Error({ userMessageID: "msg_user", text: "Budget reached.", kind: "budget-limit" }),
+      new TimelineRow.Error({
+        userMessageID: "msg_user",
+        messageID: "msg_assistant",
+        text: "Budget reached.",
+        kind: "budget-limit",
+      }),
     )
   })
 

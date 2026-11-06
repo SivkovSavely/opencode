@@ -3,6 +3,7 @@ import { HttpApi, HttpApiEndpoint, HttpApiGroup, HttpApiSchema } from "effect/ht
 import { PersistentPty } from "@opencode/schema/persistent-pty"
 import { Pty } from "@opencode/schema/pty"
 import { Worktree } from "@opencode/schema/worktree"
+import { TranscriptSearch } from "@opencode/schema/transcript-search"
 
 // Handlers answer plain fixture data: undefined properties are dropped, and other non-JSON values become null.
 const Json = Schema.Json.pipe(
@@ -204,6 +205,20 @@ const Group = HttpApiGroup.make("mock")
   )
   .add(HttpApiEndpoint.get("websearchProviders", "/api/websearch/provider", { success: Json }))
   .add(HttpApiEndpoint.get("usageLimits", "/api/experimental/usage/limits", { success: Json }))
+  .add(
+    HttpApiEndpoint.post("transcriptSearch", "/api/experimental/transcript/search", {
+      payload: TranscriptSearch.Request,
+      success: Json,
+    }),
+  )
+  .add(HttpApiEndpoint.get("transcriptStatus", "/api/experimental/transcript/status", { success: Json }))
+  .add(
+    HttpApiEndpoint.post("transcriptBackfill", "/api/experimental/transcript/backfill", {
+      payload: TranscriptSearch.Backfill,
+      success: Json,
+    }),
+  )
+  .add(HttpApiEndpoint.get("transcriptFacets", "/api/experimental/transcript/facets", { success: Json }))
   .add(
     HttpApiEndpoint.get("worktreeList", "/api/worktree", {
       query: Schema.Struct({ projectID: Schema.String }),

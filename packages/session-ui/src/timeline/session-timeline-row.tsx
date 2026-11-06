@@ -1,5 +1,6 @@
 import type {
   SessionMessageAssistant,
+  SessionMessageAssistantTool,
   SessionMessageInfo,
   SessionMessageUser,
   SessionStatus,
@@ -13,6 +14,7 @@ import {
   Switch,
   createEffect,
   createMemo,
+  mergeProps,
   onCleanup,
   untrack,
   type Accessor,
@@ -42,7 +44,7 @@ import {
   SessionCompactionMessage,
   SessionCompactionQueued,
 } from "../message/message-content"
-import { taskAgentName, ToolRegistry, type ContextGroupPart } from "../tools/tool-renderer"
+import { taskAgentName, ToolRegistry, type ContextGroupPart, type NavigableTool } from "../tools/tool-renderer"
 import { GenericTool } from "../components/basic-tool"
 import { SessionRetry } from "../components/session-retry"
 import { SessionError } from "../components/session-error"
@@ -108,6 +110,18 @@ export function createSessionTimelineRowRenderer(input: {
   // Cached timelines retain file-change subgroup identities alongside their disclosure choices.
   const patchGroupKeys = input.disclosure.patchGroupKeys ?? new Map<string, string>()
   const patchPartKeys = new WeakMap<SessionMessageAssistant["content"][number], string>()
+  const ownedTools = new WeakMap<SessionMessageAssistantTool, NavigableTool>()
+
+  function ownedTool(content: SessionMessageAssistantTool, messageID: string) {
+    const previous = ownedTools.get(content)
+
+    if (previous) return previous
+    // Keep disclosure identity stable while reading live input/state through the source, not an eager clone.
+    const tool = mergeProps(() => content, { ownerMessageID: messageID })
+    ownedTools.set(content, tool)
+
+    return tool
+  }
 
   const patchOwners = createMemo(() => {
     const owners = new Map<string, string>()
@@ -257,9 +271,10 @@ export function createSessionTimelineRowRenderer(input: {
           const content = contents.get(ref.messageID)?.get(ref.partID)
 
           if (content?.type === "tool") {
-            patchPartKeys.set(content, `${ref.messageID}:${ref.partID}`)
+            const tool = ownedTool(content, ref.messageID)
+            patchPartKeys.set(tool, `${ref.messageID}:${ref.partID}`)
 
-            return [content]
+            return [tool]
           }
 
           if (content?.type === "reasoning")
@@ -285,7 +300,11 @@ export function createSessionTimelineRowRenderer(input: {
               {
                 type: "text",
                 id: ref.partID,
-                render: () => <SessionAssistantContent message={message} content={content} contentID={ref.partID} />,
+                render: () => (
+                  <div style={{ display: "contents" }} data-transcript-message-id={message.id}>
+                    <SessionAssistantContent message={message} content={content} contentID={ref.partID} />
+                  </div>
+                ),
               },
             ]
 
@@ -358,7 +377,7 @@ export function createSessionTimelineRowRenderer(input: {
         return group.refs.flatMap((ref) => {
           const content = contents.get(ref.messageID)?.get(ref.partID)
 
-          return content?.type === "tool" ? [content] : []
+          return content?.type === "tool" ? [ownedTool(content, ref.messageID)] : []
         })
       })
 
@@ -382,7 +401,7 @@ export function createSessionTimelineRowRenderer(input: {
         return group.refs.flatMap((ref) => {
           const content = contents.get(ref.messageID)?.get(ref.partID)
 
-          return content?.type === "tool" ? [content] : []
+          return content?.type === "tool" ? [ownedTool(content, ref.messageID)] : []
         })
       })
 
@@ -581,6 +600,13 @@ export function createSessionTimelineRowRenderer(input: {
       }}
       id={Predicate.isTagged(props.row, "UserMessage") ? input.anchor?.(props.row.userMessageID) : undefined}
       data-message-id={props.row.userMessageID}
+      data-transcript-message-id={
+        "messageID" in props.row
+          ? props.row.messageID
+          : Predicate.isTagged(props.row, "AssistantPart") && props.row.group.type === "part"
+            ? props.row.group.ref.messageID
+            : props.row.userMessageID
+      }
       data-timeline-row={props.row._tag}
       data-timeline-spacing={Predicate.isTagged(props.row, "AssistantPart") ? props.row.spacing : undefined}
       classList={{
@@ -829,7 +855,12 @@ export function createSessionTimelineRowRenderer(input: {
     return (
       <Show when={message()}>
         {(message) => (
-          <div data-slot="session-turn-message-container" class={`w-full ${props.grouped ? "" : padding()}`}>
+          <div
+            data-slot="session-turn-message-container"
+            data-transcript-message-id={props.messageID}
+            data-timeline-part-id={props.messageID}
+            class={`w-full ${props.grouped ? "" : padding()}`}
+          >
             <SessionShellMessage
               message={message()}
               defaultOpen={defaultOpen()}

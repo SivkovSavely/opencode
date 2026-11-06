@@ -9,15 +9,21 @@ import type { SessionModel } from "../model"
 import { useSessionHashScroll } from "../use-session-hash-scroll"
 import { messageIdFromHash } from "../message-id-from-hash"
 import { createTimelineModel } from "./model"
-import { useData } from "@/runtime/server/current"
+import { useData, useServer } from "@/runtime/server/current"
+import { useLanguage } from "@/runtime/i18n/language"
+import { showToast } from "@opencode/ui/toast"
+import { resolveTranscriptTarget, transcriptTarget } from "../transcript-target"
+import { sessionHref } from "@/shell/routes/session"
 import { visibleTimelineMessages } from "./controller-projection"
 import { selectSessionUserMessages } from "../session-domain"
 
 export function createSessionTimelineInteraction(session: SessionModel) {
   const layout = useLayout()
-  const location = useLocation<{ reveal?: string }>()
+  const location = useLocation<{ reveal?: string; transcriptSearch?: string }>()
   const timeline = createTimelineModel({ session })
   const data = useData()
+  const server = useServer()
+  const language = useLanguage()
 
   let jump:
     | { key: string; current: () => boolean; following: boolean; mark: number; navigation: number; selected: boolean }
@@ -26,6 +32,7 @@ export function createSessionTimelineInteraction(session: SessionModel) {
   const [state, setState] = createStore<{
     messageID: string | undefined
     pendingMessage: string | undefined
+    navigationReady: boolean
     scroll: { overflow: boolean; jump: boolean }
     follow: { sessionKey: string; pinned: boolean }
     /** The composer region's height; the timeline scrolls on underneath it and fades out at its top. */
@@ -38,6 +45,7 @@ export function createSessionTimelineInteraction(session: SessionModel) {
   }>({
     messageID: undefined,
     pendingMessage: undefined,
+    navigationReady: false,
     scroll: {
       overflow: false,
       jump: false,
@@ -62,7 +70,7 @@ export function createSessionTimelineInteraction(session: SessionModel) {
     if (jump?.key === session.identity.sessionKey()) return
 
     // Geometry during history publication must not cancel a requested historical anchor.
-    if (messageIdFromHash(location.hash) && messageMark === scrollMark) return
+    if ((messageIdFromHash(location.hash) || transcriptTarget(location.hash)) && messageMark === scrollMark) return
     setState("follow", { sessionKey: session.identity.sessionKey(), pinned: true })
   }
 
@@ -93,6 +101,137 @@ export function createSessionTimelineInteraction(session: SessionModel) {
   let fillFrame: (() => void) | undefined
   let historyContinuationFrame: number | undefined
   const historyRequests = new Set<string>()
+  const targetRequests = new Map<string, Promise<Awaited<ReturnType<typeof resolveTranscriptTarget>>>>()
+  createEffect(
+    on(
+      [
+        () => location.key,
+        () => location.hash,
+        () => location.state?.transcriptSearch,
+        timeline.ready,
+        () => state.refs.scroller,
+        () => state.navigationReady,
+      ],
+      () => {
+        const target = transcriptTarget(location.hash)
+        const sessionID = session.identity.sessionID()
+
+        if (
+          !target ||
+          !sessionID ||
+          !timeline.ready() ||
+          !state.refs.scroller ||
+          !state.navigationReady ||
+          location.pathname !== sessionHref(server.key, sessionID)
+        )
+          return
+        const owner = session.ownership.capture()
+        const entry = location.key
+        const navigation = ++navigationMark
+        const mark = jumpScrollMark
+        messageMark = scrollMark
+        let disposed = false
+        let frame: number | undefined
+        let timer: ReturnType<typeof setTimeout> | undefined
+        let highlighted: HTMLElement | undefined
+
+        const current = () =>
+          !disposed &&
+          owner.current() &&
+          location.key === entry &&
+          navigationMark === navigation &&
+          jumpScrollMark === mark
+
+        setState("follow", { sessionKey: session.identity.sessionKey(), pinned: false })
+        const key = JSON.stringify([owner.key, target])
+
+        const pending =
+          targetRequests.get(key) ?? resolveTranscriptTarget(data.session.message, sessionID, target, owner.current)
+
+        targetRequests.set(key, pending)
+        void pending
+          .then((result) => {
+            if (!current() || !result) return
+
+            if (
+              result.status === "unavailable" ||
+              !timeline.messages().some((message) => message.id === target.messageID)
+            ) {
+              showToast({ variant: "error", title: language.t("transcript.targetUnavailable") })
+
+              return
+            }
+
+            setState("messageID", result.ownerID)
+            let attempts = 0
+
+            const seek = () => {
+              if (!current()) return
+              // History publication precedes the virtualizer's row projection. Reveal on
+              // the frame boundary and retry only within this bounded selection.
+              revealMessage(result.messageID, result.partID)
+              const root = state.refs.scroller
+
+              const selector = result.partID
+                ? `[data-timeline-part-id="${CSS.escape(result.partID)}"]`
+                : `[data-transcript-message-id="${CSS.escape(target.messageID)}"]`
+
+              const elements = root?.querySelectorAll<HTMLElement>(selector)
+
+              const element =
+                (!result.partID
+                  ? root?.querySelector<HTMLElement>(
+                      `[data-timeline-row="Error"][data-transcript-message-id="${CSS.escape(target.messageID)}"]`,
+                    )
+                  : undefined) ||
+                (elements &&
+                  [...elements].find(
+                    (element) =>
+                      !target.partID ||
+                      element.closest(`[data-transcript-message-id="${CSS.escape(target.messageID)}"]`),
+                  )) ||
+                [...(root?.querySelectorAll<HTMLElement>("[data-transcript-targets]") ?? [])].find((element) =>
+                  element.dataset.transcriptTargets
+                    ?.split("\n")
+                    .includes(JSON.stringify([target.messageID, result.partID])),
+                )
+
+              if (!element) {
+                if (++attempts < 90) {
+                  frame = requestAnimationFrame(seek)
+
+                  return
+                }
+
+                showToast({ variant: "error", title: language.t("transcript.targetUnavailable") })
+
+                return
+              }
+
+              element.scrollIntoView({ block: "center", behavior: "instant" })
+              highlighted = element
+              element.classList.add("transcript-target-highlight")
+              timer = setTimeout(() => element.classList.remove("transcript-target-highlight"), 1800)
+            }
+
+            frame = requestAnimationFrame(seek)
+          })
+          .catch(() => {
+            if (current()) showToast({ variant: "error", title: language.t("transcript.historyFailed") })
+          })
+          .finally(() => {
+            if (targetRequests.get(key) === pending) targetRequests.delete(key)
+          })
+        onCleanup(() => {
+          disposed = true
+
+          if (frame !== undefined) cancelAnimationFrame(frame)
+          clearTimeout(timer)
+          highlighted?.classList.remove("transcript-target-highlight")
+        })
+      },
+    ),
+  )
   const visibleUserMessages = timeline.visibleUserMessages
 
   const jumpMessages = () =>
@@ -538,6 +677,7 @@ export function createSessionTimelineInteraction(session: SessionModel) {
       },
       setRevealMessage: (reveal: (id: string, partID?: string) => void) => {
         revealMessage = reveal
+        setState("navigationReady", true)
       },
       setRevealPart: (reveal: (target: string) => boolean) => {
         revealPart = reveal

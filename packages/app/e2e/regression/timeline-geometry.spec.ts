@@ -138,7 +138,7 @@ test("keeps a grouped tool summary stable as its calls complete", async ({ page 
 
   const status = (tool: string) =>
     context.locator(
-      `[data-slot="context-tool-group-item"] [data-component="text-shimmer"][aria-label="${tool[0]!.toUpperCase()}${tool.slice(1)}"]`,
+      `[data-slot="context-tool-group-item"] [data-component="text-shimmer"][aria-label="${tool[0]!.toUpperCase()}${tool.slice(1)}"]:not([data-component="raw-tool-entry"] *)`,
     )
 
   for (const tool of contextTools) await expect(status(tool.tool)).toHaveAttribute("data-active", "true")
@@ -227,7 +227,7 @@ test("keeps a file diff anchored while it expands and collapses", async ({ page 
   const wrapper = page.locator(`[data-timeline-part-id="${id}"]`)
   const diff = wrapper.locator('[data-component="apply-patch-file-diff"]')
   const row = page.locator("[data-timeline-key]", { has: wrapper })
-  const trigger = wrapper.getByRole("button")
+  const trigger = wrapper.getByRole("button", { name: /anchored\.ts/ })
 
   const bottom = () =>
     scroller.evaluate((element) => Math.abs(element.scrollHeight - element.clientHeight - element.scrollTop))

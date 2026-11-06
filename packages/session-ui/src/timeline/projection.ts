@@ -582,6 +582,7 @@ export namespace Timeline {
         rows.push(
           new TimelineRow.Error({
             userMessageID: turnID,
+            messageID: lastAssistant.id,
             text: unwrapErrorMessage(lastAssistant.error.message),
             ...usageLimit(lastAssistant),
             ...budgetLimit(lastAssistant),
@@ -604,6 +605,11 @@ export namespace Timeline {
             rows.push(
               new TimelineRow.Error({
                 userMessageID: turnID,
+                messageID:
+                  lastAssistant?.error?.message === entry.message.error.message &&
+                  lastAssistant.error.type === entry.message.error.type
+                    ? lastAssistant.id
+                    : entry.message.id,
                 text: unwrapErrorMessage(entry.message.error.message),
                 ...usageLimit(entry.message),
                 ...budgetLimit(entry.message),

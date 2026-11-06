@@ -267,6 +267,12 @@ import type {
   ExperimentalArtifactsUpdateOutput,
   ExperimentalArtifactsDeleteInput,
   ExperimentalArtifactsDeleteOutput,
+  ExperimentalTranscriptSearchInput,
+  ExperimentalTranscriptSearchOutput,
+  ExperimentalTranscriptStatusOutput,
+  ExperimentalTranscriptBackfillInput,
+  ExperimentalTranscriptBackfillOutput,
+  ExperimentalTranscriptFacetsOutput,
   ShellListInput,
   ShellListOutput,
   ShellCreateInput,
@@ -1700,6 +1706,64 @@ const EndpointExperimentalArtifactsDelete =
       }).pipe(Effect.mapError(mapClientError)),
     )
 
+const EndpointExperimentalTranscriptSearch =
+  (raw: RawClient["server.experimental"]) => (input: ExperimentalTranscriptSearchInput) =>
+    preserveEffect<ExperimentalTranscriptSearchOutput>()(
+      raw["transcript.search"]({
+        payload: {
+          query: input["query"],
+          mode: input["mode"],
+          flags: input["flags"],
+          caseSensitive: input["caseSensitive"],
+          cursor: input["cursor"],
+          limit: input["limit"],
+          projectIDs: input["projectIDs"],
+          sessionIDs: input["sessionIDs"],
+          roles: input["roles"],
+          categories: input["categories"],
+          content: input["content"],
+          agents: input["agents"],
+          providerIDs: input["providerIDs"],
+          models: input["models"],
+          toolNames: input["toolNames"],
+          toolStatuses: input["toolStatuses"],
+          dateFrom: input["dateFrom"],
+          dateTo: input["dateTo"],
+          sessionKind: input["sessionKind"],
+          archived: input["archived"],
+          sort: input["sort"],
+        },
+      }).pipe(
+        Effect.mapError(mapClientError),
+        Effect.map((value) => value.data),
+      ),
+    )
+
+const EndpointExperimentalTranscriptStatus = (raw: RawClient["server.experimental"]) => () =>
+  preserveEffect<ExperimentalTranscriptStatusOutput>()(
+    raw["transcript.status"]({}).pipe(
+      Effect.mapError(mapClientError),
+      Effect.map((value) => value.data),
+    ),
+  )
+
+const EndpointExperimentalTranscriptBackfill =
+  (raw: RawClient["server.experimental"]) => (input?: ExperimentalTranscriptBackfillInput) =>
+    preserveEffect<ExperimentalTranscriptBackfillOutput>()(
+      raw["transcript.backfill"]({ payload: { rebuild: input?.["rebuild"] } }).pipe(
+        Effect.mapError(mapClientError),
+        Effect.map((value) => value.data),
+      ),
+    )
+
+const EndpointExperimentalTranscriptFacets = (raw: RawClient["server.experimental"]) => () =>
+  preserveEffect<ExperimentalTranscriptFacetsOutput>()(
+    raw["transcript.facets"]({}).pipe(
+      Effect.mapError(mapClientError),
+      Effect.map((value) => value.data),
+    ),
+  )
+
 const adaptGroupExperimental = (raw: RawClient["server.experimental"]) => ({
   persistentPty: {
     read: EndpointExperimentalPersistentPtyRead(raw),
@@ -1728,6 +1792,12 @@ const adaptGroupExperimental = (raw: RawClient["server.experimental"]) => ({
     get: EndpointExperimentalArtifactsGet(raw),
     update: EndpointExperimentalArtifactsUpdate(raw),
     delete: EndpointExperimentalArtifactsDelete(raw),
+  },
+  transcript: {
+    search: EndpointExperimentalTranscriptSearch(raw),
+    status: EndpointExperimentalTranscriptStatus(raw),
+    backfill: EndpointExperimentalTranscriptBackfill(raw),
+    facets: EndpointExperimentalTranscriptFacets(raw),
   },
 })
 

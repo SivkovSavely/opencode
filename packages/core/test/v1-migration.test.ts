@@ -4,6 +4,7 @@ import { EffectDrizzleSqlite } from "@opencode/core/database/drizzle"
 import { Database } from "@opencode/core/database/database"
 import { DatabaseMigration } from "@opencode/core/database/migration"
 import { V1Migration } from "@opencode/core/database/v1-migration"
+import { TranscriptSearch } from "@opencode/core/session/transcript-search"
 import { SessionMessage } from "@opencode/core/session/message"
 import { SessionSchema } from "@opencode/core/session/schema"
 import { SessionTable } from "@opencode/core/session/sql"
@@ -258,7 +259,15 @@ describe("V1Migration.transformSession", () => {
         time_created: 10,
         time_updated: 11,
         data: {
-          text: "first\n\nsecond",
+          text: "firstsecond",
+          experimental: {
+            textParts: [
+              { id: "prt_1", text: "first", timeCreated: 1 },
+              { id: "prt_5", text: "second", timeCreated: 1 },
+            ],
+            filePartIDs: [],
+            fileParts: [],
+          },
           agents: [{ name: "build", mention: { text: "@build", start: 2, end: 8 } }, { name: "review" }],
           time: { created: 10 },
         },
@@ -300,7 +309,27 @@ describe("V1Migration.transformSession", () => {
       ],
     )
     expect(result.messages[0].data).toEqual({
-      text: "prompt\n\n[Attachment unavailable after migration: named.txt (text/plain)]\n\n[Attachment unavailable after migration: https://example.test/raw (application/octet-stream)]",
+      text: "prompt",
+      experimental: {
+        textParts: [{ id: "prt_1", text: "prompt", timeCreated: 1 }],
+        filePartIDs: ["prt_2", "prt_3"],
+        fileParts: [
+          { id: "prt_2", name: "inline.txt", timeCreated: 1 },
+          { id: "prt_3", timeCreated: 1 },
+          {
+            id: "prt_4",
+            name: "named.txt",
+            timeCreated: 1,
+            unavailable: "[Attachment unavailable after migration: named.txt (text/plain)]",
+          },
+          {
+            id: "prt_5",
+            timeCreated: 1,
+            unavailable:
+              "[Attachment unavailable after migration: https://example.test/raw (application/octet-stream)]",
+          },
+        ],
+      },
       files: [
         { data: "aGVsbG8gd29ybGQ=", mime: "text/plain", source: { type: "inline" }, name: "inline.txt" },
         {
@@ -352,7 +381,20 @@ describe("V1Migration.transformSession", () => {
       ],
     )
     expect(result.messages[0].data).toEqual({
-      text: "[Attachment unavailable after migration: resource://fallback (application/json)]",
+      text: "",
+      experimental: {
+        textParts: [],
+        filePartIDs: ["prt_1", "prt_2"],
+        fileParts: [
+          { id: "prt_1", timeCreated: 1 },
+          { id: "prt_2", timeCreated: 1 },
+          {
+            id: "prt_3",
+            unavailable: "[Attachment unavailable after migration: resource://fallback (application/json)]",
+            timeCreated: 1,
+          },
+        ],
+      },
       files: [
         {
           data: "ZmlsZQ==",
@@ -440,16 +482,22 @@ describe("V1Migration.transformSession", () => {
     )
     expect(result.messages[1].data).toEqual({
       agent: "build",
+      experimental: { parentMessageID: parent.id },
       model: { id: "model", providerID: "provider", variant: "fast" },
       content: [
-        { type: "text", text: "", native: { separator: true } },
+        {
+          type: "text",
+          text: "",
+          native: { separator: true },
+          experimental: { sourcePartID: "prt_1", timeCreated: 1, searchable: true },
+        },
         { type: "reasoning", text: "think", native: { provider: 1 }, time: { created: 21, completed: 22 } },
       ],
       snapshot: { start: "snap_start", end: "snap_end", files: ["a.ts", "b.ts", "c.ts"] },
       finish: "stop",
       cost: 2.5,
       tokens: { input: 2, output: 3, reasoning: 4, cache: { read: 5, write: 6 } },
-      time: { created: 20, completed: 21 },
+      time: { created: 20, completed: 25 },
     })
     expect(result.messages[1]).toMatchObject({ time_created: 20, time_updated: 21 })
   })
@@ -526,7 +574,7 @@ describe("V1Migration.transformSession", () => {
         status: "error",
         error: { type: "tool.interrupted", message: "Tool execution was interrupted before V2 migration" },
       },
-      time: { created: 20 },
+      time: { created: 1 },
     })
     expect(content[1]).toMatchObject({
       id: "running",
@@ -561,6 +609,7 @@ describe("V1Migration.transformSession", () => {
       time: { created: 36, completed: 37 },
     })
     expect(content[5]).toEqual({
+      experimental: { sourcePartID: "prt_6" },
       type: "tool",
       id: "failed-object-output",
       name: "read",
@@ -811,7 +860,7 @@ describe("V1Migration.transformSession", () => {
       part("prt_4", "msg_missing", { type: "text", text: "orphan" }),
       part("prt_5", good.id, { type: "text", text: "after" }),
     ])
-    expect(result.messages[0].data.text).toBe("before\n\nafter")
+    expect(result.messages[0].data.text).toBe("beforeafter")
     expect(result.messages.map((row) => row.seq)).toEqual([0, 1])
     expect(result.warnings).toEqual([
       { reason: "invalid-message", sessionID: "ses_test", messageID: badJson.id },
@@ -861,12 +910,16 @@ describe("V1Migration.transformSession", () => {
       ],
     )
     expect(result.messages.map((row) => row.type)).toEqual(["user", "assistant"])
-    expect(result.messages[0].data).toEqual({ text: "", time: { created: 1 } })
+    expect(result.messages[0].data).toEqual({
+      text: "",
+      time: { created: 1 },
+      experimental: { textParts: [], filePartIDs: [], fileParts: [] },
+    })
     expect(result.messages[1].data).toMatchObject({ content: [], snapshot: { start: "standalone" } })
     expect(result.watermark).toBe(1)
   })
 
-  test("orders equal-time rows by ID and keeps SQL and payload timestamps consistent", () => {
+  test("orders equal-time rows by ID and retains SQL creation and historical completion timestamps", () => {
     const first = user("msg_000000000041aaaaaaaaaaaaaa", { time: { created: 999 } }, 10)
     const second = assistant("msg_000000000042aaaaaaaaaaaaaa", first.id, { time: { created: 998, completed: 997 } }, 10)
     const result = transform(
@@ -879,7 +932,7 @@ describe("V1Migration.transformSession", () => {
     expect(result.messages.map((row) => row.id)).toEqual([first.id, second.id])
     expect(result.messages.map((row) => [row.time_created, row.time_updated, row.data.time])).toEqual([
       [10, 11, { created: 10 }],
-      [10, 11, { created: 10, completed: 11 }],
+      [10, 11, { created: 10, completed: 997 }],
     ])
   })
 
@@ -1511,7 +1564,7 @@ describe("V1Migration database workflow", () => {
     )
   })
 
-  test("replaces projections containing apostrophes and checkpoints completion", async () => {
+  test("prefers retained durable history containing apostrophes and checkpoints completion", async () => {
     await database(
       Effect.gen(function* () {
         const { db } = yield* Database.Service
@@ -1536,7 +1589,7 @@ describe("V1Migration database workflow", () => {
           sql`INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES ('prt_1', ${source.id}, 'ses_test', 1, 2, ${sourcePart.data})`,
         )
         yield* db.run(
-          sql`INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data) VALUES ('msg_stale', 'ses_test', 'user', 0, 1, 1, '{"text":"stale","time":{"created":1}}')`,
+          sql`INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data) VALUES (${source.id}, 'ses_test', 'user', 0, 1, 1, ${JSON.stringify({ text: "durable's history", time: { created: 1 } })})`,
         )
         yield* db.run(sql`INSERT INTO event_sequence (aggregate_id, seq) VALUES ('ses_test', 9)`)
         yield* db.run(
@@ -1549,9 +1602,9 @@ describe("V1Migration database workflow", () => {
               id: source.id,
               type: "user",
               seq: 0,
-              time_created: 10,
-              time_updated: 11,
-              data: '{"text":"don\'t stop","time":{"created":10}}',
+              time_created: 1,
+              time_updated: 1,
+              data: '{"text":"durable\'s history","time":{"created":1}}',
             },
           ],
         )
@@ -1591,7 +1644,59 @@ describe("V1Migration database workflow", () => {
     )
   })
 
-  test("rolls back one session atomically and resumes from the committed cursor", async () => {
+  test("resequences retained normalized history around earlier legacy rows and can repeat the import", async () => {
+    await database(
+      Effect.gen(function* () {
+        const { db } = yield* Database.Service
+        yield* db.run(
+          sql`INSERT INTO project(id,worktree,sandboxes,time_created,time_updated) VALUES('global','/tmp/test','[]',1,2)`,
+        )
+        yield* db.run(sql`INSERT INTO session(id,project_id,slug,directory,title,version,time_created,time_updated)
+          VALUES('ses_test','global','test','/tmp/test','Mixed','1',1,2)`)
+        const source = user("msg_000000000001aaaaaaaaaaaaaa", {}, 1)
+        const sourcePart = part("prt_early", source.id, { type: "text", text: "earlier legacy sentinel" })
+        yield* db.run(sql`INSERT INTO message(id,session_id,time_created,time_updated,data)
+          VALUES(${source.id},'ses_test',1,2,${source.data})`)
+        yield* db.run(sql`INSERT INTO part(id,message_id,session_id,time_created,time_updated,data)
+          VALUES('prt_early',${source.id},'ses_test',1,2,${sourcePart.data})`)
+        yield* Effect.forEach([0, 1], (seq) =>
+          db.run(sql`INSERT INTO session_message(id,session_id,type,seq,time_created,time_updated,data)
+          VALUES(${"msg_retained_" + seq},'ses_test','assistant',${seq},${seq + 10},${seq + 10},
+          ${JSON.stringify({ agent: "build", model: { id: "old", providerID: "historical" }, content: [], time: { created: seq + 10 } })})`),
+        )
+        yield* Effect.forEach([0, 1], (seq) =>
+          db.run(sql`INSERT INTO session_part(message_id,session_id,ordinal,type,time_created,time_updated,data)
+          VALUES(${"msg_retained_" + seq},'ses_test',0,'text',${seq + 10},${seq + 10},${JSON.stringify({ text: `retained normalized sentinel ${seq}` })})`),
+        )
+        const search = yield* TranscriptSearch.make
+        expect(yield* V1Migration.run()).toEqual({ status: "completed" })
+        const expected = [
+          { id: source.id, seq: 0 },
+          { id: "msg_retained_0", seq: 1 },
+          { id: "msg_retained_1", seq: 2 },
+        ]
+        expect(yield* db.all(sql`SELECT id,seq FROM session_message ORDER BY seq`)).toEqual(expected)
+        expect(yield* db.all(sql`SELECT message_id,data FROM session_part ORDER BY message_id`)).toEqual([
+          { message_id: "msg_retained_0", data: '{"text":"retained normalized sentinel 0"}' },
+          { message_id: "msg_retained_1", data: '{"text":"retained normalized sentinel 1"}' },
+        ])
+        while (!(yield* search.status()).ready) yield* search.advance()
+        expect((yield* search.search({ query: "sentinel", sort: "oldest" })).hits.map((hit) => hit.messageID)).toEqual(
+          expected.map((row) => row.id),
+        )
+        // Re-enter the durable migration phase as after an interrupted checkpoint, without deleting history.
+        yield* db.run(sql`UPDATE kv SET value='{"phase":"sessions"}' WHERE key='migration.v1-v2'`)
+        expect(yield* V1Migration.run()).toEqual({ status: "completed" })
+        expect(yield* db.all(sql`SELECT id,seq FROM session_message ORDER BY seq`)).toEqual(expected)
+        const reopened = yield* TranscriptSearch.make
+        expect((yield* reopened.search({ query: "retained normalized" })).hits).toHaveLength(2)
+        expect(yield* db.get(sql`SELECT count(*) AS count FROM session_part`)).toEqual({ count: 2 })
+        expect(yield* db.get(sql`SELECT data FROM part WHERE id='prt_early'`)).toEqual({ data: sourcePart.data })
+      }),
+    )
+  })
+
+  test("rolls back one session atomically and resumes with authoritative normalized history intact", async () => {
     await database(
       Effect.gen(function* () {
         const { db } = yield* Database.Service
@@ -1607,7 +1712,11 @@ describe("V1Migration database workflow", () => {
           sql`CREATE TRIGGER fail_b BEFORE UPDATE ON session_v2 WHEN NEW.id = 'ses_b' BEGIN SELECT RAISE(ABORT, 'stop'); END`,
         )
         yield* db.run(
-          sql`INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data) VALUES ('msg_stale_b', 'ses_b', 'user', 0, 7, 8, '{"text":"stale","time":{"created":7}}')`,
+          sql`INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data) VALUES ('msg_stale_b', 'ses_b', 'assistant', 0, 7, 8, '{"agent":"build","model":{"id":"old","providerID":"historical","variant":"default"},"content":[],"time":{"created":7}}')`,
+        )
+        const search = yield* TranscriptSearch.make
+        yield* db.run(
+          sql`INSERT INTO session_part(message_id,session_id,ordinal,type,time_created,time_updated,data) VALUES('msg_stale_b','ses_b',0,'text',7,8,'{"text":"durable normalized sentinel"}')`,
         )
         yield* db.run(sql`INSERT INTO event_sequence (aggregate_id, seq, owner_id) VALUES ('ses_b', 7, 'owner')`)
         yield* db.run(
@@ -1636,7 +1745,7 @@ describe("V1Migration database workflow", () => {
             seq: 0,
             time_created: 7,
             time_updated: 8,
-            data: '{"text":"stale","time":{"created":7}}',
+            data: '{"agent":"build","model":{"id":"old","providerID":"historical","variant":"default"},"content":[],"time":{"created":7}}',
           },
         ])
         expect(yield* db.get(sql`SELECT seq, owner_id FROM event_sequence WHERE aggregate_id = 'ses_b'`)).toEqual({
@@ -1657,9 +1766,17 @@ describe("V1Migration database workflow", () => {
           Effect.retry(Schedule.spaced("10 millis")),
         )
         expect(yield* db.get(sql`SELECT cost FROM session_v2 WHERE id = 'ses_b'`)).toEqual({ cost: 0 })
-        expect(yield* db.all(sql`SELECT id FROM session_message WHERE session_id = 'ses_b'`)).toEqual([])
+        expect(yield* db.all(sql`SELECT id FROM session_message WHERE session_id = 'ses_b'`)).toEqual([
+          { id: "msg_stale_b" },
+        ])
+        expect(yield* db.get(sql`SELECT data FROM session_part WHERE message_id = 'msg_stale_b'`)).toEqual({
+          data: '{"text":"durable normalized sentinel"}',
+        })
+        expect((yield* search.search({ query: "durable normalized" })).hits.map((hit) => hit.messageID)).toEqual([
+          "msg_stale_b",
+        ])
         expect(yield* db.get(sql`SELECT seq, owner_id FROM event_sequence WHERE aggregate_id = 'ses_b'`)).toEqual({
-          seq: -1,
+          seq: 0,
           owner_id: null,
         })
         expect(yield* db.all(sql`SELECT id FROM event`)).toEqual([{ id: "event_after_clear" }])

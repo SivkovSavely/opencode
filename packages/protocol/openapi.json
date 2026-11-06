@@ -1051,6 +1051,22 @@
             "required": false
           },
           {
+            "name": "experimental.bookmarked",
+            "in": "query",
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "enum": ["true", "false"]
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "required": false
+          },
+          {
             "name": "cursor",
             "in": "query",
             "schema": {
@@ -1821,6 +1837,29 @@
                     "anyOf": [
                       {
                         "type": "string"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  },
+                  "experimental": {
+                    "anyOf": [
+                      {
+                        "type": "object",
+                        "properties": {
+                          "bookmarked": {
+                            "anyOf": [
+                              {
+                                "type": "boolean"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ]
+                          }
+                        },
+                        "additionalProperties": false
                       },
                       {
                         "type": "null"
@@ -10605,6 +10644,7 @@
                     "session.model.selected",
                     "session.moved",
                     "session.renamed",
+                    "session.bookmark.changed",
                     "session.metadata.updated",
                     "session.permissions",
                     "session.viewed",
@@ -10714,6 +10754,7 @@
                           "session.model.selected",
                           "session.moved",
                           "session.renamed",
+                          "session.bookmark.changed",
                           "session.metadata.updated",
                           "session.permissions",
                           "session.viewed",
@@ -13993,6 +14034,222 @@
         },
         "description": "Serve HTML and static files from the local provider. Experimental: needs experimental.artifacts in the Location's config and may change without notice.",
         "summary": "View local artifact"
+      }
+    },
+    "/api/experimental/transcript/search": {
+      "post": {
+        "tags": ["persistentPty"],
+        "operationId": "experimental.transcript.search",
+        "parameters": [],
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "data": {
+                      "$ref": "#/components/schemas/TranscriptSearch.Response"
+                    }
+                  },
+                  "required": ["data"],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "InvalidRequestError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InvalidRequestErrorEncoded"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "UnauthorizedError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UnauthorizedErrorEncoded"
+                }
+              }
+            }
+          }
+        },
+        "description": "Experimental: may change without compatibility guarantees. Searches only public persisted categories within the documented content and scan bounds; completeness is not a historical snapshot.",
+        "summary": "Transcript search",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TranscriptSearch.Request"
+              }
+            }
+          },
+          "required": true
+        }
+      }
+    },
+    "/api/experimental/transcript/status": {
+      "get": {
+        "tags": ["persistentPty"],
+        "operationId": "experimental.transcript.status",
+        "parameters": [],
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "data": {
+                      "$ref": "#/components/schemas/TranscriptSearch.Status"
+                    }
+                  },
+                  "required": ["data"],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "InvalidRequestError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InvalidRequestErrorEncoded"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "UnauthorizedError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UnauthorizedErrorEncoded"
+                }
+              }
+            }
+          }
+        },
+        "description": "Experimental: may change without compatibility guarantees. Searches only public persisted categories within the documented content and scan bounds; completeness is not a historical snapshot.",
+        "summary": "Transcript status"
+      }
+    },
+    "/api/experimental/transcript/backfill": {
+      "post": {
+        "tags": ["persistentPty"],
+        "operationId": "experimental.transcript.backfill",
+        "parameters": [],
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "data": {
+                      "$ref": "#/components/schemas/TranscriptSearch.Status"
+                    }
+                  },
+                  "required": ["data"],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "InvalidRequestError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InvalidRequestErrorEncoded"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "UnauthorizedError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UnauthorizedErrorEncoded"
+                }
+              }
+            }
+          }
+        },
+        "description": "Experimental: may change without compatibility guarantees. Searches only public persisted categories within the documented content and scan bounds; completeness is not a historical snapshot.",
+        "summary": "Transcript backfill",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TranscriptSearch.Backfill"
+              }
+            }
+          },
+          "required": true
+        }
+      }
+    },
+    "/api/experimental/transcript/facets": {
+      "get": {
+        "tags": ["persistentPty"],
+        "operationId": "experimental.transcript.facets",
+        "parameters": [],
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "data": {
+                      "$ref": "#/components/schemas/TranscriptSearch.Facets"
+                    }
+                  },
+                  "required": ["data"],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "InvalidRequestError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InvalidRequestErrorEncoded"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "UnauthorizedError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UnauthorizedErrorEncoded"
+                }
+              }
+            }
+          }
+        },
+        "description": "Experimental: may change without compatibility guarantees. Searches only public persisted categories within the documented content and scan bounds; completeness is not a historical snapshot.",
+        "summary": "Transcript facets"
       }
     },
     "/api/shell": {
@@ -23086,6 +23343,15 @@
           "parentID": {
             "$ref": "#/components/schemas/Session.ID"
           },
+          "experimental": {
+            "type": "object",
+            "properties": {
+              "bookmarked": {
+                "type": "boolean"
+              }
+            },
+            "additionalProperties": false
+          },
           "fork": {
             "type": "object",
             "properties": {
@@ -23227,6 +23493,16 @@
             "type": "string",
             "enum": ["assistant"]
           },
+          "experimental": {
+            "type": "object",
+            "properties": {
+              "parentMessageID": {
+                "type": "string"
+              }
+            },
+            "required": ["parentMessageID"],
+            "additionalProperties": false
+          },
           "agent": {
             "$ref": "#/components/schemas/Agent.ID"
           },
@@ -23353,6 +23629,22 @@
           },
           "native": {
             "$ref": "#/components/schemas/Session.Message.Native"
+          },
+          "experimental": {
+            "type": "object",
+            "properties": {
+              "sourcePartID": {
+                "type": "string"
+              },
+              "timeCreated": {
+                "type": "number"
+              },
+              "searchable": {
+                "type": "boolean"
+              }
+            },
+            "required": ["sourcePartID", "timeCreated", "searchable"],
+            "additionalProperties": false
           }
         },
         "required": ["type", "text"],
@@ -23361,6 +23653,22 @@
       "Session.Message.Assistant.Tool": {
         "type": "object",
         "properties": {
+          "experimental": {
+            "type": "object",
+            "properties": {
+              "sourcePartID": {
+                "type": "string"
+              },
+              "rawInput": {
+                "type": "string"
+              },
+              "searchable": {
+                "type": "boolean"
+              }
+            },
+            "required": ["sourcePartID"],
+            "additionalProperties": false
+          },
           "type": {
             "type": "string",
             "enum": ["tool"]
@@ -24036,6 +24344,59 @@
               "$ref": "#/components/schemas/Prompt.SkillAttachment"
             }
           },
+          "experimental": {
+            "type": "object",
+            "properties": {
+              "textParts": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "id": {
+                      "type": "string"
+                    },
+                    "text": {
+                      "type": "string"
+                    },
+                    "timeCreated": {
+                      "type": "number"
+                    }
+                  },
+                  "required": ["id", "text", "timeCreated"],
+                  "additionalProperties": false
+                }
+              },
+              "filePartIDs": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "fileParts": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "id": {
+                      "type": "string"
+                    },
+                    "name": {
+                      "type": "string"
+                    },
+                    "unavailable": {
+                      "type": "string"
+                    },
+                    "timeCreated": {
+                      "type": "number"
+                    }
+                  },
+                  "required": ["id"],
+                  "additionalProperties": false
+                }
+              }
+            },
+            "additionalProperties": false
+          },
           "type": {
             "type": "string",
             "enum": ["user"]
@@ -24710,6 +25071,420 @@
           }
         },
         "required": ["type", "text"],
+        "additionalProperties": false
+      },
+      "TranscriptSearch.Backfill": {
+        "type": "object",
+        "properties": {
+          "rebuild": {
+            "type": "boolean"
+          }
+        },
+        "additionalProperties": false
+      },
+      "TranscriptSearch.Facets": {
+        "type": "object",
+        "properties": {
+          "projects": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "id": {
+                  "type": "string"
+                },
+                "path": {
+                  "type": "string"
+                },
+                "lastUsed": {
+                  "type": "number"
+                }
+              },
+              "required": ["id", "path", "lastUsed"],
+              "additionalProperties": false
+            }
+          },
+          "agents": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "value": {
+                  "type": "string"
+                },
+                "lastUsed": {
+                  "type": "number"
+                }
+              },
+              "required": ["value", "lastUsed"],
+              "additionalProperties": false
+            }
+          },
+          "providers": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "value": {
+                  "type": "string"
+                },
+                "lastUsed": {
+                  "type": "number"
+                }
+              },
+              "required": ["value", "lastUsed"],
+              "additionalProperties": false
+            }
+          },
+          "models": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "providerID": {
+                  "type": "string"
+                },
+                "modelID": {
+                  "type": "string"
+                },
+                "lastUsed": {
+                  "type": "number"
+                }
+              },
+              "required": ["providerID", "modelID", "lastUsed"],
+              "additionalProperties": false
+            }
+          },
+          "tools": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "value": {
+                  "type": "string"
+                },
+                "lastUsed": {
+                  "type": "number"
+                }
+              },
+              "required": ["value", "lastUsed"],
+              "additionalProperties": false
+            }
+          },
+          "truncated": {
+            "type": "boolean"
+          }
+        },
+        "required": ["projects", "agents", "providers", "models", "tools", "truncated"],
+        "additionalProperties": false
+      },
+      "TranscriptSearch.Hit": {
+        "type": "object",
+        "properties": {
+          "documentID": {
+            "type": "string"
+          },
+          "messageID": {
+            "type": "string"
+          },
+          "partID": {
+            "type": "string"
+          },
+          "sessionID": {
+            "type": "string"
+          },
+          "projectID": {
+            "type": "string"
+          },
+          "projectPath": {
+            "type": "string"
+          },
+          "directory": {
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          },
+          "role": {
+            "type": "string",
+            "enum": ["user", "assistant"]
+          },
+          "category": {
+            "type": "string",
+            "enum": ["text", "file", "tool-input", "tool-output", "tool-error", "assistant-error"]
+          },
+          "agent": {
+            "type": "string"
+          },
+          "providerID": {
+            "type": "string"
+          },
+          "modelID": {
+            "type": "string"
+          },
+          "toolName": {
+            "type": "string"
+          },
+          "toolStatus": {
+            "type": "string"
+          },
+          "parentID": {
+            "type": "string"
+          },
+          "archived": {
+            "type": "boolean"
+          },
+          "timeCreated": {
+            "type": "number"
+          },
+          "excerpt": {
+            "type": "string"
+          },
+          "excerptOffset": {
+            "type": "number"
+          },
+          "offset": {
+            "type": "number"
+          },
+          "matchLength": {
+            "type": "number"
+          },
+          "truncated": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "documentID",
+          "messageID",
+          "sessionID",
+          "projectID",
+          "projectPath",
+          "directory",
+          "title",
+          "role",
+          "category",
+          "archived",
+          "timeCreated",
+          "excerpt",
+          "excerptOffset",
+          "offset",
+          "matchLength",
+          "truncated"
+        ],
+        "additionalProperties": false
+      },
+      "TranscriptSearch.Request": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "maxLength": 256,
+            "minLength": 1
+          },
+          "mode": {
+            "type": "string",
+            "enum": ["literal", "regex"]
+          },
+          "flags": {
+            "type": "string",
+            "maxLength": 256
+          },
+          "caseSensitive": {
+            "type": "boolean"
+          },
+          "cursor": {
+            "type": "string",
+            "maxLength": 4096
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 100
+          },
+          "projectIDs": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "maxLength": 256
+            },
+            "maxItems": 100
+          },
+          "sessionIDs": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "maxLength": 256
+            },
+            "maxItems": 100
+          },
+          "roles": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "enum": ["user", "assistant"]
+            },
+            "maxItems": 100
+          },
+          "categories": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "enum": ["text", "file", "tool-input", "tool-output", "tool-error", "assistant-error"]
+            },
+            "maxItems": 100
+          },
+          "content": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "role": {
+                  "type": "string",
+                  "enum": ["user", "assistant"]
+                },
+                "category": {
+                  "type": "string",
+                  "enum": ["text", "file", "tool-input", "tool-output", "tool-error", "assistant-error"]
+                }
+              },
+              "required": ["role", "category"],
+              "additionalProperties": false
+            },
+            "maxItems": 100
+          },
+          "agents": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "maxLength": 256
+            },
+            "maxItems": 100
+          },
+          "providerIDs": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "maxLength": 256
+            },
+            "maxItems": 100
+          },
+          "models": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "providerID": {
+                  "type": "string",
+                  "maxLength": 256
+                },
+                "modelID": {
+                  "type": "string",
+                  "maxLength": 256
+                }
+              },
+              "required": ["providerID", "modelID"],
+              "additionalProperties": false
+            },
+            "maxItems": 100
+          },
+          "toolNames": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "maxLength": 256
+            },
+            "maxItems": 100
+          },
+          "toolStatuses": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "enum": ["running", "completed", "error", "interrupted"]
+            },
+            "maxItems": 100
+          },
+          "dateFrom": {
+            "type": "number"
+          },
+          "dateTo": {
+            "type": "number"
+          },
+          "sessionKind": {
+            "type": "string",
+            "enum": ["all", "root", "subagent"]
+          },
+          "archived": {
+            "type": "string",
+            "enum": ["all", "active", "archived"]
+          },
+          "sort": {
+            "type": "string",
+            "enum": ["newest", "oldest", "session-title"]
+          }
+        },
+        "required": ["query"],
+        "additionalProperties": false
+      },
+      "TranscriptSearch.Response": {
+        "type": "object",
+        "properties": {
+          "hits": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/TranscriptSearch.Hit"
+            }
+          },
+          "nextCursor": {
+            "type": "string"
+          },
+          "scanned": {
+            "type": "number"
+          },
+          "complete": {
+            "type": "boolean"
+          },
+          "scanLimit": {
+            "type": "number"
+          },
+          "contentLimit": {
+            "type": "number"
+          },
+          "scanLimited": {
+            "type": "boolean"
+          },
+          "truncatedDocuments": {
+            "type": "number"
+          },
+          "status": {
+            "$ref": "#/components/schemas/TranscriptSearch.Status"
+          }
+        },
+        "required": [
+          "hits",
+          "scanned",
+          "complete",
+          "scanLimit",
+          "contentLimit",
+          "scanLimited",
+          "truncatedDocuments",
+          "status"
+        ],
+        "additionalProperties": false
+      },
+      "TranscriptSearch.Status": {
+        "type": "object",
+        "properties": {
+          "ready": {
+            "type": "boolean"
+          },
+          "backfillCursor": {
+            "type": "string"
+          },
+          "generation": {
+            "type": "string"
+          }
+        },
+        "required": ["ready", "backfillCursor", "generation"],
         "additionalProperties": false
       },
       "UnauthorizedErrorEncoded": {

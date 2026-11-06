@@ -29,6 +29,7 @@ import { Config } from "@opencode/core/config"
 import { Document, Info } from "@opencode/schema/config"
 import { ConfigExperimental } from "@opencode/schema/config/experimental"
 import { SessionHistory } from "@opencode/core/session/history"
+import { TranscriptSearch } from "@opencode/core/session/transcript-search"
 import { Shell } from "@opencode/schema/shell"
 import {
   InstructionStateTable,
@@ -152,6 +153,7 @@ describe("SessionProjector", () => {
 
   it.effect("projects staged, cleared, and committed reverts", () =>
     Effect.gen(function* () {
+      const search = yield* TranscriptSearch.make
       const db = yield* seedSession({
         cost: 1.25,
         tokens_input: 10,
@@ -197,6 +199,10 @@ describe("SessionProjector", () => {
         })
         .run()
       const bus = yield* Bus.Service
+      yield* db.run(
+        sql`UPDATE session_message SET data=json_set(data,'$.content',json('[{"type":"text","text":"revert-search-needle"}]')) WHERE session_id=${sessionID}`,
+      )
+      expect((yield* search.search({ query: "revert-search-needle" })).hits).toHaveLength(3)
       yield* bus.publish(SessionEvent.RevertEvent.Staged, {
         sessionID,
         revert: { messageID: boundary, snapshot: Snapshot.ID.make("tree"), files: [] },
@@ -206,7 +212,11 @@ describe("SessionProjector", () => {
         snapshot: "tree",
         files: [],
       })
+      expect((yield* search.search({ query: "revert-search-needle" })).hits.map((hit) => hit.messageID)).toEqual([
+        earlier,
+      ])
       yield* bus.publish(SessionEvent.RevertEvent.Cleared, { sessionID })
+      expect((yield* search.search({ query: "revert-search-needle" })).hits).toHaveLength(3)
       expect((yield* db.select({ revert: SessionTable.revert }).from(SessionTable).get())?.revert).toBeNull()
       yield* bus.publish(SessionEvent.RevertEvent.Staged, {
         sessionID,
@@ -216,6 +226,10 @@ describe("SessionProjector", () => {
         sessionID,
         to: boundary,
       })
+      expect((yield* search.search({ query: "revert-search-needle" })).hits.map((hit) => hit.messageID)).toEqual([
+        earlier,
+      ])
+      expect((yield* db.get<{ count: number }>(sql`SELECT count(*) AS count FROM transcript_document`))?.count).toBe(1)
       expect(
         (yield* db.select({ id: SessionMessageTable.id }).from(SessionMessageTable).all()).map((row) => row.id),
       ).toEqual([earlier])

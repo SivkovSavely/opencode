@@ -80,6 +80,20 @@ export const User = Schema.Struct({
   files: Prompt.fields.files,
   agents: Prompt.fields.agents,
   skills: Prompt.fields.skills,
+  experimental: Schema.Struct({
+    textParts: Schema.Array(Schema.Struct({ id: Schema.String, text: Schema.String, timeCreated: Schema.Finite })).pipe(
+      optional,
+    ),
+    filePartIDs: Schema.Array(Schema.String).pipe(optional),
+    fileParts: Schema.Array(
+      Schema.Struct({
+        id: Schema.String,
+        name: Schema.String.pipe(optional),
+        unavailable: Schema.String.pipe(optional),
+        timeCreated: Schema.Finite.pipe(optional),
+      }),
+    ).pipe(optional),
+  }).pipe(optional),
   type: Schema.tag("user"),
 }).annotate({ identifier: "Session.Message.User" })
 
@@ -169,6 +183,11 @@ export type ToolState = ToolStateStreaming | ToolStateRunning | ToolStateComplet
 
 export interface AssistantTool extends Schema.Schema.Type<typeof AssistantTool> {}
 export const AssistantTool = Schema.Struct({
+  experimental: Schema.Struct({
+    sourcePartID: Schema.String,
+    rawInput: Schema.String.pipe(optional),
+    searchable: Schema.Boolean.pipe(optional),
+  }).pipe(optional),
   type: Schema.tag("tool"),
   id: Schema.String,
   name: Schema.String,
@@ -187,6 +206,11 @@ export const AssistantText = Schema.Struct({
   type: Schema.tag("text"),
   text: Schema.String,
   native: Native.pipe(optional),
+  experimental: Schema.Struct({
+    sourcePartID: Schema.String,
+    timeCreated: Schema.Finite,
+    searchable: Schema.Boolean,
+  }).pipe(optional),
 }).annotate({ identifier: "Session.Message.Assistant.Text" })
 
 export interface AssistantReasoning extends Schema.Schema.Type<typeof AssistantReasoning> {}
@@ -221,6 +245,7 @@ export interface Assistant extends Schema.Schema.Type<typeof Assistant> {}
 export const Assistant = Schema.Struct({
   ...Base,
   type: Schema.tag("assistant"),
+  experimental: Schema.Struct({ parentMessageID: Schema.String }).pipe(optional),
   agent: Agent.ID,
   model: Model.Ref,
   content: AssistantContent.pipe(Schema.Array),

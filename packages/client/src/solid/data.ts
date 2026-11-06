@@ -1873,6 +1873,15 @@ export function createData(config: CreateDataInput) {
           const position = messageIndex.get(sessionID)?.get(messageID)
           return position === undefined ? undefined : messages?.[position]
         },
+        async refresh(sessionID: string, messageID: string) {
+          const started = deletionEpoch
+          const response = await api().session.message.get({ sessionID, messageID }).catch(evictMissing)
+          if ((deletedAt.get(sessionID) ?? 0) > started) return
+          // A targeted refresh must not reset the loaded window or its older-page cursor.
+          const position = messageIndex.get(sessionID)?.get(messageID)
+          if (position !== undefined) setStore("session", "message", sessionID, position, reconcile(stored(response)))
+          return response
+        },
         sync(sessionID: string) {
           return sync.run(`session.message:${sessionID}`, async () => {
             const started = deletionEpoch

@@ -41,6 +41,8 @@ export type TransformInput = {
   readonly session: typeof SessionTable.$inferSelect
   readonly messages: ReadonlyArray<SourceMessage>
   readonly parts: ReadonlyArray<SourcePart>
+  readonly hiddenMessageIDs?: ReadonlyArray<string>
+  readonly durableMessages?: ReadonlyArray<SourceMessage & { readonly type: SessionMessage.Type; readonly seq: number }>
 }
 
 export type Warning = {
@@ -229,6 +231,7 @@ let runtimeState: RuntimeState = { status: "idle" }
 export function transformSession(input: TransformInput): TransformResult {
   const warnings: Warning[] = []
   const messages = input.messages
+    .filter((row) => !input.hiddenMessageIDs?.includes(row.id))
     .map((row) => {
       const value = Option.getOrUndefined(decodeJson(row.data))
       const decoded =
@@ -275,6 +278,7 @@ export function transformSession(input: TransformInput): TransformResult {
     .filter((item): item is NonNullable<typeof item> => item !== undefined)
     .sort((a, b) => a.row.id.localeCompare(b.row.id))
   const byMessage = Map.groupBy(parts, (item) => item.row.message_id)
+  const partTimes = new Map(parts.map((item) => [item.row.id, item.row.time_created]))
   const paired = new Set<string>()
   const used = new Set(messages.map((item) => item.row.id))
   const projected = messages
@@ -330,13 +334,6 @@ export function transformSession(input: TransformInput): TransformResult {
         const synthetic = visible.filter((part) => part.synthetic)
         const attachments = files.flatMap((part) => migrateFile(part))
         const unavailable = files.flatMap((part) => (!part.url.startsWith("data:") ? [unavailableFile(part)] : []))
-        const text = owned
-          .flatMap((part) => {
-            if (part.type === "text" && !part.ignored && !part.synthetic) return [part.text]
-            if (part.type === "file" && !part.url.startsWith("data:")) return [unavailableFile(part)]
-            return []
-          })
-          .join("\n\n")
         const agentAttachments = agents.map((part) => ({
           name: part.name,
           ...(part.source
@@ -361,7 +358,21 @@ export function transformSession(input: TransformInput): TransformResult {
         const user = row(item.row, {
           id: item.row.id,
           type: "user",
-          text,
+          text: ordinary.map((part) => part.text).join(""),
+          experimental: {
+            textParts: ordinary.map((part) => ({
+              id: part.id,
+              text: part.text,
+              timeCreated: part.time?.start ?? partTimes.get(part.id) ?? item.row.time_created,
+            })),
+            filePartIDs: files.filter((part) => part.url.startsWith("data:")).map((part) => part.id),
+            fileParts: files.map((part) => ({
+              id: part.id,
+              timeCreated: partTimes.get(part.id) ?? item.row.time_created,
+              ...(part.filename ? { name: part.filename } : {}),
+              ...(!part.url.startsWith("data:") ? { unavailable: unavailableFile(part) } : {}),
+            })),
+          },
           ...(attachments.length ? { files: attachments } : {}),
           ...(agentAttachments.length ? { agents: agentAttachments } : {}),
           time: { created: item.row.time_created },
@@ -388,7 +399,18 @@ export function transformSession(input: TransformInput): TransformResult {
         return []
       const content = owned.flatMap((part): Array<Record<string, unknown>> => {
         if (part.type === "text")
-          return [{ type: "text", text: part.text, ...(part.metadata ? { native: part.metadata } : {}) }]
+          return [
+            {
+              type: "text",
+              text: part.text,
+              ...(part.metadata ? { native: part.metadata } : {}),
+              experimental: {
+                sourcePartID: part.id,
+                timeCreated: part.time?.start ?? partTimes.get(part.id) ?? item.row.time_created,
+                searchable: !part.synthetic && !part.ignored,
+              },
+            },
+          ]
         if (part.type === "reasoning")
           return [
             {
@@ -399,7 +421,7 @@ export function transformSession(input: TransformInput): TransformResult {
             },
           ]
         if (part.type !== "tool") return []
-        return [migrateTool(part, item.row.time_created)]
+        return [migrateTool(part, partTimes.get(part.id) ?? item.row.time_created)]
       })
       const start =
         owned.flatMap((part) => (part.type === "step-start" && part.snapshot ? [part.snapshot] : []))[0] ??
@@ -412,6 +434,7 @@ export function transformSession(input: TransformInput): TransformResult {
         row(item.row, {
           id: item.row.id,
           type: "assistant",
+          experimental: { parentMessageID: assistant.parentID },
           agent: assistant.agent,
           model: {
             providerID: assistant.providerID,
@@ -439,24 +462,50 @@ export function transformSession(input: TransformInput): TransformResult {
           ...(assistant.error ? { error: migrateError(assistant.error) } : {}),
           time: {
             created: item.row.time_created,
-            ...(assistant.time.completed === undefined ? {} : { completed: item.row.time_updated }),
+            ...(assistant.time.completed === undefined ? {} : { completed: assistant.time.completed }),
           },
         }),
       ]
     })
     .map((item, seq) => ({ ...item, seq }))
-  const last = projected.at(-1)
-  const notice = last === undefined ? undefined : legacyToolNotice(projected)
+  const durable = (input.durableMessages ?? []).flatMap((row) => {
+    if (input.hiddenMessageIDs?.includes(row.id)) return []
+    const data = {
+      ...Schema.decodeUnknownSync(Schema.fromJsonString(Schema.Record(Schema.String, Schema.Unknown)))(row.data),
+    }
+    if (row.type === "shell" && Schema.is(Schema.String)(data.output)) {
+      const size = Buffer.byteLength(data.output)
+      data.output = { output: data.output, cursor: size, size, truncated: false }
+    }
+    // Refuse incompatible preferred history instead of silently substituting stale legacy content.
+    Schema.decodeUnknownSync(SessionMessage.Info)({ ...data, id: row.id, type: row.type })
+    return [{ ...row, data }]
+  })
+  const preferred = new Set(durable.map((row) => row.id))
+  durable.forEach((row) => used.add(row.id))
+  const legacy = projected.filter((row) => !preferred.has(row.id))
+  const merged: TransformResult["messages"][number][] = []
+  let position = 0
+  // Preserve durable sequence even across clock changes; weave legacy-only rows without reordering either source.
+  for (const row of durable.toSorted((a, b) => a.seq - b.seq)) {
+    while (position < legacy.length && legacy[position]!.time_created <= row.time_created)
+      merged.push(legacy[position++]!)
+    merged.push(row)
+  }
+  merged.push(...legacy.slice(position))
+  const history = merged.map((row, seq) => ({ ...row, seq }))
+  const last = history.at(-1)
+  const notice = last === undefined ? undefined : legacyToolNotice(history)
   const migrated =
     last === undefined || notice === undefined
-      ? projected
+      ? history
       : [
-          ...projected,
+          ...history,
           {
             ...last,
             id: syntheticID(last.id, used),
             type: "system" as const,
-            seq: projected.length,
+            seq: history.length,
             data: {
               text: notice,
               time: { created: last.time_created },
@@ -587,6 +636,9 @@ export function run(
       const bookmarkColumn = yield* db.get<{ name: string }>(
         sql`SELECT name FROM pragma_table_info('session') WHERE name = 'bookmarked'`,
       )
+      const queueImportTable = yield* db.get<{ name: string }>(
+        sql`SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'session_queue_import'`,
+      )
       const cursor = state?.phase === "sessions" ? state.cursor : undefined
       const migrated =
         cursor !== undefined
@@ -714,11 +766,47 @@ export function run(
               const sourceParts = yield* tx.all<SourcePart>(
                 sql`SELECT id, message_id, session_id, time_created, time_updated, data FROM part WHERE session_id = ${next.id}`,
               )
-              const transformed = transformSession({ session: next, messages: sourceMessages, parts: sourceParts })
+              const hidden = queueImportTable
+                ? yield* tx.all<{ id: string }>(
+                    sql`SELECT h.value AS id FROM session_queue_import q,json_each(q.hidden) h WHERE q.session_id = ${next.id}`,
+                  )
+                : []
+              const durableMessages = yield* tx.all<SourceMessage & { type: SessionMessage.Type; seq: number }>(
+                sql`SELECT id,session_id,type,seq,time_created,time_updated,data FROM session_message WHERE session_id = ${next.id}`,
+              )
+              const transformed = transformSession({
+                session: next,
+                messages: sourceMessages,
+                parts: sourceParts,
+                hiddenMessageIDs: hidden.map((row) => row.id),
+                durableMessages,
+              })
               yield* Effect.forEach(transformed.warnings, (warning) =>
                 Effect.logWarning("Skipped V1 migration row", warning),
               )
-              yield* tx.delete(SessionMessageTable).where(eq(SessionMessageTable.session_id, next.id)).run()
+              // Keep authoritative rows in place: deleting/reinserting them would cascade normalized parts.
+              yield* tx.run(sql`DELETE FROM session_message WHERE session_id = ${next.id}
+                ${
+                  transformed.messages.length
+                    ? sql`AND id NOT IN (${sql.join(
+                        transformed.messages.map((row) => sql`${row.id}`),
+                        sql`,`,
+                      )})`
+                    : sql``
+                }`)
+              // Free every final sequence without deleting retained rows or their normalized children.
+              // Temporary sequences are disjoint from both the old and merged ranges; rollback restores them.
+              const temporarySeq = durableMessages.reduce(
+                (next, message) => Math.max(next, message.seq + 1),
+                transformed.messages.length,
+              )
+              yield* Effect.forEach(durableMessages, (message, index) =>
+                tx
+                  .update(SessionMessageTable)
+                  .set({ seq: temporarySeq + index })
+                  .where(eq(SessionMessageTable.id, SessionMessage.ID.make(message.id)))
+                  .run(),
+              )
               yield* Effect.forEach(transformed.messages, (message) =>
                 tx
                   .insert(SessionMessageTable)
@@ -730,6 +818,14 @@ export function run(
                     time_created: message.time_created,
                     time_updated: message.time_updated,
                     data: sql`${JSON.stringify(message.data)}`,
+                  })
+                  .onConflictDoUpdate({
+                    target: SessionMessageTable.id,
+                    set: {
+                      seq: message.seq,
+                      time_updated: message.time_updated,
+                      data: sql`${JSON.stringify(message.data)}`,
+                    },
                   })
                   .run(),
               )
@@ -1081,6 +1177,14 @@ function migrateTool(part: typeof SessionV1.ToolPart.Type, fallback: number) {
     type: "tool" as const,
     id: part.callID,
     name: part.tool,
+    experimental: {
+      sourcePartID: part.id,
+      ...(part.state.status === "pending" ? { rawInput: part.state.raw } : {}),
+      // Migration settles unfinished tools, but must not expose an active legacy question's content.
+      ...(part.tool === "question" && (part.state.status === "pending" || part.state.status === "running")
+        ? { searchable: false }
+        : {}),
+    },
     ...(part.metadata ? { native: part.metadata } : {}),
   }
   if (part.state.status === "completed")
@@ -1111,7 +1215,15 @@ function migrateTool(part: typeof SessionV1.ToolPart.Type, fallback: number) {
       state: {
         status: "error",
         input: part.state.input,
-        error: { type: "tool.execution", message: part.state.error },
+        error: {
+          type:
+            part.state.metadata?.interrupted === true ||
+            part.state.metadata?.interrupted === 1 ||
+            part.state.metadata?.status === "interrupted"
+              ? "tool.interrupted"
+              : "tool.execution",
+          message: part.state.error,
+        },
         ...(typeof part.state.metadata?.output === "string"
           ? { content: [{ type: "text", text: part.state.metadata.output }] }
           : {}),

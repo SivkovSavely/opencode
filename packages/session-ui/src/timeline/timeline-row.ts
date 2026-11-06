@@ -65,6 +65,7 @@ export namespace TimelineRow {
    */
   export class Error extends Data.TaggedClass("Error")<{
     userMessageID: string
+    messageID: string
     text: string
     kind?: "free-limit" | "go-limit" | "budget-limit" | "model-budget-limit"
     resetAt?: number
@@ -148,6 +149,7 @@ export namespace TimelineRow {
     Thinking: (row) => (other: TimelineRow) => Predicate.isTagged(other, "Thinking") && sameRef(other.ref, row.ref),
     Error: (row) => (other: TimelineRow) =>
       Predicate.isTagged(other, "Error") &&
+      other.messageID === row.messageID &&
       other.text === row.text &&
       other.kind === row.kind &&
       other.resetAt === row.resetAt,

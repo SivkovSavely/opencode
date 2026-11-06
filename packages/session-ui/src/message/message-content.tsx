@@ -351,6 +351,30 @@ export function CurrentUserMessageDisplay(props: {
   const inlineFiles = createMemo(() => files().filter((file) => !!file.mention))
   const agents = createMemo(() => props.message.agents ?? [])
   const comments = createMemo(() => props.comments ?? [])
+  const textParts = createMemo(() => props.message.experimental?.textParts)
+
+  const filePartID = (file: PromptAttachment) =>
+    props.message.experimental?.filePartIDs?.[files().indexOf(file)] ??
+    `${props.message.id}:file:${files().indexOf(file)}`
+
+  const renderText = () =>
+    textParts() ? (
+      <For each={textParts()}>
+        {(part) => (
+          <span data-timeline-part-id={part.id}>
+            <CurrentHighlightedText
+              text={part.text}
+              files={inlineFiles()}
+              agents={agents()}
+              strict
+              filePartID={filePartID}
+            />
+          </span>
+        )}
+      </For>
+    ) : (
+      <CurrentHighlightedText text={props.text} files={inlineFiles()} agents={agents()} filePartID={filePartID} />
+    )
 
   const sent = createMemo(() =>
     new Intl.DateTimeFormat(i18n.locale(), { dateStyle: "medium", timeStyle: "short" }).format(
@@ -534,7 +558,15 @@ export function CurrentUserMessageDisplay(props: {
             </Menu.Item>
             {/* Like the iOS app, a Voice message also offers the full prompt the session received. */}
             <Show when={props.voice}>
-              <Menu.Item onSelect={() => void writeClipboard(props.message.text)}>
+              <Menu.Item
+                onSelect={() =>
+                  void writeClipboard(
+                    textParts()
+                      ?.map((part) => part.text)
+                      .join("") ?? props.message.text,
+                  )
+                }
+              >
                 {i18n.t("ui.message.copyFullMessage")}
               </Menu.Item>
             </Show>
@@ -627,47 +659,51 @@ export function CurrentUserMessageDisplay(props: {
               })
 
             return (
-              <Show
-                when={!image()}
-                fallback={
-                  <div
-                    data-slot="user-message-attachment"
-                    data-type="image"
-                    data-clickable={url() ? "true" : undefined}
-                    data-placeholder={url() ? undefined : "true"}
-                    data-width={width()}
-                    data-height={height()}
-                    style={placeholderStyle()}
-                    onClick={(event) => {
-                      const src = url()
-                      const origin = event.currentTarget
+              <>
+                <Show
+                  when={!image()}
+                  fallback={
+                    <div
+                      data-slot="user-message-attachment"
+                      data-timeline-part-id={filePartID(file())}
+                      data-type="image"
+                      data-clickable={url() ? "true" : undefined}
+                      data-placeholder={url() ? undefined : "true"}
+                      data-width={width()}
+                      data-height={height()}
+                      style={placeholderStyle()}
+                      onClick={(event) => {
+                        const src = url()
+                        const origin = event.currentTarget
 
-                      if (src) dialog.show(() => <ImagePreview src={src} alt={name()} origin={origin} />)
-                    }}
-                  >
-                    <Show when={url()}>
-                      {(src) => (
-                        <img
-                          data-slot="user-message-attachment-image"
-                          src={src()}
-                          width={width()}
-                          height={height()}
-                          alt={name()}
-                        />
-                      )}
-                    </Show>
-                  </div>
-                }
-              >
-                <AttachmentCard
-                  title={getFilename(name())}
-                  hover={name()}
-                  clickable={!!props.actions?.openAttachment}
-                  onClick={() => props.actions?.openAttachment?.(file())}
+                        if (src) dialog.show(() => <ImagePreview src={src} alt={name()} origin={origin} />)
+                      }}
+                    >
+                      <Show when={url()}>
+                        {(src) => (
+                          <img
+                            data-slot="user-message-attachment-image"
+                            src={src()}
+                            width={width()}
+                            height={height()}
+                            alt={name()}
+                          />
+                        )}
+                      </Show>
+                    </div>
+                  }
                 >
-                  {typeLabel(name(), file().mime, i18n.t("ui.common.file"))}
-                </AttachmentCard>
-              </Show>
+                  <AttachmentCard
+                    partID={filePartID(file())}
+                    title={getFilename(name())}
+                    hover={name()}
+                    clickable={!!props.actions?.openAttachment}
+                    onClick={() => props.actions?.openAttachment?.(file())}
+                  >
+                    {typeLabel(name(), file().mime, i18n.t("ui.common.file"))}
+                  </AttachmentCard>
+                </Show>
+              </>
             )
           }}
         </Index>
@@ -690,6 +726,13 @@ export function CurrentUserMessageDisplay(props: {
       data-timeline-part-id={props.text ? `${props.message.id}:text:0` : undefined}
     >
       {renderAttachments()}
+      <For each={props.message.experimental?.fileParts?.filter((part) => part.unavailable)}>
+        {(part) => (
+          <div data-slot="user-message-attachment" data-timeline-part-id={part.id}>
+            {part.unavailable}
+          </div>
+        )}
+      </For>
       <Show
         when={props.text}
         fallback={
@@ -707,17 +750,14 @@ export function CurrentUserMessageDisplay(props: {
             </div>
           </Show>
           <div data-slot="user-message-text" dir="auto" data-comments={comments().length > 0 ? "true" : undefined}>
-            <Show
-              when={props.fold}
-              fallback={<CurrentHighlightedText text={props.text} files={inlineFiles()} agents={agents()} />}
-            >
+            <Show when={props.fold} fallback={renderText()}>
               <UserMessageFold
                 id={`${props.message.id}-text`}
                 text={props.text}
                 expanded={expanded()}
                 onExpandedChange={setExpanded}
               >
-                <CurrentHighlightedText text={props.text} files={inlineFiles()} agents={agents()} />
+                {renderText()}
               </UserMessageFold>
             </Show>
             <Show when={comments().length > 0}>
@@ -847,14 +887,32 @@ function scrollParent(element: HTMLElement) {
   return document.scrollingElement
 }
 
-function CurrentHighlightedText(props: { text: string; files: PromptAttachment[]; agents: PromptAgentAttachment[] }) {
+function CurrentHighlightedText(props: {
+  text: string
+  files: PromptAttachment[]
+  agents: PromptAgentAttachment[]
+  strict?: boolean
+  filePartID?: (file: PromptAttachment) => string
+}) {
   const segments = createMemo(() => {
     const references = [
       ...props.files.flatMap((file) =>
-        file.mention ? [{ start: file.mention.start, end: file.mention.end, type: "file" as const }] : [],
+        file.mention && (!props.strict || props.text.slice(file.mention.start, file.mention.end) === file.mention.text)
+          ? [
+              {
+                start: file.mention.start,
+                end: file.mention.end,
+                type: "file" as const,
+                partID: props.filePartID?.(file),
+              },
+            ]
+          : [],
       ),
       ...props.agents.flatMap((agent) =>
-        agent.mention ? [{ start: agent.mention.start, end: agent.mention.end, type: "agent" as const }] : [],
+        agent.mention &&
+        (!props.strict || props.text.slice(agent.mention.start, agent.mention.end) === agent.mention.text)
+          ? [{ start: agent.mention.start, end: agent.mention.end, type: "agent" as const, partID: undefined }]
+          : [],
       ),
     ].sort((a, b) => a.start - b.start)
 
@@ -876,7 +934,11 @@ function CurrentHighlightedText(props: { text: string; files: PromptAttachment[]
       if (reference.start < last) return
 
       if (reference.start > last) pushText(props.text.slice(last, reference.start))
-      result.push({ text: props.text.slice(reference.start, reference.end), type: reference.type })
+      result.push({
+        text: props.text.slice(reference.start, reference.end),
+        type: reference.type,
+        partID: reference.partID,
+      })
       last = reference.end
     })
 
@@ -891,7 +953,7 @@ function CurrentHighlightedText(props: { text: string; files: PromptAttachment[]
         <Show
           when={segment.type === "link"}
           fallback={
-            <span data-highlight={segment.type}>
+            <span data-highlight={segment.type} data-timeline-part-id={segment.partID}>
               <Show
                 when={segment.type && segment.text.startsWith("@")}
                 fallback={<SessionReferenceText text={segment.text} />}
@@ -911,7 +973,7 @@ function CurrentHighlightedText(props: { text: string; files: PromptAttachment[]
   )
 }
 
-type HighlightSegment = { text: string; type?: "file" | "agent" | "link" }
+type HighlightSegment = { text: string; type?: "file" | "agent" | "link"; partID?: string }
 
 function SessionReferenceText(props: { text: string }) {
   const markdown = useMarkdown()

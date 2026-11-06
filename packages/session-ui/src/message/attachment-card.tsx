@@ -4,6 +4,7 @@ import "./attachment-card.css"
 /** Shared 160px two-line card used by file and comment attachments. */
 export function AttachmentCard(props: {
   title: string
+  partID?: string
   active?: boolean
   clickable?: boolean
   wide?: boolean
@@ -17,6 +18,7 @@ export function AttachmentCard(props: {
   return (
     <div
       data-component="attachment-card"
+      data-timeline-part-id={props.partID}
       data-active={props.active ? "true" : undefined}
       data-clickable={props.clickable ? "true" : undefined}
       data-wide={props.wide ? "true" : undefined}

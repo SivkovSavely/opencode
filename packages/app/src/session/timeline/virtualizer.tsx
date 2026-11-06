@@ -134,7 +134,7 @@ export function createTimelineVirtualizer(input: Input) {
     initialTail: boolean
     scrollAdjustment: number
     /** A revealed tool whose top edge stays put until the user scrolls. */
-    anchor?: { key: string; partID: string }
+    anchor?: { key: string; partID: string; messageID: string }
   }>({ initialTail: coldBottomMount, scrollAdjustment: 0 })
 
   const rows = input.projection.rows
@@ -442,13 +442,21 @@ export function createTimelineVirtualizer(input: Input) {
     flushTouchAdjustment()
   }
 
-  // Scrolls to a tool call, named by its ID or by the shell ID a backgrounded shell call reports, and expands it and
-  // the collapsed context group that hides it. Returns whether the call is in the list.
-  function revealPart(target: string) {
+  // Reveals an exact owned text/tool part, or a tool named by its background shell ID,
+  // expanding the context group that hides it. Returns whether the part is in the list.
+  function revealPart(target: string, messageID?: string) {
     if (!active()) return false
+    const source = messageID ? input.projection.messageByID().get(messageID) : undefined
+
+    if (source?.type === "shell" && source.id === target) setToolOpen({ [source.id]: true })
 
     const matches = (ref: { messageID: string; partID: string }) => {
+      if (messageID && ref.messageID !== messageID) return false
+
+      if (source?.type === "shell" && ref.partID === target) return true
       const content = Timeline.resolveContent(input.projection.messageByID().get(ref.messageID), ref.partID)
+
+      if (messageID && ref.partID === target && content?.type === "text") return true
 
       return (
         content?.type === "tool" &&
@@ -460,7 +468,7 @@ export function createTimelineVirtualizer(input: Input) {
       .flatMap((row, index) =>
         Predicate.isTagged(row, "AssistantPart")
           ? (row.group.type === "part" ? [row.group.ref] : row.group.refs).flatMap((ref) =>
-              matches(ref) ? [{ group: row.group, index, partID: ref.partID }] : [],
+              matches(ref) ? [{ group: row.group, index, partID: ref.partID, messageID: ref.messageID }] : [],
             )
           : [],
       )
@@ -478,8 +486,13 @@ export function createTimelineVirtualizer(input: Input) {
           ? { [`context:${key}`]: true, [`${key}:tool:${found.partID}`]: true }
           : { [key]: true },
       )
-      setRendering("anchor", { key: TimelineRow.key(rows()[found.index]!), partID: found.partID })
+      setRendering("anchor", {
+        key: TimelineRow.key(rows()[found.index]!),
+        partID: found.partID,
+        messageID: found.messageID,
+      })
     })
+    virtualizer.scrollToIndex(found.index, { align: "center" })
     // Until its ResizeObserver delivers, the opened row keeps its collapsed size, so the timeline may not scroll yet
     // (and cannot unpin) or ends above the tool. Commit the real size first.
     const opened = virtualContent?.querySelector<HTMLElement>(`[data-index="${found.index}"]`)
@@ -498,10 +511,20 @@ export function createTimelineVirtualizer(input: Input) {
     const root = listRoot()
 
     if (!anchor || !root) return
-    const element = virtualContent?.querySelector<HTMLElement>(`[data-timeline-part-id="${CSS.escape(anchor.partID)}"]`)
+    const row = virtualContent?.querySelector<HTMLElement>(`[data-index="${rowKeys().indexOf(anchor.key)}"]`)
+
+    const element =
+      [...(row?.querySelectorAll<HTMLElement>(`[data-timeline-part-id="${CSS.escape(anchor.partID)}"]`) ?? [])].find(
+        (element) => element.closest(`[data-transcript-message-id="${CSS.escape(anchor.messageID)}"]`),
+      ) ??
+      [...(row?.querySelectorAll<HTMLElement>("[data-transcript-targets]") ?? [])].find((element) =>
+        element.dataset.transcriptTargets?.split("\n").includes(JSON.stringify([anchor.messageID, anchor.partID])),
+      )
 
     // Following the end is a different position to hold.
-    if (!element || !active() || input.pinned()) return releaseAnchor()
+    if (!active() || input.pinned()) return releaseAnchor()
+
+    if (!element) return
 
     const offset = Math.min(
       root.scrollHeight - root.clientHeight,
@@ -575,12 +598,17 @@ export function createTimelineVirtualizer(input: Input) {
     input.setRevealMessage?.((id, partID) => {
       if (!active()) return
 
+      if (partID && revealPart(partID, id)) return
+
       const partIndex = partID
         ? rows().findIndex(
             (row) =>
-              Predicate.isTagged(row, "AssistantPart") && row.group.type === "part" && row.group.ref.partID === partID,
+              Predicate.isTagged(row, "AssistantPart") &&
+              row.group.type === "part" &&
+              row.group.ref.partID === partID &&
+              (row.group.ref.messageID === id || row.userMessageID === id),
           )
-        : -1
+        : rows().findIndex((row) => Predicate.isTagged(row, "Error") && row.messageID === id)
 
       const promptIndex = rows().findIndex((row) => Predicate.isTagged(row, "UserMessage") && row.userMessageID === id)
 

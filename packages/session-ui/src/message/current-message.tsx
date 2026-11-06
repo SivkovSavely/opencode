@@ -105,6 +105,7 @@ export function SessionAssistantContent(props: {
         {(tool) => (
           <ToolDisplay
             id={props.contentID}
+            ownerMessageID={props.message.id}
             tool={tool().name}
             rawTool={tool()}
             input={currentToolInput(tool())}
@@ -135,7 +136,7 @@ export function SessionReadToolGroup(props: ComponentProps<typeof CurrentReadToo
 }
 
 export function SessionFileToolGroup(props: {
-  tools: SessionMessageAssistantTool[]
+  tools: (SessionMessageAssistantTool & { ownerMessageID?: string })[]
   fileOpen: (path: string) => boolean | undefined
   onFileOpenChange: (path: string, open: boolean) => void
   onSizeChange?: () => void

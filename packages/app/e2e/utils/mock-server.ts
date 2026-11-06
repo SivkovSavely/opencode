@@ -2,6 +2,7 @@ import type { Page } from "@playwright/test"
 import type { OpenCodeEvent, SessionMessageInfo } from "@opencode/client/promise"
 import { Permission } from "@opencode/schema/permission"
 import { Model } from "@opencode/schema/model"
+import { TranscriptSearch } from "@opencode/schema/transcript-search"
 import { Worktree } from "@opencode/schema/worktree"
 import { Duration, Effect, Layer, Option, Predicate, Schema } from "effect"
 import { HttpRouter, HttpServer, HttpServerResponse } from "effect/http"
@@ -95,6 +96,14 @@ export interface MockServerConfig {
   beforeMessagesResponse?: (input: { sessionID: string; before?: string }) => Promise<void>
   onMessages?: (input: { sessionID: string; before?: string; phase: "start" | "end" }) => void
   message?: (sessionID: string, messageID: string) => SessionMessageInfo | undefined
+  transcript?: {
+    search: (
+      input: TranscriptSearch.Request,
+    ) => TranscriptSearch.Response | MockAnswer | Promise<TranscriptSearch.Response | MockAnswer>
+    status?: () => TranscriptSearch.Status | MockAnswer
+    backfill?: () => TranscriptSearch.Status | MockAnswer | Promise<TranscriptSearch.Status | MockAnswer>
+    facets?: () => TranscriptSearch.Facets | MockAnswer | Promise<TranscriptSearch.Facets | MockAnswer>
+  }
   onMessage?: (input: { sessionID: string; messageID: string }) => void
   onRevertStage?: (input: { sessionID: string; messageID: string }) => void
   onSession?: (sessionID: string) => void
@@ -685,6 +694,65 @@ function mockHandlers(
               ? Buffer.from(value.content, "base64")
               : new TextEncoder().encode(value?.content ?? ""),
           )
+        }),
+      )
+      .handleRaw("transcriptSearch", (ctx) =>
+        Effect.gen(function* () {
+          const payload = yield* ctx.request.json.pipe(
+            Effect.flatMap(Schema.decodeUnknownEffect(TranscriptSearch.Request)),
+            Effect.orDie,
+          )
+
+          const answer = yield* Effect.promise(async () => config.transcript?.search(payload))
+
+          if (!answer)
+            return HttpServerResponse.jsonUnsafe({ message: "Transcript search unsupported" }, { status: 501 })
+
+          return "body" in answer
+            ? HttpServerResponse.jsonUnsafe(answer.body, { status: answer.status })
+            : HttpServerResponse.jsonUnsafe({ data: answer })
+        }),
+      )
+      .handleRaw("transcriptStatus", () =>
+        Effect.sync(() => {
+          const answer = config.transcript?.status?.() ?? {
+            ready: true,
+            backfillCursor: "part:",
+            generation: "fixture",
+          }
+
+          return "body" in answer
+            ? HttpServerResponse.jsonUnsafe(answer.body, { status: answer.status })
+            : HttpServerResponse.jsonUnsafe({ data: answer })
+        }),
+      )
+      .handleRaw("transcriptBackfill", () =>
+        Effect.promise(async () => {
+          const answer = (await config.transcript?.backfill?.()) ?? {
+            ready: true,
+            backfillCursor: "part:",
+            generation: "fixture",
+          }
+
+          return "body" in answer
+            ? HttpServerResponse.jsonUnsafe(answer.body, { status: answer.status })
+            : HttpServerResponse.jsonUnsafe({ data: answer })
+        }),
+      )
+      .handleRaw("transcriptFacets", () =>
+        Effect.promise(async () => {
+          const answer = (await config.transcript?.facets?.()) ?? {
+            projects: [],
+            models: [],
+            agents: [],
+            providers: [],
+            tools: [],
+            truncated: false,
+          }
+
+          return "status" in answer
+            ? HttpServerResponse.jsonUnsafe(answer.body, { status: answer.status })
+            : HttpServerResponse.jsonUnsafe({ data: answer })
         }),
       )
       // Raw, so a hook's answer can replace the status and body.

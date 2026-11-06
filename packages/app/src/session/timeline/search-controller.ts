@@ -61,26 +61,74 @@ function collectRanges(
     // SAFETY: SHOW_TEXT restricts this walker to Text nodes.
     let node = walker.nextNode() as Text | null
 
+    const nodes: Text[] = []
+
     while (node) {
-      const value = node.nodeValue ?? ""
+      nodes.push(node)
+
+      // SAFETY: SHOW_TEXT restricts this walker to Text nodes.
+      node = walker.nextNode() as Text | null
+    }
+
+    // User text is searched as one literal string, even across source-part/reference spans.
+    // Markdown keeps node-local matching: rendered inline formatting is not literal source text.
+    const scopes = body.matches('[data-slot="user-message-text"]') ? [nodes] : nodes.map((node) => [node])
+
+    for (const scope of scopes) {
+      let offset = 0
+
+      const spans = scope.map((node) => {
+        const start = offset
+        offset += node.length
+
+        return { node, start, end: offset }
+      })
+
+      const value = scope.map((node) => node.data).join("")
       const lowerValue = value.toLowerCase()
+      const offsets: { start: number; end: number }[] = []
+
+      // Lowercase can expand a character (U+0130 -> i + combining dot). Keep whole-string
+      // casing for contextual sigma, but map expanded units back to their source character.
+      if (value.length !== lowerValue.length) {
+        let original = 0
+
+        for (const character of value) {
+          const length = character.toLowerCase().length
+
+          for (let unit = 0; unit < length; unit += 1) {
+            offsets.push({
+              start: original + (length === character.length ? unit : 0),
+              end: original + (length === character.length ? unit + 1 : character.length),
+            })
+          }
+
+          original += character.length
+        }
+      }
+
       let from = 0
       let at = lowerValue.indexOf(lower, from)
+      let start = 0
+      let end = 0
 
       while (at !== -1) {
+        const matchStart = offsets[at]?.start ?? at
+        const matchEnd = offsets[at + lower.length - 1]?.end ?? at + lower.length
+
+        while (start < spans.length - 1 && matchStart >= spans[start].end) start += 1
+
+        while (end < spans.length - 1 && matchEnd > spans[end].end) end += 1
         const range = document.createRange()
-        range.setStart(node, at)
-        range.setEnd(node, at + query.length)
+        range.setStart(spans[start].node, matchStart - spans[start].start)
+        range.setEnd(spans[end].node, matchEnd - spans[end].start)
 
         if (isActivePart && activeOccurrence === occurrenceInPart) active.push(range)
         else hits.push(range)
         occurrenceInPart += 1
-        from = at + query.length
+        from = at + lower.length
         at = lowerValue.indexOf(lower, from)
       }
-
-      // SAFETY: SHOW_TEXT restricts this walker to Text nodes.
-      node = walker.nextNode() as Text | null
     }
   }
 
