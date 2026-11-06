@@ -518,6 +518,10 @@ export const page = Effect.fn("MessageV2.page")(function* (input: {
 })
 
 export function stream(sessionID: SessionID) {
+  return readHistory(sessionID)
+}
+
+function readHistory(sessionID: SessionID, stop?: (message: WithParts) => boolean) {
   const size = 50
   return Effect.gen(function* () {
     const result = [] as WithParts[]
@@ -531,7 +535,9 @@ export function stream(sessionID: SessionID) {
       if (next.items.length === 0) break
       for (let i = next.items.length - 1; i >= 0; i--) {
         const item = next.items[i]
-        if (item) result.push(item)
+        if (!item) continue
+        result.push(item)
+        if (stop?.(item)) return result
       }
       if (!next.more || !next.cursor) break
       before = next.cursor
@@ -603,26 +609,10 @@ export const turn = Effect.fn("MessageV2.turn")(function* (input: { sessionID: S
 
 export function filterCompacted(msgs: Iterable<WithParts>) {
   const result = [] as WithParts[]
-  const completed = new Set<string>()
-  let retain: MessageID | undefined
+  const stop = compactionBoundary()
   for (const msg of msgs) {
     result.push(msg)
-    if (retain) {
-      if (msg.info.id === retain) break
-      continue
-    }
-    if (msg.info.role === "user" && completed.has(msg.info.id)) {
-      const part = msg.parts.find((item): item is CompactionPart => item.type === "compaction")
-      if (!part) continue
-      if (!part.tail_start_id) break
-      retain = part.tail_start_id
-      if (msg.info.id === retain) break
-      continue
-    }
-    if (msg.info.role === "user" && completed.has(msg.info.id) && msg.parts.some((part) => part.type === "compaction"))
-      break
-    if (msg.info.role === "assistant" && msg.info.summary && msg.info.finish && !msg.info.error)
-      completed.add(msg.info.parentID)
+    if (stop(msg)) break
   }
   result.reverse()
   const compactionIndex = result.findLastIndex(
@@ -655,8 +645,25 @@ export function filterCompacted(msgs: Iterable<WithParts>) {
 }
 
 export const filterCompactedEffect = Effect.fnUntraced(function* (sessionID: SessionID) {
-  return filterCompacted(yield* stream(sessionID))
+  return filterCompacted(yield* readHistory(sessionID, compactionBoundary()))
 })
+
+function compactionBoundary() {
+  const completed = new Set<string>()
+  let retain: MessageID | undefined
+  return (msg: WithParts) => {
+    if (retain) return msg.info.id === retain
+    if (msg.info.role === "user" && completed.has(msg.info.id)) {
+      const part = msg.parts.find((item): item is CompactionPart => item.type === "compaction")
+      if (!part) return false
+      retain = part.tail_start_id
+      return !retain || msg.info.id === retain
+    }
+    if (msg.info.role === "assistant" && msg.info.summary && msg.info.finish && !msg.info.error)
+      completed.add(msg.info.parentID)
+    return false
+  }
+}
 
 // filterCompacted reorders messages for model consumption
 // ([compaction-user, summary, ...retained tail..., continue-user]), so array

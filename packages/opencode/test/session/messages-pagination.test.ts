@@ -5,12 +5,15 @@ import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { Effect, Option } from "effect"
 import { Session as SessionNs } from "@/session/session"
 import { MessageV2 } from "../../src/session/message-v2"
-import { MessageID, PartID, type SessionID } from "../../src/session/schema"
+import { MessageID, PartID, SessionID } from "../../src/session/schema"
 
 import { NotFoundError } from "@/storage/storage"
 import { testEffect } from "../lib/effect"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
+import { Database } from "@opencode-ai/core/database/database"
+import { SessionQueueImportTable } from "@opencode-ai/core/session/queue-import.sql"
+import { MessageTable, PartTable } from "@opencode-ai/core/session/sql"
 
 const it = testEffect(LayerNode.compile(LayerNode.group([SessionNs.node, MessageV2.node, SessionProjector.node])))
 
@@ -126,6 +129,182 @@ const addCompactionPart = Effect.fn("Test.addCompactionPart")(function* (
     tail_start_id: tailStartID,
   } as any)
 })
+
+// Seed projected rows directly so large fixtures don't benchmark event publication.
+const seedHistory = Effect.fn("Test.seedHistory")(function* (
+  sessionID: SessionID,
+  count: number,
+  boundaries: {
+    at: number
+    tail?: number
+    summary?: "unfinished" | "failed" | "unmatched" | "absent"
+    part?: false
+  }[] = [],
+  toolBytes = 0,
+) {
+  const database = yield* Database.Service
+  // Deliberately reverse IDs relative to timestamps, as imported messages can do.
+  const id = (index: number) => MessageID.make(`msg_history_${String(count - index).padStart(6, "0")}`)
+  const messages = Array.from({ length: count }, (_, index): SessionV1.WithParts => {
+    const boundary = boundaries.find((item) => item.at === index)
+    const summary = boundaries.find((item) => item.at + 1 === index)
+    const user = boundary || (!summary && index % 2 === 0)
+    const info: SessionV1.Info = user
+      ? {
+          id: id(index),
+          sessionID,
+          role: "user",
+          time: { created: index + 1 },
+          agent: "test",
+          model: { providerID: ProviderV2.ID.make("test"), modelID: ModelV2.ID.make("test") },
+        }
+      : {
+          id: id(index),
+          sessionID,
+          role: "assistant",
+          time: { created: index + 1 },
+          parentID: id(summary?.summary === "unmatched" ? -1 : index - 1),
+          modelID: ModelV2.ID.make("test"),
+          providerID: ProviderV2.ID.make("test"),
+          mode: "",
+          agent: "test",
+          path: { cwd: "/", root: "/" },
+          cost: 0,
+          tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+          summary: !!summary && summary.summary !== "absent",
+          finish: summary?.summary === "unfinished" ? undefined : "end_turn",
+          error:
+            summary?.summary === "failed"
+              ? new SessionV1.APIError({ message: "synthetic failure", isRetryable: false }).toObject()
+              : undefined,
+        }
+    const common = { id: PartID.make(`prt_history_${index}`), messageID: id(index), sessionID }
+    const part: SessionV1.Part =
+      boundary && boundary.part !== false
+        ? {
+            ...common,
+            type: "compaction",
+            auto: true,
+            tail_start_id: boundary.tail === undefined ? undefined : id(boundary.tail),
+          }
+        : !user && !summary && toolBytes
+          ? {
+              ...common,
+              type: "tool",
+              callID: `call_${index}`,
+              tool: "synthetic",
+              state: {
+                status: "completed",
+                input: {},
+                output: "x".repeat(toolBytes),
+                title: "fixture",
+                metadata: {},
+                time: { start: index + 1, end: index + 1 },
+              },
+            }
+          : { ...common, type: "text", text: `message ${index}` }
+    return { info, parts: [part] }
+  })
+  for (let offset = 0; offset < messages.length; offset += 100) {
+    const batch = messages.slice(offset, offset + 100)
+    yield* database.db.insert(MessageTable).values(
+      batch.map((message) => ({
+        id: message.info.id,
+        session_id: sessionID,
+        time_created: message.info.time.created,
+        time_updated: message.info.time.created,
+        data: message.info,
+      })),
+    )
+    yield* database.db.insert(PartTable).values(
+      batch.flatMap((message) =>
+        message.parts.map((part) => ({
+          id: part.id,
+          message_id: message.info.id,
+          session_id: sessionID,
+          time_created: message.info.time.created,
+          time_updated: message.info.time.created,
+          data: part,
+        })),
+      ),
+    )
+  }
+  return messages
+})
+
+// Observe the real connection in this fiber's transaction, without mocking SQL or
+// mutating the shared client. BEGIN/COMMIT execute outside the decorated connection.
+const measureHistory = <A, E, R>(read: Effect.Effect<A, E, R>) =>
+  Effect.gen(function* () {
+    const database = yield* Database.Service
+    const memory = process.memoryUsage()
+    const stats = {
+      statements: 2,
+      pages: 0,
+      messageRows: 0,
+      messages: 0,
+      parts: 0,
+      bytes: 0,
+      sqlMs: 0,
+      loadMs: 0,
+      transactionMs: 0,
+      heapPeak: memory.heapUsed,
+      rssPeak: memory.rss,
+    }
+    const started = performance.now()
+    const result = yield* database.db.transaction(
+      () =>
+        Effect.gen(function* () {
+          const current = Option.getOrThrow(yield* Effect.serviceOption(database.db.$client.transactionService))
+          const connection = current[0]
+          const observe = <T, E2, R2>(query: string, effect: Effect.Effect<T, E2, R2>) =>
+            Effect.gen(function* () {
+              const start = performance.now()
+              const rows = yield* effect
+              stats.sqlMs += performance.now() - start
+              stats.statements++
+              if (!Array.isArray(rows)) return rows
+              const messages = query.includes(' from "message" ') && query.includes("order by")
+              const parts = query.includes(' from "part" ')
+              if (messages) {
+                stats.pages++
+                stats.messageRows += rows.length
+                stats.messages += Math.min(rows.length, 50)
+              }
+              if (parts) stats.parts += rows.length
+              if (messages || parts) {
+                for (const row of rows) {
+                  if (!Array.isArray(row)) continue
+                  for (const value of row) if (typeof value === "string") stats.bytes += Buffer.byteLength(value)
+                }
+                const memory = process.memoryUsage()
+                stats.heapPeak = Math.max(stats.heapPeak, memory.heapUsed)
+                stats.rssPeak = Math.max(stats.rssPeak, memory.rss)
+              }
+              return rows
+            })
+          const observed = {
+            ...connection,
+            execute: (...args: Parameters<typeof connection.execute>) => observe(args[0], connection.execute(...args)),
+            executeValues: (...args: Parameters<typeof connection.executeValues>) =>
+              observe(args[0], connection.executeValues(...args)),
+            executeRaw: (...args: Parameters<typeof connection.executeRaw>) =>
+              observe(args[0], connection.executeRaw(...args)),
+            executeUnprepared: (...args: Parameters<typeof connection.executeUnprepared>) =>
+              observe(args[0], connection.executeUnprepared(...args)),
+          }
+          const start = performance.now()
+          const result = yield* read.pipe(
+            Effect.provideService(database.db.$client.transactionService, [observed, current[1]]),
+          )
+          stats.loadMs = performance.now() - start
+          return result
+        }),
+      { behavior: "immediate" },
+    )
+    stats.transactionMs = performance.now() - started
+    return { result, ...stats, heapGrowth: stats.heapPeak - memory.heapUsed, rssGrowth: stats.rssPeak - memory.rss }
+  })
 
 describe("MessageV2.page", () => {
   it.instance("returns page result", () =>
@@ -799,10 +978,12 @@ describe("MessageV2.filterCompacted", () => {
 
       const parentFiltered = MessageV2.filterCompacted(yield* MessageV2.stream(created.id))
       expect(parentFiltered.map((item) => item.info.id)).toEqual([c1, s1, u2, a2, u3, a3])
+      expect(yield* MessageV2.filterCompactedEffect(created.id)).toEqual(parentFiltered)
 
       const forked = yield* session.fork({ sessionID: created.id })
       const childFiltered = MessageV2.filterCompacted(yield* MessageV2.stream(forked.id))
       expect(childFiltered).toHaveLength(parentFiltered.length)
+      expect(yield* MessageV2.filterCompactedEffect(forked.id)).toEqual(childFiltered)
 
       const tailPart = childFiltered.flatMap((m) => m.parts).find((p) => p.type === "compaction")
       expect(tailPart?.type).toBe("compaction")
@@ -966,6 +1147,151 @@ describe("MessageV2.filterCompacted", () => {
     expect(result).toHaveLength(1)
     expect(result[0].info.id).toBe(id)
   })
+})
+
+describe("MessageV2.filterCompactedEffect", () => {
+  const cases: { name: string; boundaries: Parameters<typeof seedHistory>[2]; pages: number; toolBytes?: number }[] = [
+    { name: "no compaction", boundaries: [], pages: 6 },
+    { name: "recent completed compaction", boundaries: [{ at: 280 }], pages: 1 },
+    { name: "boundary at the end of a page", boundaries: [{ at: 250 }], pages: 1 },
+    { name: "summary and boundary on different pages", boundaries: [{ at: 249 }], pages: 2 },
+    { name: "retained tail across pages", boundaries: [{ at: 280, tail: 144 }], pages: 4 },
+    { name: "tail at the end of a page", boundaries: [{ at: 280, tail: 150 }], pages: 3 },
+    { name: "tail pointing to the compaction itself", boundaries: [{ at: 280, tail: 280 }], pages: 1 },
+    { name: "missing tail", boundaries: [{ at: 280, tail: -1 }], pages: 6 },
+    { name: "tail newer than its compaction", boundaries: [{ at: 280, tail: 290 }], pages: 6 },
+    { name: "multiple completed compactions", boundaries: [{ at: 180 }, { at: 280, tail: 244 }], pages: 2 },
+    {
+      name: "retained tail crossing an older compaction",
+      boundaries: [
+        { at: 180, tail: 140 },
+        { at: 280, tail: 144 },
+      ],
+      pages: 4,
+    },
+    { name: "unfinished summary", boundaries: [{ at: 280, summary: "unfinished" }], pages: 6 },
+    { name: "failed summary", boundaries: [{ at: 280, summary: "failed" }], pages: 6 },
+    { name: "non-summary assistant", boundaries: [{ at: 280, summary: "absent" }], pages: 6 },
+    { name: "unmatched summary parent", boundaries: [{ at: 280, summary: "unmatched" }], pages: 6 },
+    { name: "missing compaction part", boundaries: [{ at: 280, part: false }], pages: 6 },
+    { name: "failed newer compaction", boundaries: [{ at: 180 }, { at: 280, summary: "failed" }], pages: 3 },
+    { name: "large tool results", boundaries: [{ at: 280 }], pages: 1, toolBytes: 32 * 1024 },
+  ]
+  for (const fixture of cases) {
+    it.instance(`stops database paging without changing output: ${fixture.name}`, () =>
+      withSession(({ sessionID }) =>
+        Effect.gen(function* () {
+          yield* seedHistory(sessionID, 300, fixture.boundaries, fixture.toolBytes)
+          const full = yield* measureHistory(MessageV2.stream(sessionID))
+          expect(full.pages).toBe(6)
+          expect(full.messages).toBe(300)
+          expect(full.parts).toBe(300)
+          const expected = MessageV2.filterCompacted(full.result)
+          for (let iteration = 0; iteration < 2; iteration++) {
+            const actual = yield* measureHistory(MessageV2.filterCompactedEffect(sessionID))
+            expect(actual.result).toEqual(expected)
+            expect(actual.pages).toBe(fixture.pages)
+            expect(actual.messages).toBe(fixture.pages * 50)
+            expect(actual.parts).toBe(fixture.pages * 50)
+            // Every page does the queue-migration checks, message query and part query.
+            expect(actual.statements).toBe(fixture.pages * 4 + 2)
+          }
+        }),
+      ),
+    )
+  }
+
+  it.instance("stops at a remapped fork tail across pages", () =>
+    withSession(({ session, sessionID }) =>
+      Effect.gen(function* () {
+        yield* seedHistory(sessionID, 300, [{ at: 280, tail: 144 }])
+        yield* Effect.acquireUseRelease(
+          session.fork({ sessionID }),
+          (fork) =>
+            Effect.gen(function* () {
+              const full = yield* MessageV2.stream(fork.id)
+              const actual = yield* measureHistory(MessageV2.filterCompactedEffect(fork.id))
+              expect(actual.result).toEqual(MessageV2.filterCompacted(full))
+              expect(actual.result).toHaveLength(156)
+              expect(actual.pages).toBe(4)
+              expect(actual.messages).toBe(200)
+              const part = actual.result.flatMap((message) => message.parts).find((part) => part.type === "compaction")
+              expect(part?.tail_start_id).toBeDefined()
+              expect(actual.result.some((message) => message.info.id === part?.tail_start_id)).toBe(true)
+            }),
+          (fork) => session.remove(fork.id).pipe(Effect.ignore),
+        )
+      }),
+    ),
+  )
+
+  it.instance("preserves empty and missing-session behavior", () =>
+    withSession(({ sessionID }) =>
+      Effect.gen(function* () {
+        expect(yield* MessageV2.filterCompactedEffect(sessionID)).toEqual([])
+        expect(yield* MessageV2.filterCompactedEffect(SessionID.make("ses_missing"))).toEqual([])
+      }),
+    ),
+  )
+
+  if (process.env.OPENCODE_HISTORY_BENCHMARK === "1") {
+    it.instance(
+      "profiles bounded synthetic history reads",
+      () =>
+        Effect.gen(function* () {
+          for (const fixture of [
+            { name: "uncompacted", boundaries: [] },
+            { name: "compacted", boundaries: [{ at: 5980 }] },
+            { name: "retained-tail", boundaries: [{ at: 5980, tail: 5844 }] },
+          ]) {
+            yield* withSession(({ sessionID }) =>
+              Effect.gen(function* () {
+                yield* seedHistory(sessionID, 6000, fixture.boundaries, 16 * 1024)
+                const database = yield* Database.Service
+                // Model an already-imported session without per-page legacy file probes.
+                yield* database.db.insert(SessionQueueImportTable).values({ session_id: sessionID, hidden: [] })
+                for (let iteration = 0; iteration < 5; iteration++) {
+                  for (const mode of ["eager", "bounded"] as const) {
+                    Bun.gc(true)
+                    const delays = { last: performance.now(), max: 0 }
+                    const sample = () => {
+                      const now = performance.now()
+                      delays.max = Math.max(delays.max, now - delays.last)
+                      delays.last = now
+                    }
+                    const timer = setInterval(sample, 1)
+                    const measured = yield* measureHistory(
+                      mode === "eager"
+                        ? MessageV2.stream(sessionID).pipe(Effect.map(MessageV2.filterCompacted))
+                        : MessageV2.filterCompactedEffect(sessionID),
+                    ).pipe(
+                      Effect.ensuring(
+                        Effect.sync(() => {
+                          sample()
+                          clearInterval(timer)
+                        }),
+                      ),
+                    )
+                    const { result, ...stats } = measured
+                    console.log(
+                      JSON.stringify({
+                        fixture: fixture.name,
+                        mode,
+                        iteration,
+                        retained: result.length,
+                        ...stats,
+                        timerGapMs: delays.max,
+                      }),
+                    )
+                  }
+                }
+              }),
+            )
+          }
+        }),
+      120_000,
+    )
+  }
 })
 
 describe("MessageV2.cursor", () => {
