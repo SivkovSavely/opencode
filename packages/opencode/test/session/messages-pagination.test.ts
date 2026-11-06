@@ -1,8 +1,11 @@
 import { describe, expect, test } from "bun:test"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
+import { Database } from "@opencode-ai/core/database/database"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
-import { Effect, Option } from "effect"
+import { MessageTable } from "@opencode-ai/core/session/sql"
+import { eq, sql } from "drizzle-orm"
+import { Cause, Effect, Exit, Option, Schema } from "effect"
 import { Session as SessionNs } from "@/session/session"
 import { MessageV2 } from "../../src/session/message-v2"
 import { MessageID, PartID, type SessionID } from "../../src/session/schema"
@@ -125,6 +128,117 @@ const addCompactionPart = Effect.fn("Test.addCompactionPart")(function* (
     auto: true,
     tail_start_id: tailStartID,
   } as any)
+})
+
+describe("persisted output format hydration", () => {
+  for (const format of [
+    undefined,
+    new SessionV1.OutputFormatText({ type: "text" }),
+    ...[undefined, 0, 2].map(
+      (retryCount) =>
+        new SessionV1.OutputFormatJsonSchema({
+          type: "json_schema",
+          schema: { type: "object", properties: { answer: { type: "string" } }, required: ["answer"] },
+          ...(retryCount === undefined ? {} : { retryCount }),
+        }),
+    ),
+  ]) {
+    it.instance(
+      `encodes stored ${format?.type ?? "implicit text"} format (${format?.type === "json_schema" ? (format.retryCount ?? "default retries") : "no retries"})`,
+      () =>
+        withSession(({ session, sessionID }) =>
+          Effect.gen(function* () {
+            const database = yield* Database.Service
+            const user = {
+              id: MessageID.ascending(),
+              sessionID,
+              role: "user" as const,
+              time: { created: Date.now() },
+              agent: "build",
+              model: { providerID: ProviderV2.ID.make("test"), modelID: ModelV2.ID.make("test") },
+              format,
+              summary: { title: "title", body: "body", diffs: [{ file: "a.txt", additions: 1, deletions: 0 }] },
+            }
+            yield* session.updateMessage(user)
+            const text = {
+              id: PartID.ascending(),
+              sessionID,
+              messageID: user.id,
+              type: "text" as const,
+              text: "answer",
+            }
+            yield* session.updatePart(text)
+            const assistantID = yield* addAssistant(sessionID, user.id, { finish: "stop" })
+            const stored = yield* database.db.select().from(MessageTable).where(eq(MessageTable.id, user.id)).get()
+            expect(stored?.data).toMatchObject({ role: "user", ...(format ? { format: { ...format } } : {}) })
+            if (stored && "format" in stored.data) {
+              expect(stored.data.format).not.toBeInstanceOf(SessionV1.OutputFormatText)
+              expect(stored.data.format).not.toBeInstanceOf(SessionV1.OutputFormatJsonSchema)
+            }
+
+            const expected = {
+              info: {
+                ...user,
+                format: format
+                  ? { ...format, ...(format.type === "json_schema" ? { retryCount: format.retryCount ?? 2 } : {}) }
+                  : undefined,
+              },
+              parts: [text],
+            }
+            const direct = yield* MessageV2.get({ sessionID, messageID: user.id })
+            expect(Schema.encodeSync(SessionV1.WithParts)(direct)).toEqual(expected)
+            if (direct.info.role !== "user") throw new Error("Expected user")
+            if (format) expect(direct.info.format).toBeInstanceOf(format.constructor)
+            expect(yield* MessageV2.getInfo({ sessionID, messageID: user.id })).toEqual(direct.info)
+
+            const assistant = yield* MessageV2.get({ sessionID, messageID: assistantID })
+            expect(Schema.encodeSync(SessionV1.WithParts)(assistant)).toEqual(assistant)
+            expect(assistant.info).toMatchObject({ id: assistantID, parentID: user.id, role: "assistant" })
+            const first = yield* MessageV2.page({ sessionID, limit: 1 })
+            expect(Schema.encodeSync(Schema.Array(SessionV1.WithParts))(first.items)).toEqual([assistant])
+            expect(first.more).toBe(true)
+            expect(first.cursor).toBeDefined()
+            const last = yield* MessageV2.page({ sessionID, limit: 1, before: first.cursor })
+            expect(Schema.encodeSync(Schema.Array(SessionV1.WithParts))(last.items)).toEqual([expected])
+            expect(last.more).toBe(false)
+            expect(last.cursor).toBeUndefined()
+            expect(
+              Schema.encodeSync(Schema.Array(SessionV1.WithParts))(yield* session.messages({ sessionID })),
+            ).toEqual([expected, assistant])
+            expect(Schema.encodeSync(Schema.Array(SessionV1.WithParts))(yield* MessageV2.stream(sessionID))).toEqual([
+              assistant,
+              expected,
+            ])
+            expect(yield* database.db.select().from(MessageTable).where(eq(MessageTable.id, user.id)).get()).toEqual(
+              stored,
+            )
+          }),
+        ),
+    )
+  }
+
+  for (const format of [null, false, { type: "unknown" }, { type: "json_schema", schema: {}, retryCount: -1 }]) {
+    it.instance(`rejects malformed stored format ${JSON.stringify(format)}`, () =>
+      withSession(({ sessionID }) =>
+        Effect.gen(function* () {
+          const database = yield* Database.Service
+          const messageID = yield* addUser(sessionID)
+          // Represent corrupt historical data without passing through current write validation.
+          yield* database.db
+            .run(sql`UPDATE message SET data = json_set(data, '$.format', json(${JSON.stringify(format)}))
+            WHERE id = ${messageID}`)
+          for (const read of [
+            MessageV2.get({ sessionID, messageID }).pipe(Effect.asVoid),
+            MessageV2.page({ sessionID, limit: 1 }).pipe(Effect.asVoid),
+          ]) {
+            const result = yield* Effect.exit(read)
+            expect(Exit.isFailure(result)).toBe(true)
+            if (Exit.isFailure(result)) expect(Cause.pretty(result.cause)).toContain("SchemaError:")
+          }
+        }),
+      ),
+    )
+  }
 })
 
 describe("MessageV2.page", () => {

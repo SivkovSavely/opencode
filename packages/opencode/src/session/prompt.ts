@@ -136,6 +136,15 @@ function isOrphanedInterruptedTool(part: SessionV1.ToolPart) {
   )
 }
 
+function isStructuredOutputComplete(message: SessionV1.Assistant) {
+  return (
+    message.structured !== undefined &&
+    message.time.completed !== undefined &&
+    !message.error &&
+    (message.finish === "tool-calls" || message.finish === "stop")
+  )
+}
+
 export class InputError extends Schema.TaggedErrorClass<InputError>()("PromptInputError", {
   message: Schema.String,
 }) {}
@@ -2542,8 +2551,8 @@ const layer = Layer.effect(
 
           if (
             lastAssistant?.finish &&
-            !["tool-calls", "unknown"].includes(lastAssistant.finish) &&
-            !hasToolCalls &&
+            (isStructuredOutputComplete(lastAssistant) ||
+              (!["tool-calls", "unknown"].includes(lastAssistant.finish) && !hasToolCalls)) &&
             !interruptedAssistant &&
             lastAssistant.parentID === lastUser.id
           ) {
@@ -2704,7 +2713,7 @@ const layer = Layer.effect(
               Effect.onExit((exit) => (Exit.isFailure(exit) ? finalizeFailedAssistant(exit.cause) : Effect.void)),
             )
 
-          const outcome: "break" | "continue" = yield* Effect.gen(function* () {
+          const outcome: "stop" | "break" | "continue" = yield* Effect.gen(function* () {
             const lastUserMsg = msgs.findLast((m) => m.info.role === "user")
             const bypassAgentCheck = lastUserMsg?.parts.some((p) => p.type === "agent") ?? false
             const promptOps = yield* ops()
@@ -2796,7 +2805,8 @@ const layer = Layer.effect(
               handle.message.structured = structured
               handle.message.finish = handle.message.finish ?? "stop"
               yield* sessions.updateMessage(handle.message)
-              return "break" as const
+              // A permission stop or overflow cutoff is not a successful terminal boundary.
+              return result === "continue" ? ("break" as const) : ("stop" as const)
             }
 
             const finished = handle.message.finish && !["tool-calls", "unknown"].includes(handle.message.finish)
@@ -2841,11 +2851,15 @@ const layer = Layer.effect(
             ),
             Effect.onExit((exit) => (Exit.isFailure(exit) ? finalizeFailedAssistant(exit.cause) : Effect.void)),
           )
+          // Successful structured output uses the normal terminal boundary on the next iteration
+          // so admitted steers and queued inputs are preserved.
           if (
-            outcome === "break" &&
-            (handle.message.error ||
-              !handle.message.finish ||
-              ["tool-calls", "unknown"].includes(handle.message.finish))
+            outcome === "stop" ||
+            (outcome === "break" &&
+              !isStructuredOutputComplete(handle.message) &&
+              (handle.message.error ||
+                !handle.message.finish ||
+                ["tool-calls", "unknown"].includes(handle.message.finish)))
           ) {
             const flush = yield* InstanceState.get(queueState)
             flush.delete(sessionID)

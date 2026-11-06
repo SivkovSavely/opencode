@@ -122,6 +122,9 @@ const info = (row: typeof MessageTable.$inferSelect): Info => {
     id: row.id,
     sessionID: row.session_id,
   } as Info
+  if (value.role === "user" && value.format !== undefined) {
+    value.format = Schema.decodeUnknownSync(SessionV1.Format)(value.format)
+  }
   if (value.role !== "user" || !value.summary) return value
   return { ...value, summary: { ...value.summary, diffs: SnapshotDiff.limit(value.summary.diffs) } }
 }

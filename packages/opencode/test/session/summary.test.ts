@@ -380,7 +380,7 @@ it.instance("preserves persisted JSON schema output format when publishing a sum
     )
     expect(persisted?.info).toEqual({
       ...withoutRetry,
-      format: { type: "json_schema", schema: { type: "object" } },
+      format: { type: "json_schema", schema: { type: "object" }, retryCount: 2 },
       summary: { title: "title", body: "body", diffs: [] },
     })
   }),

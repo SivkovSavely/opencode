@@ -654,6 +654,348 @@ ownedRuntime.instance("managed overflow replays retain the turn budget until gen
   }),
 )
 
+it.instance("native structured terminal leaves the queue runnable without replaying a prior result", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const sessions = yield* Session.Service
+    const prompt = yield* SessionPrompt.Service
+    const queue = yield* SessionQueue.Service
+    const root = yield* sessions.create({ title: "Native structured terminal" })
+    const format = new SessionV1.OutputFormatJsonSchema({
+      type: "json_schema",
+      schema: { type: "object", properties: { answer: { type: "string" } }, required: ["answer"] },
+      retryCount: 0,
+    })
+    const parents = []
+    for (const answer of ["first", "second"]) {
+      yield* llm.push(reply().tool("StructuredOutput", { answer }))
+      const result = yield* prompt.prompt({
+        sessionID: root.id,
+        model: ref,
+        parts: [{ type: "text", text: answer }],
+        format,
+      })
+      expect(result.info.role).toBe("assistant")
+      if (result.info.role !== "assistant") throw new Error("Expected assistant")
+      parents.push(result.info.parentID)
+      expect(result.info.structured).toEqual({ answer })
+      expect(result.info.finish).toBe("tool-calls")
+      expect(result.info.time.completed).toBeDefined()
+      expect(result.info.error).toBeUndefined()
+      expect(result.parts.filter((part) => part.type === "tool")).toHaveLength(1)
+      expect(result.parts.every((part) => part.type !== "tool" || part.state.status === "completed")).toBe(true)
+      const snapshot = yield* queue.list(root.id)
+      expect(snapshot.blocked).toBe(false)
+      expect(snapshot.items).toEqual([])
+    }
+    expect(new Set(parents).size).toBe(2)
+    expect(yield* llm.hits).toHaveLength(2)
+  }),
+)
+
+for (const finish of ["tool-calls", "stop"]) {
+  it.instance(`native structured ${finish} drains an authorized backlog without replaying results`, () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const sessions = yield* Session.Service
+      const prompt = yield* SessionPrompt.Service
+      const queue = yield* SessionQueue.Service
+      const status = yield* SessionStatus.Service
+      const root = yield* sessions.create({ title: "Structured backlog" })
+      const format = new SessionV1.OutputFormatJsonSchema({
+        type: "json_schema",
+        schema: { type: "object", properties: { answer: { type: "string" } }, required: ["answer"] },
+        retryCount: 0,
+      })
+      for (const answer of ["first", "second"]) {
+        const response = reply().tool("StructuredOutput", { answer })
+        yield* llm.push(finish === "stop" ? response.stop() : response)
+        yield* queue.enqueue(root.id, {
+          id: answer,
+          payload: { kind: "prompt", agent: "build", model: ref, parts: [{ type: "text", text: answer }], format },
+        })
+      }
+      yield* llm.text("ordinary text")
+      yield* queue.enqueue(root.id, { id: "text", payload: queuedPrompt("finish with text") })
+
+      yield* prompt.queueResume(root.id)
+      yield* llm.wait(1)
+      yield* pollWithTimeout(
+        status.get(root.id).pipe(Effect.map((value) => (value.type === "idle" ? true : undefined))),
+        "structured backlog did not finish",
+      )
+
+      expect(yield* llm.calls).toBe(3)
+      expect(yield* queue.list(root.id)).toMatchObject({ blocked: false, paused: false, items: [] })
+      const assistants = (yield* sessions.messages({ sessionID: root.id })).flatMap((message) =>
+        message.info.role === "assistant" ? [message.info] : [],
+      )
+      expect(assistants.map((message) => message.parentID)).toEqual([
+        MessageID.make("msg_queue_first"),
+        MessageID.make("msg_queue_second"),
+        MessageID.make("msg_queue_text"),
+      ])
+      expect(assistants.map((message) => message.structured)).toEqual([
+        { answer: "first" },
+        { answer: "second" },
+        undefined,
+      ])
+      expect(assistants.every((message) => message.time.completed !== undefined && !message.error)).toBe(true)
+    }),
+  )
+
+  it.instance(`native structured ${finish} processes a steer admitted during the provider turn`, () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const sessions = yield* Session.Service
+      const prompt = yield* SessionPrompt.Service
+      const root = yield* sessions.create({ title: "Structured steer" })
+      const format = new SessionV1.OutputFormatJsonSchema({
+        type: "json_schema",
+        schema: { type: "object", properties: { answer: { type: "string" } }, required: ["answer"] },
+        retryCount: 0,
+      })
+      const release = yield* Deferred.make<void>()
+      const response = reply().tool("StructuredOutput", { answer: "first" })
+      const item = (finish === "stop" ? response.stop() : response).item()
+      if (item.type !== "sse") throw new Error("Expected SSE response")
+      yield* llm.push({ ...item, wait: deferredAsPromise(release) })
+      yield* llm.push(reply().tool("StructuredOutput", { answer: "steered" }))
+      const running = yield* prompt
+        .prompt({ sessionID: root.id, model: ref, format, parts: [{ type: "text", text: "first" }] })
+        .pipe(Effect.forkChild)
+      yield* llm.wait(1)
+      const steer = yield* prompt.prompt({
+        sessionID: root.id,
+        noReply: true,
+        model: ref,
+        format,
+        parts: [{ type: "text", text: "steer" }],
+      })
+      yield* Deferred.succeed(release, undefined)
+      const result = yield* Fiber.join(running)
+      expect(yield* llm.calls).toBe(2)
+      expect(result.info).toMatchObject({
+        role: "assistant",
+        parentID: steer.info.id,
+        structured: { answer: "steered" },
+      })
+    }),
+  )
+
+  it.instance(`native structured ${finish} preserves the processor overflow stop`, () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const sessions = yield* Session.Service
+      const prompt = yield* SessionPrompt.Service
+      const queue = yield* SessionQueue.Service
+      const root = yield* sessions.create({ title: "Structured overflow" })
+      const response = reply().tool("StructuredOutput", { answer: "done" }).usage({ input: 120000, output: 1 })
+      yield* llm.push(finish === "stop" ? response.stop() : response)
+      const result = yield* prompt.prompt({
+        sessionID: root.id,
+        model: ref,
+        parts: [{ type: "text", text: "Return an answer" }],
+        format: new SessionV1.OutputFormatJsonSchema({
+          type: "json_schema",
+          schema: { type: "object", properties: { answer: { type: "string" } }, required: ["answer"] },
+          retryCount: 0,
+        }),
+      })
+      expect(result.info).toMatchObject({ structured: { answer: "done" }, finish, tokens: { input: 120000 } })
+      expect((yield* queue.list(root.id)).blocked).toBe(true)
+      expect(yield* llm.calls).toBe(1)
+    }),
+  )
+
+  for (const continueOnDeny of [false, true]) {
+    it.instance(`native structured ${finish} respects permission rejection (continue=${continueOnDeny})`, () =>
+      Effect.gen(function* () {
+        const { llm } = yield* useServerConfig((url) => ({
+          ...providerCfg(url),
+          permission: { bash: "ask" },
+          experimental: { continue_loop_on_deny: continueOnDeny },
+        }))
+        const sessions = yield* Session.Service
+        const prompt = yield* SessionPrompt.Service
+        const queue = yield* SessionQueue.Service
+        const permission = yield* Permission.Service
+        const status = yield* SessionStatus.Service
+        const root = yield* sessions.create({ title: "Structured permission rejection" })
+        yield* llm.push({
+          type: "sse",
+          head: [],
+          tail: [
+            {
+              choices: [
+                {
+                  delta: {
+                    role: "assistant",
+                    tool_calls: [
+                      { name: "StructuredOutput", input: { answer: "done" } },
+                      { name: "bash", input: { command: "printf denied", description: "Permission probe" } },
+                    ].map((tool, index) => ({
+                      index,
+                      id: `call_${index}`,
+                      type: "function",
+                      function: { name: tool.name, arguments: JSON.stringify(tool.input) },
+                    })),
+                  },
+                },
+              ],
+            },
+            { choices: [{ delta: {}, finish_reason: finish === "tool-calls" ? "tool_calls" : finish }] },
+          ],
+        })
+        yield* llm.text("next queued answer")
+        yield* queue.enqueue(root.id, {
+          id: "structured",
+          payload: {
+            kind: "prompt",
+            agent: "build",
+            model: ref,
+            parts: [{ type: "text", text: "Return an answer and request permission" }],
+            format: new SessionV1.OutputFormatJsonSchema({
+              type: "json_schema",
+              schema: { type: "object", properties: { answer: { type: "string" } }, required: ["answer"] },
+              retryCount: 0,
+            }),
+          },
+        })
+        yield* queue.enqueue(root.id, { id: "pending", payload: queuedPrompt("must wait after rejection") })
+        yield* prompt.queueResume(root.id)
+        const request = yield* pollWithTimeout(
+          permission.list().pipe(Effect.map((requests) => requests.find((request) => request.sessionID === root.id))),
+          "tool permission was not requested",
+        )
+        expect(request.permission).toBe("bash")
+        yield* permission.reply({ requestID: request.id, reply: "reject" })
+        yield* pollWithTimeout(
+          status.get(root.id).pipe(Effect.map((value) => (value.type === "idle" ? true : undefined))),
+          "permission-rejected turn did not finish",
+        )
+
+        const result = yield* sessions.findMessage(
+          root.id,
+          (message) =>
+            message.info.role === "assistant" && message.info.parentID === MessageID.make("msg_queue_structured"),
+        )
+        if (result._tag !== "Some") throw new Error("Expected structured assistant")
+        expect(result.value.info).toMatchObject({ structured: { answer: "done" }, finish })
+        expect(result.value.parts.filter((part) => part.type === "tool")).toMatchObject([
+          { tool: "StructuredOutput", state: { status: "completed" } },
+          { tool: "bash", state: { status: "error" } },
+        ])
+        expect(yield* llm.calls).toBe(continueOnDeny ? 2 : 1)
+        expect(yield* queue.list(root.id)).toMatchObject({
+          blocked: !continueOnDeny,
+          paused: false,
+          items: continueOnDeny ? [] : [{ id: "pending", state: "pending" }],
+        })
+      }),
+    )
+  }
+}
+
+it.instance("native structured unknown finish still blocks the queue", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const sessions = yield* Session.Service
+    const prompt = yield* SessionPrompt.Service
+    const queue = yield* SessionQueue.Service
+    const root = yield* sessions.create({ title: "Native structured unknown finish" })
+    const response = reply().tool("StructuredOutput", { answer: "done" }).item()
+    if (response.type !== "sse") throw new Error("Expected SSE response")
+    yield* llm.push({
+      ...response,
+      tail: [...response.tail.slice(0, -1), { choices: [{ delta: {}, finish_reason: "unknown" }] }],
+    })
+    const result = yield* prompt.prompt({
+      sessionID: root.id,
+      model: ref,
+      parts: [{ type: "text", text: "Return an answer" }],
+      format: new SessionV1.OutputFormatJsonSchema({
+        type: "json_schema",
+        schema: { type: "object", properties: { answer: { type: "string" } }, required: ["answer"] },
+        retryCount: 0,
+      }),
+    })
+    expect(result.info.role).toBe("assistant")
+    if (result.info.role !== "assistant") throw new Error("Expected assistant")
+    expect(result.info.structured).toEqual({ answer: "done" })
+    expect(result.info.finish).toBe("unknown")
+    expect(result.info.time.completed).toBeDefined()
+    expect(result.info.error).toBeUndefined()
+    expect(completedTool(result.parts)?.tool).toBe("StructuredOutput")
+    expect((yield* queue.list(root.id)).blocked).toBe(true)
+    expect(yield* llm.hits).toHaveLength(1)
+  }),
+)
+
+it.instance("native structured stop preserves a paused pending queue", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const sessions = yield* Session.Service
+    const prompt = yield* SessionPrompt.Service
+    const queue = yield* SessionQueue.Service
+    const root = yield* sessions.create({ title: "Native structured stop" })
+    const pending = yield* queue.enqueue(root.id, { id: "pending", payload: queuedPrompt("must wait") })
+    yield* queue.update(root.id, { revision: pending.revision, mutation: { action: "pause", paused: true } })
+    yield* llm.push(reply().tool("StructuredOutput", { answer: "done" }).stop())
+    const result = yield* prompt.prompt({
+      sessionID: root.id,
+      model: ref,
+      parts: [{ type: "text", text: "Return an answer" }],
+      format: new SessionV1.OutputFormatJsonSchema({
+        type: "json_schema",
+        schema: { type: "object", properties: { answer: { type: "string" } }, required: ["answer"] },
+        retryCount: 0,
+      }),
+    })
+    expect(result.info.role).toBe("assistant")
+    if (result.info.role !== "assistant") throw new Error("Expected assistant")
+    expect(result.info.structured).toEqual({ answer: "done" })
+    expect(result.info.finish).toBe("stop")
+    expect(result.info.time.completed).toBeDefined()
+    expect(result.info.error).toBeUndefined()
+    expect(completedTool(result.parts)?.tool).toBe("StructuredOutput")
+    expect(yield* queue.list(root.id)).toMatchObject({
+      paused: true,
+      blocked: false,
+      items: [{ id: "pending", state: "pending" }],
+    })
+    expect(yield* llm.hits).toHaveLength(1)
+  }),
+)
+
+it.instance("native structured prompt without output blocks the queue", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const sessions = yield* Session.Service
+    const prompt = yield* SessionPrompt.Service
+    const queue = yield* SessionQueue.Service
+    const root = yield* sessions.create({ title: "Missing structured output" })
+    yield* llm.push(reply().text("No structured output").stop())
+    const result = yield* prompt.prompt({
+      sessionID: root.id,
+      model: ref,
+      parts: [{ type: "text", text: "Return an answer" }],
+      format: new SessionV1.OutputFormatJsonSchema({
+        type: "json_schema",
+        schema: { type: "object", properties: { answer: { type: "string" } }, required: ["answer"] },
+        retryCount: 0,
+      }),
+    })
+    expect(result.info.role).toBe("assistant")
+    if (result.info.role !== "assistant") throw new Error("Expected assistant")
+    expect(result.info.structured).toBeUndefined()
+    expect(result.info.error?.name).toBe("StructuredOutputError")
+    expect(result.info.time.completed).toBeDefined()
+    expect((yield* queue.list(root.id)).blocked).toBe(true)
+    expect(yield* llm.hits).toHaveLength(1)
+  }),
+)
+
 ownedRuntime.instance("managed compression preserves structured-output enforcement on the next provider turn", () =>
   Effect.gen(function* () {
     const { llm } = yield* useServerConfig((url) => providerCfg(url))
