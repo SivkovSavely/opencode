@@ -32,6 +32,7 @@ type Active = {
   /** Where focus was before this dialog opened, or before the dialogs it replaced opened. */
   focus?: FocusReturn
   returnFocus: () => void
+  escape: (event: KeyboardEvent) => boolean
 }
 
 const Context = createContext<ReturnType<typeof init>>()
@@ -41,6 +42,7 @@ const Context = createContext<ReturnType<typeof init>>()
 const LayerContext = createContext<{
   setBackdropDismiss: (value: boolean) => void
   setExitDuration: (ms: number) => void
+  setEscapeHandler: (handler: (event: KeyboardEvent) => boolean) => void
   container?: HTMLElement
 }>()
 
@@ -133,6 +135,20 @@ function init(container: () => HTMLElement | undefined) {
 
       if (within && event.target instanceof Node && !within.contains(event.target)) return
 
+      if (event.isComposing || event.keyCode === 229) {
+        // Keep Kobalte's document listener from dismissing, without cancelling the IME default action.
+        event.stopPropagation()
+
+        return
+      }
+
+      if (top()?.escape(event)) {
+        event.preventDefault()
+        event.stopPropagation()
+
+        return
+      }
+
       // A control that cancels its own edit on Escape, such as an inline rename, keeps the dialog open.
       if (event.target instanceof Element && event.target.closest("[data-owns-escape]")) return
       dismiss()
@@ -169,6 +185,7 @@ function init(container: () => HTMLElement | undefined) {
     let setClosing: ((closing: boolean) => void) | undefined
     let layerRef: HTMLDivElement | undefined
     let exit = 100
+    let escape = (_event: KeyboardEvent) => false
 
     // Stacked dialogs render as sibling portals, so only the top layer may own the focus trap.
     const node = runWithOwner(owner, () =>
@@ -208,7 +225,12 @@ function init(container: () => HTMLElement | undefined) {
                 }}
               >
                 <LayerContext.Provider
-                  value={{ setBackdropDismiss, setExitDuration: (ms) => (exit = ms), container: container() }}
+                  value={{
+                    setBackdropDismiss,
+                    setExitDuration: (ms) => (exit = ms),
+                    setEscapeHandler: (handler) => (escape = handler),
+                    container: container(),
+                  }}
                 >
                   {element()}
                 </LayerContext.Provider>
@@ -229,6 +251,7 @@ function init(container: () => HTMLElement | undefined) {
       onClose,
       setClosing,
       exit: () => exit,
+      escape: (event) => escape(event),
       focus,
       returnFocus: () => {
         // A close inside a reactive update unmounts the dialog, and its focus trap, only when the update ends.

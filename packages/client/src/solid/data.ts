@@ -1910,6 +1910,26 @@ export function createData(config: CreateDataInput) {
         loading(sessionID: string) {
           return store.session.messageLoading[sessionID] ?? false
         },
+        progress(sessionID: string) {
+          return {
+            cursor: store.session.messageCursor[sessionID],
+            records: store.session.message[sessionID]?.length ?? 0,
+          }
+        },
+        async settled(sessionID: string) {
+          await messageLoads.get(sessionID)
+        },
+        async loadPage(sessionID: string) {
+          const before = this.progress(sessionID)
+          const pending = messageLoads.get(sessionID)
+          if (pending) {
+            await pending
+            return { status: "shared" as const, before, after: this.progress(sessionID) }
+          }
+          if (before.cursor === undefined) return { status: "skipped" as const, before, after: before }
+          await this.loadMore(sessionID)
+          return { status: "loaded" as const, before, after: this.progress(sessionID) }
+        },
         async loadMore(
           sessionID: string,
           options?: {
@@ -1942,7 +1962,10 @@ export function createData(config: CreateDataInput) {
           const request = (async () => {
             const fetched: SessionMessageInfo[] = []
             let next: string | undefined = cursor
+            const visited = new Set<string>()
             do {
+              if (visited.has(next)) throw new Error("History cursor did not advance")
+              visited.add(next)
               const response = await api().message.list(
                 {
                   sessionID,
@@ -1959,7 +1982,14 @@ export function createData(config: CreateDataInput) {
             // A jump through history publishes once, not once per page of offscreen messages.
             const existing = store.session.message[sessionID] ?? []
             const ids = new Set(existing.map((item) => item.id))
-            const messages = [...fetched.reverse().filter((item) => !ids.has(item.id)), ...existing]
+            const messages = [
+              ...fetched.reverse().filter((item) => {
+                if (ids.has(item.id)) return false
+                ids.add(item.id)
+                return true
+              }),
+              ...existing,
+            ]
             batch(() => {
               options?.beforePublish?.()
               messageIndex.set(sessionID, new Map(messages.map((item, position) => [item.id, position])))

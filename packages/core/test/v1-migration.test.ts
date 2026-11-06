@@ -23,6 +23,7 @@ import { initRepo } from "./fixture/git"
 import { encodedEventPayloads } from "./fixture/encoded-events"
 import fs from "fs/promises"
 import path from "path"
+import { promptSearchItems, searchMessages, parseMessageSearch } from "../../app/src/session/timeline/message-search"
 
 const makeDb = EffectDrizzleSqlite.makeWithDefaults()
 const run = <A, E>(effect: Effect.Effect<A, E, SqlClient | Scope.Scope | Global.Service>) =>
@@ -136,6 +137,49 @@ const transform = (messages: V1Migration.SourceMessage[], parts: V1Migration.Sou
 }
 
 describe("V1Migration.transformSession", () => {
+  test("F003 searches migrated ordinary prompts without synthetic/ignored text or identity/date drift", () => {
+    const mixed = user("msg_000000000004aaaaaaaaaaaaaa", {}, 1_700_000_000_000)
+    const attachment = user("msg_000000000005aaaaaaaaaaaaaa", {}, 1_700_000_000_001)
+    const empty = user("msg_000000000006aaaaaaaaaaaaaa", {}, 1_700_000_000_002)
+    const result = transform(
+      [empty, attachment, mixed],
+      [
+        part("prt_1", mixed.id, { type: "text", text: " first\n\tpart " }),
+        part("prt_2", mixed.id, { type: "text", text: "invisible ignored", ignored: true }),
+        part("prt_3", mixed.id, { type: "text", text: "invisible synthetic", synthetic: true }),
+        part("prt_4", mixed.id, { type: "text", text: "second\u00a0part" }),
+        part("prt_5", attachment.id, {
+          type: "file",
+          mime: "text/plain",
+          filename: "notes.txt",
+          url: "data:text/plain;base64,aGk=",
+        }),
+        part("prt_6", empty.id, { type: "text", text: "", ignored: true }),
+      ],
+    )
+    const messages = result.messages.map((row) =>
+      Schema.encodeSync(SessionMessage.Info)(
+        Schema.decodeUnknownSync(SessionMessage.Info)({ id: row.id, type: row.type, ...row.data }),
+      ),
+    )
+    const items = promptSearchItems(messages.filter((message) => message.type === "user"))
+    expect(
+      items.map((item) => ({ id: item.id, text: item.text, created: item.created, attachment: item.attachment })),
+    ).toEqual([
+      { id: mixed.id, text: "first part second part", created: 1_700_000_000_000, attachment: false },
+      { id: attachment.id, text: "", created: 1_700_000_000_001, attachment: true },
+      { id: empty.id, text: "", created: 1_700_000_000_002, attachment: false },
+    ])
+    expect(searchMessages(items, parseMessageSearch("invisible"))).toEqual([])
+    expect(searchMessages(items, parseMessageSearch("second part")).map((item) => item.id)).toEqual([mixed.id])
+    expect(searchMessages(items, parseMessageSearch("")).map((item) => item.id)).toEqual([
+      mixed.id,
+      attachment.id,
+      empty.id,
+    ])
+    expect(messages.find((message) => message.type === "synthetic")?.id).not.toBe(mixed.id)
+  })
+
   test("reloads retained V1 raw details through the native message schema without changing identity or values", () => {
     const parent = user("msg_000000000007aaaaaaaaaaaaaa")
     const message = assistant("msg_000000000008aaaaaaaaaaaaaa", parent.id)

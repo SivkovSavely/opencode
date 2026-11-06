@@ -49,6 +49,8 @@ import { useServer } from "@/runtime/server/current"
 import { reviewGlyphFill, SessionReviewToggle } from "./header/session-header-actions"
 import { createTimelineCache } from "./timeline/cache"
 import { createPanelMotion, holdLandingWidth, panelOpacity } from "@/shell/panel-motion"
+import { Menu } from "@opencode/ui/menu"
+import { useCommand } from "@/shell/commands/command"
 
 export function SessionScreenView(props: { session: SessionModel }) {
   // Link handling for the rest of the screen; each cached timeline provides its own for its session.
@@ -77,6 +79,7 @@ function SessionScreenContent(props: {
 }) {
   const session = props.session
   const language = useLanguage()
+  const command = useCommand()
   const attachment = usePluginAttachment()
   const settings = useSettings()
   const server = useServer()
@@ -304,6 +307,7 @@ function SessionScreenContent(props: {
             actions={actions}
             scroll={timeline.scroll}
             onResumeScroll={timeline.actions.resume}
+            beginMessageJump={timeline.actions.beginMessageJump}
             setScrollRef={timeline.view.setScrollRef}
             onScheduleScrollState={timeline.view.scheduleScrollState}
             onPin={timeline.view.pin}
@@ -379,6 +383,22 @@ function SessionScreenContent(props: {
               screen: props.screen,
             }}
           />
+          <div class="flex-1" />
+          <Menu placement="bottom-end">
+            <Menu.Trigger
+              as={IconButton}
+              icon={<Icon name="outline-dots" />}
+              variant="ghost-muted"
+              aria-label={language.t("common.moreOptions")}
+            />
+            <Menu.Portal>
+              <Menu.Content>
+                <Menu.Item onSelect={() => command.trigger("session.jump")}>
+                  {language.t("session.jump.menu")}
+                </Menu.Item>
+              </Menu.Content>
+            </Menu.Portal>
+          </Menu>
         </div>
       </Show>
       {/* Surface query errors without suspending session metadata while messages load. */}

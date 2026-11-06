@@ -1260,6 +1260,100 @@ test("loads bounded message pages", async () => {
   }
 })
 
+test("message page outcomes retain raw cursor progress, join actual work, and retry failures", async () => {
+  const release = Promise.withResolvers<void>()
+  const arrived = Promise.withResolvers<void>()
+  const requests: string[] = []
+  let fail = true
+  const api = OpenCode.make({
+    baseUrl: "http://opencode.local",
+    fetch: async (input) => {
+      const cursor =
+        new URL(input instanceof Request ? input.url : String(input)).searchParams.get("cursor") ?? "initial"
+      requests.push(cursor)
+      if (cursor === "initial") return Response.json({ data: [], cursor: { next: "empty" } })
+      if (cursor === "empty") {
+        arrived.resolve()
+        await release.promise
+        return Response.json({ data: [], cursor: { next: "overlap" } })
+      }
+      if (fail) return Response.json({ message: "offline" }, { status: 503 })
+      return Response.json({
+        data: [1, 1, 2].map((index) => ({
+          id: `msg_${index}`,
+          type: "user",
+          text: String(index),
+          time: { created: index },
+        })),
+        cursor: {},
+      })
+    },
+  })
+  const setup = createRoot((dispose) => ({
+    data: createData({ api: () => api, directory: "/project", event: { on: () => () => {}, listen: () => () => {} } }),
+    dispose,
+  }))
+  try {
+    const messages = setup.data.session.message
+    expect((await messages.loadPage("ses_pages")).status).toBe("skipped")
+    await messages.sync("ses_pages")
+    const load = messages.loadPage("ses_pages")
+    await arrived.promise
+    const shared = messages.loadPage("ses_pages")
+    const settled = messages.settled("ses_pages")
+    expect(messages.loading("ses_pages")).toBe(true)
+    release.resolve()
+    expect(await load).toEqual({
+      status: "loaded",
+      before: { cursor: "empty", records: 0 },
+      after: { cursor: "overlap", records: 0 },
+    })
+    expect((await shared).status).toBe("shared")
+    await settled
+    expect(requests).toEqual(["initial", "empty"])
+    await expect(messages.loadPage("ses_pages")).rejects.toBeDefined()
+    expect(messages.progress("ses_pages")).toEqual({ cursor: "overlap", records: 0 })
+    expect(messages.loading("ses_pages")).toBe(false)
+    fail = false
+    expect((await messages.loadPage("ses_pages")).after).toEqual({ cursor: undefined, records: 2 })
+    expect(messages.list("ses_pages").map((item) => item.id)).toEqual(["msg_2", "msg_1"])
+    expect((await messages.loadPage("ses_pages")).status).toBe("skipped")
+  } finally {
+    release.resolve()
+    setup.dispose()
+  }
+})
+
+test.each(["same", "cycle"])("bulk message paging terminates %s cursors", async (mode) => {
+  const requests: string[] = []
+  const api = OpenCode.make({
+    baseUrl: "http://opencode.local",
+    fetch: async (input) => {
+      const cursor =
+        new URL(input instanceof Request ? input.url : String(input)).searchParams.get("cursor") ?? "initial"
+      requests.push(cursor)
+      return Response.json({
+        data: [],
+        cursor: { next: cursor === "initial" || mode === "same" || cursor === "b" ? "a" : "b" },
+      })
+    },
+  })
+  const setup = createRoot((dispose) => ({
+    data: createData({ api: () => api, directory: "/project", event: { on: () => () => {}, listen: () => () => {} } }),
+    dispose,
+  }))
+  try {
+    await setup.data.session.message.sync("ses_cycle")
+    await expect(setup.data.session.message.loadMore("ses_cycle", { all: true })).rejects.toThrow(
+      "History cursor did not advance",
+    )
+    expect(requests).toEqual(mode === "same" ? ["initial", "a"] : ["initial", "a", "b"])
+    expect(setup.data.session.message.loading("ses_cycle")).toBe(false)
+  } finally {
+    setup.dispose()
+  }
+})
+
 test.each(["success", "failure", "cancel", "cancel-retry", "cancel-page", "join-cancel", "join-failure"])(
   "bulk history (%s)",
   async (mode) => {

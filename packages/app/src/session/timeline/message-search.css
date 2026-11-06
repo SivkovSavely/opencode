@@ -1,0 +1,95 @@
+[data-component="dialog-v2"][data-size="large"] [data-slot="dialog-container"].message-jump-container {
+  width: min(720px, calc(100vw - 24px));
+  height: min(600px, calc(100dvh - 24px));
+}
+[data-component="dialog-v2"] .message-jump-container [data-slot="dialog-content"].message-jump-dialog {
+  min-height: 0;
+  overflow: hidden;
+}
+[data-component="dialog-v2"] .message-jump-container [data-slot="dialog-body"] {
+  min-height: 0;
+}
+.message-jump-query {
+  display: flex;
+  flex-shrink: 0;
+  align-items: center;
+  gap: 8px;
+}
+.message-jump-query input {
+  width: 100%;
+  min-width: 0;
+  padding: 10px 12px;
+  border: 1px solid var(--border-base);
+  border-radius: 6px;
+  color: var(--text-base);
+  background: var(--background-base);
+}
+.message-jump-status {
+  display: flex;
+  flex-shrink: 0;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 8px 0;
+  color: var(--text-weak);
+}
+.message-jump-results {
+  flex: 1;
+  max-height: 360px;
+  min-height: 0;
+  overflow-y: auto;
+  position: relative;
+  font-size: 13px;
+  line-height: var(--line-height-base);
+}
+.message-jump-option {
+  position: absolute;
+  left: 0;
+  right: 0;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 0 12px;
+  cursor: pointer;
+  border-radius: 6px;
+}
+.message-jump-option[aria-selected="true"] {
+  background: var(--surface-raised-base);
+}
+.message-jump-option time {
+  flex-shrink: 0;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-weak);
+}
+.message-jump-ordinal {
+  min-width: 2ch;
+  color: var(--text-weak);
+  font-variant-numeric: tabular-nums;
+}
+.message-jump-preview {
+  flex: 1;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+}
+.message-jump-preview mark {
+  color: var(--text-strong);
+  background: var(--surface-info-base);
+}
+.message-jump-empty {
+  padding: 20px 12px;
+  color: var(--text-weak);
+}
+.message-jump-hints {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 16px;
+  color: var(--text-weak);
+  font-size: 12px;
+  line-height: var(--line-height-compact);
+}
+@media (max-width: 480px) {
+  .message-jump-option {
+    gap: 6px;
+    padding: 0 4px;
+  }
+}

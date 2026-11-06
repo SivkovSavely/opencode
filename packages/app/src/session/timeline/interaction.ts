@@ -7,12 +7,21 @@ import { frameLoop } from "@opencode/ui/motion"
 import { useLayout } from "@/shell/state/layout"
 import type { SessionModel } from "../model"
 import { useSessionHashScroll } from "../use-session-hash-scroll"
+import { messageIdFromHash } from "../message-id-from-hash"
 import { createTimelineModel } from "./model"
+import { useData } from "@/runtime/server/current"
+import { visibleTimelineMessages } from "./controller-projection"
+import { selectSessionUserMessages } from "../session-domain"
 
 export function createSessionTimelineInteraction(session: SessionModel) {
   const layout = useLayout()
   const location = useLocation<{ reveal?: string }>()
   const timeline = createTimelineModel({ session })
+  const data = useData()
+
+  let jump:
+    | { key: string; current: () => boolean; following: boolean; mark: number; navigation: number; selected: boolean }
+    | undefined
 
   const [state, setState] = createStore<{
     messageID: string | undefined
@@ -48,7 +57,14 @@ export function createSessionTimelineInteraction(session: SessionModel) {
   // The single source of truth for "follow the newest content". The virtualizer pins and unpins
   // it from scroll geometry; everything else only expresses explicit intent.
   const pinned = () => state.follow.sessionKey !== session.identity.sessionKey() || state.follow.pinned
-  const pin = () => setState("follow", { sessionKey: session.identity.sessionKey(), pinned: true })
+
+  const pin = () => {
+    if (jump?.key === session.identity.sessionKey()) return
+
+    // Geometry during history publication must not cancel a requested historical anchor.
+    if (messageIdFromHash(location.hash) && messageMark === scrollMark) return
+    setState("follow", { sessionKey: session.identity.sessionKey(), pinned: true })
+  }
 
   const unpin = () => {
     if (!scroller || scroller.scrollHeight - scroller.clientHeight <= 1) return
@@ -69,13 +85,25 @@ export function createSessionTimelineInteraction(session: SessionModel) {
   let page = (_direction: 1 | -1) => {}
 
   let scrollMark = 0
+  let jumpScrollMark = 0
   let messageMark = 0
+  let navigationMark = 0
   let scrollStateFrame: (() => void) | undefined
   let scrollStateTarget: HTMLDivElement | undefined
   let fillFrame: (() => void) | undefined
   let historyContinuationFrame: number | undefined
   const historyRequests = new Set<string>()
   const visibleUserMessages = timeline.visibleUserMessages
+
+  const jumpMessages = () =>
+    selectSessionUserMessages(
+      visibleTimelineMessages(
+        timeline.messages(),
+        data.session.pending.list(session.identity.sessionID()!),
+        session.data.info()?.revert?.messageID,
+      ),
+    )
+
   const anchor = (id: string) => `message-${id}`
 
   const cursor = () => {
@@ -112,6 +140,7 @@ export function createSessionTimelineInteraction(session: SessionModel) {
   }
 
   const setActiveMessage = (message: SessionMessageUser | undefined) => {
+    navigationMark += 1
     messageMark = scrollMark
     setState("messageID", message?.id)
   }
@@ -163,7 +192,8 @@ export function createSessionTimelineInteraction(session: SessionModel) {
     setPendingMessage: (value) => setState("pendingMessage", value),
     setActiveMessage,
     follow: {
-      unpin,
+      // A hash is navigation intent even before the scroller has mounted or can overflow.
+      unpin: () => setState("follow", { sessionKey: session.identity.sessionKey(), pinned: false }),
       toBottom: () => {
         pin()
         scrollToEnd()
@@ -178,19 +208,25 @@ export function createSessionTimelineInteraction(session: SessionModel) {
 
   let resumeFrame: (() => void) | undefined
 
-  const resume = (behavior?: ScrollBehavior) => {
+  const resume = (behavior?: ScrollBehavior, current?: () => boolean) => {
+    navigationMark += 1
+    jump = undefined
     setState("messageID", undefined)
+    clearMessageHash()
     pin()
+    const navigation = navigationMark
+    const mark = jumpScrollMark
     // Scrolls on the next frame, before it paints. A submit resumes from its key handler right after changing the
     // DOM, where reading the scroll range would force a layout that the frame then repeats.
     resumeFrame?.()
     resumeFrame = frameLoop.add(() => {
       resumeFrame = undefined
+
+      if (current && (!current() || navigation !== navigationMark || mark !== jumpScrollMark)) return false
       scrollToEnd(behavior)
 
       return false
     })
-    clearMessageHash()
 
     if (scroller) scheduleScrollState(scroller)
   }
@@ -216,13 +252,16 @@ export function createSessionTimelineInteraction(session: SessionModel) {
   }
 
   // A gesture inside a nested scrollable region scrolls that region, not the timeline.
-  const markUserScroll = (target?: EventTarget | null) => {
+  const markUserScroll = (target?: EventTarget | null, pointer = false) => {
     if (!scroller) return
     const element = target instanceof Element ? target : undefined
     const nested = element?.closest("[data-scrollable]")
 
     if (nested && nested !== scroller) return
     scrollMark += 1
+
+    // Toolbar clicks count as native cursor intent, but are not scrolling away from a pending picker.
+    if (!pointer || !element?.closest("button, a, input, textarea, [contenteditable]")) jumpScrollMark += 1
   }
 
   const selectionInteraction = () => {
@@ -241,6 +280,7 @@ export function createSessionTimelineInteraction(session: SessionModel) {
   }
 
   async function loadOlder() {
+    if (jump?.key === session.identity.sessionKey()) return
     const owner = session.ownership.capture()
 
     if (timeline.history.loading() || historyRequests.has(owner.key)) return
@@ -394,9 +434,78 @@ export function createSessionTimelineInteraction(session: SessionModel) {
 
   return {
     actions: {
+      beginMessageJump: () => {
+        const owner = session.ownership.capture()
+        const id = session.identity.sessionID()
+        const key = session.identity.sessionKey()
+        const previous = jump
+
+        const token = {
+          key,
+          current: owner.current,
+          following:
+            previous?.key === key &&
+            previous.current() &&
+            !previous.selected &&
+            previous.mark === jumpScrollMark &&
+            previous.navigation === navigationMark
+              ? previous.following
+              : pinned(),
+          mark: jumpScrollMark,
+          navigation: navigationMark,
+          selected: false,
+        }
+
+        jump = token
+        setState("follow", { sessionKey: token.key, pinned: false })
+        let selected: { id: string; mark: number; navigation: number } | undefined
+
+        return {
+          select: (id: string) => {
+            if (!owner.current() || jump !== token) return
+            const message = jumpMessages().find((message) => message.id === id)
+
+            if (!message) return
+            token.selected = true
+            scrollToMessage(message, "auto")
+            selected = { id, mark: jumpScrollMark, navigation: navigationMark }
+          },
+          close: () => {
+            void (id ? data.session.message.settled(id) : Promise.resolve())
+              .catch(() => undefined)
+              .then(() => {
+                if (jump !== token) return
+                jump = undefined
+
+                if (!owner.current()) return
+
+                if (selected) {
+                  if (
+                    selected.mark !== jumpScrollMark ||
+                    selected.navigation !== navigationMark ||
+                    state.messageID !== selected.id ||
+                    messageIdFromHash(location.hash) !== selected.id
+                  )
+                    return
+                  const message = jumpMessages().find((message) => message.id === selected!.id)
+
+                  if (message) scrollToMessage(message, "auto")
+
+                  return
+                }
+
+                if (token.following && token.mark === jumpScrollMark && token.navigation === navigationMark)
+                  resume("auto", () => owner.current() && !jump)
+              })
+          },
+        }
+      },
       navigateMessage,
       page: (direction: 1 | -1) => page(direction),
-      revealMessage: (id: string, partID?: string) => revealMessage(id, partID),
+      revealMessage: (id: string, partID?: string) => {
+        navigationMark += 1
+        revealMessage(id, partID)
+      },
       revealPart: (target: string) => revealPart(target),
       resume,
       setActiveMessage,

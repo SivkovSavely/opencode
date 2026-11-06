@@ -84,7 +84,7 @@ type Input = {
   onPin: () => void
   onUnpin: () => void
   onSelectionInteraction: (event: MouseEvent) => void
-  onUserScroll: (target?: EventTarget | null) => void
+  onUserScroll: (target?: EventTarget | null, pointer?: boolean) => void
   onHistoryScroll: () => void
   canRenderImmediately?: (
     row: TimelineRow.TimelineRow,
@@ -780,13 +780,13 @@ export function createTimelineVirtualizer(input: Input) {
     if (active()) input.setScrollRef(root)
     viewportObserver?.observe(root)
     settleColdBottom()
-    // The scrollbar thumb sits beside the viewport and stops its pointerdown from propagating, so
-    // listen on the ScrollView root in the capture phase: thumb drags are user scrolls too.
-    const scrollView = root.parentElement
+    // The thumb is portaled into visibleArea beside ScrollView and stops bubbling pointerdown.
+    // Their common view owns capture for both viewport interaction and external thumb drags.
+    const view = viewRoot()
 
-    if (!scrollView) return
-    scrollView.addEventListener("pointerdown", handleListPointerDown, { capture: true })
-    onCleanup(() => scrollView.removeEventListener("pointerdown", handleListPointerDown, { capture: true }))
+    if (!view) return
+    view.addEventListener("pointerdown", handleListPointerDown, { capture: true })
+    onCleanup(() => view.removeEventListener("pointerdown", handleListPointerDown, { capture: true }))
   }
 
   // Upward input is the one intent geometry cannot recover: nudging up while still a pixel from
@@ -858,7 +858,7 @@ export function createTimelineVirtualizer(input: Input) {
   // so a held pointer is what separates those from the virtualizer's own measurement adjustments.
   const handleListPointerDown = (event: PointerEvent) => {
     releaseAnchor()
-    input.onUserScroll(event.target)
+    input.onUserScroll(event.target, true)
     pointerHeld = true
   }
 

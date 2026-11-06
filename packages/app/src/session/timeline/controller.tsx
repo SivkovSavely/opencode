@@ -1,8 +1,8 @@
 import type { SessionMessageInfo } from "@opencode/client/promise"
 import { DialogFooter, DialogHeader, DialogTitleGroup, Dialog } from "@opencode/ui/dialog"
 import { Button } from "@opencode/ui/button"
-import { useNavigate } from "@solidjs/router"
-import { createEffect, createMemo, on, type Accessor } from "solid-js"
+import { useLocation, useNavigate } from "@solidjs/router"
+import { createEffect, createMemo, on, onCleanup, type Accessor } from "solid-js"
 import { createStore } from "solid-js/store"
 import { Option, Predicate, Schema } from "effect"
 import { notifySessionTabsRemoved } from "@/shell/titlebar/session-events"
@@ -24,6 +24,8 @@ import { createTimelineProjection } from "./projection"
 import { useServer } from "@/runtime/server/current"
 import { getSessionMessageHandoff } from "@/session/handoff"
 import type { ReasoningMode } from "@opencode/session-ui/timeline/projection"
+import { DialogJumpToMessage } from "./dialog-jump-to-message"
+import { selectSessionUserMessages } from "../session-domain"
 
 const emptyMessages: SessionMessageInfo[] = []
 
@@ -56,8 +58,13 @@ export type TimelineSessionSource = {
   history: Pick<SessionModel["history"], "messages">
 }
 
-export function createTimelineController(input: { session: TimelineSessionSource; active: Accessor<boolean> }) {
+export function createTimelineController(input: {
+  session: TimelineSessionSource
+  active: Accessor<boolean>
+  beginMessageJump?: () => { select: (id: string) => void; close: () => void }
+}) {
   const navigate = useNavigate()
+  const location = useLocation()
   const sdk = useWorkspaceLocation()
   const serverSDK = useServerSDK()
   const server = useServer()
@@ -349,6 +356,41 @@ export function createTimelineController(input: { session: TimelineSessionSource
       rename: () => pending.rename,
     },
     action: {
+      jumpToMessage: () => {
+        const id = input.session.identity.sessionID()
+
+        if (!id || !input.beginMessageJump) return
+        const key = input.session.identity.sessionKey()
+        const path = location.pathname
+        const layerKey = `jump-message-${server.key}-${key}`
+        const controller = new AbortController()
+        const navigation = input.beginMessageJump()
+        dialog.show(
+          () => {
+            createEffect(() => {
+              if (!input.active() || location.pathname !== path || input.session.identity.sessionKey() !== key)
+                dialog.close(layerKey)
+            })
+            onCleanup(() => controller.abort())
+
+            return (
+              <DialogJumpToMessage
+                sessionID={id}
+                messages={() => selectSessionUserMessages(visibleMessages())}
+                history={data.session.message}
+                signal={controller.signal}
+                select={navigation.select}
+                close={() => dialog.close(layerKey)}
+              />
+            )
+          },
+          () => {
+            controller.abort()
+            navigation.close()
+          },
+          layerKey,
+        )
+      },
       rename,
       export: exportSession,
       showDelete: (id: string) => dialog.show(() => <DeleteDialog sessionID={id} />),

@@ -361,6 +361,27 @@ export function inboxDelivered(data: Extract<OpenCodeEvent, { type: "session.inb
   return makeEvent("session.inbox.delivered", data)
 }
 
+// Transport-level failures and raw cursor stalls cannot be expressed by the successful page builder.
+export async function interruptNextMessagePage(page: Page, mode: "failure" | "stalled", gate?: Promise<void>) {
+  const pattern = /\/api\/session\/[^/]+\/message\?/
+  const arrived = Promise.withResolvers<void>()
+  await page.route(pattern, async (route) => {
+    const cursor = new URL(route.request().url()).searchParams.get("cursor")
+
+    if (!cursor) return route.fallback()
+    await page.unroute(pattern)
+    arrived.resolve()
+    await gate
+    await route.fulfill({
+      status: mode === "failure" ? 503 : 200,
+      contentType: "application/json",
+      body: JSON.stringify(mode === "failure" ? { message: "offline" } : { data: [], cursor: { next: cursor } }),
+    })
+  })
+
+  return { arrived: arrived.promise }
+}
+
 export function compactionStarted(data: Extract<OpenCodeEvent, { type: "session.compaction.started" }>["data"]) {
   return makeEvent("session.compaction.started", data)
 }

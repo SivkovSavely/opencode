@@ -85,7 +85,7 @@ type MessageTimelineProps = {
   onScheduleScrollState: (el: HTMLDivElement) => void
   onPin: () => void
   onUnpin: () => void
-  onUserScroll: (target?: EventTarget | null) => void
+  onUserScroll: (target?: EventTarget | null, pointer?: boolean) => void
   onHistoryScroll: () => void
   onSelectionInteraction: (event: MouseEvent) => void
   pinned: boolean
@@ -101,10 +101,16 @@ type MessageTimelineProps = {
   setPage?: (fn: (direction: 1 | -1) => void) => void
   reveal?: { target: () => string | undefined; done: () => void }
   search?: JSX.Element
+  beginMessageJump?: () => { select: (id: string) => void; close: () => void }
 }
 
 export function MessageTimeline(props: MessageTimelineProps) {
-  const controller = createTimelineController({ session: props.session, active: () => props.active !== false })
+  const controller = createTimelineController({
+    session: props.session,
+    active: () => props.active !== false,
+    beginMessageJump: props.beginMessageJump,
+  })
+
   const tail = props.pinned ? controller.data.projection.rows().at(-1) : undefined
 
   if (tail?._tag === "AssistantPart" && tail.group.type === "part") {
@@ -326,6 +332,20 @@ function MessageTimelineView(
 
               if (id) props.action.showDelete(id)
             },
+          },
+        ],
+  )
+
+  command.register(() =>
+    props.active === false
+      ? []
+      : [
+          {
+            id: "session.jump",
+            category: language.t("command.category.session"),
+            title: language.t("session.jump.menu"),
+            disabled: !sessionID(),
+            onSelect: props.action.jumpToMessage,
           },
         ],
   )
@@ -677,6 +697,9 @@ function MessageTimelineView(
                         </Menu.Item>
                         <Menu.Item onSelect={() => void props.action.export(id)}>
                           {language.t("common.export")}…
+                        </Menu.Item>
+                        <Menu.Item onSelect={() => props.action.jumpToMessage()}>
+                          {language.t("session.jump.menu")}
                         </Menu.Item>
                         <Menu.Item onSelect={() => command.trigger("session.bookmark")}>
                           {language.t(

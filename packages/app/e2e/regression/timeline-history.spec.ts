@@ -1,11 +1,14 @@
 import type { SessionMessageAssistant, SessionMessageInfo } from "@opencode/client/promise"
 import { expect, test, type Page } from "@playwright/test"
-import { sessionHref } from "../utils/app"
+import { REMOTE_SERVER, session, sessionHref } from "../utils/app"
 import { trackPageErrors } from "../utils/errors"
 import { fixture, installTimelineSettings, mockStressTimeline } from "../utils/session-fixture"
 import {
   assistantMessage,
   historyMessages,
+  inboxDelivered,
+  inboxEnqueued,
+  interruptNextMessagePage,
   messageUpdated,
   partUpdated,
   sessionID,
@@ -16,9 +19,1100 @@ import {
   validateTimelineMessages,
 } from "../utils/timeline"
 import { expectSessionTitle } from "../utils/waits"
-import { openSession } from "../utils/workspace"
+import { mockRemoteServer, mockWorkspace, openSession } from "../utils/workspace"
 
 test.use({ serviceWorkers: "block" })
+
+test.describe("jump to message", () => {
+  test("closes on server switch with colliding session IDs and absorbs the old page's late rejection", async ({
+    page,
+  }) => {
+    const held = Promise.withResolvers<void>()
+    const errors: string[] = []
+    page.on("pageerror", (error) => errors.push(error.message))
+    const id = "ses_jump_collision"
+    await mockRemoteServer(page, {
+      sessions: [session({ id, directory: "C:/OpenCode/Remote", title: "Remote collision" })],
+      pageMessages: () => ({ items: [userMessage([textPart("prt_remote_collision", "Remote-only prompt")])] }),
+    })
+    await openSession(page, {
+      name: "JumpCollision",
+      sessions: [{ id }],
+      seed: { servers: [REMOTE_SERVER], tabs: [id, { session: id, server: REMOTE_SERVER }] },
+      pageMessages: () => ({
+        items: Array.from({ length: 30 }, (_, index) =>
+          userMessage([textPart(`prt_collision_${index}`, `Local collision ${index} ${"words ".repeat(30)}`)], {
+            id: `msg_collision_${index}`,
+            created: index + 1,
+          }),
+        ),
+        cursor: "held",
+      }),
+    })
+    const transport = await interruptNextMessagePage(page, "failure", held.promise)
+
+    try {
+      await openJump(page)
+      await transport.arrived
+      await page.getByRole("combobox").fill("Local")
+      await page
+        .locator(`[data-slot="titlebar-tabs"] a[href="${sessionHref(id, REMOTE_SERVER)}"]`)
+        .evaluate((element: HTMLAnchorElement) => element.click())
+      await expect(page).toHaveURL(sessionHref(id, REMOTE_SERVER))
+      await expect(page.getByRole("dialog", { name: "Jump to message" })).toHaveCount(0)
+      await expect(page.getByText("Remote-only prompt", { exact: true })).toBeVisible()
+      const rejected = page.waitForResponse((response) => response.status() === 503)
+      held.resolve()
+      await rejected
+      await openJump(page)
+      await expect(page.getByRole("combobox")).toHaveValue("")
+      await expect(page.getByRole("option")).toHaveCount(1)
+      await expect(page.getByRole("option")).toContainText("Remote-only prompt")
+      expect(errors).toEqual([])
+    } finally {
+      held.resolve()
+    }
+  })
+
+  test("reveals an unloaded existing hash and returns to latest through native navigation", async ({ page }) => {
+    const id = "ses_jump_hash"
+
+    const messages = Array.from({ length: 50 }, (_, index) =>
+      userMessage([textPart(`prt_hash_${index}`, `Hash prompt ${index} ${"words ".repeat(30)}`)], {
+        id: `msg_hash_${String(index).padStart(4, "0")}`,
+        created: index + 1,
+      }),
+    )
+
+    await mockWorkspace(page, {
+      name: "JumpHash",
+      sessions: [{ id }],
+      pageMessages: (_id, _limit, before) =>
+        before ? { items: messages.slice(0, 20) } : { items: messages.slice(20), cursor: "older" },
+    })
+    await page.goto(sessionHref(id) + "#message-msg_hash_0001")
+    await expect(page.locator("#message-msg_hash_0001")).toBeInViewport()
+    await page.getByRole("button", { name: "Jump to latest", exact: true }).click()
+    await expect(page).toHaveURL(sessionHref(id))
+    await expect(page.locator("#message-msg_hash_0049")).toBeInViewport()
+  })
+
+  test("does not reveal a reverted tail even while its boundary is unloaded", async ({ page }) => {
+    const held = Promise.withResolvers<void>()
+    const arrived = Promise.withResolvers<void>()
+    const id = "ses_jump_revert"
+    await openSession(page, {
+      name: "JumpRevert",
+      sessions: [{ id, revert: { messageID: "msg_revert_0020" } }],
+      beforeMessagesResponse: ({ before }) => {
+        if (before) {
+          arrived.resolve()
+
+          return held.promise
+        }
+
+        return Promise.resolve()
+      },
+      pageMessages: (_id, _limit, before) =>
+        before
+          ? {
+              items: [
+                userMessage([textPart("prt_revert_before", "Before revert")], { id: "msg_revert_0001", created: 1 }),
+                userMessage([textPart("prt_revert_boundary", "Boundary excluded")], {
+                  id: "msg_revert_0020",
+                  created: 20,
+                }),
+              ],
+            }
+          : {
+              items: [
+                userMessage([textPart("prt_revert_hidden", "Hidden tail")], { id: "msg_revert_0030", created: 30 }),
+              ],
+              cursor: "boundary",
+            },
+    })
+
+    try {
+      await openJump(page)
+      await arrived.promise
+      await expect(page.getByRole("option")).toHaveCount(0)
+      held.resolve()
+      await expect(page.getByRole("option")).toHaveCount(1)
+      await expect(page.getByRole("option")).toContainText("Before revert")
+      await page.getByRole("combobox").press("Enter")
+      await expect(page.locator("#message-msg_revert_0001")).toBeInViewport()
+      await openJump(page)
+      await expect(page.getByRole("option")).toHaveCount(1)
+    } finally {
+      held.resolve()
+    }
+  })
+
+  for (const mode of ["failure", "stalled"] as const) {
+    test(`retains partial query and explicitly retries ${mode} discovery`, async ({ page }) => {
+      const messages = Array.from({ length: 40 }, (_, index) =>
+        userMessage([textPart(`prt_retry_${index}`, `Retry needle ${index} ${"words ".repeat(20)}`)], {
+          id: `msg_retry_${String(index).padStart(4, "0")}`,
+          created: index + 1,
+        }),
+      )
+
+      await openSession(page, {
+        name: "JumpRetry",
+        sessions: [{ id: "ses_jump_retry" }],
+        pageMessages: (_id, _limit, before) =>
+          before ? { items: messages.slice(0, 10) } : { items: messages.slice(10), cursor: "older" },
+      })
+      await interruptNextMessagePage(page, mode)
+      await openJump(page)
+      const dialog = page.getByRole("dialog")
+      const input = dialog.getByRole("combobox")
+      await input.fill("needle")
+      await expect(dialog.getByRole("alert")).toContainText(
+        mode === "failure" ? "Could not load older messages" : "History stopped making progress",
+      )
+      await expect(dialog.getByRole("status")).toContainText("30 matches in 30 loaded messages (partial)")
+      await dialog.getByRole("button", { name: "Try again", exact: true }).click()
+      await expect(dialog.getByRole("status")).toHaveText("40 matches (40 total)")
+      await expect(dialog.getByRole("alert")).toHaveCount(0)
+      await expect(input).toHaveValue("needle")
+      await input.fill("/^Retry needle 1 /")
+      await expect(dialog.getByRole("option")).toHaveCount(1)
+      await input.press("Enter")
+      await expect(page.locator("#message-msg_retry_0001")).toBeInViewport()
+    })
+  }
+
+  for (const width of [1280, 390, 900]) {
+    test(`browses eligible prompts, searches safely, resets and handles IME at ${width}px`, async ({ page }) => {
+      const height = width === 900 ? 390 : 900
+      await page.setViewportSize({ width, height })
+
+      if (width === 390) await page.emulateMedia({ reducedMotion: "reduce" })
+      const writes: string[] = []
+      page.on("request", (request) => {
+        // Native location refresh and goal/get RPC use POST for reads; mutations remain forbidden.
+        if (
+          request.url().includes("/api/") &&
+          !/\/api\/(worktree\/refresh|rpc\/opencode.goal\/get)(\?|$)/.test(request.url()) &&
+          ["POST", "PATCH", "PUT", "DELETE"].includes(request.method())
+        )
+          writes.push(request.url())
+      })
+      await openSession(page, {
+        name: "JumpBrowse",
+        sessions: [{ id: "ses_jump_browse" }],
+        pageMessages: () => ({
+          items: [
+            userMessage([textPart("prt_jump_a", "  <b>Needle</b>\n\tissue-123  ")], {
+              id: "msg_jump_a",
+              created: 1_700_000_000_000,
+            }),
+            assistantMessage([textPart("prt_jump_secret", "assistant secret")], {
+              id: "msg_jump_b",
+              created: 1_700_000_000_001,
+            }),
+            userMessage(
+              [
+                {
+                  id: "prt_jump_file",
+                  type: "file",
+                  mime: "text/plain",
+                  url: "file:///notes.txt",
+                  filename: "notes.txt",
+                },
+              ],
+              { id: "msg_jump_c", created: 1_700_000_000_002 },
+            ),
+            userMessage([], { id: "msg_jump_d", created: 1_700_000_000_003 }),
+          ],
+        }),
+      })
+      const composer = page.locator('[data-component="composer-editor"]')
+      await composer.fill("Unsubmitted draft stays here")
+      const before = [...writes]
+      await openJump(page)
+      const dialog = page.getByRole("dialog", { name: "Jump to message" })
+      const input = dialog.getByRole("combobox")
+      await expect(input).toBeFocused()
+      await expect(input).toHaveAttribute("placeholder", "Search user messages...")
+      const container = dialog.locator("..")
+      await expect
+        .poll(() =>
+          container.evaluate((element) => {
+            const box = element.getBoundingClientRect()
+
+            return {
+              top: box.top >= 0,
+              left: box.left >= 0,
+              right: box.right <= innerWidth,
+              bottom: box.bottom <= innerHeight,
+            }
+          }),
+        )
+        .toEqual({ top: true, left: true, right: true, bottom: true })
+      await expect(dialog.getByRole("button", { name: "Close" })).toBeInViewport()
+      await expect(dialog.getByRole("heading", { name: "Jump to message", exact: true })).toBeInViewport()
+      await expect(input).toBeInViewport()
+      await expect(dialog.getByRole("option")).toHaveCount(3)
+      await expect(input).not.toHaveAttribute("aria-activedescendant")
+      await expect(dialog.getByText("↑ ↓ Navigate · Enter Jump", { exact: true })).toBeInViewport()
+      await expect(dialog.getByText("Esc Clear / Close", { exact: true })).toBeInViewport()
+      await input.press("ArrowDown")
+      await expect(dialog.getByRole("option", { selected: true })).toContainText("Needle")
+      await input.fill(" ")
+      await expect(input).not.toHaveAttribute("aria-activedescendant")
+      await input.press("ArrowUp")
+      await expect(dialog.getByRole("option", { selected: true })).toContainText("Empty prompt")
+      await expect(dialog.getByRole("option").first()).toContainText("<b>Needle</b> issue-123")
+      await expect(dialog.locator("time").first()).toHaveAttribute("datetime", "2023-11-14T22:13:20.000Z")
+      await expect(dialog.locator("time").first()).toHaveText(/\d{2}:\d{2}:\d{2}/)
+      await expect(dialog.locator("time").first()).toHaveAttribute("title", /2023/)
+      expect(await dialog.evaluate((element) => element.getBoundingClientRect().right)).toBeLessThanOrEqual(width)
+
+      for (const query of ["assistant secret", "notes.txt", "Attachment"]) {
+        await input.fill(query)
+        await expect(dialog.getByRole("option")).toHaveCount(0)
+        await input.press("Enter")
+        await expect(dialog).toBeVisible()
+      }
+
+      await input.fill("/[")
+      await expect(dialog.getByRole("alert")).toBeVisible()
+      await input.fill("/ISSUE-\\d+/i")
+      await expect(dialog.getByRole("option")).toHaveCount(1)
+      await expect(dialog.getByRole("status")).toHaveText("1 match (3 total)")
+      await expect(input).not.toHaveAttribute("aria-activedescendant")
+      await expect(dialog.getByText("Regex", { exact: true })).toBeVisible()
+      await expect(dialog.getByRole("alert")).toHaveCount(0)
+
+      for (const key of ["ArrowDown", "Enter", "Escape"]) {
+        expect(
+          await input.evaluate((element, key) => {
+            const event = new KeyboardEvent("keydown", { key, isComposing: true, bubbles: true, cancelable: true })
+            element.dispatchEvent(event)
+
+            return event.defaultPrevented
+          }, key),
+        ).toBe(false)
+        await expect(input).toHaveValue("/ISSUE-\\d+/i")
+        await expect(input).not.toHaveAttribute("aria-activedescendant")
+        await expect(dialog).toBeVisible()
+      }
+
+      await dialog.getByRole("button", { name: "Close" }).focus()
+      expect(
+        await dialog.getByRole("button", { name: "Close" }).evaluate((element) => {
+          const event = new KeyboardEvent("keydown", {
+            key: "Escape",
+            isComposing: true,
+            bubbles: true,
+            cancelable: true,
+          })
+
+          element.dispatchEvent(event)
+
+          return event.defaultPrevented
+        }),
+      ).toBe(false)
+      await expect(input).toHaveValue("/ISSUE-\\d+/i")
+      await page.keyboard.press("Escape")
+      await expect(input).toHaveValue("")
+      await expect(input).not.toHaveAttribute("aria-activedescendant")
+      await expect(input).toBeFocused()
+      await dialog.getByRole("button", { name: "Close" }).focus()
+      expect(
+        await dialog.getByRole("button", { name: "Close" }).evaluate((element) => {
+          const event = new KeyboardEvent("keydown", { key: "Escape", keyCode: 229, bubbles: true, cancelable: true })
+          element.dispatchEvent(event)
+
+          return event.defaultPrevented
+        }),
+      ).toBe(false)
+      await expect(dialog).toBeVisible()
+      await input.press("Escape")
+      await expect(dialog).toHaveCount(0)
+      await openJump(page)
+      await expect(page.getByRole("combobox")).toHaveValue("")
+      await expect(page.getByRole("option")).toHaveCount(3)
+      await expect(page.getByRole("combobox")).not.toHaveAttribute("aria-activedescendant")
+      await page.getByRole("combobox").press("Enter")
+      await expect(page.locator("#message-msg_jump_a")).toBeInViewport()
+      await openJump(page)
+      await page.getByRole("option", { name: /Attachment/ }).click()
+      await expect(page.locator("#message-msg_jump_c")).toBeInViewport()
+      await expect(page).toHaveURL(/#message-msg_jump_c$/)
+      await openJump(page)
+      await page.getByRole("combobox").fill("Needle")
+      await page.getByRole("dialog").getByRole("button", { name: "Close" }).click()
+      await expect(page.getByRole("dialog")).toHaveCount(0)
+      await expect(composer).toHaveText("Unsubmitted draft stays here")
+      expect(writes).toEqual(before)
+    })
+  }
+
+  test("queued raw prompts become searchable only after native delivery", async ({ page }) => {
+    const id = "ses_jump_queue"
+
+    const workspace = await openSession(page, {
+      name: "JumpQueue",
+      sessions: [{ id }],
+      pageMessages: () => ({
+        items: [
+          userMessage([textPart("prt_queue_visible", "Visible baseline")], { id: "msg_queue_0001", created: 1 }),
+          userMessage([textPart("prt_queue_hidden", "Queued secret")], { id: "msg_queue_0002", created: 2 }),
+        ],
+      }),
+      inbox: [
+        {
+          id: "msg_queue_0002",
+          sessionID: id,
+          type: "user",
+          delivery: "queue",
+          payload: { text: "Queued secret" },
+          time: { created: 2 },
+        },
+      ],
+    })
+
+    await openJump(page)
+    const dialog = page.getByRole("dialog")
+    await expect(dialog.getByRole("option")).toHaveCount(1)
+    await expect(dialog.getByRole("status")).toHaveText("1 match (1 total)")
+    await dialog.getByRole("combobox").fill("Queued secret")
+    await expect(dialog.getByRole("option")).toHaveCount(0)
+    await dialog.getByRole("combobox").press("Enter")
+    await expect(dialog).toBeVisible()
+    await workspace.push([inboxDelivered({ sessionID: id, inboxID: "msg_queue_0002" })])
+    await expect(dialog.getByRole("status")).toHaveText("1 match (2 total)")
+    await dialog.getByRole("combobox").press("Enter")
+    await expect(page.locator("#message-msg_queue_0002")).toBeInViewport()
+  })
+
+  test("a reopened picker invalidates the previous dismissal's queued restoration frame", async ({ page }) => {
+    await page.clock.install()
+    const held = Promise.withResolvers<void>()
+    const arrived = Promise.withResolvers<void>()
+
+    const messages = Array.from({ length: 60 }, (_, index) =>
+      userMessage([textPart(`prt_reopen_phase_${index}`, `Reopen prompt ${index} ${"context ".repeat(40)}`)], {
+        id: `msg_reopen_phase_${String(index).padStart(4, "0")}`,
+        created: index + 1,
+      }),
+    )
+
+    const output = assistantMessage([textPart("prt_reopen_initial", "Initial live response.")], {
+      id: "msg_reopen_output",
+      parentID: "msg_reopen_phase_0059",
+      created: 61,
+      completed: false,
+    })
+
+    const workspace = await openSession(page, {
+      name: "JumpReopenFrame",
+      sessions: [{ id: sessionID }],
+      pageMessages: (_id, _limit, before) =>
+        before ? { items: messages.slice(0, 10) } : { items: [...messages.slice(10), output], cursor: "older" },
+      beforeMessagesResponse: ({ before }) => {
+        if (!before) return Promise.resolve()
+        arrived.resolve()
+
+        return held.promise
+      },
+    })
+
+    const fromEnd = () =>
+      timelineScroller(page).evaluate((element) => element.scrollHeight - element.clientHeight - element.scrollTop)
+
+    try {
+      await expect.poll(fromEnd).toBeLessThanOrEqual(1)
+      await openJump(page)
+      await arrived.promise
+      await workspace.push(
+        partUpdated({
+          ...textPart(
+            "prt_reopen_growth",
+            Array.from({ length: 40 }, (_, index) => `Live reopen paragraph ${index}.`).join("\n\n"),
+          ),
+          messageID: output.id,
+        }),
+      )
+      await expect(page.getByText("Live reopen paragraph 39.", { exact: true })).toBeAttached()
+      await expect.poll(fromEnd).toBeGreaterThan(600)
+      await page.getByRole("dialog").getByRole("button", { name: "Close" }).click()
+      await expect(page.getByRole("dialog")).toHaveCount(0)
+      await page.getByRole("button", { name: "More options", exact: true }).click()
+      const reopen = page.getByRole("menuitem", { name: "Jump to message...", exact: true })
+      await expect(reopen).toBeVisible()
+      const content = page.locator("[data-timeline-virtual-content]")
+      const height = await content.evaluate((element: HTMLElement) => element.style.height)
+      await page.clock.pauseAt(new Date((await page.evaluate(() => Date.now())) + 1000))
+
+      const published = page.waitForResponse(
+        (response) =>
+          response.url().includes("/message?") &&
+          new URL(response.url()).searchParams.has("cursor") &&
+          response.status() === 200,
+      )
+
+      held.resolve()
+      await published
+      await expect.poll(() => content.evaluate((element: HTMLElement) => element.style.height)).not.toBe(height)
+      // The menu is ready; real mouse input reopens it without advancing the deliberately paused animation frame.
+      const box = (await reopen.boundingBox())!
+      await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2)
+      const dialog = page.getByRole("dialog", { name: "Jump to message" })
+      await expect(dialog).toBeVisible()
+      const top = await timelineScroller(page).evaluate((element) => element.scrollTop)
+      await expect.poll(fromEnd).toBeGreaterThan(600)
+      await page.clock.runFor(16)
+      await expect.poll(() => timelineScroller(page).evaluate((element) => element.scrollTop)).toBe(top)
+      await expect(dialog).toBeVisible()
+
+      await page.clock.resume()
+      await dialog.getByRole("button", { name: "Close" }).click()
+      await expect(dialog).toHaveCount(0)
+      await expect.poll(fromEnd).toBeLessThanOrEqual(1)
+      await workspace.push(
+        partUpdated({
+          ...textPart("prt_reopen_final", "Following restored after the final dismissal.\n\n".repeat(20)),
+          messageID: output.id,
+        }),
+      )
+      await expect(page.getByText("Following restored after the final dismissal.", { exact: true })).toHaveCount(20)
+      await expect.poll(fromEnd).toBeLessThanOrEqual(1)
+    } finally {
+      held.resolve()
+    }
+  })
+
+  test("an upward gesture after dismissal settlement wins over the queued restoration frame", async ({ page }) => {
+    await page.clock.install()
+    const held = Promise.withResolvers<void>()
+    const arrived = Promise.withResolvers<void>()
+
+    const messages = Array.from({ length: 60 }, (_, index) =>
+      userMessage([textPart(`prt_phase_${index}`, `Phase prompt ${index} ${"context ".repeat(40)}`)], {
+        id: `msg_phase_${String(index).padStart(4, "0")}`,
+        created: index + 1,
+      }),
+    )
+
+    await openSession(page, {
+      name: "JumpFrame",
+      sessions: [{ id: "ses_jump_frame" }],
+      pageMessages: (_id, _limit, before) =>
+        before ? { items: messages.slice(0, 10) } : { items: messages.slice(10), cursor: "older" },
+      beforeMessagesResponse: ({ before }) => {
+        if (!before) return Promise.resolve()
+        arrived.resolve()
+
+        return held.promise
+      },
+    })
+
+    try {
+      await expect(page.locator("#message-msg_phase_0059")).toBeInViewport()
+      await openJump(page)
+      await arrived.promise
+      await page.getByRole("dialog").getByRole("button", { name: "Close" }).click()
+      await expect(page.getByRole("dialog")).toHaveCount(0)
+      const content = page.locator("[data-timeline-virtual-content]")
+      const height = await content.evaluate((element: HTMLElement) => element.style.height)
+      // Freeze native animation frames before publication; network and Solid publication still run.
+      await page.clock.pauseAt(new Date((await page.evaluate(() => Date.now())) + 1000))
+
+      const published = page.waitForResponse(
+        (response) =>
+          response.url().includes("/message?") &&
+          new URL(response.url()).searchParams.has("cursor") &&
+          response.status() === 200,
+      )
+
+      held.resolve()
+      await published
+      await expect.poll(() => content.evaluate((element: HTMLElement) => element.style.height)).not.toBe(height)
+      await timelineScroller(page).evaluate((element) => {
+        element.dispatchEvent(new WheelEvent("wheel", { bubbles: true, deltaY: -1 }))
+        element.scrollTop = Math.max(
+          0,
+          Math.min(element.scrollTop - 500, element.scrollHeight - element.clientHeight - 1200),
+        )
+      })
+      // Run the next scheduled native frame only after the newer upward intent.
+      await page.clock.runFor(16)
+      await expect
+        .poll(() =>
+          timelineScroller(page).evaluate((element) => element.scrollHeight - element.clientHeight - element.scrollTop),
+        )
+        .toBeGreaterThan(600)
+      await expect(page.locator("#message-msg_phase_0059")).not.toBeInViewport()
+    } finally {
+      held.resolve()
+    }
+  })
+
+  for (const intent of ["return", "next", "find", "thumb", "scroll", "reopen", "reopen-scroll"] as const) {
+    test(`pending picker settlement preserves ${intent} intent`, async ({ page }) => {
+      const held = Promise.withResolvers<void>()
+      const id = `ses_jump_intent_${intent}`
+      const other = `ses_jump_intent_other_${intent}`
+      const requests: (string | undefined)[] = []
+
+      const workspace = await openSession(page, {
+        name: "JumpIntent",
+        sessions: [{ id }, { id: other }],
+        pageMessages: (sessionID, _limit, before) => {
+          if (sessionID === other)
+            return { items: [userMessage([textPart("prt_intent_other", "Other loaded session")])] }
+
+          return {
+            items: Array.from({ length: 50 }, (_, index) =>
+              userMessage([textPart(`prt_intent_${index}`, `Intent prompt ${index} ${"context ".repeat(40)}`)], {
+                id: `msg_intent_${String(index).padStart(4, "0")}`,
+                created: index + 1,
+              }),
+            ),
+            cursor: before ? undefined : "older",
+          }
+        },
+        onMessages: ({ sessionID, before, phase }) => {
+          if (sessionID === id && phase === "start") requests.push(before)
+        },
+      })
+
+      // Preload B through its real tab before opening the picker in A.
+      await page.locator(`[data-slot="titlebar-tabs"] a[href="${sessionHref(other)}"]`).click()
+      await expect(page.getByText("Other loaded session", { exact: true })).toBeVisible()
+      await page.locator(`[data-slot="titlebar-tabs"] a[href="${sessionHref(id)}"]`).click()
+      await expect(page.locator("#message-msg_intent_0049")).toBeInViewport()
+      const failure = await interruptNextMessagePage(page, "failure", held.promise)
+
+      const added = Array.from({ length: 10 }, (_, index) => [
+        inboxEnqueued({
+          sessionID: id,
+          inboxID: `msg_intent_999${index}`,
+          item: {
+            type: "user",
+            payload: { text: `Newest intent sentinel ${index} ${"context ".repeat(40)}` },
+            delivery: "steer",
+          },
+        }),
+        inboxDelivered({ sessionID: id, inboxID: `msg_intent_999${index}` }),
+      ]).flat()
+
+      try {
+        await openJump(page)
+        await failure.arrived
+
+        if (intent === "next" || intent === "find" || intent === "thumb" || intent === "scroll") {
+          await page.getByRole("combobox").fill("/^Intent prompt 20 /")
+          await expect(page.getByRole("option")).toHaveCount(1)
+          await page.getByRole("combobox").press("Enter")
+          await expect(page.locator("#message-msg_intent_0020")).toBeInViewport()
+
+          if (intent === "next") {
+            await page.keyboard.press("Control+Alt+]")
+            await expect(page).toHaveURL(/#message-msg_intent_0021$/)
+          }
+
+          if (intent === "find") {
+            await page.keyboard.press("Control+f")
+            const search = page.locator('[data-component="timeline-search-bar"] input')
+            await expect(search).toBeFocused()
+            await search.fill("Intent prompt 18 ")
+            await expect(page.locator("#message-msg_intent_0018")).toBeInViewport()
+            await expect
+              .poll(() => page.evaluate(() => CSS.highlights.get("timeline-search-hit-active")?.size ?? 0))
+              .toBe(1)
+          }
+
+          if (intent === "thumb") {
+            await timelineScroller(page).hover()
+
+            const thumb = page.locator(
+              '[data-slot="session-timeline-visible"] .scroll-view__thumb[data-orientation="vertical"]',
+            )
+
+            await expect(thumb).toHaveAttribute("data-visible", "true")
+            expect(
+              await thumb.evaluate((element) => ({
+                outsideScrollView: !element.closest(".scroll-view"),
+                commonView: element
+                  .closest('[data-slot="session-timeline-visible"]')
+                  ?.parentElement?.contains(document.querySelector('[data-slot="session-timeline-scroll"]')),
+              })),
+            ).toEqual({ outsideScrollView: true, commonView: true })
+            const box = (await thumb.boundingBox())!
+            const track = (await page.locator('[data-slot="session-timeline-visible"]').boundingBox())!
+            await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2)
+            await page.mouse.down()
+            await page.mouse.move(box.x + box.width / 2, track.y + box.height / 2 + 60)
+            await page.mouse.up()
+            await expect.poll(() => timelineScroller(page).evaluate((element) => element.scrollTop)).toBeLessThan(1500)
+            await expect(page.locator("#message-msg_intent_0020")).not.toBeInViewport()
+          }
+        } else {
+          if (intent !== "return") await page.getByRole("dialog").getByRole("button", { name: "Close" }).click()
+
+          if (intent.startsWith("reopen")) {
+            await openJump(page)
+            await page.getByRole("dialog").getByRole("button", { name: "Close" }).click()
+          }
+
+          if (intent === "return") {
+            await page
+              .locator(`[data-slot="titlebar-tabs"] a[href="${sessionHref(other)}"]`)
+              .evaluate((element: HTMLAnchorElement) => element.click())
+            await expect(page.getByRole("dialog", { name: "Jump to message" })).toHaveCount(0)
+            await expect(page.getByText("Other loaded session", { exact: true })).toBeVisible()
+            await page.locator(`[data-slot="titlebar-tabs"] a[href="${sessionHref(id)}"]`).click()
+            await expect(page.locator("#message-msg_intent_0049")).toBeInViewport()
+            await workspace.push(added)
+            await expect(page.locator("#message-msg_intent_9999")).toBeInViewport()
+          }
+        }
+
+        if (intent === "scroll" || intent === "reopen-scroll") {
+          const target =
+            intent === "reopen-scroll"
+              ? page.getByRole("button", { name: "More options", exact: true })
+              : timelineScroller(page)
+
+          await target.dispatchEvent("wheel", { bubbles: true, deltaY: -1 })
+          await timelineScroller(page).evaluate((element) => {
+            element.scrollTop = 600
+          })
+          await expect.poll(() => timelineScroller(page).evaluate((element) => element.scrollTop)).toBeGreaterThan(400)
+          await expect.poll(() => timelineScroller(page).evaluate((element) => element.scrollTop)).toBeLessThan(1000)
+        }
+
+        const response = page.waitForResponse(
+          (response) => response.url().includes("/message?") && response.status() === 503,
+        )
+
+        held.resolve()
+        await response
+
+        if (intent === "return") {
+          await expect(page.locator("#message-msg_intent_9999")).toBeInViewport()
+          await timelineScroller(page).evaluate((element) => {
+            element.dispatchEvent(new WheelEvent("wheel", { bubbles: true, deltaY: -1 }))
+            element.scrollTop = 0
+          })
+          await expect.poll(() => requests.includes("older")).toBe(true)
+        } else if (intent === "scroll" || intent === "find" || intent === "thumb") {
+          // Isolate pending-page replay from native hash reconciliation on newly delivered prompts.
+          await expect(page).toHaveURL(/#message-msg_intent_0020$/)
+
+          if (intent === "find") await expect(page.locator("#message-msg_intent_0018")).toBeInViewport()
+
+          if (intent === "scroll") {
+            await expect
+              .poll(() => timelineScroller(page).evaluate((element) => element.scrollTop))
+              .toBeGreaterThan(400)
+            await expect.poll(() => timelineScroller(page).evaluate((element) => element.scrollTop)).toBeLessThan(1000)
+          }
+
+          if (intent === "thumb") {
+            await expect.poll(() => timelineScroller(page).evaluate((element) => element.scrollTop)).toBeLessThan(1500)
+            await expect(page.locator("#message-msg_intent_0020")).not.toBeInViewport()
+          }
+        } else {
+          await workspace.push(added)
+
+          if (intent === "reopen") await expect(page.locator("#message-msg_intent_9999")).toBeInViewport()
+
+          if (intent === "next") {
+            await expect(page).toHaveURL(/#message-msg_intent_0021$/)
+            await expect(page.locator("#message-msg_intent_0021")).toBeInViewport()
+          }
+
+          if (intent === "reopen-scroll") {
+            await expect(page.locator("#message-msg_intent_9999")).not.toBeInViewport()
+            await expect
+              .poll(() => timelineScroller(page).evaluate((element) => element.scrollTop))
+              .toBeGreaterThan(400)
+            await expect.poll(() => timelineScroller(page).evaluate((element) => element.scrollTop)).toBeLessThan(1000)
+          }
+        }
+      } finally {
+        held.resolve()
+      }
+    })
+  }
+
+  test("virtualizes 1003 prompts, retains active identity, wraps keys and reveals the same target again", async ({
+    page,
+  }) => {
+    await openSession(page, {
+      name: "JumpVirtual",
+      sessions: [{ id: "ses_jump_virtual" }],
+      pageMessages: () => ({
+        items: Array.from({ length: 1003 }, (_, index) =>
+          userMessage([textPart(`prt_jump_${index}`, `Prompt ${index} ${"context ".repeat(20)} END-${index}😀`)], {
+            id: `msg_jump_${String(index).padStart(4, "0")}`,
+            created: index + 1,
+          }),
+        ),
+      }),
+    })
+    await openJump(page)
+    const dialog = page.getByRole("dialog", { name: "Jump to message" })
+    const input = dialog.getByRole("combobox")
+    await expect(dialog.getByText("1003 matches (1003 total)", { exact: true })).toBeVisible()
+    expect(await dialog.getByRole("option").count()).toBeLessThan(30)
+    await expect(input).not.toHaveAttribute("aria-activedescendant")
+    await input.press("ArrowDown")
+    const active = await input.getAttribute("aria-activedescendant")
+    await dialog.getByRole("listbox").evaluate((element) => {
+      element.scrollTop = 20_000
+    })
+    await expect(page.locator(`[id="${active}"]`)).toHaveCount(1)
+    await input.press("ArrowUp")
+    await expect(dialog.getByRole("option", { selected: true })).toContainText("Prompt 1002")
+    await input.press("ArrowDown")
+    await expect(dialog.getByRole("option", { selected: true })).toContainText("Prompt 0")
+    await input.fill("Prompt")
+    await input.press("ArrowUp")
+    await expect(dialog.getByRole("option", { selected: true })).toContainText("Prompt 1002")
+    await input.fill("prompt")
+    await expect(input).not.toHaveAttribute("aria-activedescendant")
+    await expect.poll(() => dialog.getByRole("listbox").evaluate((element) => element.scrollTop)).toBe(0)
+    await input.fill("END-500")
+    await expect(dialog.getByRole("option")).toHaveCount(1)
+    await expect(dialog.getByRole("status")).toHaveText("1 match (1003 total)")
+    await expect(dialog.getByRole("option").locator("mark")).toHaveText("END-500")
+    await page.setViewportSize({ width: 390, height: 900 })
+    await expect(dialog.getByRole("option").locator("mark")).toHaveText("END-500")
+    expect(
+      await dialog.getByRole("option").evaluate((element) => element.getBoundingClientRect().right),
+    ).toBeLessThanOrEqual(390)
+    await page.setViewportSize({ width: 1280, height: 900 })
+    await input.press("Enter")
+    await expect(dialog).toHaveCount(0)
+    await expect(page).toHaveURL(/#message-msg_jump_0500$/)
+    const target = page.locator("#message-msg_jump_0500")
+    await expect(target).toBeInViewport()
+    await timelineScroller(page).evaluate((element) => {
+      element.scrollTop = element.scrollHeight
+    })
+    await openJump(page)
+    await page.getByRole("combobox").fill("END-500")
+    await page.getByRole("combobox").press("Enter")
+    await expect(target).toBeInViewport()
+  })
+
+  test("discovers advancing empty and overlapping history while invalid, and keeps a selected target after a held page", async ({
+    page,
+  }) => {
+    const held = Promise.withResolvers<void>()
+    const arrived = Promise.withResolvers<void>()
+    const requests: string[] = []
+    const recent = userMessage([textPart("prt_jump_recent", "Recent target")], { id: "msg_jump_0900", created: 900 })
+    const ancient = userMessage([textPart("prt_jump_ancient", "Ancient target")], { id: "msg_jump_0001", created: 1 })
+    await openSession(page, {
+      name: "JumpPages",
+      sessions: [{ id: "ses_jump_pages" }],
+      beforeMessagesResponse: ({ before }) => {
+        if (before === "held") {
+          arrived.resolve()
+
+          return held.promise
+        }
+
+        return Promise.resolve()
+      },
+      pageMessages: (_session, _limit, before) => {
+        requests.push(before ?? "initial")
+
+        if (!before) return { items: [recent], cursor: "held" }
+
+        if (before === "held") return { items: [], cursor: "overlap" }
+
+        if (before === "overlap") return { items: [recent], cursor: "metadata" }
+
+        if (before === "metadata")
+          return {
+            items: [{ id: "msg_jump_meta", type: "synthetic", text: "Excluded metadata", time: { created: 50 } }],
+            cursor: "ancient",
+          }
+
+        return { items: [ancient] }
+      },
+    })
+
+    try {
+      await openJump(page)
+      await arrived.promise
+      await page.getByRole("combobox").fill("/[")
+      await expect(page.getByRole("alert")).toBeVisible()
+      held.resolve()
+      await expect(page.getByText("0 matches (2 total)", { exact: true })).toBeVisible()
+      expect(requests).toEqual(["initial", "held", "overlap", "metadata", "ancient"])
+      await page.getByRole("combobox").fill("Ancient")
+      await expect(page.getByRole("option")).toHaveCount(1)
+      await page.getByRole("combobox").press("Enter")
+      await expect(page.locator("#message-msg_jump_0001")).toBeInViewport()
+    } finally {
+      held.resolve()
+    }
+  })
+
+  test("loaded matches remain selectable during discovery and late pages cannot steal the selected anchor", async ({
+    page,
+  }) => {
+    const held = Promise.withResolvers<void>()
+    const arrived = Promise.withResolvers<void>()
+    const ended = Promise.withResolvers<void>()
+
+    const messages = Array.from({ length: 50 }, (_, index) =>
+      userMessage([textPart(`prt_held_${index}`, `Held target ${index} ${"words ".repeat(30)}`)], {
+        id: `msg_held_${String(index).padStart(4, "0")}`,
+        created: index + 1,
+      }),
+    )
+
+    await openSession(page, {
+      name: "JumpHeld",
+      sessions: [{ id: "ses_jump_held" }],
+      beforeMessagesResponse: ({ before }) => {
+        if (before) {
+          arrived.resolve()
+
+          return held.promise
+        }
+
+        return Promise.resolve()
+      },
+      onMessages: ({ before, phase }) => {
+        if (before && phase === "end") ended.resolve()
+      },
+      pageMessages: (_id, _limit, before) =>
+        before ? { items: messages.slice(0, 20) } : { items: messages.slice(20), cursor: "older" },
+    })
+
+    try {
+      await openJump(page)
+      await arrived.promise
+      await expect(page.getByRole("dialog").getByRole("status")).toContainText(
+        "30 matches in 30 loaded messages (partial)",
+      )
+      await page.getByRole("combobox").fill("Held target 25 ")
+      await page.getByRole("combobox").press("Enter")
+      const target = page.locator("#message-msg_held_0025")
+      await expect(target).toBeInViewport()
+      held.resolve()
+      await ended.promise
+      await expect(target).toBeInViewport()
+      await expect(page).toHaveURL(/#message-msg_held_0025$/)
+    } finally {
+      held.resolve()
+    }
+  })
+
+  test("preserves scrolled active identity on prepend and reacts to native user/synthetic replacement", async ({
+    page,
+  }) => {
+    const held = Promise.withResolvers<void>()
+    const arrived = Promise.withResolvers<void>()
+    const id = "ses_jump_live"
+
+    const messages = Array.from({ length: 100 }, (_, index) =>
+      userMessage([textPart(`prt_live_${index}`, `Live needle ${index}`)], {
+        id: `msg_live_${String(index).padStart(4, "0")}`,
+        created: index + 1,
+      }),
+    )
+
+    const workspace = await openSession(page, {
+      name: "JumpLive",
+      sessions: [{ id }],
+      beforeMessagesResponse: ({ before }) => {
+        if (before) {
+          arrived.resolve()
+
+          return held.promise
+        }
+
+        return Promise.resolve()
+      },
+      pageMessages: (_id, _limit, before) =>
+        before ? { items: messages.slice(0, 20) } : { items: messages.slice(20), cursor: "older" },
+    })
+
+    try {
+      await openJump(page)
+      await arrived.promise
+      const dialog = page.getByRole("dialog")
+      const input = dialog.getByRole("combobox")
+      await input.fill("needle")
+      await input.press("ArrowDown")
+      await input.press("ArrowDown")
+      const active = await input.getAttribute("aria-activedescendant")
+      await dialog.getByRole("listbox").evaluate((element) => {
+        element.scrollTop = 1200
+      })
+      const offset = await dialog.getByRole("listbox").evaluate((element) => element.scrollTop)
+
+      const position = () =>
+        dialog.getByRole("listbox").evaluate((element) => {
+          const top = element.getBoundingClientRect().top
+
+          const row = [...element.querySelectorAll('[role="option"]')].find(
+            (item) => item.getBoundingClientRect().bottom > top,
+          )
+
+          return row ? { id: row.id, offset: row.getBoundingClientRect().top - top } : undefined
+        })
+
+      const before = await position()
+      held.resolve()
+      await expect(dialog.getByRole("status")).toHaveText("100 matches (100 total)")
+      await expect(input).toHaveAttribute("aria-activedescendant", active!)
+      expect(await dialog.getByRole("listbox").evaluate((element) => element.scrollTop)).toBe(offset)
+      await test.info().attach("F003-D02-prepend-position", {
+        body: JSON.stringify({ before, after: await position() }),
+        contentType: "application/json",
+      })
+      await workspace.push([
+        inboxEnqueued({
+          sessionID: id,
+          inboxID: "msg_live_0021",
+          item: { type: "user", payload: { text: "Updated needle value" }, delivery: "steer" },
+        }),
+        inboxDelivered({ sessionID: id, inboxID: "msg_live_0021" }),
+      ])
+      await expect(dialog.getByRole("option", { selected: true })).toContainText("Updated needle value")
+      await workspace.push([
+        inboxEnqueued({
+          sessionID: id,
+          inboxID: "msg_live_0021",
+          item: { type: "synthetic", payload: { text: "Updated needle value" }, delivery: "steer" },
+        }),
+        inboxDelivered({ sessionID: id, inboxID: "msg_live_0021" }),
+      ])
+      await expect(input).not.toHaveAttribute("aria-activedescendant")
+      await expect(dialog.getByRole("status")).toHaveText("99 matches (99 total)")
+      await input.fill("LIVE")
+      await expect.poll(() => dialog.getByRole("listbox").evaluate((element) => element.scrollTop)).toBe(0)
+      await dialog.getByRole("button", { name: "Clear", exact: true }).click()
+      await expect(input).toBeFocused()
+      await expect(input).toHaveValue("")
+      await expect(input).not.toHaveAttribute("aria-activedescendant")
+      await input.dispatchEvent("keydown", { key: "Enter", keyCode: 229, bubbles: true })
+      await expect(dialog).toBeVisible()
+    } finally {
+      held.resolve()
+    }
+  })
+
+  for (const mode of ["following", "reading", "switch", "reopen"] as const) {
+    test(`closing held discovery respects ${mode} ownership`, async ({ page }) => {
+      const held = Promise.withResolvers<void>()
+      const arrived = Promise.withResolvers<void>()
+      const ended = Promise.withResolvers<void>()
+      const errors = trackPageErrors(page)
+      const id = `ses_jump_close_${mode}`
+      const other = `ses_jump_other_${mode}`
+
+      const messages = Array.from({ length: 50 }, (_, index) =>
+        userMessage([textPart(`prt_close_${index}`, `Close prompt ${index} ${"words ".repeat(30)}`)], {
+          id: `msg_close_${String(index).padStart(4, "0")}`,
+          created: index + 1,
+        }),
+      )
+
+      const workspace = await openSession(page, {
+        name: "JumpClose",
+        sessions: [{ id }, { id: other }],
+        beforeMessagesResponse: ({ sessionID, before }) => {
+          if (sessionID === id && before) {
+            arrived.resolve()
+
+            return held.promise
+          }
+
+          return Promise.resolve()
+        },
+        onMessages: ({ sessionID, before, phase }) => {
+          if (sessionID === id && before && phase === "end") ended.resolve()
+        },
+        pageMessages: (sessionID, _limit, before) =>
+          sessionID === other
+            ? { items: [userMessage([textPart("prt_other_jump", "Other scope prompt")])] }
+            : before
+              ? { items: messages.slice(0, 10) }
+              : { items: messages.slice(10), cursor: "older" },
+      })
+
+      try {
+        if (mode === "reading") {
+          await timelineScroller(page).evaluate((element) => {
+            element.dispatchEvent(new WheelEvent("wheel", { bubbles: true, deltaY: -1 }))
+            element.scrollTop = 100
+          })
+        }
+
+        await openJump(page)
+        await arrived.promise
+
+        if (mode === "switch") {
+          // Native route link activation during an outstanding modal, without replacing the document.
+          await page
+            .locator(`[data-slot="titlebar-tabs"] a[href="${sessionHref(other)}"]`)
+            .evaluate((element: HTMLAnchorElement) => element.click())
+          await expect(page.getByRole("dialog", { name: "Jump to message" })).toHaveCount(0)
+          await expect(page.getByText("Other scope prompt", { exact: true })).toBeVisible()
+        } else {
+          await page.getByRole("dialog").getByRole("button", { name: "Close" }).click()
+          await expect(page.getByRole("dialog", { name: "Jump to message" })).toHaveCount(0)
+
+          if (mode === "reopen") {
+            await openJump(page)
+            await page.getByRole("combobox").fill("Close prompt 25")
+          }
+        }
+
+        held.resolve()
+        await ended.promise
+
+        if (mode === "reopen") {
+          await expect(page.getByRole("combobox")).toHaveValue("Close prompt 25")
+          await expect(page.getByRole("option")).toHaveCount(1)
+          await page.getByRole("combobox").press("Enter")
+          await expect(page.locator("#message-msg_close_0025")).toBeInViewport()
+        }
+
+        if (mode === "following" || mode === "reading") {
+          await workspace.push([
+            inboxEnqueued({
+              sessionID: id,
+              inboxID: "msg_close_9999",
+              item: { type: "user", payload: { text: "Newest after dismissal" }, delivery: "steer" },
+            }),
+            inboxDelivered({ sessionID: id, inboxID: "msg_close_9999" }),
+          ])
+
+          if (mode === "following") await expect(page.locator("#message-msg_close_9999")).toBeInViewport()
+
+          if (mode === "reading") await expect(page.locator("#message-msg_close_9999")).not.toBeInViewport()
+        }
+
+        if (mode === "switch") await expect(page.getByText("Other scope prompt", { exact: true })).toBeInViewport()
+        expect(errors).toEqual([])
+      } finally {
+        held.resolve()
+      }
+    })
+  }
+})
+
+async function openJump(page: Page) {
+  await page.getByRole("button", { name: "More options", exact: true }).click()
+  await page.getByRole("menuitem", { name: "Jump to message...", exact: true }).click()
+  await expect(page.getByRole("dialog", { name: "Jump to message" })).toBeVisible()
+}
 
 test.describe("timeline history", () => {
   test("restoring a paged transcript waits for another upward scroll before loading history", async ({ page }) => {
@@ -56,6 +1150,25 @@ test.describe("timeline history", () => {
     })
     const scroller = timelineScroller(page)
     await expect(page.locator("[data-timeline-virtual-content]")).toHaveCSS("visibility", "visible")
+    // The virtual container can be visible before Markdown expands and initial bottom restoration finishes.
+    await expect(page.getByText("Paragraph 39.", { exact: true })).toBeAttached()
+    await expect(scroller.locator('[data-component="markdown"]:not([data-markdown-ready])')).toHaveCount(0)
+    await expect
+      .poll(() =>
+        scroller.evaluate(
+          (element) =>
+            new Promise<{ overflow: boolean; atEnd: boolean }>((resolve) => {
+              // Observe after the browser's initial scroll/resize delivery, not mid-restoration.
+              requestAnimationFrame(() =>
+                resolve({
+                  overflow: element.scrollHeight - element.clientHeight > 200,
+                  atEnd: Math.abs(element.scrollHeight - element.clientHeight - element.scrollTop) <= 1,
+                }),
+              )
+            }),
+        ),
+      )
+      .toEqual({ overflow: true, atEnd: true })
     // One upward gesture, without wheel momentum carrying across the page prepend.
     await scroller.evaluate((element) => {
       element.dispatchEvent(new WheelEvent("wheel", { bubbles: true, deltaY: -1 }))
