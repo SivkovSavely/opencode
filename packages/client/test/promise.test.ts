@@ -63,6 +63,9 @@ test("exposes every standard HTTP API group", () => {
     "media",
     "schedule",
     "artifacts",
+    "transcript",
+    "projects",
+    "workspace",
     "migration",
     "usage",
     "config",
@@ -84,6 +87,7 @@ test("exposes every standard HTTP API group", () => {
   expect(Object.keys(client.experimental.media)).toEqual(["get"])
   expect(Object.keys(client.experimental.schedule)).toEqual(["create", "list", "get", "pause", "resume", "delete"])
   expect(client.experimental.persistentPty.read).toBeFunction()
+  expect(Object.keys(client.experimental.workspace)).toEqual(["dispatch"])
 })
 
 test("nests a method under client.experimental exactly when its route is experimental", async () => {

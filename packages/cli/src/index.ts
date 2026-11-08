@@ -1,6 +1,5 @@
 #!/usr/bin/env bun
 
-import { ensurePluginRuntime } from "@opencode/plugin/runtime"
 import { NodeRuntime, NodeServices } from "@effect/platform-node"
 import { Cause, Effect } from "effect"
 import { getErrorReported } from "effect/Runtime"
@@ -31,8 +30,6 @@ const noProxy = [
 
 process.env.NO_PROXY = noProxy
 process.env.no_proxy = noProxy
-
-ensurePluginRuntime()
 
 if (process.env.OPENCODE_SSH_ASKPASS_PORT) {
   const { askpass } = await import("./ssh-askpass")
@@ -94,7 +91,17 @@ const Handlers = Runtime.handlers(Commands, {
     unset: () => import("./commands/handlers/service/unset"),
   },
   serve: () => import("./commands/handlers/serve"),
-})
+}).map((handler) => ({
+  ...handler,
+  load: async () => {
+    // Native parsing selects the handler before plugin startup, including global flag values and aliases.
+    if (handler.path[0] !== "api") {
+      const { ensurePluginRuntime } = await import("@opencode/plugin/runtime")
+      ensurePluginRuntime()
+    }
+    return handler.load()
+  },
+}))
 
 Effect.gen(function* () {
   yield* Heap.listen
@@ -119,14 +126,14 @@ Effect.gen(function* () {
     version: OPENCODE_VERSION,
     channel: OPENCODE_CHANNEL,
     local: OPENCODE_LOCAL,
-    args: process.argv.slice(2),
+    args: "[redacted]",
   })
   return yield* Runtime.run(Commands, Handlers, { version: OPENCODE_VERSION })
 }).pipe(
   Effect.catchCause((cause) =>
     Effect.logError("cli process failed", {
       cause,
-      args: process.argv.slice(2),
+      args: "[redacted]",
     }).pipe(Effect.andThen(Effect.failCause(cause))),
   ),
   Effect.annotateLogs({ role: "cli" }),

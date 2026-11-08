@@ -1,4 +1,5 @@
 - After changing the public Protocol or Server `HttpApi`, run `bun run generate` from `packages/client`. Do not edit generated client files directly.
+- Public API additions, removals and parameter/schema changes also require `bun run api:generate` from `packages/cli` after updating Protocol OpenAPI. `bun run api:check` compares the catalog with the live Protocol declarations and bundled spec; root lint/check enforces it. Do not edit `packages/cli/src/api/catalog.generated.json` manually. Unsupported transports need an explicit diagnostic/adapter, not silent catalog exclusion.
 - Keep runtime dependencies directed from Schema to Core and Protocol, then from Core and Protocol to Server. Client runtime code may depend on Schema and Protocol but never Core or Server; `sdk` composes Client, Core, and Server.
 - This repository does not use Changesets. Do not add `.changeset` files; follow the existing release workflow instead.
 - The default branch is `dev`. Base branches and worktrees on `origin/dev`, target PRs at `dev`, and diff against `origin/dev` unless told otherwise.

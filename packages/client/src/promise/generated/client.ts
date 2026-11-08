@@ -278,6 +278,8 @@ import type {
   ExperimentalProjectsListOutput,
   ExperimentalProjectsUpdateInput,
   ExperimentalProjectsUpdateOutput,
+  ExperimentalWorkspaceDispatchInput,
+  ExperimentalWorkspaceDispatchOutput,
   ShellListInput,
   ShellListOutput,
   ShellCreateInput,
@@ -410,7 +412,8 @@ export function make(options: ClientOptions) {
 
   const request = async <A>(descriptor: RequestDescriptor, requestOptions?: RequestOptions): Promise<A> => {
     const response = await execute(descriptor, requestOptions)
-    if (response.status !== descriptor.successStatus) return responseError(response, descriptor)
+    if (descriptor.binary ? !response.ok : response.status !== descriptor.successStatus)
+      return responseError(response, descriptor)
     if (descriptor.binary) return new Uint8Array(await response.arrayBuffer()) as A
     if (descriptor.empty) {
       try {
@@ -1783,6 +1786,21 @@ export function make(options: ClientOptions) {
               successStatus: 200,
               declaredStatuses: [400, 401, 503],
               empty: false,
+            },
+            requestOptions,
+          ),
+      },
+      workspace: {
+        dispatch: (input: ExperimentalWorkspaceDispatchInput, requestOptions?: RequestOptions) =>
+          request<ExperimentalWorkspaceDispatchOutput>(
+            {
+              method: "POST",
+              path: `/api/experimental/workspace/${encodeURIComponent(input.workspaceID)}/dispatch`,
+              body: { method: input["method"], path: input["path"], headers: input["headers"], body: input["body"] },
+              successStatus: 200,
+              declaredStatuses: [400, 401, 403, 409, 503],
+              empty: false,
+              binary: true,
             },
             requestOptions,
           ),

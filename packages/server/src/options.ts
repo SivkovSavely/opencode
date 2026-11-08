@@ -16,6 +16,22 @@ export const ServerOptions = Schema.Struct({
   password: Schema.optional(Schema.String),
   cors: Schema.optional(Schema.Array(Schema.String)),
   simulation: Schema.optional(Schema.Boolean),
+  experimental: Schema.optional(
+    Schema.Struct({
+      // Host-only authority. Never populated from a request, public config, or workspace metadata.
+      workspaceTargets: Schema.optional(
+        Schema.Array(
+          Schema.Struct({
+            id: Schema.String,
+            url: Schema.String,
+            password: Schema.String,
+            directory: Schema.String,
+            operations: Schema.Array(Schema.String),
+          }),
+        ),
+      ),
+    }),
+  ),
   database: Schema.optional(Database.Options),
   pty: Schema.optional(PersistentPty.Options),
   events: Schema.optional(

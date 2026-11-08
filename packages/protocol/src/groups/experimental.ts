@@ -4,6 +4,7 @@ import { PersistentPtyGroup } from "./persistent-pty.js"
 import { ScheduleEndpoints } from "./schedule.js"
 import { TranscriptEndpoints } from "./transcript-search.js"
 import { ProjectListEndpoints } from "./project-list.js"
+import { WorkspaceDispatchEndpoint } from "./workspace.js"
 
 /** `server.experimental`: routes under /api/experimental, without compatibility guarantees. */
 export const ExperimentalGroup = PersistentPtyGroup.add(
@@ -12,4 +13,5 @@ export const ExperimentalGroup = PersistentPtyGroup.add(
   ...ArtifactEndpoints,
   ...TranscriptEndpoints,
   ...ProjectListEndpoints,
+  WorkspaceDispatchEndpoint,
 )

@@ -2624,6 +2624,18 @@ export type ExperimentalProjectsUpdateOperation<E = never> = (
   input: ExperimentalProjectsUpdateInput,
 ) => Effect.Effect<ExperimentalProjectsUpdateOutput, E>
 
+export type ExperimentalWorkspaceDispatchInput = {
+  readonly workspaceID: string
+  readonly method: "GET" | "POST" | "PUT" | "PATCH" | "DELETE" | "HEAD" | "OPTIONS" | "TRACE" | "QUERY"
+  readonly path: string
+  readonly headers: { readonly [x: string]: string }
+  readonly body?: string | undefined
+}
+export type ExperimentalWorkspaceDispatchOutput = globalThis.Uint8Array
+export type ExperimentalWorkspaceDispatchOperation<E = never> = (
+  input: ExperimentalWorkspaceDispatchInput,
+) => Effect.Effect<ExperimentalWorkspaceDispatchOutput, E>
+
 export interface ExperimentalApi<E = never> {
   readonly persistentPty: {
     readonly read: ExperimentalPersistentPtyReadOperation<E>
@@ -2663,6 +2675,7 @@ export interface ExperimentalApi<E = never> {
     readonly list: ExperimentalProjectsListOperation<E>
     readonly update: ExperimentalProjectsUpdateOperation<E>
   }
+  readonly workspace: { readonly dispatch: ExperimentalWorkspaceDispatchOperation<E> }
 }
 
 export type ShellListInput = { readonly location?: { readonly directory?: string | undefined } | undefined }

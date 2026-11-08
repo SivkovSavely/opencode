@@ -14373,6 +14373,98 @@
         }
       }
     },
+    "/api/experimental/workspace/{workspaceID}/dispatch": {
+      "post": {
+        "tags": ["persistentPty"],
+        "operationId": "experimental.workspace.dispatch",
+        "parameters": [
+          {
+            "name": "workspaceID",
+            "in": "path",
+            "schema": {
+              "type": "string"
+            },
+            "required": true
+          }
+        ],
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/octet-stream": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "InvalidRequestError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InvalidRequestErrorEncoded"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "UnauthorizedError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UnauthorizedErrorEncoded"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "ForbiddenError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ForbiddenErrorEncoded"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "ConflictError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConflictErrorEncoded"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "ServiceUnavailableError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServiceUnavailableErrorEncoded"
+                }
+              }
+            }
+          }
+        },
+        "description": "Experimental: may change without compatibility guarantees. Requires trusted host registration, independent backend credentials and explicit grants by declared native HTTP operation ID, including mutations and execution when authorized. Preserves backend status, media and streamed response. Recursive dispatch and interactive upgrades are denied. Session resources must belong to the registered backend location. No implicit-local fallback, additional execution policy or managed-isolation guarantee. The caller never supplies a destination URL or backend credentials.",
+        "summary": "Dispatch to a host-authorized workspace backend",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Workspace.DispatchInput"
+              }
+            }
+          },
+          "required": true
+        }
+      }
+    },
     "/api/shell": {
       "get": {
         "tags": ["shell"],
@@ -26237,6 +26329,37 @@
           }
         },
         "required": ["url", "time"],
+        "additionalProperties": false
+      },
+      "Workspace.DispatchInput": {
+        "type": "object",
+        "properties": {
+          "method": {
+            "type": "string",
+            "enum": ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "TRACE", "QUERY"]
+          },
+          "path": {
+            "type": "string"
+          },
+          "headers": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            }
+          },
+          "body": {
+            "anyOf": [
+              {
+                "type": "string",
+                "description": "Original request bytes, base64 encoded."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": ["method", "path", "headers"],
         "additionalProperties": false
       },
       "Worktree.CreateInput": {

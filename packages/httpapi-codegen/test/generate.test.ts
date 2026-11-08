@@ -1199,33 +1199,36 @@ describe("HttpApiCodegen.generate", () => {
     expect(await client.session.interrupt({ sessionID: "session" })).toBeUndefined()
   })
 
-  test("executes an emitted binary wildcard GET through fetch", async () => {
-    const output = emitPromise(
-      compileContract(
-        api(
-          HttpApiEndpoint.get("read", "/file/*", {
-            query: { token: Schema.optional(Schema.String) },
-            success: Schema.Uint8Array.pipe(HttpApiSchema.asUint8Array()),
-          }),
+  test.each([200, 201, 204, 206])(
+    "executes an emitted binary wildcard GET with status %i through fetch",
+    async (status) => {
+      const output = emitPromise(
+        compileContract(
+          api(
+            HttpApiEndpoint.get("read", "/file/*", {
+              query: { token: Schema.optional(Schema.String) },
+              success: Schema.Uint8Array.pipe(HttpApiSchema.asUint8Array()),
+            }),
+          ),
         ),
-      ),
-    )
-    await using emitted = await emittedModule(output)
-    let request: Request | undefined
-    const client = emitted.module.OpenCode.make({
-      baseUrl: "https://example.com",
-      fetch: async (input: RequestInfo | URL) => {
-        request = input instanceof Request ? input : new Request(input)
-        return new Response(new Uint8Array([1, 2, 3]))
-      },
-    })
+      )
+      await using emitted = await emittedModule(output)
+      let request: Request | undefined
+      const client = emitted.module.OpenCode.make({
+        baseUrl: "https://example.com",
+        fetch: async (input: RequestInfo | URL) => {
+          request = input instanceof Request ? input : new Request(input)
+          return new Response(status === 204 ? null : new Uint8Array([1, 2, 3]), { status })
+        },
+      })
 
-    const result = await client.session.read({ path: "src/a b#c.ts", token: "x/y" })
-    expect(result).toBeInstanceOf(Uint8Array)
-    expect(Array.from(result)).toEqual([1, 2, 3])
-    expect(request?.method).toBe("GET")
-    expect(request?.url).toBe("https://example.com/file/src/a%20b%23c.ts?token=x%2Fy")
-  })
+      const result = await client.session.read({ path: "src/a b#c.ts", token: "x/y" })
+      expect(result).toBeInstanceOf(Uint8Array)
+      expect(Array.from(result)).toEqual(status === 204 ? [] : [1, 2, 3])
+      expect(request?.method).toBe("GET")
+      expect(request?.url).toBe("https://example.com/file/src/a%20b%23c.ts?token=x%2Fy")
+    },
+  )
 
   test("serializes flattened query, header, and JSON payload inputs", async () => {
     const output = emitPromise(

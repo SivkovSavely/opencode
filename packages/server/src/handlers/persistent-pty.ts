@@ -24,6 +24,7 @@ import { type Outbound, runPtySocket } from "./pty-socket"
 import { makeSchedule } from "./schedule"
 import { TranscriptSearch } from "@opencode/core/session/transcript-search"
 import { ProjectList } from "@opencode/core/project-list"
+import { makeWorkspaceDispatch } from "../workspace"
 
 export const PersistentPtyHandler = HttpApiBuilder.group(Api, "server.experimental", (handlers) =>
   Effect.gen(function* () {
@@ -35,8 +36,10 @@ export const PersistentPtyHandler = HttpApiBuilder.group(Api, "server.experiment
     const schedule = yield* makeSchedule
     const transcript = yield* TranscriptSearch.make
     const projectList = yield* ProjectList.Service
+    const workspaceDispatch = yield* makeWorkspaceDispatch
 
     return handlers
+      .handle("workspace.dispatch", (ctx) => workspaceDispatch(ctx.params.workspaceID, ctx.payload))
       .handle("projects.list", () =>
         projectList.list().pipe(Effect.mapError((error) => new ServiceUnavailableError({ message: error.message }))),
       )

@@ -17,6 +17,8 @@
     "./server-process": "./src/server-process.ts"
   },
   "scripts": {
+    "api:generate": "bun run script/api-cli.ts",
+    "api:check": "bun run script/api-cli.ts --check",
     "build": "bun run script/build.ts",
     "build:node": "bun run script/build-node.ts",
     "pack": "bun run script/pack.ts",

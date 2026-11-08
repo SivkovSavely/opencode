@@ -40,10 +40,13 @@ type ProvidedCommand = Command.Command<
 
 export type Handlers<Node extends Spec.Any> = keyof Node["commands"] extends never
   ? Loader<Node>
-  : { readonly $?: Loader<Node> } & { readonly [Key in keyof Node["commands"]]: Handlers<Node["commands"][Key]> }
+  :
+      | Loader<Node>
+      | ({ readonly $?: Loader<Node> } & { readonly [Key in keyof Node["commands"]]: Handlers<Node["commands"][Key]> })
 
 interface LazyHandler {
   readonly spec: Command.Command.Any
+  readonly path: readonly string[]
   readonly load: () => Promise<{ default: RuntimeHandler }>
 }
 
@@ -64,20 +67,24 @@ export function handler<const Node extends Spec.Any, Error, Requirements>(
 export function handlers<const Root extends Spec.Any>(root: Root, handlers: Handlers<Root>) {
   const result: LazyHandler[] = []
 
-  function add(node: Spec.Any, value: RuntimeHandlers) {
+  function add(node: Spec.Any, value: RuntimeHandlers, path: readonly string[]) {
     if (typeof value === "function") {
-      result.push({ spec: node.spec, load: value as () => Promise<{ default: RuntimeHandler }> })
-      for (const alias of node.aliases) result.push({ spec: alias.spec, load: value as () => Promise<{ default: RuntimeHandler }> })
+      result.push({ spec: node.spec, path, load: value as () => Promise<{ default: RuntimeHandler }> })
+      for (const alias of node.aliases)
+        result.push({ spec: alias.spec, path, load: value as () => Promise<{ default: RuntimeHandler }> })
+      for (const child of Object.values(node.commands)) add(child, value, [...path, child.name])
       return
     }
     if (value.$) {
-      result.push({ spec: node.spec, load: value.$ as () => Promise<{ default: RuntimeHandler }> })
-      for (const alias of node.aliases) result.push({ spec: alias.spec, load: value.$ as () => Promise<{ default: RuntimeHandler }> })
+      result.push({ spec: node.spec, path, load: value.$ as () => Promise<{ default: RuntimeHandler }> })
+      for (const alias of node.aliases)
+        result.push({ spec: alias.spec, path, load: value.$ as () => Promise<{ default: RuntimeHandler }> })
     }
-    for (const [name, child] of Object.entries(node.commands)) add(child, value[name] as RuntimeHandlers)
+    for (const [name, child] of Object.entries(node.commands))
+      add(child, value[name] as RuntimeHandlers, [...path, name])
   }
 
-  add(root, handlers as RuntimeHandlers)
+  add(root, handlers as RuntimeHandlers, [])
   return result
 }
 

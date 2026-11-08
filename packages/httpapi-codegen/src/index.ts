@@ -844,7 +844,7 @@ function renderImportedEffectFiles(
       // HttpApiClient distributes union payloads into union request objects, while rebuilding a flattened input
       // produces one object containing a union value. The shapes are equivalent but TypeScript cannot correlate them.
       const rawCall = `raw[${JSON.stringify(item.endpoint.identifier)}]({ ${request} }${isOpaquePayload(item) ? ` as ${prefix}Request` : ""})`
-      const mapped = `${rawCall}.pipe(Effect.mapError(mapClientError)${item.unwrapData ? ", Effect.map((value) => value.data)" : ""})`
+      const mapped = `${rawCall}.pipe(${renderBinarySuccessRecovery(item)}Effect.mapError(mapClientError)${item.unwrapData ? ", Effect.map((value) => value.data)" : ""})`
       const result =
         item.operation.success === "stream"
           ? `Stream.unwrap(${rawCall}.pipe(Effect.mapError(mapClientError), Effect.map((stream) => stream.pipe(Stream.mapError(mapClientError)))))`
@@ -1561,7 +1561,11 @@ function normalizePromiseClientContent(content: string, groups: ReadonlyArray<Gr
   const sseReady = replaceOne(content, "let next: ReadableStreamReadResult<Uint8Array>", "let next")
   const binaryReady = usesBinary
     ? replaceOne(
-        replaceOne(sseReady, "readonly empty: boolean\n}", "readonly empty: boolean\n  readonly binary?: true\n}"),
+        replaceOne(
+          replaceOne(sseReady, "readonly empty: boolean\n}", "readonly empty: boolean\n  readonly binary?: true\n}"),
+          "if (response.status !== descriptor.successStatus)",
+          "if (descriptor.binary ? !response.ok : response.status !== descriptor.successStatus)",
+        ),
         "if (descriptor.empty) {",
         "if (descriptor.binary) return new Uint8Array(await response.arrayBuffer()) as A\n    if (descriptor.empty) {",
       )
@@ -1627,6 +1631,13 @@ function promiseWildcardInput(endpoint: Endpoint): PromiseInputField | undefined
 
 function isBinarySchema(schema: Schema.Top) {
   return (resolveHttpApiEncoding(schema.ast)?._tag ?? "Json") === "Uint8Array"
+}
+
+function renderBinarySuccessRecovery(endpoint: Endpoint) {
+  // Native HttpApiClient selects exact statuses; raw binary responses retain backend 2xx statuses.
+  return isBinarySchema(endpoint.successes[0])
+    ? 'Effect.catch((error) => HttpClientError.isHttpClientError(error) && error.reason._tag === "DecodeError" && error.reason.response.status >= 200 && error.reason.response.status < 300 ? Effect.map(error.reason.response.arrayBuffer, (buffer) => new Uint8Array(buffer)) : Effect.fail(error)), '
+    : ""
 }
 
 function promisePath(path: string, input: ReadonlyArray<InputField>, wildcard?: PromiseInputField) {
@@ -2174,7 +2185,7 @@ function renderGroup(group: Group) {
     // HttpApiClient distributes union payloads into union request objects, while rebuilding a flattened input
     // produces one object containing a union value. The shapes are equivalent but TypeScript cannot correlate them.
     const rawCall = `raw[${JSON.stringify(endpoint.identifier)}]({ ${request} }${opaquePayload ? ` as ${prefix}Request` : ""})`
-    const mapped = `${rawCall}.pipe(Effect.mapError(map${prefix}Error)${operation.unwrapData ? ", Effect.map((value) => value.data)" : ""})`
+    const mapped = `${rawCall}.pipe(${renderBinarySuccessRecovery(operation)}Effect.mapError(map${prefix}Error)${operation.unwrapData ? ", Effect.map((value) => value.data)" : ""})`
     const inputDeclaration =
       operation.operation.inputMode === "none"
         ? ""

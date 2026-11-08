@@ -4793,6 +4793,16 @@ export type ExperimentalProjectsUpdateInput = {
 
 export type ExperimentalProjectsUpdateOutput = ProjectListSnapshot
 
+export type ExperimentalWorkspaceDispatchInput = {
+  readonly workspaceID: string
+  readonly method: "GET" | "POST" | "PUT" | "PATCH" | "DELETE" | "HEAD" | "OPTIONS" | "TRACE" | "QUERY"
+  readonly path: string
+  readonly headers: { readonly [x: string]: string }
+  readonly body?: string | undefined
+}
+
+export type ExperimentalWorkspaceDispatchOutput = globalThis.Uint8Array
+
 export type ShellListInput = { readonly location?: { readonly directory?: string | undefined } | undefined }
 
 export type ShellListOutput = { location: LocationPublicRef; data: Array<ShellInfo1> }

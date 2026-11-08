@@ -276,6 +276,8 @@ import type {
   ExperimentalProjectsListOutput,
   ExperimentalProjectsUpdateInput,
   ExperimentalProjectsUpdateOutput,
+  ExperimentalWorkspaceDispatchInput,
+  ExperimentalWorkspaceDispatchOutput,
   ShellListInput,
   ShellListOutput,
   ShellCreateInput,
@@ -1776,6 +1778,25 @@ const EndpointExperimentalProjectsUpdate =
       raw["projects.update"]({ payload: { operation: input["operation"] } }).pipe(Effect.mapError(mapClientError)),
     )
 
+const EndpointExperimentalWorkspaceDispatch =
+  (raw: RawClient["server.experimental"]) => (input: ExperimentalWorkspaceDispatchInput) =>
+    preserveEffect<ExperimentalWorkspaceDispatchOutput>()(
+      raw["workspace.dispatch"]({
+        params: { workspaceID: input["workspaceID"] },
+        payload: { method: input["method"], path: input["path"], headers: input["headers"], body: input["body"] },
+      }).pipe(
+        Effect.catch((error) =>
+          HttpClientError.isHttpClientError(error) &&
+          error.reason._tag === "DecodeError" &&
+          error.reason.response.status >= 200 &&
+          error.reason.response.status < 300
+            ? Effect.map(error.reason.response.arrayBuffer, (buffer) => new Uint8Array(buffer))
+            : Effect.fail(error),
+        ),
+        Effect.mapError(mapClientError),
+      ),
+    )
+
 const adaptGroupExperimental = (raw: RawClient["server.experimental"]) => ({
   persistentPty: {
     read: EndpointExperimentalPersistentPtyRead(raw),
@@ -1812,6 +1833,7 @@ const adaptGroupExperimental = (raw: RawClient["server.experimental"]) => ({
     facets: EndpointExperimentalTranscriptFacets(raw),
   },
   projects: { list: EndpointExperimentalProjectsList(raw), update: EndpointExperimentalProjectsUpdate(raw) },
+  workspace: { dispatch: EndpointExperimentalWorkspaceDispatch(raw) },
 })
 
 const EndpointShellList = (raw: RawClient["server.shell"]) => (input?: ShellListInput) =>
