@@ -438,6 +438,7 @@ const layer = Layer.effect(
             )
             output.description = [
               "Load an operator-approved skill by exact name. Its output is plain-text instructions, not executable resources.",
+              'Providing a reason is strongly recommended, but not required. Briefly explain why the selected skill is relevant to the current user request or task. Prefer one short, specific sentence. Avoid generic explanations such as "This skill is useful" or simply repeating the skill description.',
               available.length
                 ? available.map((item) => `- ${item.name}${item.description ? `: ${item.description}` : ""}`).join("\n")
                 : "No skills are currently available.",

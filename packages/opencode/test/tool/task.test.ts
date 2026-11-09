@@ -15,12 +15,17 @@ import { Session } from "@/session/session"
 import { Format } from "../../src/format"
 import { LSP } from "@/lsp/lsp"
 import { FSUtil } from "@opencode-ai/core/fs-util"
-import type { SessionPrompt } from "../../src/session/prompt"
+import { SessionPrompt } from "../../src/session/prompt"
+import { MessageV2 } from "../../src/session/message-v2"
+import { Provider } from "../../src/provider/provider"
+import { Plugin } from "../../src/plugin"
+import { LLMRequestPrep } from "../../src/session/llm/request"
 import { MessageID, PartID, SessionID } from "../../src/session/schema"
 import { SessionRunState } from "@/session/run-state"
 import { SessionStatus } from "@/session/status"
 
 import { TaskTool, type TaskPromptOps } from "../../src/tool/task"
+import { ToolJsonSchema } from "../../src/tool/json-schema"
 import { CompressTool } from "../../src/tool/compress"
 import { ApplyPatchTool } from "../../src/tool/apply_patch"
 import { Truncate } from "@/tool/truncate"
@@ -56,6 +61,7 @@ const layer = (flags: Partial<RuntimeFlags.Info> = {}) =>
       LSP.node,
       CrossSpawnSpawner.node,
       Session.node,
+      SessionPrompt.node,
       SessionProjector.node,
       SessionRunState.node,
       SessionStatus.node,
@@ -64,12 +70,43 @@ const layer = (flags: Partial<RuntimeFlags.Info> = {}) =>
       Database.node,
       RuntimeFlags.node,
       Ripgrep.node,
+      Provider.node,
+      Plugin.node,
     ]),
     [[RuntimeFlags.node, RuntimeFlags.layer(flags)]],
   )
 
 const it = testEffect(layer())
 const background = testEffect(layer({ experimentalBackgroundSubagents: true }))
+
+const modelConfig = {
+  enabled_providers: ["test"],
+  provider: {
+    test: {
+      npm: "@ai-sdk/openai-compatible",
+      options: { apiKey: "test-key" },
+      blacklist: ["unavailable-model"],
+      models: {
+        "test-model": { name: "Parent", variants: { xhigh: { reasoningEffort: "xhigh" } } },
+        "configured-model": {
+          name: "Configured",
+          options: { reasoningEffort: "low" },
+          variants: {
+            default: { reasoningEffort: "xhigh" },
+            high: { reasoningEffort: "high" },
+            low: { reasoningEffort: "low" },
+          },
+        },
+        "org/override-model": {
+          name: "Override",
+          variants: { low: { reasoningEffort: "low" }, high: { reasoningEffort: "high" } },
+        },
+        "plain-model": { name: "Plain" },
+        "unavailable-model": { name: "Unavailable" },
+      },
+    },
+  },
+}
 
 function defer<T>() {
   let resolve!: (value: T | PromiseLike<T>) => void
@@ -183,6 +220,341 @@ function reply(
 }
 
 describe("tool.task", () => {
+  for (const source of ["json", "markdown"]) {
+    for (const selection of [
+      {
+        name: "configured model and variant without an override",
+        agent: "configured",
+        model: undefined,
+        modelID: "configured-model",
+        variant: undefined,
+        savedVariant: "high",
+        effort: "high",
+        inheritVariant: false,
+      },
+      {
+        name: "parent model and variant without a configured model",
+        agent: "inherited",
+        model: undefined,
+        modelID: "test-model",
+        variant: "xhigh",
+        savedVariant: "xhigh",
+        effort: "xhigh",
+        inheritVariant: true,
+      },
+      {
+        name: "model-only override of a configured model",
+        agent: "configured",
+        model: "test/org/override-model",
+        modelID: "org/override-model",
+        variant: "",
+        savedVariant: "",
+        effort: undefined,
+        inheritVariant: false,
+      },
+      {
+        name: "model and variant override of a configured model",
+        agent: "configured",
+        model: "test/org/override-model#low",
+        modelID: "org/override-model",
+        variant: "low",
+        savedVariant: "low",
+        effort: "low",
+        inheritVariant: false,
+      },
+      {
+        name: "model-only override matching the configured model resets its variant",
+        agent: "configured",
+        model: "test/configured-model",
+        modelID: "configured-model",
+        variant: "",
+        savedVariant: "",
+        effort: "low",
+        inheritVariant: false,
+      },
+      {
+        name: "variant override matching the configured model",
+        agent: "configured",
+        model: "test/configured-model#low",
+        modelID: "configured-model",
+        variant: "low",
+        savedVariant: "low",
+        effort: "low",
+        inheritVariant: false,
+      },
+      {
+        name: "explicit named default variant is distinct from model-only selection",
+        agent: "configured",
+        model: "test/configured-model#default",
+        modelID: "configured-model",
+        variant: "default",
+        savedVariant: "default",
+        effort: "xhigh",
+        inheritVariant: false,
+      },
+      {
+        name: "model-only override does not inherit the parent variant",
+        agent: "inherited",
+        model: "test/test-model",
+        modelID: "test-model",
+        variant: "",
+        savedVariant: "",
+        effort: undefined,
+        inheritVariant: false,
+      },
+    ]) {
+      it.instance(
+        `${selection.name} (${source})`,
+        () =>
+          Effect.gen(function* () {
+            const sessions = yield* Session.Service
+            const prompt = yield* SessionPrompt.Service
+            const agents = yield* Agent.Service
+            const before = yield* agents.get("configured")
+            const { chat, assistant } = yield* seed()
+            const tool = yield* TaskTool.pipe(Effect.flatMap((tool) => tool.init()))
+            const inputs: SessionPrompt.PromptInput[] = []
+            const result = yield* tool.execute(
+              {
+                description: "select model",
+                prompt: "inspect",
+                subagent_type: selection.agent,
+                model: selection.model,
+              },
+              {
+                sessionID: chat.id,
+                messageID: assistant.id,
+                callID: "selection",
+                agent: "build",
+                abort: new AbortController().signal,
+                extra: {
+                  promptOps: {
+                    ...stubOps(),
+                    prompt: (input, parent) => {
+                      inputs.push(input)
+                      return prompt.prompt({ ...input, noReply: true }, parent).pipe(Effect.orDie)
+                    },
+                  } satisfies TaskPromptOps,
+                },
+                messages: [],
+                metadata: () => Effect.void,
+                ask: () => Effect.void,
+              },
+            )
+            expect(inputs).toHaveLength(1)
+            expect(inputs[0]?.model).toEqual({
+              providerID: ref.providerID,
+              modelID: ModelV2.ID.make(selection.modelID),
+            })
+            expect(inputs[0]?.variant).toBe(selection.variant)
+            const saved = yield* MessageV2.get({
+              sessionID: SessionID.make(result.metadata.sessionId),
+              messageID: MessageID.make(result.metadata.messageID),
+            })
+            expect(saved.info.role === "user" && saved.info.model).toEqual({
+              providerID: ref.providerID,
+              modelID: ModelV2.ID.make(selection.modelID),
+              variant: selection.savedVariant,
+            })
+            if (saved.info.role !== "user") throw new Error("expected persisted user message")
+            const selected = yield* agents.get(selection.agent)
+            if (!selected) throw new Error("expected subagent")
+            const providers = yield* Provider.Service
+            const plugin = yield* Plugin.Service
+            const flags = yield* RuntimeFlags.Service
+            const request = yield* LLMRequestPrep.prepare({
+              user: saved.info,
+              sessionID: saved.info.sessionID,
+              model: yield* providers.getModel(saved.info.model.providerID, saved.info.model.modelID),
+              agent: selected,
+              system: [],
+              messages: [],
+              tools: {},
+              provider: yield* providers.getProvider(saved.info.model.providerID),
+              auth: undefined,
+              plugin,
+              flags,
+              isWorkflow: false,
+            })
+            expect(request.params.options.reasoningEffort).toBe(selection.effort)
+            expect(result.metadata).toMatchObject({
+              model: { providerID: "test", modelID: selection.modelID },
+              variant: selection.variant,
+              inheritVariant: selection.inheritVariant,
+            })
+            expect((yield* sessions.get(SessionID.make(result.metadata.sessionId))).metadata?.task).toMatchObject({
+              model: { providerID: "test", modelID: selection.modelID },
+              ...(selection.variant === undefined ? {} : { variant: selection.variant }),
+              inheritVariant: selection.inheritVariant,
+            })
+            expect(yield* agents.get("configured")).toEqual(before)
+            expect((yield* MessageV2.get({ sessionID: chat.id, messageID: assistant.id })).info).toEqual(assistant)
+          }),
+        {
+          config: {
+            ...modelConfig,
+            agent: {
+              inherited: { mode: "subagent", variant: "high" },
+              ...(source === "json"
+                ? { configured: { mode: "subagent", model: "test/configured-model", variant: "high" } }
+                : {}),
+            },
+          },
+          init: (directory) =>
+            source === "markdown"
+              ? Effect.promise(() =>
+                  Bun.write(
+                    path.join(directory, ".opencode/agents/configured.md"),
+                    "---\nmode: subagent\nmodel: test/configured-model\nvariant: high\n---\nConfigured subagent.\n",
+                  ),
+                ).pipe(Effect.asVoid)
+              : Effect.void,
+        },
+      )
+    }
+  }
+
+  for (const [model, error] of [
+    ["", "Invalid model"],
+    ["test-model", "Invalid model"],
+    ["/test-model", "Invalid model"],
+    ["test/", "Invalid model"],
+    ["te#st/test-model", "Invalid model"],
+    ["test/test-model#", "Invalid model"],
+    ["test/test-model#high#low", "Invalid model"],
+    ["missing/test-model", "Model not found: missing/test-model"],
+    ["test/missing-model", "Model not found: test/missing-model"],
+    ["test/unavailable-model", "Model not found: test/unavailable-model"],
+    ["test/toString", "Model not found: test/toString"],
+    ["test/constructor", "Model not found: test/constructor"],
+    ["test/__proto__", "Model not found: test/__proto__"],
+    ["toString/test-model", "Model not found: toString/test-model"],
+    ["constructor/test-model", "Model not found: constructor/test-model"],
+    ["__proto__/test-model", "Model not found: __proto__/test-model"],
+    ["test/org/override-model#unsupported", 'Variant "unsupported"'],
+    ["test/org/override-model#toString", 'Variant "toString"'],
+    ["test/plain-model#high", "has no variants"],
+  ]) {
+    it.instance(
+      `rejects explicit model ${JSON.stringify(model)} before creating or resuming a child`,
+      () =>
+        Effect.gen(function* () {
+          const sessions = yield* Session.Service
+          const { chat, assistant } = yield* seed()
+          const child = yield* sessions.create({ parentID: chat.id, title: "Existing child" })
+          const tool = yield* TaskTool.pipe(Effect.flatMap((tool) => tool.init()))
+          let prompts = 0
+          let metadata = 0
+          for (const task_id of [undefined, child.id]) {
+            const exit = yield* tool
+              .execute(
+                { description: "invalid model", prompt: "inspect", subagent_type: "general", model, task_id },
+                {
+                  sessionID: chat.id,
+                  messageID: assistant.id,
+                  agent: "build",
+                  abort: new AbortController().signal,
+                  extra: { promptOps: stubOps({ onPrompt: () => prompts++ }) },
+                  messages: [],
+                  metadata: () => Effect.sync(() => void metadata++),
+                  ask: () => Effect.void,
+                },
+              )
+              .pipe(Effect.exit)
+            expect(Exit.isFailure(exit)).toBe(true)
+            if (Exit.isFailure(exit)) expect(Cause.pretty(exit.cause)).toContain(error)
+          }
+          expect(prompts).toBe(0)
+          expect(metadata).toBe(0)
+          expect((yield* sessions.children(chat.id)).map((session) => session.id)).toEqual([child.id])
+          expect(yield* sessions.get(child.id)).toEqual(child)
+        }),
+      { config: modelConfig },
+    )
+  }
+
+  it.instance(
+    "task_id model overrides are per-call and omission restores V1 agent selection",
+    () =>
+      Effect.gen(function* () {
+        const sessions = yield* Session.Service
+        const prompt = yield* SessionPrompt.Service
+        const { chat, assistant } = yield* seed()
+        const tool = yield* TaskTool.pipe(Effect.flatMap((tool) => tool.init()))
+        const childIDs: string[] = []
+        for (const [index, selection] of [
+          { model: "test/org/override-model#low", modelID: "org/override-model", variant: "low" },
+          { model: undefined, modelID: "configured-model", variant: "high" },
+          { model: "test/configured-model", modelID: "configured-model", variant: "" },
+          { model: "test/configured-model#low", modelID: "configured-model", variant: "low" },
+        ].entries()) {
+          const result = yield* tool.execute(
+            {
+              description: "resume selection",
+              prompt: `follow-up ${index}`,
+              subagent_type: "configured",
+              model: selection.model,
+              task_id: childIDs[0],
+            },
+            {
+              sessionID: chat.id,
+              messageID: assistant.id,
+              callID: `resume-${index}`,
+              agent: "build",
+              abort: new AbortController().signal,
+              extra: {
+                promptOps: {
+                  ...stubOps(),
+                  prompt: (input, parent) => prompt.prompt({ ...input, noReply: true }, parent).pipe(Effect.orDie),
+                } satisfies TaskPromptOps,
+              },
+              messages: [],
+              metadata: () => Effect.void,
+              ask: () => Effect.void,
+            },
+          )
+          childIDs.push(result.metadata.sessionId)
+          const saved = yield* MessageV2.get({
+            sessionID: SessionID.make(result.metadata.sessionId),
+            messageID: MessageID.make(result.metadata.messageID),
+          })
+          expect(saved.info.role === "user" && saved.info.model).toEqual({
+            providerID: ref.providerID,
+            modelID: ModelV2.ID.make(selection.modelID),
+            variant: selection.variant,
+          })
+          expect(result.metadata.model).toEqual({
+            providerID: ref.providerID,
+            modelID: ModelV2.ID.make(selection.modelID),
+          })
+        }
+        expect(new Set(childIDs).size).toBe(1)
+        expect(yield* sessions.children(chat.id)).toHaveLength(1)
+      }),
+    {
+      config: {
+        ...modelConfig,
+        agent: { configured: { mode: "subagent", model: "test/configured-model", variant: "high" } },
+      },
+    },
+  )
+
+  for (const [runner, enabled] of [
+    [it, false],
+    [background, true],
+  ] as const) {
+    runner.instance(`exposes optional model with background subagents ${enabled ? "enabled" : "disabled"}`, () =>
+      Effect.gen(function* () {
+        const tool = yield* TaskTool.pipe(Effect.flatMap((tool) => tool.init()))
+        const schema = tool.jsonSchema ?? ToolJsonSchema.fromSchema(tool.parameters)
+        expect(schema.properties?.model).toMatchObject({ type: "string" })
+        expect(schema.required).not.toContain("model")
+        expect(schema.properties).not.toHaveProperty("variant")
+        expect(schema.properties?.background !== undefined).toBe(enabled)
+      }),
+    )
+  }
+
   it.instance("read-only managed children preserve their ceiling through nested task creation and resume", () =>
     Effect.gen(function* () {
       const previous = process.env.OPENCODE_MANAGED_PROFILE
@@ -353,6 +725,8 @@ describe("tool.task", () => {
         // Load the test's trusted agent configuration before enabling managed project-config isolation.
         const agents = yield* Agent.Service
         expect(yield* agents.get("reviewer")).toBeDefined()
+        const provider = yield* Provider.Service
+        yield* provider.getModel(ProviderV2.ID.make("test"), ModelV2.ID.make("org/override-model"))
         const previous = process.env.OPENCODE_MANAGED_PROFILE
         yield* Effect.acquireRelease(
           Effect.sync(() => {
@@ -387,6 +761,11 @@ describe("tool.task", () => {
               () =>
                 Effect.gen(function* () {
                   children.push(input.sessionID)
+                  expect(input.model).toEqual({
+                    providerID: ref.providerID,
+                    modelID: ModelV2.ID.make("org/override-model"),
+                  })
+                  expect(input.variant).toBe("low")
                   expect(yield* jobs.get(input.sessionID)).toBeUndefined()
                   const child = yield* sessions.get(input.sessionID)
                   expect(child.parentID).toBe(chat.id)
@@ -420,6 +799,7 @@ describe("tool.task", () => {
               description: `${name} review`,
               prompt: "Review without detaching",
               subagent_type: name,
+              model: "test/org/override-model#low",
               background,
               task_id,
             },
@@ -499,6 +879,7 @@ describe("tool.task", () => {
       }),
     {
       config: {
+        ...modelConfig,
         agent: {
           build: { permission: { bash: { "*": "deny", "echo *": "allow", "rm *": "deny" }, task: "deny" } },
           reviewer: { mode: "subagent", permission: { bash: { "*": "allow", "echo secret": "deny" }, task: "allow" } },
@@ -1560,78 +1941,94 @@ describe("tool.task", () => {
     }),
   )
 
-  background.instance("background task completion waits for running updates", () =>
-    Effect.gen(function* () {
-      const jobs = yield* BackgroundJob.Service
-      const { chat, assistant } = yield* seed()
-      const tool = yield* TaskTool
-      const def = yield* tool.init()
-      const first = defer<void>()
-      const second = defer<void>()
-      const updated = defer<SessionPrompt.PromptInput>()
-      const injected = defer<SessionPrompt.PromptInput>()
-      let prompts = 0
-      const promptOps: TaskPromptOps = {
-        ...stubOps(),
-        prompt: (input) => {
-          if (input.sessionID === chat.id) {
-            injected.resolve(input)
-            return Effect.succeed(reply(input, "done"))
-          }
-          prompts++
-          if (prompts === 1) return Effect.promise(() => first.promise).pipe(Effect.as(reply(input, "first done")))
-          updated.resolve(input)
-          return Effect.promise(() => second.promise).pipe(Effect.as(reply(input, "second done")))
-        },
-      }
-      const context = {
-        sessionID: chat.id,
-        messageID: assistant.id,
-        agent: "build",
-        abort: new AbortController().signal,
-        extra: { promptOps },
-        messages: [],
-        metadata: () => Effect.void,
-        ask: () => Effect.void,
-      }
+  background.instance(
+    "background task completion waits for running updates",
+    () =>
+      Effect.gen(function* () {
+        const jobs = yield* BackgroundJob.Service
+        const { chat, assistant } = yield* seed()
+        const tool = yield* TaskTool
+        const def = yield* tool.init()
+        const first = defer<void>()
+        const second = defer<void>()
+        const updated = defer<SessionPrompt.PromptInput>()
+        const injected = defer<SessionPrompt.PromptInput>()
+        const inputs: SessionPrompt.PromptInput[] = []
+        let prompts = 0
+        const promptOps: TaskPromptOps = {
+          ...stubOps(),
+          prompt: (input) => {
+            if (input.sessionID === chat.id) {
+              injected.resolve(input)
+              return Effect.succeed(reply(input, "done"))
+            }
+            inputs.push(input)
+            prompts++
+            if (prompts === 1) return Effect.promise(() => first.promise).pipe(Effect.as(reply(input, "first done")))
+            updated.resolve(input)
+            return Effect.promise(() => second.promise).pipe(Effect.as(reply(input, "second done")))
+          },
+        }
+        const context = {
+          sessionID: chat.id,
+          messageID: assistant.id,
+          agent: "build",
+          abort: new AbortController().signal,
+          extra: { promptOps },
+          messages: [],
+          metadata: () => Effect.void,
+          ask: () => Effect.void,
+        }
 
-      const started = yield* def.execute(
-        {
-          description: "inspect bug",
-          prompt: "look into the cache key path",
-          subagent_type: "general",
-          background: true,
-        },
-        context,
-      )
-      const result = yield* def.execute(
-        {
-          description: "add investigation scope",
-          prompt: "also inspect cancellation",
-          subagent_type: "general",
-          task_id: started.metadata.sessionId,
-        },
-        context,
-      )
+        const started = yield* def.execute(
+          {
+            description: "inspect bug",
+            prompt: "look into the cache key path",
+            subagent_type: "general",
+            background: true,
+            model: "test/org/override-model",
+          },
+          context,
+        )
+        const result = yield* def.execute(
+          {
+            description: "add investigation scope",
+            prompt: "also inspect cancellation",
+            subagent_type: "general",
+            task_id: started.metadata.sessionId,
+            model: "test/configured-model#low",
+          },
+          context,
+        )
 
-      expect(result.metadata.sessionId).toBe(started.metadata.sessionId)
-      expect(result.metadata.background).toBe(true)
-      expect(result.output).toContain("Background task updated")
-      first.resolve()
-      expect((yield* jobs.get(started.metadata.sessionId))?.status).toBe("running")
-      expect((yield* Effect.promise(() => updated.promise)).parts).toEqual([
-        { type: "text", text: "also inspect cancellation" },
-      ])
+        expect(result.metadata.sessionId).toBe(started.metadata.sessionId)
+        expect(result.metadata.background).toBe(true)
+        expect(result.output).toContain("Background task updated")
+        first.resolve()
+        expect((yield* jobs.get(started.metadata.sessionId))?.status).toBe("running")
+        expect((yield* Effect.promise(() => updated.promise)).parts).toEqual([
+          { type: "text", text: "also inspect cancellation" },
+        ])
+        expect(inputs.map((input) => ({ model: input.model, variant: input.variant }))).toEqual([
+          { model: { providerID: ref.providerID, modelID: ModelV2.ID.make("org/override-model") }, variant: "" },
+          { model: { providerID: ref.providerID, modelID: ModelV2.ID.make("configured-model") }, variant: "low" },
+        ])
+        expect(result.metadata).toMatchObject({
+          model: { providerID: "test", modelID: "configured-model" },
+          variant: "low",
+          inheritVariant: false,
+        })
 
-      second.resolve()
-      const waited = yield* jobs.wait({ id: started.metadata.sessionId, timeout: 1_000 })
-      expect(waited.info?.status).toBe("completed")
-      expect(waited.info?.output).toBe("second done")
-      const notification = yield* Effect.promise(() => injected.promise)
-      expect(notification.variant).toBe("xhigh")
-      expect(notification.parts[0]?.type).toBe("text")
-      if (notification.parts[0]?.type === "text") expect(notification.parts[0].text).toContain("second done")
-    }),
+        second.resolve()
+        const waited = yield* jobs.wait({ id: started.metadata.sessionId, timeout: 1_000 })
+        expect(waited.info?.status).toBe("completed")
+        expect(waited.info?.output).toBe("second done")
+        const notification = yield* Effect.promise(() => injected.promise)
+        expect(notification.variant).toBe("xhigh")
+        expect(notification.parts[0]?.type).toBe("text")
+        if (notification.parts[0]?.type === "text") expect(notification.parts[0].text).toContain("second done")
+      }),
+    { config: modelConfig },
   )
 
   background.instance("background tasks complete through the background job service", () =>

@@ -289,6 +289,10 @@ exports[`tool parameters JSON Schema (wire shape) skill 1`] = `
       "description": "The name of the skill from available_skills",
       "type": "string",
     },
+    "reason": {
+      "description": "Providing a reason is strongly recommended, but not required. Briefly explain why the selected skill is relevant to the current user request or task. Prefer one short, specific sentence. Avoid generic explanations such as "This skill is useful" or simply repeating the skill description.",
+      "type": "string",
+    },
   },
   "required": [
     "name",
@@ -311,6 +315,10 @@ exports[`tool parameters JSON Schema (wire shape) task 1`] = `
     },
     "description": {
       "description": "A short (3-5 words) description of the task",
+      "type": "string",
+    },
+    "model": {
+      "description": "NEVER set this unless the user explicitly asks for a particular model or variant. Use "providerID/modelID" or "providerID/modelID#variant". Omitting the variant uses the model default, ignoring agent and parent variants.",
       "type": "string",
     },
     "prompt": {
