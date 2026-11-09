@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test"
 import { createServer, type IncomingMessage } from "node:http"
 import { type AddressInfo } from "node:net"
 import { WebSocketServer } from "ws"
+import type { Auth } from "../../src/auth"
 import {
   CodexAuthPlugin,
   parseJwtClaims,
@@ -48,6 +49,11 @@ describe("plugin.codex", () => {
       const header = Buffer.from("{}").toString("base64url")
       const invalidJson = Buffer.from("not json").toString("base64url")
       expect(parseJwtClaims(`${header}.${invalidJson}.sig`)).toBeUndefined()
+    })
+
+    test("ignores malformed claim types", () => {
+      const claims = parseJwtClaims(createTestJwt({ chatgpt_account_id: 123, organizations: "invalid" }))
+      expect(claims && extractAccountIdFromClaims(claims)).toBeUndefined()
     })
   })
 
@@ -229,6 +235,7 @@ describe("plugin.codex", () => {
       },
     })
     const hooks = await CodexAuthPlugin({} as never, {
+      issuer: server.url.origin,
       codexApiEndpoint: new URL("/backend-api/codex/responses", server.url).toString(),
     })
     const loaded = await hooks.auth!.loader!(
@@ -244,7 +251,7 @@ describe("plugin.codex", () => {
       {} as never,
     )
 
-    await loaded.fetch!("https://api.openai.com/v1/responses")
+    await loaded.fetch!(new URL("/v1/responses", server.url))
     await loaded.fetch!(new URL("/other", server.url))
 
     expect(requests).toEqual([
@@ -256,6 +263,7 @@ describe("plugin.codex", () => {
   test("sends token residency through the WebSocket transport", async () => {
     await using server = await createCodexWebSocketServer()
     const hooks = await CodexAuthPlugin({} as never, {
+      issuer: new URL(server.url).origin,
       codexApiEndpoint: server.url,
       experimentalWebSockets: true,
     })
@@ -272,7 +280,7 @@ describe("plugin.codex", () => {
       {} as never,
     )
 
-    const response = await loaded.fetch!("https://api.openai.com/v1/responses", {
+    const response = await loaded.fetch!(new URL("/v1/responses", server.url), {
       method: "POST",
       headers: { "session-id": "session-1" },
       body: JSON.stringify({ stream: true, input: "hi" }),
@@ -365,19 +373,15 @@ describe("plugin.codex", () => {
     const refreshedAccess = createTestJwt({
       "https://api.openai.com/auth": { chatgpt_compute_residency: "eu" },
     })
-    let auth = {
-      type: "oauth" as const,
+    let auth: Auth.Oauth = {
+      type: "oauth",
       refresh: "refresh-old",
       access: "",
       expires: 0,
     }
-    const authUpdates: Array<{
-      body: { refresh: string; access: string; expires: number; accountId?: string }
-    }> = []
-    let resolveRefresh: (() => void) | undefined
-    const refreshReady = new Promise<void>((resolve) => {
-      resolveRefresh = resolve
-    })
+    const authUpdates: Auth.Oauth[] = []
+    const refreshStarted = Promise.withResolvers<void>()
+    const refreshReady = Promise.withResolvers<void>()
     let refreshRequests = 0
     const apiRequests: { authorization: string | null; accountId: string | null; residency: string | null }[] = []
 
@@ -388,7 +392,8 @@ describe("plugin.codex", () => {
         if (url.pathname === "/oauth/token") {
           expect(await request.text()).toContain("refresh_token=refresh-old")
           refreshRequests += 1
-          await refreshReady
+          refreshStarted.resolve()
+          await refreshReady.promise
           return Response.json({
             id_token: createTestJwt({ chatgpt_account_id: "acc-123" }),
             access_token: refreshedAccess,
@@ -410,66 +415,38 @@ describe("plugin.codex", () => {
       },
     })
 
-    const hooks = await CodexAuthPlugin(
-      {
-        client: {
-          auth: {
-            async set(input: { body: { refresh: string; access: string; expires: number; accountId?: string } }) {
-              authUpdates.push(input)
-              auth = {
-                type: "oauth",
-                refresh: input.body.refresh,
-                access: input.body.access,
-                expires: input.body.expires,
-                ...(input.body.accountId && { accountId: input.body.accountId }),
-              }
-            },
-          },
-        } as never,
-        project: {} as never,
-        directory: "",
-        worktree: "",
-        experimental_workspace: {
-          register() {},
-        },
-        serverUrl: new URL("https://example.com"),
-        $: {} as never,
+    const hooks = await CodexAuthPlugin({} as never, {
+      issuer: server.url.origin,
+      codexApiEndpoint: new URL("/backend-api/codex/responses", server.url).toString(),
+      async compareAndSet(expected, next) {
+        expect(auth).toEqual(expected)
+        authUpdates.push(next)
+        auth = next
+        return true
       },
-      {
-        issuer: server.url.origin,
-        codexApiEndpoint: new URL("/backend-api/codex/responses", server.url).toString(),
-      },
-    )
+    })
     const loaded = await hooks.auth!.loader!(async () => auth as never, {} as never)
 
-    const first = loaded.fetch!("https://api.openai.com/v1/responses")
-    const second = loaded.fetch!("https://api.openai.com/v1/responses")
+    const first = loaded.fetch!(new URL("/v1/responses", server.url))
+    const second = loaded.fetch!(new URL("/v1/responses", server.url))
 
-    await waitFor(() => refreshRequests === 1)
+    await refreshStarted.promise
     expect(apiRequests).toHaveLength(0)
 
-    resolveRefresh!()
+    refreshReady.resolve()
     await Promise.all([first, second])
 
     expect(refreshRequests).toBe(1)
     expect(authUpdates).toHaveLength(1)
-    expect(authUpdates[0]?.body.refresh).toBe("refresh-new")
-    expect(authUpdates[0]?.body.access).toBe(refreshedAccess)
-    expect(authUpdates[0]?.body.accountId).toBe("acc-123")
+    expect(authUpdates[0]?.refresh).toBe("refresh-new")
+    expect(authUpdates[0]?.access).toBe(refreshedAccess)
+    expect(authUpdates[0]?.accountId).toBe("acc-123")
     expect(apiRequests).toEqual([
       { authorization: `Bearer ${refreshedAccess}`, accountId: "acc-123", residency: "eu" },
       { authorization: `Bearer ${refreshedAccess}`, accountId: "acc-123", residency: "eu" },
     ])
   })
 })
-
-async function waitFor(predicate: () => boolean) {
-  const started = Date.now()
-  while (!predicate()) {
-    if (Date.now() - started > 1_000) throw new Error("timed out waiting for condition")
-    await new Promise((resolve) => setTimeout(resolve, 1))
-  }
-}
 
 async function createCodexWebSocketServer() {
   let headers: IncomingMessage["headers"] | undefined

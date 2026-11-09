@@ -17,6 +17,7 @@ import { Process } from "@/util/process"
 import { errorMessage } from "@/util/error"
 import { text } from "node:stream/consumers"
 import { Effect, Option } from "effect"
+import { OpenAICommand } from "./openai"
 
 type PluginAuth = NonNullable<Hooks["auth"]>
 
@@ -238,10 +239,15 @@ export function resolvePluginProviders(input: {
 
 export const ProvidersCommand = cmd({
   command: "providers",
-  aliases: ["auth"],
+  aliases: ["auth", "provider"],
   describe: "manage AI providers and credentials",
   builder: (yargs) =>
-    yargs.command(ProvidersListCommand).command(ProvidersLoginCommand).command(ProvidersLogoutCommand).demandCommand(),
+    yargs
+      .command(ProvidersListCommand)
+      .command(ProvidersLoginCommand)
+      .command(ProvidersLogoutCommand)
+      .command(OpenAICommand)
+      .demandCommand(),
   async handler() {},
 })
 

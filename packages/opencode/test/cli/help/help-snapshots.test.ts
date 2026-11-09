@@ -48,7 +48,7 @@ const TOP_LEVEL = [
   "attach",
   "run",
   "debug",
-  "providers", // aliased to `auth`
+  "providers", // aliased to `auth` and `provider`
   "agent",
   "upgrade",
   "uninstall",
@@ -76,6 +76,10 @@ const SUBCOMMANDS = [
   ["providers", "list"],
   ["providers", "login"],
   ["providers", "logout"],
+  ["provider", "openai"],
+  ["provider", "openai", "usage"],
+  ["provider", "openai", "reset", "list"],
+  ["provider", "openai", "reset", "redeem"],
   ["agent", "create"],
   ["agent", "list"],
   ["session", "list"],

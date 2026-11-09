@@ -6,6 +6,15 @@ import { setTimeout as sleep } from "node:timers/promises"
 import { createServer } from "http"
 import { OpenAIWebSocketPool } from "./ws-pool"
 import { OauthCallbackPage } from "@opencode-ai/core/oauth/page"
+import { CodexOAuth } from "./oauth"
+import { extractAccountId, extractResidency } from "./oauth"
+export {
+  parseJwtClaims,
+  extractAccountIdFromClaims,
+  extractAccountId,
+  extractResidency,
+  type IdTokenClaims,
+} from "./oauth"
 
 const CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
 const ISSUER = "https://auth.openai.com"
@@ -35,56 +44,6 @@ function base64UrlEncode(buffer: ArrayBuffer): string {
   return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "")
 }
 
-export interface IdTokenClaims {
-  chatgpt_account_id?: string
-  chatgpt_compute_residency?: string
-  organizations?: Array<{ id: string }>
-  email?: string
-  "https://api.openai.com/auth"?: {
-    chatgpt_account_id?: string
-    chatgpt_compute_residency?: string
-  }
-}
-
-export function parseJwtClaims(token: string): IdTokenClaims | undefined {
-  const parts = token.split(".")
-  if (parts.length !== 3) return undefined
-  try {
-    return JSON.parse(Buffer.from(parts[1], "base64url").toString())
-  } catch {
-    return undefined
-  }
-}
-
-export function extractAccountIdFromClaims(claims: IdTokenClaims): string | undefined {
-  return (
-    claims.chatgpt_account_id ||
-    claims["https://api.openai.com/auth"]?.chatgpt_account_id ||
-    claims.organizations?.[0]?.id
-  )
-}
-
-export function extractAccountId(tokens: TokenResponse): string | undefined {
-  if (tokens.id_token) {
-    const claims = parseJwtClaims(tokens.id_token)
-    const accountId = claims && extractAccountIdFromClaims(claims)
-    if (accountId) return accountId
-  }
-  if (tokens.access_token) {
-    const claims = parseJwtClaims(tokens.access_token)
-    return claims ? extractAccountIdFromClaims(claims) : undefined
-  }
-  return undefined
-}
-
-export function extractResidency(token: string): string | undefined {
-  const claims = parseJwtClaims(token)
-  const residency =
-    claims?.["https://api.openai.com/auth"]?.chatgpt_compute_residency ?? claims?.chatgpt_compute_residency
-  if (!residency || residency === "no_constraint") return undefined
-  return residency
-}
-
 function buildAuthorizeUrl(redirectUri: string, pkce: PkceCodes, state: string): string {
   const params = new URLSearchParams({
     response_type: "code",
@@ -112,6 +71,7 @@ interface CodexAuthPluginOptions {
   issuer?: string
   codexApiEndpoint?: string
   experimentalWebSockets?: boolean
+  compareAndSet?: CodexOAuth.CompareAndSet
 }
 
 async function exchangeCodeForTokens(code: string, redirectUri: string, pkce: PkceCodes): Promise<TokenResponse> {
@@ -128,22 +88,6 @@ async function exchangeCodeForTokens(code: string, redirectUri: string, pkce: Pk
   })
   if (!response.ok) {
     throw new Error(`Token exchange failed: ${response.status}`)
-  }
-  return response.json()
-}
-
-async function refreshAccessToken(refreshToken: string, issuer = ISSUER): Promise<TokenResponse> {
-  const response = await fetch(`${issuer}/oauth/token`, {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: new URLSearchParams({
-      grant_type: "refresh_token",
-      refresh_token: refreshToken,
-      client_id: CLIENT_ID,
-    }).toString(),
-  })
-  if (!response.ok) {
-    throw new Error(`Token refresh failed: ${response.status}`)
   }
   return response.json()
 }
@@ -338,13 +282,6 @@ export async function CodexAuthPlugin(input: PluginInput, options: CodexAuthPlug
         }
         if (auth.type !== "oauth") return websocketFetch ? { fetch: websocketFetch } : {}
 
-        let refreshPromise:
-          | Promise<{
-              access: string
-              accountId: string | undefined
-            }>
-          | undefined
-
         return {
           apiKey: OAUTH_DUMMY_KEY,
           async fetch(requestInput: RequestInfo | URL, init?: RequestInit) {
@@ -360,41 +297,8 @@ export async function CodexAuthPlugin(input: PluginInput, options: CodexAuthPlug
               }
             }
 
-            const currentAuth = await getAuth()
-            if (currentAuth.type !== "oauth")
-              return websocketFetch ? websocketFetch(requestInput, init) : fetch(requestInput, init)
-
-            const authWithAccount = currentAuth as typeof currentAuth & { accountId?: string }
-
-            if (!currentAuth.access || currentAuth.expires < Date.now()) {
-              if (!refreshPromise) {
-                refreshPromise = refreshAccessToken(currentAuth.refresh, issuer)
-                  .then(async (tokens) => {
-                    const accountId = extractAccountId(tokens) || authWithAccount.accountId
-                    await input.client.auth.set({
-                      path: { id: "openai" },
-                      body: {
-                        type: "oauth",
-                        refresh: tokens.refresh_token,
-                        access: tokens.access_token,
-                        expires: Date.now() + (tokens.expires_in ?? 3600) * 1000,
-                        ...(accountId && { accountId }),
-                      },
-                    })
-                    return {
-                      access: tokens.access_token,
-                      accountId,
-                    }
-                  })
-                  .finally(() => {
-                    refreshPromise = undefined
-                  })
-              }
-
-              const refreshed = await refreshPromise
-              currentAuth.access = refreshed.access
-              authWithAccount.accountId = refreshed.accountId
-            }
+            const currentAuth = await CodexOAuth.resolve(getAuth, options.compareAndSet, { issuer })
+            if (!currentAuth) return websocketFetch ? websocketFetch(requestInput, init) : fetch(requestInput, init)
 
             const headers = new Headers()
             if (init?.headers) {
@@ -411,8 +315,8 @@ export async function CodexAuthPlugin(input: PluginInput, options: CodexAuthPlug
               }
             }
             headers.set("authorization", `Bearer ${currentAuth.access}`)
-            if (authWithAccount.accountId) {
-              headers.set("ChatGPT-Account-Id", authWithAccount.accountId)
+            if (currentAuth.accountId) {
+              headers.set("ChatGPT-Account-Id", currentAuth.accountId)
             }
 
             const parsed =
@@ -428,6 +332,7 @@ export async function CodexAuthPlugin(input: PluginInput, options: CodexAuthPlug
 
             const requestInit = {
               ...init,
+              redirect: "error" as const,
               body: init?.body,
               headers,
             }
