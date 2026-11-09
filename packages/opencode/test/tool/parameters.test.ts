@@ -227,10 +227,31 @@ describe("tool parameters", () => {
 
   describe("skill", () => {
     test("accepts name", () => {
-      expect(parse(Skill, { name: "foo" }).name).toBe("foo")
+      expect(parse(Skill, { name: "foo" })).toEqual({ name: "foo" })
+    })
+    test("accepts an optional reason", () => {
+      expect(parse(Skill, { name: "foo", reason: "Review the current changes." })).toEqual({
+        name: "foo",
+        reason: "Review the current changes.",
+      })
+    })
+    test.each(["", "x".repeat(10000)])("accepts reason without length constraints (case %#)", (reason) => {
+      expect(parse(Skill, { name: "foo", reason })).toEqual({ name: "foo", reason })
     })
     test("rejects missing name", () => {
       expect(accepts(Skill, {})).toBe(false)
+      expect(accepts(Skill, { reason: "Review the current changes." })).toBe(false)
+    })
+    test.each([{ reason: 123 }, { reason: true }, { reason: null }, { reason: [] }, { reason: {} }])(
+      "rejects non-string reason (case %#)",
+      (input) => {
+        expect(accepts(Skill, { name: "foo", ...input })).toBe(false)
+      },
+    )
+    test("exposes reason as an optional string in JSON Schema", () => {
+      const schema = toJsonSchema(Skill)
+      expect(schema.properties?.reason).toEqual({ type: "string", description: expect.any(String) })
+      expect(schema.required).toEqual(["name"])
     })
   })
 

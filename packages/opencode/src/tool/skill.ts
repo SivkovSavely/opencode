@@ -8,6 +8,10 @@ import { ManagedSkill } from "../skill/managed"
 
 export const Parameters = Schema.Struct({
   name: Schema.String.annotate({ description: "The name of the skill from available_skills" }),
+  reason: Schema.optional(Schema.String).annotate({
+    description:
+      'Providing a reason is strongly recommended, but not required. Briefly explain why the selected skill is relevant to the current user request or task. Prefer one short, specific sentence. Avoid generic explanations such as "This skill is useful" or simply repeating the skill description.',
+  }),
 })
 
 export const SkillTool = Tool.define(

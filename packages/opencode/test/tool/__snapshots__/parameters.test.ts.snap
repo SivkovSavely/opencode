@@ -289,6 +289,10 @@ exports[`tool parameters JSON Schema (wire shape) skill 1`] = `
       "description": "The name of the skill from available_skills",
       "type": "string",
     },
+    "reason": {
+      "description": "Providing a reason is strongly recommended, but not required. Briefly explain why the selected skill is relevant to the current user request or task. Prefer one short, specific sentence. Avoid generic explanations such as "This skill is useful" or simply repeating the skill description.",
+      "type": "string",
+    },
   },
   "required": [
     "name",

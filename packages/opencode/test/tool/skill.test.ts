@@ -90,6 +90,14 @@ Use this skill.
       expect(result.output).toContain(`<skill_content name="tool-skill">`)
       expect(result.output).toContain(`Base directory for this skill: ${skill}`)
       expect(result.output).toContain(`<file>${file}</file>`)
+
+      const withReason = yield* tool.execute(
+        { name: "tool-skill", reason: "Load the workflow needed for the current tool tests." },
+        ctx,
+      )
+      expect(withReason).toEqual(result)
+      expect(requests).toHaveLength(2)
+      expect(requests[1]).toEqual(requests[0])
     }),
   )
 
@@ -126,6 +134,23 @@ Use this skill.
       expect(Exit.isFailure(exit)).toBe(true)
       if (Exit.isFailure(exit)) {
         const error = Cause.squash(exit.cause)
+        expect(error).toBeInstanceOf(Error)
+        if (error instanceof Error) expect(error.message).toContain('Skill "missing-skill" not found.')
+      }
+
+      const withReason = yield* tool
+        .execute(
+          { name: "missing-skill", reason: "Load the workflow needed for the current tool tests." },
+          {
+            ...baseCtx,
+            ask: () => Effect.die("Missing skills must not request permission"),
+          },
+        )
+        .pipe(Effect.exit)
+
+      expect(Exit.isFailure(withReason)).toBe(true)
+      if (Exit.isFailure(withReason)) {
+        const error = Cause.squash(withReason.cause)
         expect(error).toBeInstanceOf(Error)
         if (error instanceof Error) expect(error.message).toContain('Skill "missing-skill" not found.')
       }
