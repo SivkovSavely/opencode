@@ -317,6 +317,10 @@ exports[`tool parameters JSON Schema (wire shape) task 1`] = `
       "description": "A short (3-5 words) description of the task",
       "type": "string",
     },
+    "model": {
+      "description": "NEVER set this unless the user explicitly asks for a particular model or variant. Use "providerID/modelID" or "providerID/modelID#variant". Omitting the variant uses the model default, ignoring agent and parent variants.",
+      "type": "string",
+    },
     "prompt": {
       "description": "The task for the agent to perform",
       "type": "string",

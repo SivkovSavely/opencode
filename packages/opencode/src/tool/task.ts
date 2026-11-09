@@ -10,6 +10,7 @@ import { Agent } from "../agent/agent"
 import { deriveSubagentSessionPermission } from "../agent/subagent-permissions"
 import type { SessionPrompt } from "../session/prompt"
 import { Config } from "@/config/config"
+import { Provider } from "@/provider/provider"
 import { Cause, Effect, Exit, Fiber, Schema, Scope } from "effect"
 import { EffectBridge } from "@/effect/bridge"
 import { RuntimeFlags } from "@/effect/runtime-flags"
@@ -57,6 +58,10 @@ const BaseParameterFields = {
   description: Schema.String.annotate({ description: "A short (3-5 words) description of the task" }),
   prompt: Schema.String.annotate({ description: "The task for the agent to perform" }),
   subagent_type: Schema.String.annotate({ description: "The type of specialized agent to use for this task" }),
+  model: Schema.optional(Schema.String).annotate({
+    description:
+      'NEVER set this unless the user explicitly asks for a particular model or variant. Use "providerID/modelID" or "providerID/modelID#variant". Omitting the variant uses the model default, ignoring agent and parent variants.',
+  }),
   task_id: Schema.optional(Schema.String).annotate({
     description:
       "This should only be set if you mean to resume a previous task (you can pass a prior task_id and the task will continue the same subagent session as before instead of creating a fresh one)",
@@ -101,6 +106,35 @@ export const TaskTool = Tool.define(
     const scope = yield* Scope.Scope
     const flags = yield* RuntimeFlags.Service
     const database = yield* Database.Service
+    const provider = yield* Provider.Service
+
+    const resolveModel = Effect.fn("TaskTool.resolveModel")(function* (input: string) {
+      const [value, variant, ...rest] = input.split("#")
+      const selected = Provider.parseModel(value)
+      if (!selected.providerID || !selected.modelID || rest.length > 0 || variant === "")
+        return yield* Effect.fail(
+          new Error(`Invalid model "${input}". Use "providerID/modelID" or "providerID/modelID#variant".`),
+        )
+      const available = yield* provider.list()
+      if (
+        !Object.hasOwn(available, selected.providerID) ||
+        !Object.hasOwn(available[selected.providerID].models, selected.modelID)
+      )
+        return yield* new Provider.ModelNotFoundError(selected)
+      const model = available[selected.providerID].models[selected.modelID]
+      if (variant !== undefined && !Object.hasOwn(model.variants ?? {}, variant)) {
+        const variants = Object.keys(model.variants ?? {})
+        return yield* Effect.fail(
+          new Error(
+            variants.length === 0
+              ? `Model "${value}" has no variants. Omit the variant.`
+              : `Variant "${variant}" is not available for "${value}". Available: ${variants.join(", ")}.`,
+          ),
+        )
+      }
+      // Empty bypasses SessionPrompt's nullish agent fallback without selecting a named variant.
+      return { model: selected, variant: variant ?? "" }
+    })
 
     const run = Effect.fn("TaskTool.execute")(function* (
       params: Schema.Schema.Type<typeof Parameters>,
@@ -197,10 +231,13 @@ export const TaskTool = Tool.define(
       )
       if (msg.info.role !== "assistant") return yield* Effect.fail(new Error("Not an assistant message"))
       const variant = msg.info.variant
-      const model = next.model ?? {
-        modelID: msg.info.modelID,
-        providerID: msg.info.providerID,
-      }
+      const override = params.model === undefined ? undefined : yield* resolveModel(params.model)
+      const model = override?.model ??
+        next.model ?? {
+          modelID: msg.info.modelID,
+          providerID: msg.info.providerID,
+        }
+      const childVariant = override?.variant ?? (next.model ? undefined : variant)
 
       const previousTask = session?.metadata?.task
       const reusableMessageID =
@@ -220,8 +257,8 @@ export const TaskTool = Tool.define(
         parentCallID: ctx.callID,
         messageID: childMessageID,
         model,
-        inheritVariant: next.model === undefined,
-        variant: next.model ? undefined : variant,
+        inheritVariant: override === undefined && next.model === undefined,
+        variant: childVariant,
         ...(runInBackground ? { background: true } : {}),
       }
       const permission = [
@@ -292,7 +329,7 @@ export const TaskTool = Tool.define(
               modelID: model.modelID,
               providerID: model.providerID,
             },
-            variant: next.model ? undefined : variant,
+            variant: childVariant,
             agent: next.name,
             parts,
           },
