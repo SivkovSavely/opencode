@@ -28,12 +28,17 @@ export function encode(data: Record<string, unknown>): string | Uint8Array {
 }
 
 export function encodeJson(json: string): string | Uint8Array {
-  const size = Buffer.byteLength(json)
-  if (size < threshold || (!bun && !node)) return json
+  if (Buffer.byteLength(json) < threshold || (!bun && !node)) return json
+  return encodeBytes(Buffer.from(json)) ?? json
+}
+
+export function encodeBytes(bytes: Uint8Array): Uint8Array | undefined {
+  const size = bytes.byteLength
+  if (size < threshold || (!bun && !node)) return
   const compressed = bun
-    ? Bun.zstdCompressSync(Buffer.from(json), { level: 3 })
-    : zlib.zstdCompressSync(json, { params: { [zlib.constants.ZSTD_c_compressionLevel]: 3 } })
-  if (compressed.byteLength + headerSize >= size) return json
+    ? Bun.zstdCompressSync(bytes, { level: 3 })
+    : zlib.zstdCompressSync(bytes, { params: { [zlib.constants.ZSTD_c_compressionLevel]: 3 } })
+  if (compressed.byteLength + headerSize >= size) return
   const result = Buffer.allocUnsafe(headerSize + compressed.byteLength)
   magic.copy(result)
   result[4] = version

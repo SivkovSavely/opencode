@@ -1,10 +1,12 @@
 import { constants, Database } from "bun:sqlite"
+import { isUtf8 } from "node:buffer"
 import { lstatSync, statfsSync } from "node:fs"
 import path from "node:path"
 import { pathToFileURL } from "node:url"
 import { parseArgs } from "node:util"
 import zlib from "node:zlib"
 import { EventData } from "../src/event/data"
+import { CompressionTimings, timingSummary, type TimingPhase, type TimingStats } from "./event-compress-timings"
 
 export type Options = {
   db: string
@@ -18,6 +20,7 @@ export type Options = {
   checkpointRows?: number
   maxWalBytes?: number
   busyTimeoutMs?: number
+  timings?: boolean
   signal?: AbortSignal
 }
 
@@ -38,6 +41,7 @@ export type Stats = {
   peakWalBytes: number
   peakRssBytes: number
   stopped: "complete" | "max-scanned" | "max-converted" | "interrupted"
+  timings?: TimingStats
 }
 
 type Metadata = { rowid: string; storage: string; bytes: number }
@@ -49,6 +53,7 @@ export async function compressEvents(input: Options, onProgress?: (stats: Stats)
   const options = validateOptions(input)
   const filename = checkPath(options.db, options.mode)
   const identity = lstatSync(filename)
+  const timings = options.timings ? new CompressionTimings() : undefined
   const stats: Stats = {
     examinedRows: 0,
     eligibleRows: 0,
@@ -89,7 +94,7 @@ export async function compressEvents(input: Options, onProgress?: (stats: Stats)
     `)
     if (options.mode === "dry-run") db.exec("PRAGMA query_only = ON")
     stage = "checking SQLite compatibility and event schema"
-    checkSchema(db)
+    const sqliteMaxLength = checkSchema(db)
     if (typeof zlib.zstdDecompressSync !== "function")
       throw new SafetyError("This Bun runtime lacks bounded native Zstandard decompression; upgrade Bun")
 
@@ -108,6 +113,7 @@ export async function compressEvents(input: Options, onProgress?: (stats: Stats)
       return size
     }
     const checkpoint = () => {
+      const started = timings ? performance.now() : 0
       stage = "checkpointing WAL"
       space(options.maxPayloadBytes)
       walBytes()
@@ -119,6 +125,9 @@ export async function compressEvents(input: Options, onProgress?: (stats: Stats)
           "WAL checkpoint blocked or incomplete. Close every other connection to this working copy, then restart",
         )
       stats.checkpoints++
+      const ms = timings ? performance.now() - started : 0
+      timings?.checkpoint(ms)
+      return ms
     }
 
     if (options.mode === "write") {
@@ -143,7 +152,7 @@ export async function compressEvents(input: Options, onProgress?: (stats: Stats)
       SELECT CAST(data AS BLOB) AS data FROM event
       WHERE rowid = ? AND typeof(data) = 'text' AND octet_length(data) = ? AND octet_length(data) <= ?
     `)
-    const valid = db.query<{ valid: number }, [string]>("SELECT json_valid(?) AS valid")
+    const valid = db.query<{ valid: number }, [Uint8Array]>("SELECT json_valid(CAST(? AS TEXT)) AS valid")
     const update =
       options.mode === "write"
         ? db.query("UPDATE event SET data = ? WHERE rowid = ? AND typeof(data) = 'text' AND CAST(data AS BLOB) = ?")
@@ -189,27 +198,48 @@ export async function compressEvents(input: Options, onProgress?: (stats: Stats)
         else if (row.bytes > options.maxPayloadBytes) stats.oversizedRows++
         else if (row.bytes < 4096) stats.skippedSmallRows++
         else {
+          if (row.bytes >= sqliteMaxLength)
+            throw new SafetyError(
+              `Payload at rowid ${row.rowid} reaches SQLite MAX_LENGTH=${sqliteMaxLength}; this limit includes the entire row, not just data. A 1 GiB configured cap does not override engine limits`,
+            )
           stats.eligibleRows++
+          const started = timings ? performance.now() : 0
+          let mark = started
+          const measurements: Partial<Record<TimingPhase, number>> = {}
+          const phase = (name: TimingPhase) => {
+            if (!timings) return
+            measurements[name] = performance.now() - mark
+            stats.peakRssBytes = Math.max(stats.peakRssBytes, process.memoryUsage.rss())
+            mark = performance.now()
+          }
           stage = `loading bounded TEXT at rowid ${row.rowid}`
           const original = read.get(BigInt(row.rowid), row.bytes, options.maxPayloadBytes)?.data
           if (!original || original.byteLength !== row.bytes)
             throw new SafetyError(
               `TEXT changed or became unavailable at rowid ${row.rowid}; restart on an offline copy`,
             )
-          const json = decodeUtf8(original, row.rowid)
-          if (valid.get(json)?.valid !== 1)
+          phase("load")
+          stage = `validating UTF-8 and JSON at rowid ${row.rowid}`
+          if (!isUtf8(original)) throw new SafetyError(`Invalid UTF-8 at rowid ${row.rowid}; no payload logged`)
+          if (valid.get(original)?.valid !== 1)
             throw new SafetyError(`Invalid JSON at rowid ${row.rowid}; no payload logged`)
-          if (!Buffer.from(json).equals(original)) throw new SafetyError(`UTF-8 byte mismatch at rowid ${row.rowid}`)
-          stage = `compressing and verifying rowid ${row.rowid}`
-          const encoded = EventData.encodeJson(json)
-          if (typeof encoded === "string") {
+          phase("validation")
+          stage = `compressing rowid ${row.rowid}`
+          // Reuse validated stored bytes instead of allocating/re-encoding a full JS string.
+          const encoded = EventData.encodeBytes(original)
+          phase("compression")
+          if (!encoded) {
             stats.nonprofitableRows++
             stats.inputBytes += row.bytes
             stats.outputBytes += row.bytes
           } else {
-            const restored = zlib.zstdDecompressSync(encoded.subarray(41), { maxOutputLength: row.bytes })
-            if (!restored.equals(original))
-              throw new SafetyError(`Compression round-trip byte mismatch at rowid ${row.rowid}`)
+            stage = `verifying decompression at rowid ${row.rowid}`
+            {
+              const restored = zlib.zstdDecompressSync(encoded.subarray(41), { maxOutputLength: row.bytes })
+              if (!restored.equals(original))
+                throw new SafetyError(`Compression round-trip byte mismatch at rowid ${row.rowid}`)
+            }
+            phase("verification")
             if (options.mode === "write") {
               stage = `updating rowid ${row.rowid}`
               checkPath(filename, "write")
@@ -217,8 +247,10 @@ export async function compressEvents(input: Options, onProgress?: (stats: Stats)
               if (current.dev !== identity.dev || current.ino !== identity.ino)
                 throw new SafetyError("Working-copy identity changed; refusing further writes")
               space(row.bytes)
+              mark = timings ? performance.now() : 0
               // Exactly one bounded payload per transaction, compression finished before BEGIN.
               write.immediate(BigInt(row.rowid), original, encoded)
+              phase("write")
               stats.updatedRows++
             }
             stats.compressedRows++
@@ -229,8 +261,13 @@ export async function compressEvents(input: Options, onProgress?: (stats: Stats)
               options.mode === "write" &&
               (walBytes() >= options.maxWalBytes || stats.updatedRows % options.checkpointRows === 0)
             )
-              checkpoint()
+              measurements.checkpoint = checkpoint()
           }
+          if (timings)
+            timings.record(row.bytes, encoded?.byteLength ?? row.bytes, {
+              ...measurements,
+              total: performance.now() - started,
+            })
         }
         stats.peakRssBytes = Math.max(stats.peakRssBytes, process.memoryUsage.rss())
         onProgress?.({ ...stats })
@@ -240,6 +277,7 @@ export async function compressEvents(input: Options, onProgress?: (stats: Stats)
     }
     if (options.mode === "write") checkpoint()
     stats.peakRssBytes = Math.max(stats.peakRssBytes, process.memoryUsage.rss())
+    if (timings) stats.timings = timings.summary()
     return stats
   } catch (cause) {
     if (cause instanceof SafetyError) throw cause
@@ -248,7 +286,7 @@ export async function compressEvents(input: Options, onProgress?: (stats: Stats)
         ? cause.code
         : "unknown error"
     throw new SafetyError(
-      `Failed while ${stage} (${code}). Stop other connections, check disk space and SQLite compatibility. Earlier committed rows are retained; restart from the beginning. No payload logged`,
+      `Failed while ${stage} (${code}). ${code === "SQLITE_TOOBIG" ? "SQLite string/BLOB/whole-row MAX_LENGTH was exceeded; the configured cap does not override it. " : ""}Stop other connections, check disk space and SQLite compatibility. Earlier committed rows are retained; restart from the beginning. No payload logged`,
     )
   }
 }
@@ -267,7 +305,7 @@ function validateOptions(input: Options) {
     busyTimeoutMs: input.busyTimeoutMs ?? 5000,
   }
   for (const [name, value, minimum, maximum] of [
-    ["max-payload-bytes", options.maxPayloadBytes, 1, 64 * 1024 * 1024],
+    ["max-payload-bytes", options.maxPayloadBytes, 1, 1024 * 1024 * 1024],
     ["page-rows", options.pageRows, 1, 1024],
     ["min-free-bytes", options.minFreeBytes, 0, Number.MAX_SAFE_INTEGER],
     ["checkpoint-rows", options.checkpointRows, 1, 1024],
@@ -325,6 +363,15 @@ function checkSchema(db: Database) {
     .map(Number)
   if (version[0] < 3 || (version[0] === 3 && version[1] < 43))
     throw new SafetyError("SQLite 3.43.0 or later is required for metadata-only octet_length(); upgrade Bun")
+  const length = db
+    .query<
+      { compile_options: string },
+      []
+    >("SELECT compile_options FROM pragma_compile_options WHERE compile_options GLOB 'MAX_LENGTH=*' LIMIT 1")
+    .get()
+  const maximum = Number(length?.compile_options.slice("MAX_LENGTH=".length))
+  if (!Number.isSafeInteger(maximum) || maximum < 1)
+    throw new SafetyError("Cannot determine SQLite MAX_LENGTH; refusing payload reads without engine limit metadata")
   if (db.query<{ encoding: string }, []>("PRAGMA encoding").get()?.encoding !== "UTF-8")
     throw new SafetyError("Only UTF-8 SQLite databases are supported; refusing to transcode historical JSON")
   const table = db.query<{ type: string; wr: number }, []>("PRAGMA main.table_list('event')").get()
@@ -351,14 +398,7 @@ function checkSchema(db: Database) {
       .get()
   )
     throw new SafetyError("Foreign keys referencing event.data are not supported")
-}
-
-function decodeUtf8(bytes: Uint8Array, rowid: string) {
-  try {
-    return new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes)
-  } catch {
-    throw new SafetyError(`Invalid UTF-8 at rowid ${rowid}; no payload logged`)
-  }
+  return maximum
 }
 
 const help = `Offline V1 historical event compression (never run against production).
@@ -372,7 +412,8 @@ Usage:
 --write --offline         Explicitly opt in to writes on an isolated offline copy
 --max-scanned N           Stop after N examined rows, including skips
 --max-converted N         Stop after N verified profitable rows (also in dry-run)
---max-payload-bytes N     Per-row cap, default 16777216, maximum 67108864
+--max-payload-bytes N     Per-row cap, default 16777216, maximum 1073741824
+--timings                 Bounded per-size phase statistics and human summary
 --page-rows N             Metadata page size, default 128, maximum 1024
 --min-free-bytes N        Disk reserve, default 1073741824, plus 3x row budget
 --checkpoint-rows N       Checkpoint every N updates, default 32, maximum 1024
@@ -385,6 +426,9 @@ Restart from the beginning: BLOBs are skipped, no persisted rowid cursor.
 Existing BLOBs and skipped TEXT are NOT validated. No VACUUM, deletion or cutover.
 JSON summaries contain counts/bytes only. savedBytes is potential in dry-run;
 database file size does not shrink until separate operator-managed compaction.
+The cap is not a promise: SQLite MAX_LENGTH also limits the entire encoded row.
+Large-payload tests require verified MemoryMax=8G, MemorySwapMax=0; use
+systemd-run --user --scope --expand-environment=no and verify limits inside it.
 Exit: 0 success/bounded stop, 1 safety/SQLite failure, 2 usage, 130 INT, 143 TERM.
 `
 
@@ -409,6 +453,7 @@ if (import.meta.main) {
           "dry-run": { type: "boolean" },
           write: { type: "boolean" },
           offline: { type: "boolean" },
+          timings: { type: "boolean" },
           help: { type: "boolean" },
           ...Object.fromEntries(
             [
@@ -440,6 +485,7 @@ if (import.meta.main) {
         db: values.db,
         mode: values.write ? "write" : "dry-run",
         offline: values.offline === true,
+        timings: values.timings === true,
         maxScanned: number("max-scanned"),
         maxConverted: number("max-converted"),
         maxPayloadBytes: number("max-payload-bytes"),
@@ -457,6 +503,7 @@ if (import.meta.main) {
         last = Date.now()
       })
       console.log(JSON.stringify(result))
+      if (result.timings) console.error(timingSummary(result.timings))
       process.exitCode = interrupted
     }
   } catch (cause) {

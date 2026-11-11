@@ -287,6 +287,111 @@ describe("offline event compression", () => {
     ])
   })
 
+  test("accepts a 1 GiB cap without allocating a large payload and keeps the 16 MiB default", async () => {
+    await using tmp = await tmpdir()
+    const filename = `${tmp.path}/events.sqlite`
+    fixture(filename, [{ data: payload() }])
+    const accepted = await cli(["--db", filename, "--dry-run", "--max-payload-bytes", "1073741824"])
+    expect(accepted.code, accepted.stderr).toBe(0)
+    expect(JSON.parse(accepted.stdout).compressedRows).toBe(1)
+    expect((await cli(["--help"])).stdout).toContain("default 16777216, maximum 1073741824")
+    // SQLite creates this oversized invalid TEXT without allocating a JS payload.
+    using db = new Database(filename, { create: false })
+    db.query("UPDATE event SET data = CAST(zeroblob(?) AS TEXT)").run(16777217)
+    expect(await compressEvents({ db: filename, mode: "dry-run" })).toMatchObject({
+      oversizedRows: 1,
+      eligibleRows: 0,
+    })
+  })
+
+  test.each(["dry-run", "write"] as const)("%s reports optional phase timings without event contents", async (mode) => {
+    await using tmp = await tmpdir()
+    const filename = `${tmp.path}/events.sqlite`
+    fixture(filename, [{ data: payload() }, { data: payload(16384) }, { data: payload(4095) }])
+    const options = { db: filename, mode, offline: true, minFreeBytes: 0, checkpointRows: 1 }
+    expect(await compressEvents({ ...options, maxScanned: 1 })).not.toHaveProperty("timings")
+    // The first untimed write is intentionally already a BLOB in write mode.
+    const result = await compressEvents({ ...options, timings: true })
+    const buckets = result.timings!.buckets
+    expect(buckets.map((bucket) => bucket.label)).toEqual(mode === "write" ? ["16-64 KiB"] : ["4-16 KiB", "16-64 KiB"])
+    for (const bucket of buckets) {
+      expect(bucket.rows).toBe(1)
+      expect(bucket.phases.load.count).toBe(1)
+      expect(bucket.phases.validation.count).toBe(1)
+      expect(bucket.phases.compression.count).toBe(1)
+      expect(bucket.phases.verification.count).toBe(1)
+      expect(bucket.phases.compression.totalMs).toBeGreaterThan(0)
+      expect(bucket.phases.total.totalMs).toBeGreaterThanOrEqual(bucket.phases.compression.totalMs)
+      expect(bucket.phases.write.count).toBe(mode === "write" ? 1 : 0)
+      expect(bucket.phases.checkpoint.count).toBe(mode === "write" ? 1 : 0)
+      expect(bucket.inputBytes - bucket.outputBytes).toBeGreaterThan(0)
+      expect(bucket.throughputMiBps).toBeGreaterThan(0)
+    }
+    expect(result.timings!.checkpoint.count).toBe(mode === "write" ? 3 : 0)
+    expect(JSON.stringify(result.timings)).not.toContain("aaaa")
+  })
+
+  test("timing mode includes nonprofitable attempts and leaves empty timing buckets absent", async () => {
+    await using tmp = await tmpdir()
+    const filename = `${tmp.path}/events.sqlite`
+    fixture(filename, [{ data: payload(4095) }])
+    expect((await compressEvents({ db: filename, mode: "dry-run", timings: true })).timings!.buckets).toEqual([])
+    using db = new Database(filename, { create: false })
+    db.query("UPDATE event SET data = ?").run(noise())
+    const result = await compressEvents({ db: filename, mode: "dry-run", timings: true })
+    expect(result.nonprofitableRows).toBe(1)
+    expect(result.timings!.buckets[0]).toMatchObject({
+      rows: 1,
+      inputBytes: result.inputBytes,
+      outputBytes: result.inputBytes,
+      savingsPercent: 0,
+      phases: { compression: { count: 1 }, verification: { count: 0 } },
+    })
+  })
+
+  test("CLI timing mode preserves JSON stdout and adds a bounded human-readable summary on stderr", async () => {
+    await using tmp = await tmpdir()
+    const filename = `${tmp.path}/events.sqlite`
+    fixture(filename, [{ data: payload() }])
+    const plain = await cli(["--db", filename, "--dry-run"])
+    expect(JSON.parse(plain.stdout)).not.toHaveProperty("timings")
+    expect(plain.stderr).not.toContain("Compression timings")
+    const timed = await cli(["--db", filename, "--dry-run", "--timings"])
+    expect(timed.code, timed.stderr).toBe(0)
+    expect(JSON.parse(timed.stdout).timings.buckets[0].rows).toBe(1)
+    expect(timed.stderr).toContain("Compression timings")
+    expect(timed.stderr).toContain("4-16 KiB")
+    expect(timed.stderr).toContain("p95")
+    expect(timed.stderr).not.toContain(payload())
+  })
+
+  test("compression failures stop before UPDATE without exposing contents even with timings enabled", async () => {
+    await using tmp = await tmpdir()
+    const filename = `${tmp.path}/events.sqlite`
+    fixture(filename, [{ data: payload() }])
+    const before = stored(filename)
+    const child = Bun.spawn(
+      [
+        process.execPath,
+        "--eval",
+        `import { compressEvents } from ${JSON.stringify(new URL("../script/event-compress.ts", import.meta.url).pathname)};
+       Bun.zstdCompressSync = () => { throw new Error("private-compression-failure") };
+       try { await compressEvents({db:${JSON.stringify(filename)},mode:"write",offline:true,minFreeBytes:0,timings:true}) }
+       catch (error) { console.error(error.message); process.exitCode = 1 }`,
+      ],
+      { stdout: "pipe", stderr: "pipe" },
+    )
+    const [stdout, stderr, code] = await Promise.all([
+      new Response(child.stdout).text(),
+      new Response(child.stderr).text(),
+      child.exited,
+    ])
+    expect(code).toBe(1)
+    expect(stderr).toContain("compressing")
+    expect(`${stdout}${stderr}`).not.toContain("private-compression-failure")
+    expect(stored(filename)).toEqual(before)
+  })
+
   test.each(["dry-run", "write"] as const)(
     "%s rejects eligible invalid JSON and malformed UTF-8 unchanged",
     async (mode) => {
@@ -746,7 +851,7 @@ describe("offline event compression", () => {
       ["--db", filename, "--dry-run", "--unknown"],
       ["--db", filename, "--dry-run", "--page-rows", "0"],
       ["--db", filename, "--dry-run", "--page-rows", "1025"],
-      ["--db", filename, "--dry-run", "--max-payload-bytes", "67108865"],
+      ["--db", filename, "--dry-run", "--max-payload-bytes", "1073741825"],
       ["--db", filename, "--dry-run", "--max-scanned", "1.5"],
     ]) {
       const result = await cli(args)

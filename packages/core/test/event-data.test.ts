@@ -31,6 +31,18 @@ describe("event payload storage codec", () => {
     expect(EventData.encodeJson(' {"a": 1} ')).toBe(' {"a": 1} ')
   })
 
+  test("encodes existing UTF-8 byte views without changing the format or mutating the input", () => {
+    const json = ` \n{ "text": "${"\u96ea".repeat(4096)}", "escaped": "\\u96ea", "key": 1, "key": 2 }\n`
+    const bytes = Buffer.from(json)
+    const view = Buffer.concat([Buffer.alloc(7), bytes, Buffer.alloc(11)]).subarray(7, -11)
+    const encoded = EventData.encodeBytes(view)!
+    expect(EventData.encodeJson(json)).toEqual(encoded)
+    expect(encoded).toEqual(frame(bytes))
+    expect(view).toEqual(bytes)
+    expect(EventData.encodeBytes(Buffer.from(JSON.stringify({ text: "a".repeat(4084) })))).toBeUndefined()
+    expect(EventData.encodeBytes(Buffer.from(JSON.stringify({ text: "a".repeat(4085) })))).toBeInstanceOf(Uint8Array)
+  })
+
   test("reads legacy TEXT and round-trips large UTF-8 JSON without changing its logical shape", () => {
     expect(EventData.decode(JSON.stringify(large))).toEqual(large)
     const encoded = EventData.encode(large)
