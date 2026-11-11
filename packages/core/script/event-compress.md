@@ -258,11 +258,69 @@ artifacts. Different regimes and classes do not justify universal linear scaling
 The extrapolation has no measured confidence interval and must not be used to
 infer 1 GiB support or full-backfill/fsync duration.
 
+## Independent final database verification
+
+`script/event-verify.ts` independently compares the final fresh backup with the
+final `VACUUM INTO` output. It does not import the compressor or `EventData`.
+Both explicit paths must already exist and identify distinct, closed, UTF-8,
+sidecar-free regular files, with no symbolic links in their paths or hard links.
+Inputs are opened immutable/read-only with `query_only`; the verifier never runs
+migrations, writes, checkpoints, `VACUUM`, or database creation. Keep their
+directories isolated and every writer stopped. File identity, size and change
+timestamps are checked before and after verification.
+
+All ordinary tables are compared, including `event_sequence`, sequence counters
+and migration journals. Indexed primary-key streams compare every stored column
+and its SQLite storage type; event identity is the stable `id`, not implicit
+rowid. INTEGER values retain all 64 bits; REAL values and raw TEXT/BLOB bytes are
+compared exactly. Only `event.data` may differ in storage representation. TEXT
+and independently validated OCEZ v1 BLOBs must produce identical serialized
+UTF-8 JSON bytes, including whitespace and escaping. Header/version, declared
+length, SHA-256, complete single Zstandard frame, bounded decoder window/output,
+UTF-8 and JSON validity are checked without parsing/reserializing JS objects.
+
+Schema object names and SQL definitions (tables, indexes, triggers and views)
+must match exactly. Persistent `application_id`, `user_version`, `encoding`,
+`page_size`, `auto_vacuum` and `default_cache_size` are compared. Physical root
+pages, implicit rowids, schema-cookie/change counters, freelists, page counts,
+SQLite writer version and journal mode are not logical-content comparisons and
+may change during compression/compaction. Views are compared by definition;
+their underlying ordinary tables are compared, not arbitrary view execution.
+
+Limits deliberately **fail verification**, never silently skip data:
+
+- `--max-row-bytes` defaults to 268435456 (256 MiB), maximum 1073741824.
+  SQL byte-size guards precede returned row values; decoded event bytes plus the
+  other columns must also fit. TEXT/BLOB bytes count by stored length, numeric
+  values by eight bytes, NULL by zero. The ceiling does not override SQLite's
+  whole-row limit. Several bounded buffers can coexist; use the verified 8 GiB,
+  zero-swap scope below.
+- Primary keys must have ascending BINARY ordering and no observed NULL values.
+  Small keyless tables use exact duplicate-preserving multisets, bounded to
+  1024 rows and 16 MiB of type/length-prefixed data per input. Larger keyless
+  tables are unsupported; no unbounded SQL sorting or row arrays are used.
+- Schema is bounded to 1024 objects, 4 MiB of definitions/names, and 256 columns
+  per table, with a 1 MiB repeated query-expression budget. **Virtual/shadow
+  tables (including FTS5) and generated columns are
+  unsupported.** If present, stop: this verifier cannot certify that database.
+  Do not drop or ignore tables/indexes to force a pass; additional independently
+  reviewed verification would be required for such a layout.
+
+Progress is throttled JSON on stderr; stdout contains `verified: true` and counts
+only after the entire comparison and final input checks pass. Mismatches identify
+table/row/column ordinals without logging keys, values or SQL definitions. Exit
+0 means fully verified, 1 means mismatch/corruption/unsupported/safety failure,
+2 means usage error, 130/143 mean interruption. Interruptions never report PASS;
+restart verification from the beginning. A native synchronous read/decompression
+must finish before a pending signal can be handled.
+
 ## Operator Procedure
 
 The following is an operator-run production maintenance procedure, not work
 performed by a development session. Do not run these commands against a live
 database or from an OpenCode development process.
+Development compression validation is complete. The next full compression is
+the final cutover working copy, not another development run or repeated dry-run.
 
 1. Before accessing any database, confirm the intended maintenance host and
    working-copy filesystem have sufficient free space and enforce the process
@@ -271,20 +329,20 @@ database or from an OpenCode development process.
    before opening the database. The process RSS statistic is observational,
    not an enforcement mechanism.
 2. Stop OpenCode and confirm no clients or other processes have production
-   database connections. Use SQLite's backup API or another SQLite-safe backup
-   procedure while the service is stopped. Preserve the pristine backup and
-   NAS copy untouched. Do not make the working copy by copying a live database
+   database connections. Preserve the pristine backup and NAS copy untouched.
+   Do not make the working copy by copying a live database
    file with active WAL state.
 3. After a clean checkpoint and closing every connection, make a fresh,
    separately named backup of the latest production database. Create a
    separate local working copy from that backup. A same-filesystem
    `cp --reflink=always --preserve=all` may be used only after checkpoint and
    close; verify the copy is independent and do not operate on the backup.
-4. Run a bounded dry-run against the working copy, then review the counts and
-   disk headroom. Only after that, run the full compressor against the copy
-   under the verified memory limit. Do not target production. The bounded
-   `--max-converted 100` example above is a write smoke sample, not a substitute
-   for a full dry-run or full conversion.
+   This one fresh backup is also the retained rollback original; do not create
+   another duplicate original at cutover.
+4. Check disk headroom and run the full compressor once on that final working
+   copy under the verified memory limit. Do not target production. The earlier
+   bounded/dry-run examples document options; they are not additional required
+   maintenance passes. Failures stop the procedure; do not cut over partial work.
 5. After conversion, checkpoint and close the working-copy connection. Produce
    a separate compact output with SQLite `VACUUM INTO`; budget space for the
    original, fresh backup, working copy, compact output, copy-on-write
@@ -295,18 +353,18 @@ database or from an OpenCode development process.
    identity; compare exact original UTF-8 TEXT bytes with compressed bytes, or
    decode pre-existing OCEZ BLOBs to their original raw bytes. Do not treat
    JSON parse/stringify equality or rowid equality as proof. Also compare other
-   tables and schema content and preserve sequence state. No new verification
-   utility is provided here; if reliable streaming byte and logical-content
-   comparisons are not available, require a separately reviewed verifier
-   before cutover.
+   tables, schema and persistent metadata and preserve sequence state. Require
+   `script/event-verify.ts` to complete successfully against the fresh backup
+   and compact output. Unsupported layouts or bounds are a stop, not permission
+   to skip verification.
 7. Confirm every client is stopped and all database connections are closed.
    Ensure the old database has been checkpointed and all SQLite sidecars are
    absent through normal SQLite close/checkpoint handling. Never blindly delete
    `-wal`, `-shm`, or journal files: stale sidecars must not be replayed onto a
    different database. Verify the deployed binary supports OCEZ BLOBs before
    starting it; older binaries are not downgrade-compatible. Keep a separate
-   rollback copy of the original and stage the compact output as a `.next` file
-   in the production directory, preserving ownership, mode, and required
+   fresh backup of the original for rollback and stage the compact output as a
+   `.next` file in the production directory, preserving ownership, mode, and required
    metadata. Flush the staged file and directory, then use one same-filesystem
    atomic rename/replace of `.next` over the database path. Do not implement
    cutover as two renames that leave the production pathname absent. Retain the
@@ -343,8 +401,7 @@ cp --reflink=always --preserve=all -- "$BACKUP" "$WORK" || exit 1
 
 Enforce and verify cgroup limits **inside the same scope** before invoking Bun.
 For example, this Linux cgroup-v2 wrapper refuses to start without the requested
-limits. Use it first with the bounded dry-run arguments, then with bounded write
-arguments, then without run bounds only when ready for the full backfill:
+limits. Run the final working-copy compression without sampling bounds:
 
 ```sh
 systemd-run --user --scope --expand-environment=no -p MemoryMax=8G -p MemorySwapMax=0 \
@@ -354,11 +411,7 @@ systemd-run --user --scope --expand-environment=no -p MemoryMax=8G -p MemorySwap
     test "$(cat "/sys/fs/cgroup$cg/memory.max")" = 8589934592
     test "$(cat "/sys/fs/cgroup$cg/memory.swap.max")" = 0
     exec bun script/event-compress.ts "$@"
-  ' sh --db "$WORK" --dry-run --max-scanned 1000 --max-converted 100
-# Repeat the same verified wrapper with:
-#   --db "$WORK" --write --offline --max-scanned 1000 --max-converted 100
-# Later full backfill, only on WORK, with no --max-scanned/--max-converted:
-#   --db "$WORK" --write --offline
+  ' sh --db "$WORK" --write --offline --max-payload-bytes 1073741824 --timings || exit 1
 ```
 
 Review `oversizedRows` and `nonprofitableRows`; completion does not mean every
@@ -377,33 +430,35 @@ integrity=$(sqlite3 "$COMPACT" 'PRAGMA integrity_check;') || exit 1
 test "$integrity" = ok || exit 1
 foreign_keys=$(sqlite3 "$COMPACT" 'PRAGMA foreign_key_check;') || exit 1
 test -z "$foreign_keys" || exit 1
-before_count=$(sqlite3 "$BACKUP" 'SELECT count(*) FROM event;') || exit 1
-after_count=$(sqlite3 "$COMPACT" 'SELECT count(*) FROM event;') || exit 1
-test "$before_count" = "$after_count" || exit 1
 ```
 
-Before cutover, require a reviewed **bounded streaming content verification** of
-`BACKUP` versus `COMPACT`, ordered by stable event `id`, not rowid. Compare
-`id`, `aggregate_id`, `seq`, and `type`, and compare exact serialized UTF-8 bytes
-after bounded OCEZ decompression with header/checksum validation. Length-prefix
-fields if hashing, to avoid ambiguous concatenations. Check stored byte length
-before loading each payload, bound decompressed output, and fail rather than
-silently skip an oversized or corrupt row. Also compare schema, all other tables,
-and sequence/owner state. Counts, integrity checks, and the compressor's per-row
-checks do not replace this end-to-end comparison. No general whole-database
-verifier is shipped here: **do not cut over until this verification is available
-and passes**.
+Before cutover, run the independent verifier from `packages/core`. The source is
+the **fresh backup created for this final run**, not a prior development backup;
+the destination is the final `VACUUM INTO` output. This command verifies the
+effective cgroup limits before Bun opens either file. Counts, integrity checks
+and the compressor's own checks do not replace this comparison. **Do not cut over
+unless it exits 0 with `verified: true`.** Retain the summary with the backup.
+
+```sh
+systemd-run --user --scope --expand-environment=no -p MemoryMax=8G -p MemorySwapMax=0 \
+  sh -eu -c '
+    cg=$(awk -F: '\''$1 == "0" { print $3 }'\'' /proc/self/cgroup)
+    test -n "$cg"
+    test "$(cat "/sys/fs/cgroup$cg/memory.max")" = 8589934592
+    test "$(cat "/sys/fs/cgroup$cg/memory.swap.max")" = 0
+    exec bun script/event-verify.ts "$@"
+  ' sh --source "$BACKUP" --destination "$COMPACT" --max-row-bytes 268435456 || exit 1
+```
 
 ```sh
 # Operator only AFTER all verification passes, while every client remains stopped.
-# Stage on the production filesystem. Retain an independent rollback original.
+# Stage on the production filesystem. Retain the already verified fresh backup.
 NEXT="$PROD.next"
-ROLLBACK="$PROD.before-compression"
-test ! -e "$NEXT" && test ! -e "$ROLLBACK" || exit 1
-for db in "$PROD" "$COMPACT"; do
+ROLLBACK="$BACKUP"
+test ! -e "$NEXT" && test ! -L "$NEXT" || exit 1
+for db in "$PROD" "$COMPACT" "$ROLLBACK"; do
   for suffix in -wal -shm -journal; do test ! -e "$db$suffix" || exit 1; done
 done
-cp --reflink=always --preserve=all -- "$PROD" "$ROLLBACK" || exit 1
 cp --reflink=always --preserve=all -- "$COMPACT" "$NEXT" || exit 1
 cmp -s -- "$PROD" "$ROLLBACK" || exit 1
 cmp -s -- "$COMPACT" "$NEXT" || exit 1
@@ -414,6 +469,7 @@ production_device=$(stat -c %d -- "$PROD") || exit 1
 staged_device=$(stat -c %d -- "$NEXT") || exit 1
 test "$production_device" = "$staged_device" || exit 1
 sync -f "$ROLLBACK" || exit 1
+sync -f "$(dirname "$ROLLBACK")" || exit 1
 sync -f "$NEXT" || exit 1
 sync -f "$(dirname "$PROD")" || exit 1
 mv -T -- "$NEXT" "$PROD" || exit 1  # One same-filesystem atomic pathname replacement.
