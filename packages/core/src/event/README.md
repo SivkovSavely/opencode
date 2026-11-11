@@ -2,8 +2,10 @@
 
 Only `event.data` uses this codec. The column retains its existing `TEXT`
 declaration; SQLite also permits BLOB values in that column. There is no schema
-migration or historical conversion. Opening a database does not rewrite its
-events, and other JSON columns remain uncompressed.
+migration or automatic historical conversion. Opening a database does not
+rewrite its events, and other JSON columns remain uncompressed. An explicit,
+standalone offline utility for historical conversion is documented in
+[`../../script/event-compress.md`](../../script/event-compress.md).
 
 The Drizzle column mapper returns the same logical JSON object for both legacy
 TEXT and compressed BLOB rows. Event IDs, versioned types, aggregate IDs, sequence
@@ -69,12 +71,10 @@ read-only, and prints metadata plus decoded JSON. It bypasses the application
 database layer: no migrations, WAL configuration, conversion, or checkpoint
 commands. Decoded events can contain sensitive file contents and tool output.
 
-A future conversion-back utility should be an explicit, separately tested
-maintenance operation: decode BLOB rows and replace only `data` with
-`JSON.stringify(decoded)` TEXT in bounded transactions, preserving all event
-identity and ordering columns. It would need backups, interruption/restart
-handling, verification that no BLOBs remain, and tests against the intended older
-binary. No conversion utility or automatic historical rewrite is included here.
+Conversion back to TEXT for an older binary remains a separate maintenance
+operation requiring its own backup, bounded restartable procedure, verification,
+and compatibility testing. Do not downgrade a database containing OCEZ BLOBs
+without that separately verified process.
 
 ## Persistence cost
 

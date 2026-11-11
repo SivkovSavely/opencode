@@ -24,7 +24,10 @@ export class LimitError extends Error {
 }
 
 export function encode(data: Record<string, unknown>): string | Uint8Array {
-  const json = JSON.stringify(data)
+  return encodeJson(JSON.stringify(data))
+}
+
+export function encodeJson(json: string): string | Uint8Array {
   const size = Buffer.byteLength(json)
   if (size < threshold || (!bun && !node)) return json
   const compressed = bun

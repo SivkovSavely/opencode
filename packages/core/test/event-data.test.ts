@@ -23,6 +23,14 @@ function frame(bytes: Uint8Array) {
 }
 
 describe("event payload storage codec", () => {
+  test("encodes serialized JSON without normalizing whitespace, escaping or duplicate keys", () => {
+    const json = ` \n{ "text": "${"a".repeat(4096)}", "escaped": "\\u96ea", "key": 1, "key": 2 }\n`
+    const encoded = EventData.encodeJson(json)
+    expect(encoded).toEqual(frame(Buffer.from(json)))
+    expect(Buffer.from(Bun.zstdDecompressSync((encoded as Uint8Array).subarray(41)))).toEqual(Buffer.from(json))
+    expect(EventData.encodeJson(' {"a": 1} ')).toBe(' {"a": 1} ')
+  })
+
   test("reads legacy TEXT and round-trips large UTF-8 JSON without changing its logical shape", () => {
     expect(EventData.decode(JSON.stringify(large))).toEqual(large)
     const encoded = EventData.encode(large)
