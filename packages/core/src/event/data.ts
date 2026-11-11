@@ -6,7 +6,7 @@ import zlib from "node:zlib"
 const magic = Buffer.from("OCEZ")
 const version = 1
 const headerSize = 41
-const threshold = 16 * 1024
+const threshold = 4 * 1024
 const bun =
   typeof Bun !== "undefined" &&
   typeof Bun.zstdCompressSync === "function" &&
@@ -30,7 +30,7 @@ export function encode(data: Record<string, unknown>): string | Uint8Array {
   const compressed = bun
     ? Bun.zstdCompressSync(Buffer.from(json), { level: 3 })
     : zlib.zstdCompressSync(json, { params: { [zlib.constants.ZSTD_c_compressionLevel]: 3 } })
-  if (compressed.byteLength + headerSize > size * 0.75) return json
+  if (compressed.byteLength + headerSize >= size) return json
   const result = Buffer.allocUnsafe(headerSize + compressed.byteLength)
   magic.copy(result)
   result[4] = version

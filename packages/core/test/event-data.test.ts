@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { createHash, randomBytes } from "node:crypto"
+import { createHash } from "node:crypto"
 import { Cause, Effect, Exit } from "effect"
 import { layer } from "#sqlite"
 import { eq, sql } from "drizzle-orm"
@@ -34,14 +34,97 @@ describe("event payload storage codec", () => {
     expect(EventData.decode(view.subarray(7, -11))).toEqual(large)
   })
 
-  test("keeps small and high-entropy payloads as JSON TEXT and measures the threshold in UTF-8 bytes", () => {
-    const small = { text: "a".repeat(16 * 1024 - 12) }
-    expect(typeof EventData.encode(small)).toBe("string")
-    expect(EventData.encode({ text: "a".repeat(16 * 1024 - 11) })).toBeInstanceOf(Uint8Array)
-    expect(EventData.encode({ text: "\u96ea".repeat(6000) })).toBeInstanceOf(Uint8Array)
-    const entropy = { text: randomBytes(64 * 1024).toString("base64") }
-    expect(typeof EventData.encode(entropy)).toBe("string")
-    expect(EventData.decode(EventData.encode(entropy))).toEqual(entropy)
+  test("keeps JSON just below 4096 bytes as TEXT and compresses at the inclusive threshold", () => {
+    const small = { text: "a".repeat(4096 - 12) }
+    const boundary = { text: "a".repeat(4096 - 11) }
+    expect(Buffer.byteLength(JSON.stringify(small))).toBe(4095)
+    expect(EventData.encode(small)).toBe(JSON.stringify(small))
+    expect(Buffer.byteLength(JSON.stringify(boundary))).toBe(4096)
+    const encoded = EventData.encode(boundary)
+    expect(encoded).toBeInstanceOf(Uint8Array)
+    expect(EventData.decode(encoded)).toEqual(boundary)
+  })
+
+  test("measures the threshold in UTF-8 bytes rather than JavaScript string length", () => {
+    const small = { text: "\u96ea".repeat(1361) + "a" }
+    const boundary = { text: "\u96ea".repeat(1361) + "aa" }
+    expect(Buffer.byteLength(JSON.stringify(small))).toBe(4095)
+    expect(EventData.encode(small)).toBe(JSON.stringify(small))
+    expect(Buffer.byteLength(JSON.stringify(boundary))).toBe(4096)
+    expect(JSON.stringify(boundary).length).toBeLessThan(4096)
+    const encoded = EventData.encode(boundary)
+    expect(encoded).toBeInstanceOf(Uint8Array)
+    expect(EventData.decode(encoded)).toEqual(boundary)
+  })
+
+  test("compresses eligible payloads between 4 KiB and 16 KiB", () => {
+    const data = { text: "a".repeat(8192) }
+    const encoded = EventData.encode(data)
+    expect(encoded).toBeInstanceOf(Uint8Array)
+    expect(EventData.decode(encoded)).toEqual(data)
+  })
+
+  test("retains profitable high-entropy base64 even when net savings are less than 25%", () => {
+    const data = {
+      text: Buffer.concat(
+        Array.from({ length: 2048 }, (_, index) => createHash("sha256").update(String(index)).digest()),
+      ).toString("base64"),
+    }
+    const size = Buffer.byteLength(JSON.stringify(data))
+    const framed = frame(Buffer.from(JSON.stringify(data)))
+    expect(framed.byteLength).toBeGreaterThan(size * 0.75)
+    expect(framed.byteLength).toBeLessThan(size)
+    const encoded = EventData.encode(data)
+    expect(encoded).toBeInstanceOf(Uint8Array)
+    expect(encoded).toEqual(framed)
+    expect(EventData.decode(encoded)).toEqual(data)
+  })
+
+  test("retains a one-byte net saving but rejects equal or larger complete envelopes", async () => {
+    await using tmp = await tmpdir()
+    const build = await Bun.build({
+      entrypoints: [new URL("../src/event/data.ts", import.meta.url).pathname],
+      target: "node",
+      outdir: tmp.path,
+    })
+    expect(build.success, JSON.stringify(build.logs)).toBe(true)
+    // Isolate controlled compressor lengths from the runner and native Zstandard version differences.
+    const child = Bun.spawn(
+      [
+        "node",
+        "--input-type=module",
+        "--eval",
+        `
+          import zlib from "node:zlib"
+          const data = { text: "a".repeat(8192) }
+          const json = JSON.stringify(data)
+          const size = Buffer.byteLength(json)
+          const results = []
+          for (const difference of [-1, 0, 1, 41]) {
+            zlib.zstdCompressSync = () => Buffer.alloc(size - 41 + difference)
+            const { EventData } = await import(${JSON.stringify(`${tmp.path}/data.js`)})
+            const encoded = EventData.encode(data)
+            results.push(typeof encoded === "string"
+              ? { storage: "text", unchanged: encoded === json }
+              : { storage: "blob", savings: size - encoded.byteLength })
+          }
+          console.log(JSON.stringify(results))
+        `,
+      ],
+      { stdout: "pipe", stderr: "pipe" },
+    )
+    const [stdout, stderr, code] = await Promise.all([
+      new Response(child.stdout).text(),
+      new Response(child.stderr).text(),
+      child.exited,
+    ])
+    expect(code, stderr).toBe(0)
+    expect(JSON.parse(stdout)).toEqual([
+      { storage: "blob", savings: 1 },
+      { storage: "text", unchanged: true },
+      { storage: "text", unchanged: true },
+      { storage: "text", unchanged: true },
+    ])
   })
 
   test("rejects oversized TEXT before JSON parsing, including multi-byte UTF-8", () => {

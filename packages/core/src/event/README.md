@@ -13,11 +13,12 @@ envelope. Raw SQL bypasses this mapper and must use `EventData.decode` itself.
 
 ## Write policy and format
 
-JSON smaller than 16 KiB (UTF-8 bytes) remains TEXT. Larger payloads are tried
-with native Zstandard level 3 and retained as BLOB only if the entire envelope is
-at most 75% of the original JSON size. Small and insufficiently compressible
-payloads remain TEXT. This avoids paying a persistent format cost for marginal
-savings, although attempting compression still costs CPU.
+JSON smaller than 4 KiB (4096 UTF-8 bytes) remains TEXT. Payloads at or above
+4096 bytes are tried with native Zstandard level 3 and retained as BLOB only if
+the complete encoded representation, including its 41-byte header, is strictly
+smaller than the original JSON UTF-8 byte length. Even a one-byte net saving is
+retained; equal-size or larger representations remain TEXT. Attempting
+compression still costs CPU.
 
 Version 1 is a 41-byte header followed by a standard Zstandard frame:
 
@@ -84,7 +85,8 @@ measured iterations. Synthetic ASCII/UTF-8 diff and high-entropy cases cover
 1, 4, 8, 16, 32, 256, and 1024 KiB targets. JSON escaping makes actual sizes differ
 from the target.
 
-Representative local medians on Bun 1.4.4, WAL, `synchronous=NORMAL`, in microseconds:
+Historical local medians under the former 16 KiB threshold and 25% minimum
+savings policy, on Bun 1.4.4, WAL, `synchronous=NORMAL`, in microseconds:
 
 | Payload                      | JSON / stored bytes    | Stringify | Codec encode | Publish total / writer lock | Outer transaction total / lock |
 | ---------------------------- | ---------------------- | --------- | ------------ | --------------------------- | ------------------------------ |
@@ -94,11 +96,12 @@ Representative local medians on Bun 1.4.4, WAL, `synchronous=NORMAL`, in microse
 | Diff ASCII, 1 MiB target     | 1,122,741 / 111,012    | 897       | 2,300        | 3,475 / 492                 | 3,213 / 3,139                  |
 | Diff UTF-8, 1 MiB target     | 1,116,459 / 107,745    | 929       | 2,831        | 3,221 / 478                 | 3,066 / 3,026                  |
 
-These results support the conservative 16 KiB threshold: near-threshold diffs
-save about 89% with tens of microseconds of encoding work. The 25% savings gate
-keeps these synthetic entropy cases as TEXT. Results vary between runs and are
-not production distribution or concurrent-writer benchmarks. Separate stringify
-timings are a serialization reference, not a full legacy persistence baseline.
+Under that former policy, near-threshold diffs saved about 89% with tens of
+microseconds of encoding work, while the 25% savings gate kept these synthetic
+entropy cases as TEXT. These measurements have not been rerun for the current
+4 KiB / strictly-smaller policy. Results vary between runs and are not production
+distribution or concurrent-writer benchmarks. Separate stringify timings are a
+serialization reference, not a full legacy persistence baseline.
 
 Event persistence prepares the storage representation before acquiring its own
 `BEGIN IMMEDIATE` writer lock. If the caller already holds an outer transaction,
