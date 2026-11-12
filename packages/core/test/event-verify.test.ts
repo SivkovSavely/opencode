@@ -44,6 +44,26 @@ function change(filename: string, sql: string) {
   db.exec(sql)
 }
 
+function transcriptFixture(filename: string) {
+  change(
+    filename,
+    `CREATE TABLE transcript_search(part_id TEXT PRIMARY KEY, body TEXT, truncated INTEGER);
+     CREATE TABLE transcript_search_v2(message_id TEXT NOT NULL, part_id TEXT NOT NULL, body TEXT, PRIMARY KEY(message_id,part_id));
+     CREATE TABLE message(id TEXT PRIMARY KEY, data TEXT);
+     INSERT INTO transcript_search VALUES ('p1','searchable alpha transcript',0),('p2','searchable beta transcript',0);
+     INSERT INTO transcript_search_v2 VALUES ('m1','p1','searchable alpha transcript'),('m2','p2','searchable beta transcript');
+     INSERT INTO message VALUES ('m1','{}'),('m2','{}');
+     CREATE VIRTUAL TABLE transcript_search_fts USING fts5(body, content='transcript_search', content_rowid='rowid', tokenize='trigram');
+     CREATE VIRTUAL TABLE transcript_search_error_fts USING fts5(body, content='', contentless_delete=1, tokenize='trigram');
+     CREATE VIRTUAL TABLE transcript_search_v2_fts USING fts5(body, content='transcript_search_v2', content_rowid='rowid', tokenize='trigram');
+     CREATE VIRTUAL TABLE transcript_search_v2_error USING fts5(message_id UNINDEXED, body, tokenize='trigram');
+     INSERT INTO transcript_search_fts(rowid,body) SELECT rowid,body FROM transcript_search;
+     INSERT INTO transcript_search_v2_fts(rowid,body) SELECT rowid,body FROM transcript_search_v2;
+     INSERT INTO transcript_search_error_fts(rowid,body) SELECT rowid,'searchable error transcript' FROM message;
+     INSERT INTO transcript_search_v2_error(message_id,body) VALUES ('m1','searchable error transcript');`,
+  )
+}
+
 async function cli(args: string[]) {
   const child = Bun.spawn([process.execPath, "script/event-verify.ts", ...args], {
     cwd: new URL("..", import.meta.url).pathname,
@@ -413,5 +433,128 @@ describe("offline event database verification", () => {
     expect((await cli(["--source", source, "--destination", destination, "--max-row-bytes", "1073741825"])).code).toBe(
       2,
     )
+  })
+
+  describe("TranscriptSearch FTS5", () => {
+    test("compares all known virtual definitions and shadow data after VACUUM INTO", async () => {
+      const { tmp, source, destination } = await pair()
+      await using _tmp = tmp
+      for (const filename of [source, destination]) transcriptFixture(filename)
+      change(destination, "UPDATE event SET rowid=rowid+100")
+      const compact = `${tmp.path}/compact.sqlite`
+      change(destination, `VACUUM INTO '${compact}'`)
+      expect(await verifyDatabases({ source, destination: compact })).toMatchObject({
+        verified: true,
+        tablesCompared: 27,
+      })
+    })
+
+    test.each([
+      ["segments", "UPDATE transcript_search_v2_fts_data SET block=x'ffeedd' WHERE id=1"],
+      ["index", "UPDATE transcript_search_v2_fts_idx SET pgno=pgno+1"],
+      ["document sizes", "UPDATE transcript_search_v2_fts_docsize SET sz=x'ff'"],
+      ["configuration types", "UPDATE transcript_search_v2_fts_config SET v=CAST(v AS TEXT)"],
+      ["content", "UPDATE transcript_search_v2_error_content SET c0='private changed content'"],
+    ])("compares exact stored shadow %s", async (_label, sql) => {
+      const { tmp, source, destination } = await pair()
+      await using _tmp = tmp
+      for (const filename of [source, destination]) transcriptFixture(filename)
+      // Bun keeps defensive mode enabled; disable it only in this synthetic corruption writer.
+      const writer = Bun.spawnSync([
+        "node",
+        "--input-type=module",
+        "-e",
+        `import { DatabaseSync } from 'node:sqlite';
+         const db = new DatabaseSync(process.argv[1]);
+         db.enableDefensive(false);
+         if (db.prepare(process.argv[2]).run().changes < 1) throw new Error('Fixture update changed no rows');
+         db.close();`,
+        destination,
+        sql,
+      ])
+      expect(writer.exitCode, writer.stderr.toString()).toBe(0)
+      await expect(verifyDatabases({ source, destination })).rejects.toThrow(/Storage type\/value mismatch/)
+    })
+
+    test.each(["transcript_search", "transcript_search_v2", "message"])(
+      "rejects changed external-content rowid mappings for %s after VACUUM INTO",
+      async (table) => {
+        const { tmp, source, destination } = await pair()
+        await using _tmp = tmp
+        for (const filename of [source, destination]) transcriptFixture(filename)
+        change(destination, `UPDATE ${table} SET rowid=rowid+100`)
+        const compact = `${tmp.path}/compact.sqlite`
+        change(destination, `VACUUM INTO '${compact}'`)
+        await expect(verifyDatabases({ source, destination: compact })).rejects.toThrow(
+          /FTS external-content rowid mapping mismatch/,
+        )
+      },
+    )
+
+    test.each([
+      "CREATE VIRTUAL TABLE unknown_search USING fts5(body)",
+      "CREATE VIRTUAL TABLE transcript_search_fts USING rtree(id, minimum, maximum)",
+      "CREATE VIRTUAL TABLE transcript_search_fts USING fts5(body, content='message', tokenize='trigram')",
+    ])("refuses unknown virtual modules/names/layouts: %s", async (sql) => {
+      const { tmp, source, destination } = await pair()
+      await using _tmp = tmp
+      for (const filename of [source, destination]) change(filename, sql)
+      await expect(verifyDatabases({ source, destination })).rejects.toThrow(/Unsupported.*virtual|Unsupported.*FTS/i)
+    })
+
+    test("still compares supported virtual SQL definitions exactly", async () => {
+      const { tmp, source, destination } = await pair()
+      await using _tmp = tmp
+      for (const filename of [source, destination]) transcriptFixture(filename)
+      change(
+        destination,
+        "DROP TABLE transcript_search_v2_error; CREATE VIRTUAL TABLE transcript_search_v2_error USING fts5(message_id UNINDEXED, body, tokenize = 'trigram')",
+      )
+      await expect(verifyDatabases({ source, destination })).rejects.toThrow(/Schema definitions mismatch/)
+    })
+
+    test("does not misclassify triggers sharing virtual-table names", async () => {
+      const { tmp, source, destination } = await pair()
+      await using _tmp = tmp
+      for (const filename of [source, destination]) {
+        transcriptFixture(filename)
+        change(filename, "CREATE TRIGGER transcript_search_fts AFTER INSERT ON unrelated BEGIN SELECT 1; END")
+      }
+      expect((await verifyDatabases({ source, destination })).verified).toBe(true)
+    })
+
+    test("does not exclude ordinary prefix lookalikes or allow generated columns", async () => {
+      const { tmp, source, destination } = await pair()
+      await using _tmp = tmp
+      for (const filename of [source, destination]) {
+        transcriptFixture(filename)
+        change(
+          filename,
+          "CREATE TABLE transcript_search_v2_fts_extra(id INTEGER PRIMARY KEY, value); INSERT INTO transcript_search_v2_fts_extra VALUES(1,'same')",
+        )
+      }
+      change(destination, "UPDATE transcript_search_v2_fts_extra SET value='different'")
+      await expect(verifyDatabases({ source, destination })).rejects.toThrow(/Storage type\/value mismatch/)
+      for (const filename of [source, destination])
+        change(
+          filename,
+          "UPDATE transcript_search_v2_fts_extra SET value='same'; CREATE TABLE generated(a INTEGER PRIMARY KEY,b INTEGER GENERATED ALWAYS AS(a+1))",
+        )
+      await expect(verifyDatabases({ source, destination })).rejects.toThrow(/Unsupported generated\/hidden/)
+    })
+
+    test("metadata-only preflight permits FTS hidden columns without certifying or reading contents", async () => {
+      const { tmp, source, destination } = await pair()
+      await using _tmp = tmp
+      for (const filename of [source, destination]) {
+        transcriptFixture(filename)
+        change(filename, "UPDATE event SET data='invalid private JSON'")
+      }
+      const result = await cli(["--source", source, "--destination", destination, "--preflight"])
+      expect(result.code, result.stderr).toBe(0)
+      expect(JSON.parse(result.stdout)).toMatchObject({ preflight: true, verified: false, rowsCompared: 0 })
+      expect(result.stdout + result.stderr).not.toContain("invalid private JSON")
+      await expect(verifyDatabases({ source, destination })).rejects.toThrow(/Invalid serialized event/)
+    })
   })
 })

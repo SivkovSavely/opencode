@@ -11,6 +11,7 @@ type Options = {
   source: string
   destination: string
   maxRowBytes?: number
+  preflight?: boolean
   signal?: AbortSignal
 }
 
@@ -21,6 +22,7 @@ export type Stats = {
   eventRowsCompared: number
   eventBytesCompared: number
   peakRssBytes: number
+  preflight?: true
 }
 
 type Column = { name: string; type: string; pk: number; hidden: number }
@@ -32,6 +34,24 @@ const schemaBytes = 4 * 1024 * 1024
 const keylessRows = 1024
 const keylessBytes = 16 * 1024 * 1024
 const maximumColumns = 256
+const transcriptFts = [
+  {
+    name: "transcript_search_fts",
+    args: ["body", "content='transcript_search'", "content_rowid='rowid'", "tokenize='trigram'"],
+    content: "transcript_search",
+  },
+  {
+    name: "transcript_search_error_fts",
+    args: ["body", "content=''", "contentless_delete=1", "tokenize='trigram'"],
+    content: "message",
+  },
+  {
+    name: "transcript_search_v2_fts",
+    args: ["body", "content='transcript_search_v2'", "content_rowid='rowid'", "tokenize='trigram'"],
+    content: "transcript_search_v2",
+  },
+  { name: "transcript_search_v2_error", args: ["message_id UNINDEXED", "body", "tokenize='trigram'"], content: null },
+]
 
 class UsageError extends Error {}
 class VerificationError extends Error {}
@@ -55,6 +75,7 @@ export async function verifyDatabases(input: Options, onProgress?: (stats: Stats
     eventRowsCompared: 0,
     eventBytesCompared: 0,
     peakRssBytes: process.memoryUsage.rss(),
+    ...(input.preflight ? { preflight: true as const } : {}),
   }
   const progress = async () => {
     stats.peakRssBytes = Math.max(stats.peakRssBytes, process.memoryUsage.rss())
@@ -100,20 +121,41 @@ export async function verifyDatabases(input: Options, onProgress?: (stats: Stats
     const b = inventory(right)
     if (
       a.length !== b.length ||
-      a.some((item, index) => (["type", "name", "table", "sql"] as const).some((key) => item[key] !== b[index][key]))
+      a.some((item, index) =>
+        (["type", "name", "table", "sql", "kind", "wr"] as const).some((key) => item[key] !== b[index][key]),
+      )
     )
       throw new VerificationError("Schema definitions mismatch; table/index/trigger/view names or SQL changed")
     const tables = a.filter((item) => item.type === "table")
     if (!tables.some((table) => table.name === "event")) throw new VerificationError("Missing required event table")
+    const rowids = new Set(
+      tables.flatMap((table) => {
+        const content = table.kind === "virtual" ? transcriptFts.find((fts) => fts.name === table.name)?.content : null
+        return content ? [content] : []
+      }),
+    )
+    if (
+      [...rowids].some(
+        (name) => !tables.some((table) => table.name === name && table.kind === "table" && table.wr === 0),
+      )
+    )
+      throw new VerificationError("Unsupported FTS external-content table layout; require ordinary rowid tables")
     for (const [index, table] of tables.entries()) {
       abort()
       stage = `table ${index + 1}`
+      // Virtual definitions were checked exactly; compare all their backing tables instead of hidden columns.
+      if (table.kind === "virtual") {
+        stats.tablesCompared++
+        continue
+      }
       const columns = left
         .query<Column, [string]>("SELECT name, type, pk, hidden FROM pragma_table_xinfo(?) LIMIT 257")
         .all(table.name)
       if (!columns.length || columns.length > maximumColumns || columns.some((column) => column.hidden !== 0))
         throw new VerificationError(`Unsupported generated/hidden columns or column limit at ${stage}`)
       const keys = columns.filter((column) => column.pk > 0).sort((a, b) => a.pk - b.pk)
+      if (rowids.has(table.name) && (!keys.length || columns.some((column) => column.name.toLowerCase() === "rowid")))
+        throw new VerificationError(`Unsupported FTS external-content primary key/rowid at ${stage}`)
       if (
         table.name === "event" &&
         (keys.length !== 1 ||
@@ -162,13 +204,17 @@ export async function verifyDatabases(input: Options, onProgress?: (stats: Stats
         `typeof(${quote(column.name)}) AS t${i}`,
         `CASE WHEN (${bytes}) <= ${budget} THEN CASE WHEN typeof(${quote(column.name)}) IN ('text','blob') THEN CAST(${quote(column.name)} AS BLOB) ELSE ${quote(column.name)} END END AS v${i}`,
       ])
-      const sql = `SELECT (${bytes}) AS bytes, ${fields.join(", ")} FROM ${quote(table.name)}${pk.length ? ` INDEXED BY ${quote(pk[0].name)}` : ""}${keys.length ? ` ORDER BY ${keys.map((key) => `${quote(key.name)} COLLATE BINARY ASC`).join(", ")}` : ` LIMIT ${keylessRows + 1}`}`
+      const sql = `SELECT (${bytes}) AS bytes, ${fields.join(", ")}${rowids.has(table.name) ? ", rowid AS fts_rowid" : ""} FROM ${quote(table.name)}${pk.length ? ` INDEXED BY ${quote(pk[0].name)}` : ""}${keys.length ? ` ORDER BY ${keys.map((key) => `${quote(key.name)} COLLATE BINARY ASC`).join(", ")}` : ` LIMIT ${keylessRows + 1}`}`
       for (const db of [left, right]) {
         const plan = db.query<{ detail: string }, []>(`EXPLAIN QUERY PLAN ${sql}`).all()
         if (plan.some((step) => /TEMP B-TREE|AUTOMATIC INDEX/i.test(step.detail)))
           throw new VerificationError(
             `Unsupported query plan at ${stage}; refusing temporary sorting/index construction`,
           )
+      }
+      if (input.preflight) {
+        stats.tablesCompared++
+        continue
       }
       const first = left.prepare<Row, []>(sql)
       const second = right.prepare<Row, []>(sql)
@@ -210,6 +256,11 @@ export async function verifyDatabases(input: Options, onProgress?: (stats: Stats
             const br = bi.next()
             if (ar.done && br.done) break
             if (ar.done || br.done) throw new VerificationError(`Missing/extra row at ${stage}, row ${ordinal}`)
+            if (
+              rowids.has(table.name) &&
+              (typeof ar.value.fts_rowid !== "bigint" || ar.value.fts_rowid !== br.value.fts_rowid)
+            )
+              throw new VerificationError(`FTS external-content rowid mapping mismatch at ${stage}, row ${ordinal}`)
             const av = readRow(ar.value, columns.length, budget)
             const bv = readRow(br.value, columns.length, budget)
             for (const key of keys) {
@@ -245,7 +296,7 @@ export async function verifyDatabases(input: Options, onProgress?: (stats: Stats
     await progress()
     unchanged(source)
     unchanged(destination)
-    stats.verified = true
+    stats.verified = !input.preflight
     return stats
   } catch (cause) {
     if (cause instanceof VerificationError) throw cause
@@ -315,11 +366,12 @@ function inventory(db: Database) {
   if (rows.length > schemaObjects || rows.reduce((sum, row) => sum + row.bytes, 0) > schemaBytes)
     throw new VerificationError("Schema metadata object/byte limit exceeded")
   const kinds = db
-    .query<{ type: string }, []>("SELECT type FROM pragma_table_list WHERE schema='main' LIMIT 1026")
+    .query<
+      { name: string; type: string; wr: number },
+      []
+    >("SELECT name, type, wr FROM pragma_table_list WHERE schema='main' LIMIT 1026")
     .all()
-  if (kinds.some((row) => row.type === "virtual" || row.type === "shadow"))
-    throw new VerificationError("Unsupported virtual/shadow tables; verification cannot certify this database")
-  return rows
+  const objects = rows
     .map((row) => {
       const item = db
         .query<
@@ -331,14 +383,50 @@ function inventory(db: Database) {
         if (!isUtf8(bytes)) throw new VerificationError("Unsupported non-UTF-8 schema metadata")
         return Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength).toString("utf8")
       }
+      const name = text(item.name)
+      const type = text(item.type)
+      const kind = type === "table" || type === "view" ? kinds.find((row) => row.name === name) : undefined
       return {
-        type: text(item.type),
-        name: text(item.name),
+        type,
+        name,
         table: text(item.table),
         sql: item.sql === null ? null : text(item.sql),
+        kind: kind?.type ?? null,
+        wr: kind?.wr ?? null,
       }
     })
     .sort((a, b) => (a.type < b.type ? -1 : a.type > b.type ? 1 : a.name < b.name ? -1 : a.name > b.name ? 1 : 0))
+  const shadows = new Set<string>()
+  for (const table of objects.filter((table) => table.kind === "virtual")) {
+    const fts = transcriptFts.find((fts) => fts.name === table.name)
+    const definition = table.sql?.match(
+      /^CREATE\s+VIRTUAL\s+TABLE\s+(?:"([^"]+)"|`([^`]+)`|\[([^\]]+)\]|(\w+))\s+USING\s+fts5\s*\(([^;]*)\)\s*$/i,
+    )
+    const args = definition?.[5].split(",").map((arg) =>
+      arg
+        .trim()
+        .replace(/\s*=\s*/g, "=")
+        .replace(/\s+/g, " ")
+        .toLowerCase(),
+    )
+    if (
+      !fts ||
+      !definition ||
+      (definition[1] ?? definition[2] ?? definition[3] ?? definition[4]) !== table.name ||
+      args?.length !== fts.args.length ||
+      args.some((arg, i) => arg !== fts.args[i].toLowerCase())
+    )
+      throw new VerificationError("Unsupported virtual table/module or TranscriptSearch FTS5 layout")
+    for (const suffix of ["data", "idx", "config", "docsize", ...(fts.content === null ? ["content"] : [])]) {
+      const name = `${table.name}_${suffix}`
+      if (!objects.some((item) => item.name === name && item.kind === "shadow"))
+        throw new VerificationError("Unsupported or missing FTS5 shadow table metadata")
+      shadows.add(name)
+    }
+  }
+  if (objects.some((table) => table.kind === "shadow" && !shadows.has(table.name)))
+    throw new VerificationError("Unsupported FTS5 shadow table metadata; no supported owning virtual table")
+  return objects
 }
 
 function readRow(row: Row, count: number, maximum: number): Cell[] {
@@ -461,16 +549,18 @@ Usage: bun script/event-verify.ts --source BACKUP --destination COMPACT [options
 --source PATH          Explicit existing pristine offline source (required)
 --destination PATH     Explicit existing compressed/VACUUM output (required)
 --max-row-bytes N      Stored/logical row cap, default 268435456, max 1073741824
+--preflight            Metadata/plans only; never certifies contents (verified=false)
 --help                 Show help
 
 Inputs must be distinct, closed, UTF-8, sidecar-free regular files with no links.
 Immutable read-only: no migrations, writes, checkpoints, VACUUM or file creation.
 All columns/types and schema are compared; only event.data TEXT/OCEZ may differ.
-Stable indexed primary keys, never implicit rowids. Keyless tables: max 1024 rows
-and 16 MiB encoded bytes each. Virtual/shadow/generated layouts are unsupported.
+Stable indexed primary keys; FTS-referenced content rowid mappings must also match.
+Known TranscriptSearch FTS5 schemas and ALL shadow data are compared, not hidden columns.
+Other virtual/generated layouts are unsupported. Keyless tables: max 1024 rows/16 MiB.
 Limits or corruption FAIL verification, never skip. Use verified MemoryMax=8G,
 MemorySwapMax=0 for final comparison. Requires SQLite >=3.43 and bounded Zstd.
-Exit: 0 fully verified, 1 mismatch/safety/unsupported, 2 usage, 130 INT, 143 TERM.
+Exit: 0 complete (preflight is metadata only), 1 mismatch/safety/unsupported, 2 usage, 130 INT, 143 TERM.
 `
 
 if (import.meta.main) {
@@ -492,6 +582,7 @@ if (import.meta.main) {
           source: { type: "string" },
           destination: { type: "string" },
           "max-row-bytes": { type: "string" },
+          preflight: { type: "boolean" },
           help: { type: "boolean" },
         },
         strict: true,
@@ -512,6 +603,7 @@ if (import.meta.main) {
           maxRowBytes:
             parsed.values["max-row-bytes"] === undefined ? undefined : Number(parsed.values["max-row-bytes"]),
           signal: controller.signal,
+          preflight: parsed.values.preflight === true,
         },
         (stats) => {
           if (stats.rowsCompared % 1000 !== 0 && Date.now() - last < 5000) return

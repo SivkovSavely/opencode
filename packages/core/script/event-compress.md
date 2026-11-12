@@ -282,10 +282,32 @@ UTF-8 and JSON validity are checked without parsing/reserializing JS objects.
 Schema object names and SQL definitions (tables, indexes, triggers and views)
 must match exactly. Persistent `application_id`, `user_version`, `encoding`,
 `page_size`, `auto_vacuum` and `default_cache_size` are compared. Physical root
-pages, implicit rowids, schema-cookie/change counters, freelists, page counts,
+pages, unrelated implicit rowids, schema-cookie/change counters, freelists, page counts,
 SQLite writer version and journal mode are not logical-content comparisons and
 may change during compression/compaction. Views are compared by definition;
 their underlying ordinary tables are compared, not arbitrary view execution.
+
+The four known TranscriptSearch FTS5 layouts are supported:
+`transcript_search_fts`, `transcript_search_error_fts`, `transcript_search_v2_fts`
+and `transcript_search_v2_error`. Their virtual SQL definitions are compared
+exactly. Ownership requires the known FTS5 declaration **and** SQLite
+`pragma_table_list` metadata identifying every expected backing table as
+`shadow`, not merely a matching name prefix. All `_data`, `_idx`, `_config`,
+`_docsize` and applicable `_content` tables are streamed and compared by their
+declared keys, exact storage types and bytes. For example,
+`transcript_search_v2_fts_config` is expected, not corruption. Virtual hidden
+columns are not read as ordinary data; no INSERT-based FTS integrity commands
+are issued.
+
+FTS rowid references are an explicit exception to ignoring implicit rowids:
+`transcript_search_fts` references `transcript_search.rowid`,
+`transcript_search_v2_fts` references `transcript_search_v2.rowid`, and
+`transcript_search_error_fts` stores `message.rowid` even though it is contentless.
+When each index exists, the verifier compares its content table's rowid mapping
+ordered by that table's stable logical primary key. `VACUUM INTO` must preserve
+these mappings. A changed mapping **fails verification and blocks cutover**;
+unchanged shadow bytes alone cannot establish a usable external-content index.
+Unrelated tables, including `event`, may still have different implicit rowids.
 
 Limits deliberately **fail verification**, never silently skip data:
 
@@ -300,19 +322,38 @@ Limits deliberately **fail verification**, never silently skip data:
   1024 rows and 16 MiB of type/length-prefixed data per input. Larger keyless
   tables are unsupported; no unbounded SQL sorting or row arrays are used.
 - Schema is bounded to 1024 objects, 4 MiB of definitions/names, and 256 columns
-  per table, with a 1 MiB repeated query-expression budget. **Virtual/shadow
-  tables (including FTS5) and generated columns are
-  unsupported.** If present, stop: this verifier cannot certify that database.
+  per table, with a 1 MiB repeated query-expression budget. **Unknown virtual
+  modules/tables, unrecognized FTS5 layouts/shadows and ordinary generated
+  columns remain unsupported.** If present, stop: this verifier cannot certify that database.
   Do not drop or ignore tables/indexes to force a pass; additional independently
   reviewed verification would be required for such a layout.
 
 Progress is throttled JSON on stderr; stdout contains `verified: true` and counts
 only after the entire comparison and final input checks pass. Mismatches identify
 table/row/column ordinals without logging keys, values or SQL definitions. Exit
-0 means fully verified, 1 means mismatch/corruption/unsupported/safety failure,
+0 means fully verified (except metadata-only `--preflight`), 1 means mismatch/corruption/unsupported/safety failure,
 2 means usage error, 130/143 mean interruption. Interruptions never report PASS;
 restart verification from the beginning. A native synchronous read/decompression
 must finish before a pending signal can be handled.
+
+### Corrected metadata-only cutover preflight
+
+Replace blanket checks rejecting every `type IN ('virtual','shadow')` or every
+`hidden != 0` column with the verifier's metadata-only preflight. After the final
+fresh `BACKUP` and separate `WORK` already exist, run from `packages/core`:
+
+```sh
+bun script/event-verify.ts --source "$BACKUP" --destination "$WORK" --preflight || exit 1
+```
+
+This performs only bounded schema/metadata and query-plan checks, with no table
+content scan. Expected FTS5 virtual/shadow tables and their hidden columns are
+permitted; unknown layouts and ordinary generated columns still fail. Exit 0
+reports `preflight: true`, `verified: false`, and zero compared rows. It does
+**not** validate contents or rowid mappings and cannot authorize cutover.
+Reuse already-created final files rather than repeating backup/compression work.
+After final compaction, the full verifier command below **without `--preflight`**
+must still exit 0 with `verified: true`.
 
 ## Operator Procedure
 
@@ -339,7 +380,7 @@ the final cutover working copy, not another development run or repeated dry-run.
    close; verify the copy is independent and do not operate on the backup.
    This one fresh backup is also the retained rollback original; do not create
    another duplicate original at cutover.
-4. Check disk headroom and run the full compressor once on that final working
+4. Run the metadata-only preflight above, then check disk headroom and run the full compressor once on that final working
    copy under the verified memory limit. Do not target production. The earlier
    bounded/dry-run examples document options; they are not additional required
    maintenance passes. Failures stop the procedure; do not cut over partial work.
@@ -347,7 +388,8 @@ the final cutover working copy, not another development run or repeated dry-run.
    a separate compact output with SQLite `VACUUM INTO`; budget space for the
    original, fresh backup, working copy, compact output, copy-on-write
    allocation, and WAL. `VACUUM INTO` can change implicit rowids, so do not use
-   a pre-compaction rowid cursor afterward.
+   a pre-compaction rowid cursor afterward. The three FTS-referenced rowid
+   mappings must nevertheless remain unchanged; full verification enforces this.
 6. Verify the compact output before cutover: run full `PRAGMA integrity_check`
    and `PRAGMA foreign_key_check`; confirm stable event count and logical event
    identity; compare exact original UTF-8 TEXT bytes with compressed bytes, or
