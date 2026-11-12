@@ -82,16 +82,16 @@ export function engine(input: {
   const progress = { reconcile: "" }
   const candidate = (now: number, excluded: readonly string[], occurrences: readonly string[]) =>
     db.get<{ id: string; scheduled: number; occurrence: string | null }>(sql`
-    SELECT s.id, s.next AS scheduled, NULL AS occurrence, s.time_created AS created
+    SELECT s.id, s.next AS scheduled, NULL AS occurrence, s.definition_order AS definition_order
     FROM session_schedule s WHERE s.status = 'active' AND s.next <= ${now}
       AND s.id NOT IN (SELECT value FROM json_each(${JSON.stringify(excluded)}))
     UNION ALL
-    SELECT s.id, o.scheduled, o.id AS occurrence, s.time_created AS created
+    SELECT s.id, o.scheduled, o.id AS occurrence, s.definition_order AS definition_order
     FROM session_schedule_occurrence o JOIN session_schedule s ON s.id = o.schedule_id
     WHERE s.status = 'active' AND o.state = 'deferred'
       AND s.id NOT IN (SELECT value FROM json_each(${JSON.stringify(excluded)}))
       AND o.id NOT IN (SELECT value FROM json_each(${JSON.stringify(occurrences)}))
-    ORDER BY scheduled, created, id LIMIT 1
+    ORDER BY scheduled, definition_order LIMIT 1
   `)
   // Configuration and instance bootstrap may perform I/O. Resolve before acquiring
   // either admission or SQLite's writer lock, then revalidate the selected snapshot.
@@ -109,6 +109,9 @@ export function engine(input: {
       if (!schedule) return
       const session = yield* db.select().from(SessionTable).where(eq(SessionTable.id, schedule.session_id)).get()
       if (!session) return
+      // Discarded missed ticks need no instance, model/config or legacy queue I/O.
+      if (!selected.occurrence && selected.scheduled < input.startup && schedule.input.missed === "none")
+        return { selected, schedule, session, result: undefined, instance: undefined, invalidated: { value: false } }
       const invalidated = { value: false }
       const onEvent = (event: GlobalEvent) => {
         if (event.directory === session.directory && event.payload?.type === "server.instance.disposed")
@@ -160,19 +163,22 @@ export function engine(input: {
     for (const occurrence of accepted) {
       progress.reconcile = occurrence.id
       const queued = yield* db.select().from(SessionQueueTable).where(eq(SessionQueueTable.id, occurrence.id)).get()
-      const message = queued?.message_id
-        ? yield* db.select().from(MessageTable).where(eq(MessageTable.id, queued.message_id)).get()
-        : undefined
       const schedule = yield* db
         .select()
         .from(SessionScheduleTable)
         .where(eq(SessionScheduleTable.id, occurrence.schedule_id))
         .get()
       if (!schedule) continue
-      if (message?.data.role === "user" && message.session_id === schedule.session_id) {
+      const matches =
+        queued?.session_id === schedule.session_id &&
+        queued.payload.kind === "prompt" &&
+        queued.origin?.type === "scheduled" &&
+        queued.origin.scheduleID === schedule.id &&
+        queued.origin.occurrenceID === occurrence.id
+      if (matches && queued.state === "delivered" && queued.message_id) {
         yield* db
           .update(SessionScheduleOccurrenceTable)
-          .set({ state: "delivered", message_id: message.id, processed: Date.now(), error: null })
+          .set({ state: "delivered", message_id: queued.message_id, processed: Date.now(), error: null })
           .where(eq(SessionScheduleOccurrenceTable.id, occurrence.id))
           .run()
         yield* db
@@ -204,15 +210,20 @@ export function engine(input: {
       const abandoned =
         Option.isSome(owner) && owner.value.process && RuntimeLifecycle.processLiveness(owner.value.process) === "dead"
       if (
-        (!queued || queued.state === "uncertain" || queued.state === "deleted" || abandoned) &&
-        (occurrence.state !== "uncertain" || queued?.state === "deleted")
+        (!matches ||
+          queued.state === "delivered" ||
+          queued.state === "uncertain" ||
+          queued.state === "deleted" ||
+          abandoned) &&
+        (occurrence.state !== "uncertain" || (matches && queued.state === "deleted") || !occurrence.error)
       ) {
         yield* db
           .update(SessionScheduleOccurrenceTable)
           .set({
-            state: queued?.state === "deleted" ? "discarded" : "uncertain",
+            state: matches && queued.state === "deleted" ? "discarded" : "uncertain",
             processed: Date.now(),
-            error: queued?.state === "deleted" ? null : "Admission has no conclusive materialization evidence",
+            error:
+              matches && queued.state === "deleted" ? null : "Admission has no conclusive materialization evidence",
           })
           .where(eq(SessionScheduleOccurrenceTable.id, occurrence.id))
           .run()
@@ -261,17 +272,28 @@ export function engine(input: {
               const retired = yield* db.get(
                 sql`SELECT 1 FROM runtime_retirement WHERE session_id = ${schedule.session_id}`,
               )
+              const execution = yield* db.get<{
+                state: string
+                desired_active: number
+                owner_lineage: string
+                owner_instance: string
+              }>(
+                sql`SELECT state, desired_active, owner_lineage, owner_instance FROM runtime_execution WHERE session_id = ${schedule.session_id}`,
+              )
               if (
                 !session ||
                 session.time_archived !== null ||
                 retired ||
+                execution?.state === "cancelled" ||
                 (process.env.OPENCODE_MANAGED_PROFILE === "1" && session.parent_id)
               ) {
                 const error = retired
                   ? "Session root is retired"
                   : session?.time_archived !== null
                     ? "Session is archived or missing"
-                    : "Managed foreground child cannot accept scheduled inputs"
+                    : execution?.state === "cancelled"
+                      ? "Session was cancelled; resume the session and its queue before resuming this schedule"
+                      : "Managed foreground child cannot accept scheduled inputs"
                 yield* db
                   .insert(SessionScheduleOccurrenceTable)
                   .values({
@@ -302,6 +324,7 @@ export function engine(input: {
                   .set({ status: "paused", next: null })
                   .where(eq(SessionScheduleTable.id, schedule.id))
                   .run()
+                notifications.add(schedule.session_id)
                 return { id: schedule.id, blocked: true }
               }
               if (
@@ -309,14 +332,6 @@ export function engine(input: {
                 schedule.completed + (reserved?.count ?? 0) >= schedule.input.limit
               )
                 return { id: schedule.id, blocked: true }
-              const execution = yield* db.get<{
-                state: string
-                desired_active: number
-                owner_lineage: string
-                owner_instance: string
-              }>(
-                sql`SELECT state, desired_active, owner_lineage, owner_instance FROM runtime_execution WHERE session_id = ${schedule.session_id}`,
-              )
               if (executionBlocked(execution, input.runtime)) return { id: schedule.id, blocked: true }
               const occurrence: Occurrence = selected.occurrence
                 ? ((yield* db
@@ -400,7 +415,7 @@ export function engine(input: {
               // Without a loaded instance, dispatch cannot check live session state.
               // Preserve the bootstrap error instead of reloading under the writer lock.
               const result =
-                input.store && prepared && !prepared.instance && Result.isFailure(prepared.result)
+                input.store && prepared?.result && !prepared.instance && Result.isFailure(prepared.result)
                   ? prepared.result
                   : yield* Effect.suspend(() => {
                       const dispatch = input.dispatch(schedule, occurrence, session, prepared?.result)
@@ -524,6 +539,7 @@ export const layer = Layer.effect(
       prepare: (schedule, session) =>
         Effect.gen(function* () {
           const sessionID = SessionID.make(session.id)
+          yield* queue.prepareScheduled(sessionID)
           const latestUser = yield* database.db
             .select()
             .from(MessageTable)
@@ -543,21 +559,24 @@ export const layer = Layer.effect(
               ? yield* agents.get(user.agent)
               : yield* agents.defaultInfo()
           if (!agent) return yield* Effect.fail(new Error("Scheduled agent is unavailable"))
-          const model =
-            agent.model ??
-            (session.model
-              ? {
-                  providerID: ProviderV2.ID.make(session.model.providerID),
-                  modelID: ModelV2.ID.make(session.model.id),
-                }
-              : user
-                ? user.model
-                : yield* provider.defaultModel())
-          yield* provider.getModel(model.providerID, model.modelID)
+          const model = session.model
+            ? {
+                providerID: ProviderV2.ID.make(session.model.providerID),
+                modelID: ModelV2.ID.make(session.model.id),
+              }
+            : (agent.model ?? user?.model ?? (yield* provider.defaultModel()))
+          const full = yield* provider.getModel(model.providerID, model.modelID)
+          const same = agent.model?.providerID === model.providerID && agent.model?.modelID === model.modelID
+          const variant =
+            session.model?.variant ??
+            (!session.model && !agent.model ? user?.model.variant : undefined) ??
+            (same && agent.variant && full.variants?.[agent.variant] ? agent.variant : "default")
           return {
             kind: "prompt" as const,
             agent: agent.name,
             model,
+            variant,
+            selection: {},
             parts: [{ type: "text" as const, text: schedule.input.message }],
           }
         }).pipe(Effect.provideService(WorkspaceRef, session.workspace_id ?? undefined)),
@@ -579,6 +598,7 @@ export const layer = Layer.effect(
             sessionID,
             { id: occurrence.id, payload: prepared.success },
             { type: "scheduled", scheduleID: schedule.id, occurrenceID: occurrence.id },
+            { prepared: true },
           )
           return currentBusy ? ("busy" as const) : ("idle" as const)
         }).pipe(Effect.provideService(WorkspaceRef, session.workspace_id ?? undefined)),

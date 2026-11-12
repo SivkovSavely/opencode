@@ -1,9 +1,9 @@
 {
   "version": "7",
   "dialect": "sqlite",
-  "id": "5041f680-12ea-41a1-89ec-93efa8404df7",
+  "id": "d9a7916c-d326-43a6-a6d9-c9dea0d7016c",
   "prevIds": [
-    "ba223fc8-0f47-4a0e-a839-03c45d791748"
+    "5041f680-12ea-41a1-89ec-93efa8404df7"
   ],
   "ddl": [
     {
@@ -1163,6 +1163,16 @@
       "default": null,
       "generated": null,
       "name": "time_created",
+      "entityType": "columns",
+      "table": "session_schedule"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "0",
+      "generated": null,
+      "name": "definition_order",
       "entityType": "columns",
       "table": "session_schedule"
     },

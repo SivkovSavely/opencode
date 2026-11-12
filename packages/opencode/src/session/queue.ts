@@ -25,10 +25,12 @@ type Result<A> = Effect.Effect<A, QueueError>
 export interface Interface {
   readonly list: (sessionID: SessionID) => Result<SessionQueueV1.Snapshot>
   readonly enqueue: (sessionID: SessionID, input: SessionQueueV1.Submit) => Result<SessionQueueV1.Snapshot>
+  readonly prepareScheduled: (sessionID: SessionID) => Effect.Effect<void>
   readonly enqueueScheduled: (
     sessionID: SessionID,
     input: SessionQueueV1.Submit,
     origin: SessionV1.ScheduledOrigin,
+    options?: { prepared?: boolean },
   ) => Result<SessionQueueV1.Snapshot>
   readonly update: (sessionID: SessionID, input: SessionQueueV1.Update) => Result<SessionQueueV1.Snapshot>
   readonly registerSteer: (
@@ -136,11 +138,15 @@ export const layer = Layer.effect(
         return yield* new QueueError({ reason: "conflict", message: "Message already belongs to another queue entry" })
     })
 
-    const transaction = <A>(sessionID: SessionID, action: (state: State) => Result<{ value: A; changed: boolean }>) =>
+    const transaction = <A>(
+      sessionID: SessionID,
+      action: (state: State) => Result<{ value: A; changed: boolean }>,
+      prepared = false,
+    ) =>
       Effect.gen(function* () {
-        const imported = yield* SessionQueueMigration.ensure(sessionID).pipe(
-          Effect.provideService(Database.Service, { db }),
-        )
+        const imported = prepared
+          ? undefined
+          : yield* SessionQueueMigration.ensure(sessionID).pipe(Effect.provideService(Database.Service, { db }))
         const result = yield* db
           .transaction(
             () =>
@@ -274,6 +280,7 @@ export const layer = Layer.effect(
       delivery: SessionQueueV1.Delivery,
       messageID?: MessageID,
       origin?: SessionV1.ScheduledOrigin,
+      prepared = false,
     ) {
       const encoded = yield* Schema.encodeEffect(SessionQueueV1.Payload)(input.payload).pipe(
         Effect.mapError((error) => new QueueError({ reason: "invalid", message: error.message })),
@@ -289,51 +296,54 @@ export const layer = Layer.effect(
           }),
         catch: () => new QueueError({ reason: "invalid", message: "Queue payload must be JSON serializable" }),
       })
-      return yield* transaction(sessionID, () =>
-        Effect.gen(function* () {
-          const retired = yield* db
-            .get<{
-              root_session_id: string
-            }>(sql`SELECT root_session_id FROM runtime_retirement WHERE session_id = ${sessionID}`)
-            .pipe(Effect.orDie)
-          if (retired) return yield* new QueueError({ reason: "conflict", message: "Session root is retired" })
-          const existing = yield* db
-            .select()
-            .from(SessionQueueTable)
-            .where(eq(SessionQueueTable.id, input.id))
-            .get()
-            .pipe(Effect.orDie)
-          if (existing) {
-            if (existing.session_id !== sessionID || existing.submission !== submission)
-              return yield* new QueueError({
-                reason: "conflict",
-                message: "Queue ID was already submitted with different input",
-              })
-            return { value: entry(existing), changed: false }
-          }
-          if (messageID) yield* requireMessage(sessionID, messageID, input.id)
-          const group = (yield* rows(sessionID)).filter((row) => row.delivery === delivery)
-          const position = group.length
-            ? input.front
-              ? Math.min(...group.map((row) => row.position)) - 1
-              : Math.max(...group.map((row) => row.position)) + 1
-            : 0
-          const row = {
-            id: input.id,
-            session_id: sessionID,
-            payload: encoded,
-            submission,
-            origin: origin ?? null,
-            delivery,
-            state: "pending" as const,
-            position,
-            message_id: messageID ?? null,
-            owner: null,
-            time_created: Date.now(),
-          }
-          yield* db.insert(SessionQueueTable).values(row).run().pipe(Effect.orDie)
-          return { value: entry(row), changed: true }
-        }),
+      return yield* transaction(
+        sessionID,
+        () =>
+          Effect.gen(function* () {
+            const retired = yield* db
+              .get<{
+                root_session_id: string
+              }>(sql`SELECT root_session_id FROM runtime_retirement WHERE session_id = ${sessionID}`)
+              .pipe(Effect.orDie)
+            if (retired) return yield* new QueueError({ reason: "conflict", message: "Session root is retired" })
+            const existing = yield* db
+              .select()
+              .from(SessionQueueTable)
+              .where(eq(SessionQueueTable.id, input.id))
+              .get()
+              .pipe(Effect.orDie)
+            if (existing) {
+              if (existing.session_id !== sessionID || existing.submission !== submission)
+                return yield* new QueueError({
+                  reason: "conflict",
+                  message: "Queue ID was already submitted with different input",
+                })
+              return { value: entry(existing), changed: false }
+            }
+            if (messageID) yield* requireMessage(sessionID, messageID, input.id)
+            const group = (yield* rows(sessionID)).filter((row) => row.delivery === delivery)
+            const position = group.length
+              ? input.front
+                ? Math.min(...group.map((row) => row.position)) - 1
+                : Math.max(...group.map((row) => row.position)) + 1
+              : 0
+            const row = {
+              id: input.id,
+              session_id: sessionID,
+              payload: encoded,
+              submission,
+              origin: origin ?? null,
+              delivery,
+              state: "pending" as const,
+              position,
+              message_id: messageID ?? null,
+              owner: null,
+              time_created: Date.now(),
+            }
+            yield* db.insert(SessionQueueTable).values(row).run().pipe(Effect.orDie)
+            return { value: entry(row), changed: true }
+          }),
+        prepared,
       )
     })
 
@@ -341,6 +351,7 @@ export const layer = Layer.effect(
       sessionID: SessionID,
       input: SessionQueueV1.Submit,
       origin?: SessionV1.ScheduledOrigin,
+      prepared = false,
     ) {
       const payload = input.payload
       if (
@@ -363,16 +374,30 @@ export const layer = Layer.effect(
           reason: "invalid",
           message: "Queue attachments must use durable URLs, not browser blob URLs",
         })
-      return (yield* admit(sessionID, input, "queue", undefined, origin)).snapshot
+      return (yield* admit(sessionID, input, "queue", undefined, origin, prepared)).snapshot
+    })
+    const prepareScheduled = Effect.fn("SessionQueue.prepareScheduled")(function* (sessionID: SessionID) {
+      const imported = yield* SessionQueueMigration.ensure(sessionID).pipe(
+        Effect.provideService(Database.Service, { db }),
+      )
+      if (!imported) return
+      const state = yield* db
+        .select()
+        .from(SessionQueueStateTable)
+        .where(eq(SessionQueueStateTable.session_id, sessionID))
+        .get()
+        .pipe(Effect.orDie)
+      if (state) yield* events.publish(Event.Changed, { sessionID, revision: state.revision })
     })
     const enqueueScheduled = Effect.fn("SessionQueue.enqueueScheduled")(function* (
       sessionID: SessionID,
       input: SessionQueueV1.Submit,
       origin: SessionV1.ScheduledOrigin,
+      options?: { prepared?: boolean },
     ) {
       if (input.payload.kind !== "prompt" || input.id !== origin.occurrenceID)
         return yield* new QueueError({ reason: "invalid", message: "Invalid scheduled submission identity" })
-      return yield* enqueue(sessionID, input, origin)
+      return yield* enqueue(sessionID, input, origin, options?.prepared)
     })
     const registerSteer = Effect.fn("SessionQueue.registerSteer")(function* (
       sessionID: SessionID,
@@ -612,6 +637,7 @@ export const layer = Layer.effect(
     return Service.of({
       list,
       enqueue,
+      prepareScheduled,
       enqueueScheduled,
       update,
       registerSteer,

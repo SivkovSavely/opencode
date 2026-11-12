@@ -1,5 +1,6 @@
 /** @jsxImportSource @opentui/solid */
 import { createDefaultOpenTuiKeymap } from "@opentui/keymap/opentui"
+import { InputRenderable, TextareaRenderable } from "@opentui/core"
 import { testRender, useRenderer } from "@opentui/solid"
 import { expect, test } from "bun:test"
 import { mkdir } from "node:fs/promises"
@@ -13,7 +14,7 @@ import { tmpdir } from "../fixture/fixture"
 import { createTuiResolvedConfig } from "../fixture/tui-runtime"
 import { TestTuiContexts } from "../fixture/tui-environment"
 
-async function mountSchedules(root: string) {
+async function mountSchedules(root: string, spec = newSchedule().spec) {
   const state = path.join(root, "state")
   await mkdir(state, { recursive: true })
   await Bun.write(path.join(state, "kv.json"), "{}")
@@ -36,6 +37,7 @@ async function mountSchedules(root: string) {
   ])
   let item: SessionScheduleV1.Info = {
     ...newSchedule(),
+    spec,
     id: "schedule",
     sessionID: SessionID.make("ses_ui_schedule"),
     message: "Original message",
@@ -63,7 +65,10 @@ async function mountSchedules(root: string) {
         failPreview = false
         throw new Error("Invalid schedule from server")
       }
-      return { summary: "Server preview", times: [100, 200, 300, 400, 500] }
+      return {
+        summary: "Server preview",
+        times: [Date.parse("2026-03-08T06:30:00Z"), Date.parse("2026-03-08T07:30:00Z")],
+      }
     },
     pause: async (_, __, paused) => {
       calls.push({ name: "pause", input: paused })
@@ -112,23 +117,42 @@ async function mountSchedules(root: string) {
   }
   const app = await testRender(() => <Harness />, { width: 110, height: 50, kittyKeyboard: true })
   async function frame() {
-    await Bun.sleep(15)
     await app.renderOnce()
     return app.captureCharFrame()
   }
-  await frame()
+  async function wait(check: (screen: string) => boolean) {
+    const deadline = Date.now() + 3000
+    while (true) {
+      const screen = await frame()
+      if (check(screen)) return screen
+      if (Date.now() > deadline) throw new Error(`Timed out waiting for schedule dialog:\n${screen}`)
+      await Bun.sleep(5)
+    }
+  }
+  await wait(
+    (screen) => screen.includes("2/5 successes") && app.renderer.currentFocusedEditor instanceof InputRenderable,
+  )
   return {
     app,
     calls,
     frame,
+    wait,
     failPreview: () => {
       failPreview = true
     },
     async choose(text: string) {
+      await wait(() => app.renderer.currentFocusedEditor instanceof InputRenderable)
+      const previous = app.renderer.currentFocusedEditor
       await app.mockInput.typeText(text)
-      await frame()
+      await wait((screen) => screen.includes(text))
       app.mockInput.pressEnter()
-      return frame()
+      return wait(
+        (screen) =>
+          (app.renderer.currentFocusedEditor !== previous &&
+            (app.renderer.currentFocusedEditor instanceof InputRenderable ||
+              app.renderer.currentFocusedEditor instanceof TextareaRenderable)) ||
+          screen.includes("Invalid schedule from server"),
+      )
     },
   }
 }
@@ -143,7 +167,10 @@ test("schedule dialogs edit, preview, save, pause/resume, paginate errors and co
     await ui.choose("State:")
     expect(await ui.choose("Send when idle")).toContain("[ ] If busy")
     expect(await ui.choose("If busy")).toContain("[x] If busy")
-    expect(await ui.choose("Preview next")).toContain("Server preview")
+    const preview = await ui.choose("Preview next")
+    expect(preview).toContain("Server preview")
+    expect(preview).toContain(new Date("2026-03-08T06:30:00Z").toLocaleString())
+    expect(preview).not.toContain("Times in ")
     expect(await ui.choose("Confirm and save")).toContain("History and errors")
     expect(ui.calls.filter((call) => call.name === "save")).toHaveLength(1)
     expect(ui.calls.find((call) => call.name === "save")?.input).toMatchObject({
@@ -206,12 +233,12 @@ test("creating a schedule preserves exact text and recovers from server preview 
     await ui.choose("Message:")
     await ui.app.mockInput.typeText("  exact message  ")
     ui.app.mockInput.pressEnter()
-    await ui.frame()
+    await ui.wait(() => ui.app.renderer.currentFocusedEditor instanceof InputRenderable)
     ui.failPreview()
     expect(await ui.choose("Preview next")).toContain("Invalid schedule from server")
     expect(ui.calls.some((call) => call.name === "save")).toBe(false)
     ui.app.mockInput.pressEnter()
-    expect(await ui.frame()).toContain("Server preview")
+    expect(await ui.wait((screen) => screen.includes("Server preview"))).toContain("Server preview")
     await ui.choose("Confirm and save")
     expect(ui.calls.find((call) => call.name === "save")?.input).toMatchObject({ message: "  exact message  " })
     expect(ui.calls.find((call) => call.name === "preview")?.input).toMatchObject({ scheduleID: undefined })
@@ -219,3 +246,24 @@ test("creating a schedule preserves exact text and recovers from server preview 
     ui.app.renderer.destroy()
   }
 })
+
+for (const spec of [
+  { mode: "calendar", rule: "daily", time: "01:30", timeZone: "America/New_York" },
+  { mode: "cron", expression: "30 * * * *", timeZone: "America/New_York" },
+] as const) {
+  test(`${spec.mode} preview uses the schedule zone across DST`, async () => {
+    await using tmp = await tmpdir()
+    const ui = await mountSchedules(tmp.path, spec)
+    try {
+      await ui.choose("Original message")
+      await ui.choose("Edit")
+      const screen = await ui.choose("Preview next")
+      expect(ui.calls.find((call) => call.name === "preview")?.input).toMatchObject({ spec })
+      expect(screen).toContain("Times in America/New_York")
+      expect(screen).toContain("3/8/2026, 1:30:00 AM")
+      expect(screen).toContain("3/8/2026, 3:30:00 AM")
+    } finally {
+      ui.app.renderer.destroy()
+    }
+  })
+}

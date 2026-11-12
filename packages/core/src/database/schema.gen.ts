@@ -176,6 +176,7 @@ export default {
           \`input\` text NOT NULL,
           \`anchor\` integer NOT NULL,
           \`time_created\` integer NOT NULL,
+          \`definition_order\` integer DEFAULT 0 NOT NULL,
           \`status\` text NOT NULL,
           \`completed\` integer DEFAULT 0 NOT NULL,
           \`next\` integer,

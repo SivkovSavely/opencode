@@ -8,6 +8,7 @@ import { Database } from "@opencode-ai/core/database/database"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { SessionTable } from "@opencode-ai/core/session/sql"
 import { SessionScheduleTable, SessionScheduleOccurrenceTable } from "@opencode-ai/core/session/schedule.sql"
+import { SessionQueueStateTable } from "@opencode-ai/core/session/queue.sql"
 import { SessionScheduleV1 } from "@opencode-ai/schema/v1/session-schedule"
 import { InstanceRef, WorkspaceRef } from "@/effect/instance-ref"
 import { EventV2Bridge } from "@/event-v2-bridge"
@@ -159,7 +160,7 @@ export const layer = Layer.effect(
             .select()
             .from(SessionScheduleTable)
             .where(eq(SessionScheduleTable.session_id, sessionID))
-            .orderBy(asc(SessionScheduleTable.time_created), asc(SessionScheduleTable.id))
+            .orderBy(asc(SessionScheduleTable.definition_order))
             .all()
             .pipe(Effect.orDie)).map(info)
         }),
@@ -170,12 +171,17 @@ export const layer = Layer.effect(
             yield* authorize(sessionID)
             const input = yield* validate(submitted)
             const now = Date.now()
+            const order = yield* db
+              .get<{ value: number }>(sql`SELECT COALESCE(MAX(definition_order), 0) + 1 AS value FROM session_schedule`)
+              .pipe(Effect.orDie)
+            if (!order) return yield* Effect.die("Missing schedule definition order")
             const row = {
               id: `sch_${randomUUID()}`,
               session_id: sessionID,
               input,
               anchor: now,
               time_created: now,
+              definition_order: order.value,
               status: "active" as const,
               completed: 0,
               next:
@@ -246,6 +252,22 @@ export const layer = Layer.effect(
             const row = yield* requireRow(sessionID, id)
             if (row.status === "completed") return info(row)
             if ((row.status === "paused") === paused) return info(row)
+            if (!paused) {
+              const cancelled = yield* db
+                .get(sql`SELECT 1 FROM runtime_execution WHERE session_id = ${sessionID} AND state = 'cancelled'`)
+                .pipe(Effect.orDie)
+              const queue = yield* db
+                .select()
+                .from(SessionQueueStateTable)
+                .where(eq(SessionQueueStateTable.session_id, sessionID))
+                .get()
+                .pipe(Effect.orDie)
+              if (cancelled || queue?.blocked)
+                return yield* new ScheduleError({
+                  reason: "conflict",
+                  message: "Resume the session and start its queue before resuming this schedule",
+                })
+            }
             yield* db
               .update(SessionScheduleOccurrenceTable)
               .set({ state: "discarded", processed: Date.now() })

@@ -15,6 +15,7 @@ import { WorkspaceV2 } from "@opencode-ai/core/workspace"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { SessionSchedule } from "@/session/schedule"
 import { SessionQueue } from "@/session/queue"
+import { SessionRevert } from "@/session/revert"
 import { Session } from "@/session/session"
 import { MessageID } from "@/session/schema"
 import { ServerScheduler } from "@/server/scheduler"
@@ -37,6 +38,7 @@ const it = testEffect(
     LayerNode.group([
       SessionSchedule.node,
       SessionQueue.node,
+      SessionRevert.node,
       Session.node,
       SessionProjector.node,
       Database.node,
@@ -164,15 +166,21 @@ describe("durable schedules", () => {
     }),
   )
 
-  it.instance("reserves finite delivery allowance but counts only a persisted user message", () =>
+  it.instance("reserves finite delivery allowance until scheduled delivery", () =>
     Effect.gen(function* () {
       const s = yield* setup
       const schedule = yield* s.schedules.create(s.sessionID, { ...input, limit: 1 })
       const scheduler = ServerScheduler.engine({
         database: s.database,
         startup: 0,
-        dispatch: (_, occurrence) =>
-          s.queue.enqueue(s.sessionID, { id: occurrence.id, payload }).pipe(Effect.as("idle" as const)),
+        dispatch: (row, occurrence) =>
+          s.queue
+            .enqueueScheduled(
+              s.sessionID,
+              { id: occurrence.id, payload },
+              { type: "scheduled", scheduleID: row.id, occurrenceID: occurrence.id },
+            )
+            .pipe(Effect.as("idle" as const)),
       })
       yield* scheduler.step(schedule.anchor)
       expect((yield* s.schedules.get(s.sessionID, schedule.id)).completed).toBe(0)
@@ -199,6 +207,145 @@ describe("durable schedules", () => {
     }),
   )
 
+  for (const [limit, removal] of [
+    [1, "delete"],
+    [2, "delete"],
+    [1, "revert"],
+    [2, "revert"],
+  ] as const) {
+    it.instance(
+      `counts delivered scheduled messages removed by ${removal} before reconciliation with limit ${limit}`,
+      () =>
+        Effect.gen(function* () {
+          const s = yield* setup
+          const schedule = yield* s.schedules.create(s.sessionID, { ...input, limit })
+          const make = () =>
+            ServerScheduler.engine({
+              database: s.database,
+              startup: 0,
+              dispatch: (row, occurrence) =>
+                s.queue
+                  .enqueueScheduled(
+                    s.sessionID,
+                    { id: occurrence.id, payload },
+                    {
+                      type: "scheduled",
+                      scheduleID: row.id,
+                      occurrenceID: occurrence.id,
+                    },
+                  )
+                  .pipe(Effect.as("idle" as const)),
+            })
+          const scheduler = make()
+          for (let i = 0; i < limit; i++) {
+            yield* scheduler.step(schedule.anchor + i * 60_000)
+            const queued = yield* s.queue.claimNext(s.sessionID)
+            if (!queued) return yield* Effect.die("Missing queue claim")
+            const messageID = MessageID.ascending()
+            const data = {
+              role: "user" as const,
+              agent: "build",
+              model: { providerID: ProviderV2.ID.make("test"), modelID: ModelV2.ID.make("test") },
+              time: { created: Date.now() },
+            }
+            yield* s.db.insert(MessageTable).values({ id: messageID, session_id: s.sessionID, data }).run()
+            yield* s.queue.delivered(s.sessionID, queued.id, messageID)
+            if (removal === "delete") yield* s.sessions.removeMessage({ sessionID: s.sessionID, messageID })
+            if (removal === "revert") {
+              const revert = yield* SessionRevert.Service
+              yield* s.sessions.setRevert({ sessionID: s.sessionID, revert: { messageID }, summary: undefined })
+              yield* revert.cleanup(yield* s.sessions.get(s.sessionID))
+            }
+            expect(yield* s.db.select().from(MessageTable).where(eq(MessageTable.id, messageID)).get()).toBeUndefined()
+            yield* scheduler.reconcile
+            yield* make().reconcile
+            expect((yield* s.schedules.get(s.sessionID, schedule.id)).completed).toBe(i + 1)
+            expect(
+              (yield* s.schedules.history(s.sessionID, schedule.id)).items.find((item) => item.id === queued.id),
+            ).toMatchObject({ state: "delivered", messageID })
+          }
+          expect((yield* s.schedules.get(s.sessionID, schedule.id)).status).toBe("completed")
+        }),
+    )
+  }
+
+  for (const invalid of [
+    "pending",
+    "claimed",
+    "uncertain",
+    "origin",
+    "schedule",
+    "occurrence",
+    "session",
+    "payload",
+    "message",
+  ] as const) {
+    it.instance(`does not count ${invalid} queue evidence as delivery`, () =>
+      Effect.gen(function* () {
+        const s = yield* setup
+        const other = yield* s.sessions.create({})
+        yield* Effect.addFinalizer(() =>
+          s.db.delete(SessionTable).where(eq(SessionTable.id, other.id)).run().pipe(Effect.orDie),
+        )
+        const schedule = yield* s.schedules.create(s.sessionID, { ...input, limit: 1 })
+        const scheduler = ServerScheduler.engine({
+          database: s.database,
+          startup: 0,
+          dispatch: (row, occurrence) =>
+            s.queue
+              .enqueueScheduled(
+                s.sessionID,
+                { id: occurrence.id, payload },
+                {
+                  type: "scheduled",
+                  scheduleID: row.id,
+                  occurrenceID: occurrence.id,
+                },
+              )
+              .pipe(Effect.as("idle" as const)),
+        })
+        yield* scheduler.step(schedule.anchor)
+        const queued = yield* s.queue.claimNext(s.sessionID)
+        if (!queued) return yield* Effect.die("Missing queue claim")
+        const messageID = MessageID.ascending()
+        const data = {
+          role: "user" as const,
+          agent: "build",
+          model: { providerID: ProviderV2.ID.make("test"), modelID: ModelV2.ID.make("test") },
+          time: { created: Date.now() },
+        }
+        yield* s.db.insert(MessageTable).values({ id: messageID, session_id: s.sessionID, data }).run()
+        yield* s.queue.delivered(s.sessionID, queued.id, messageID)
+        yield* s.db
+          .update(SessionQueueTable)
+          .set({
+            ...(invalid === "pending" || invalid === "claimed" || invalid === "uncertain" ? { state: invalid } : {}),
+            ...(invalid === "origin" ? { origin: null } : {}),
+            ...(invalid === "schedule"
+              ? { origin: { type: "scheduled" as const, scheduleID: "wrong", occurrenceID: queued.id } }
+              : {}),
+            ...(invalid === "occurrence"
+              ? { origin: { type: "scheduled" as const, scheduleID: schedule.id, occurrenceID: "wrong" } }
+              : {}),
+            ...(invalid === "session" ? { session_id: other.id } : {}),
+            ...(invalid === "payload"
+              ? { payload: { kind: "shell" as const, agent: "build", model: payload.model, command: "true" } }
+              : {}),
+            ...(invalid === "message" ? { message_id: null } : {}),
+          })
+          .where(eq(SessionQueueTable.id, queued.id))
+          .run()
+        yield* scheduler.reconcile
+        yield* scheduler.reconcile
+        expect((yield* s.schedules.get(s.sessionID, schedule.id)).completed).toBe(0)
+        const occurrence = (yield* s.schedules.history(s.sessionID, schedule.id)).items[0]
+        expect(occurrence?.state).not.toBe("delivered")
+        if (invalid !== "pending" && invalid !== "claimed")
+          expect(occurrence).toMatchObject({ state: "uncertain", error: expect.any(String) })
+      }),
+    )
+  }
+
   it.instance("serializes concurrent dispatches with deterministic occurrence identities", () =>
     Effect.gen(function* () {
       const s = yield* setup
@@ -220,6 +367,56 @@ describe("durable schedules", () => {
     }),
   )
 
+  it.instance("orders equal-time candidates by durable definition order across sessions", () =>
+    Effect.gen(function* () {
+      const s = yield* setup
+      const other = yield* s.sessions.create({})
+      yield* Effect.addFinalizer(() =>
+        s.db.delete(SessionTable).where(eq(SessionTable.id, other.id)).run().pipe(Effect.orDie),
+      )
+      const created = yield* Effect.all(
+        [s.sessionID, other.id, s.sessionID].map((id) => s.schedules.create(id, input)),
+        { concurrency: "unbounded" },
+      )
+      const rows = yield* s.db.all<{ id: string }>(sql`SELECT id FROM session_schedule ORDER BY rowid`)
+      const ordered = rows.filter((row) => created.some((item) => item.id === row.id))
+      const ids = ["sch_z", "sch_m", "sch_a"]
+      const now = Date.now()
+      for (const [index, row] of ordered.entries()) {
+        yield* s.db
+          .update(SessionScheduleTable)
+          .set({ id: ids[index], time_created: now, anchor: now, next: now })
+          .where(eq(SessionScheduleTable.id, row.id))
+          .run()
+      }
+      // A deferred occurrence competes with new occurrences on the same scheduled time.
+      yield* s.db
+        .insert(SessionScheduleOccurrenceTable)
+        .values({ id: "occ_deferred", schedule_id: ids[1], scheduled: now, state: "deferred" })
+        .run()
+      yield* s.db
+        .update(SessionScheduleTable)
+        .set({ next: now + 60_000 })
+        .where(eq(SessionScheduleTable.id, ids[1]))
+        .run()
+      const dispatched: string[] = []
+      const make = () =>
+        ServerScheduler.engine({
+          database: s.database,
+          startup: 0,
+          dispatch: (schedule) =>
+            Effect.sync(() => {
+              dispatched.push(schedule.id)
+              return "idle" as const
+            }),
+        })
+      yield* make().step(now)
+      yield* make().step(now)
+      yield* make().step(now)
+      expect(dispatched).toEqual(ids)
+    }),
+  )
+
   for (const missed of ["all", "latest", "none"] as const) {
     it.instance(`incrementally recovers ${missed} missed occurrences without a replay cap`, () =>
       Effect.gen(function* () {
@@ -229,8 +426,14 @@ describe("durable schedules", () => {
         const scheduler = ServerScheduler.engine({
           database: s.database,
           startup,
-          dispatch: (_, occurrence) =>
-            s.queue.enqueue(s.sessionID, { id: occurrence.id, payload }).pipe(Effect.as("idle" as const)),
+          dispatch: (row, occurrence) =>
+            s.queue
+              .enqueueScheduled(
+                s.sessionID,
+                { id: occurrence.id, payload },
+                { type: "scheduled", scheduleID: row.id, occurrenceID: occurrence.id },
+              )
+              .pipe(Effect.as("idle" as const)),
         })
         for (let i = 0; i < 4; i++) yield* scheduler.step(startup)
         const history = yield* s.schedules.history(s.sessionID, schedule.id)
@@ -242,6 +445,34 @@ describe("durable schedules", () => {
       }),
     )
   }
+
+  it.instance("skips model and queue preparation for discarded missed occurrences", () =>
+    Effect.gen(function* () {
+      const s = yield* setup
+      const schedule = yield* s.schedules.create(s.sessionID, { ...input, missed: "none" })
+      const startup = schedule.anchor + 180_001
+      const prepared: string[] = []
+      const scheduler = ServerScheduler.engine({
+        database: s.database,
+        startup,
+        prepare: (row) =>
+          Effect.sync(() => {
+            prepared.push(row.id)
+            return payload
+          }),
+        dispatch: () => Effect.die("Discarded occurrence must not dispatch"),
+      })
+      yield* scheduler.drain(() => startup)
+      expect(prepared).toEqual([])
+      expect((yield* s.schedules.history(s.sessionID, schedule.id)).items.map((row) => row.state)).toEqual([
+        "discarded",
+        "discarded",
+        "discarded",
+        "discarded",
+      ])
+      expect((yield* s.schedules.get(s.sessionID, schedule.id)).next).toBe(schedule.anchor + 240_000)
+    }),
+  )
 
   it.instance("rechecks deferred busy state without blocking another schedule", () =>
     Effect.gen(function* () {
@@ -368,8 +599,14 @@ describe("durable schedules", () => {
       const scheduler = ServerScheduler.engine({
         database: s.database,
         startup: 0,
-        dispatch: (_, occurrence) =>
-          s.queue.enqueue(s.sessionID, { id: occurrence.id, payload }).pipe(Effect.as("idle" as const)),
+        dispatch: (row, occurrence) =>
+          s.queue
+            .enqueueScheduled(
+              s.sessionID,
+              { id: occurrence.id, payload },
+              { type: "scheduled", scheduleID: row.id, occurrenceID: occurrence.id },
+            )
+            .pipe(Effect.as("idle" as const)),
       })
       yield* scheduler.step(schedule.anchor)
       const queued = yield* s.queue.claimNext(s.sessionID)
@@ -409,8 +646,14 @@ describe("durable schedules", () => {
       const scheduler = ServerScheduler.engine({
         database: s.database,
         startup: 0,
-        dispatch: (_, occurrence) =>
-          s.queue.enqueue(s.sessionID, { id: occurrence.id, payload }).pipe(Effect.as("idle" as const)),
+        dispatch: (row, occurrence) =>
+          s.queue
+            .enqueueScheduled(
+              s.sessionID,
+              { id: occurrence.id, payload },
+              { type: "scheduled", scheduleID: row.id, occurrenceID: occurrence.id },
+            )
+            .pipe(Effect.as("idle" as const)),
       })
       yield* scheduler.step(schedule.anchor)
       yield* scheduler.step(schedule.anchor + 60_000)
@@ -1037,8 +1280,14 @@ describe("durable schedules", () => {
         const scheduler = ServerScheduler.engine({
           database: s.database,
           startup: 0,
-          dispatch: (_, occurrence) =>
-            s.queue.enqueue(s.sessionID, { id: occurrence.id, payload }).pipe(Effect.as("idle" as const)),
+          dispatch: (row, occurrence) =>
+            s.queue
+              .enqueueScheduled(
+                s.sessionID,
+                { id: occurrence.id, payload },
+                { type: "scheduled", scheduleID: row.id, occurrenceID: occurrence.id },
+              )
+              .pipe(Effect.as("idle" as const)),
         })
         yield* scheduler.drain(() => valid.anchor)
         yield* scheduler.drain(() => valid.anchor)
@@ -1103,8 +1352,14 @@ describe("durable schedules", () => {
       const scheduler = ServerScheduler.engine({
         database: s.database,
         startup: 0,
-        dispatch: (_, occurrence) =>
-          s.queue.enqueue(s.sessionID, { id: occurrence.id, payload }).pipe(Effect.as("idle" as const)),
+        dispatch: (row, occurrence) =>
+          s.queue
+            .enqueueScheduled(
+              s.sessionID,
+              { id: occurrence.id, payload },
+              { type: "scheduled", scheduleID: row.id, occurrenceID: occurrence.id },
+            )
+            .pipe(Effect.as("idle" as const)),
       })
       yield* scheduler.step(schedule.anchor)
       const entry = yield* s.queue.claimNext(s.sessionID)
@@ -1171,7 +1426,7 @@ describe("durable schedules", () => {
     }),
   )
 
-  it.instance("dispatches equal timestamps by schedule creation then ID across sessions", () =>
+  it.instance("dispatches earlier scheduled timestamps before earlier definitions across sessions", () =>
     Effect.gen(function* () {
       const s = yield* setup
       const other = yield* s.sessions.create({})
@@ -1182,7 +1437,7 @@ describe("durable schedules", () => {
       const second = yield* s.schedules.create(other.id, input)
       yield* s.db
         .update(SessionScheduleTable)
-        .set({ next: first.anchor, time_created: 1 })
+        .set({ next: first.anchor - 1 })
         .where(eq(SessionScheduleTable.id, second.id))
         .run()
       const scheduler = ServerScheduler.engine({

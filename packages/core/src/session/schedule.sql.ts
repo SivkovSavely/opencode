@@ -13,6 +13,7 @@ export const SessionScheduleTable = sqliteTable(
     input: text({ mode: "json" }).$type<SessionScheduleV1.Input>().notNull(),
     anchor: integer().notNull(),
     time_created: integer().notNull(),
+    definition_order: integer().notNull().default(0),
     status: text().$type<SessionScheduleV1.Info["status"]>().notNull(),
     completed: integer().notNull().default(0),
     next: integer(),

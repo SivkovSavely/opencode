@@ -340,6 +340,14 @@ export function SchedulesView(props: { sessionID: string; api: ScheduleAPI }) {
             void run(async () => {
               const preview = await props.api.preview(props.sessionID, draft().spec, editing)
               if (!alive) return
+              const spec = draft().spec
+              const times =
+                spec.mode === "interval"
+                  ? preview.times.map((time) => new Date(time).toLocaleString())
+                  : [
+                      `Times in ${spec.timeZone}`,
+                      ...preview.times.map((time) => new Date(time).toLocaleString("en", { timeZone: spec.timeZone })),
+                    ]
               menu(
                 "Preview next 5",
                 [
@@ -354,11 +362,7 @@ export function SchedulesView(props: { sessionID: string; api: ScheduleAPI }) {
                   },
                   { title: "Back to editor", run: editor },
                 ],
-                [
-                  preview.summary,
-                  ...preview.times.map((time) => new Date(time).toLocaleString()),
-                  `Message: ${draft().message}`,
-                ],
+                [preview.summary, ...times, `Message: ${draft().message}`],
               )
             })
           },
@@ -440,6 +444,7 @@ export function SchedulesView(props: { sessionID: string; api: ScheduleAPI }) {
       },
       {
         title: `[${spec.immediate ? "x" : " "}] Send immediately first`,
+        details: ["Applies on creation or interval changes. Editing this alone keeps the next send."],
         run: () => {
           setDraft({ ...draft(), spec: { ...spec, immediate: !spec.immediate } })
           interval()

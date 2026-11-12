@@ -42,10 +42,30 @@ async function request<T>(path: string, body?: unknown) {
   return (await response.json()) as T
 }
 
+async function setSelection(
+  sessionID: string,
+  agent: string,
+  model: { providerID: string; id: string; variant: string },
+) {
+  const { Database } = await import("bun:sqlite")
+  using db = new Database(process.env.OPENCODE_DB!)
+  assert.equal(
+    db.query("UPDATE session SET agent = ?, model = ? WHERE id = ?").run(agent, JSON.stringify(model), sessionID)
+      .changes,
+    1,
+  )
+}
+
 try {
   if (process.argv[2] === "accept") {
     const session = (await sdk.session.create({ title: "durable scheduled restart" })).data!
-    await sdk.session.queueUpdate({ sessionID: session.id, revision: 0, mutation: { action: "pause", paused: true } })
+    await setSelection(session.id, "selected", { providerID: "test", id: "selected", variant: "xhigh" })
+    const initial = (await sdk.session.queueList({ sessionID: session.id })).data!
+    await sdk.session.queueUpdate({
+      sessionID: session.id,
+      revision: initial.revision,
+      mutation: { action: "pause", paused: true },
+    })
     const schedule = await request<SessionScheduleV1.Info>(`/session/${session.id}/schedule`, {
       message: text,
       spec: { mode: "interval", amount: 1, unit: "minutes", immediate: true },
@@ -73,7 +93,15 @@ try {
     })
     assert(queue.items[0].payload.kind === "prompt")
     assert.deepEqual(queue.items[0].payload.parts, [{ type: "text", text }])
-    assert.deepEqual((await sdk.session.messages({ sessionID: session.id })).data, [])
+    assert.equal(queue.items[0].payload.agent, "selected")
+    assert.deepEqual(queue.items[0].payload.model, { providerID: "test", modelID: "selected" })
+    assert.equal(queue.items[0].payload.variant, "xhigh")
+    await setSelection(session.id, "build", { providerID: "test", id: "test-model", variant: "default" })
+    assert.deepEqual((await sdk.session.get({ sessionID: session.id })).data!.model, {
+      providerID: "test",
+      id: "test-model",
+      variant: "default",
+    })
     assert.equal((await request<SessionScheduleV1.Info>(`/session/${session.id}/schedule/${schedule.id}`)).completed, 0)
     await Bun.write(stateFile, JSON.stringify({ schedule, history }))
   } else {
@@ -111,9 +139,16 @@ try {
       const status = (await sdk.session.status()).data!
       return !status[sessionID] || status[sessionID].type === "idle" ? true : undefined
     })
-    const users = (await sdk.session.messages({ sessionID })).data!.filter((message) => message.info.role === "user")
+    const users = (await sdk.session.messages({ sessionID })).data!.filter(
+      (message) => message.info.role === "user" && message.info.origin?.type === "scheduled",
+    )
     assert.equal(users.length, 1)
     assert(users[0].info.role === "user")
+    assert.equal(users[0].info.agent, "selected")
+    assert.deepEqual(users[0].info.model, { providerID: "test", modelID: "selected", variant: "xhigh" })
+    const current = (await sdk.session.get({ sessionID })).data!
+    assert.equal(current.agent, "build")
+    assert.deepEqual(current.model, { providerID: "test", id: "test-model", variant: "default" })
     assert.equal(users[0].info.id, history.items[0].messageID)
     assert.deepEqual(users[0].info.origin, {
       type: "scheduled",

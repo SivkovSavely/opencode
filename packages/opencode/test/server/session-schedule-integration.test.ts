@@ -98,9 +98,27 @@ describe("scheduled messages over a live listener", () => {
     () =>
       Effect.gen(function* () {
         const llm = yield* TestLLMServer
+        const config = testProviderConfig(llm.url)
         const directory = yield* tmpdirScoped({
           git: true,
-          config: { ...testProviderConfig(llm.url), model: "test/test-model" },
+          config: {
+            ...config,
+            model: "test/test-model",
+            agent: { selected: { mode: "primary", model: "test/test-model" } },
+            provider: {
+              test: {
+                ...config.provider.test,
+                models: {
+                  ...config.provider.test.models,
+                  selected: {
+                    ...config.provider.test.models["test-model"],
+                    id: "selected",
+                    variants: { xhigh: { reasoningEffort: "xhigh" } },
+                  },
+                },
+              },
+            },
+          },
         })
         yield* llm.text("persisted scheduled response")
         // Run, not test: the normal test preload intentionally forces an in-memory DB.
@@ -153,6 +171,7 @@ describe("scheduled messages over a live listener", () => {
           expect(result).toMatchObject({ code: 0 })
           expect(result.stdout).toContain(`schedule restart ${phase} verified`)
           expect(yield* llm.calls).toBe(phase === "accept" ? 0 : 1)
+          if (phase !== "accept") expect((yield* llm.inputs)[0]?.model).toBe("selected")
         }
         expect(yield* Effect.promise(() => Bun.file(`${directory}/schedule.sqlite`).exists())).toBe(true)
       }),
