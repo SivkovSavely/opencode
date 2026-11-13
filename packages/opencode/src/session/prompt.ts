@@ -145,6 +145,14 @@ function isStructuredOutputComplete(message: SessionV1.Assistant) {
   )
 }
 
+function queueSelection(payload: SessionQueueV1.Payload, origin?: SessionV1.ScheduledOrigin) {
+  // Older accepted schedules have an empty selection; enforce their stored variant
+  // without rewriting the durable payload or its idempotency identity.
+  return origin?.type === "scheduled"
+    ? { ...payload.selection, variant: payload.variant ?? "default" }
+    : payload.selection
+}
+
 export class InputError extends Schema.TaggedErrorClass<InputError>()("PromptInputError", {
   message: Schema.String,
 }) {}
@@ -1542,10 +1550,13 @@ const layer = Layer.effect(
             )
             const variant = input.selection.variant ?? inherited?.variant ?? info.model.variant ?? "default"
             const supported = variant === "default" || Object.hasOwn(full.variants ?? {}, variant)
-            if (input.selection.variant !== undefined && !supported)
+            if (input.selection.variant !== undefined && !supported) {
+              if (delivery?.origin?.type === "scheduled" && delivery.state === "claimed")
+                yield* queue.releaseClaim(input.sessionID, delivery.id).pipe(Effect.orDie)
               return yield* new InputError({
                 message: `Variant not found: "${variant}" for ${selected.providerID}/${selected.modelID}`,
               })
+            }
             info.model = {
               providerID: ProviderV2.ID.make(selected.providerID),
               modelID: ModelV2.ID.make(selected.modelID),
@@ -1815,6 +1826,16 @@ const layer = Layer.effect(
 
     const materialize = Effect.fn("SessionPrompt.materializeQueue")(function* (entry: SessionQueueV1.Entry) {
       const payload = entry.payload
+      // Reject deterministic snapshot errors before revert cleanup, parts or hooks.
+      if (entry.origin?.type === "scheduled")
+        yield* validateQueueSelection(entry.sessionID, payload, entry.origin).pipe(
+          Effect.tapError((error) =>
+            error.reason === "invalid" && entry.state === "claimed"
+              ? queue.releaseClaim(entry.sessionID, entry.id)
+              : Effect.void,
+          ),
+        )
+      const selection = queueSelection(payload, entry.origin)
       const input = {
         sessionID: entry.sessionID,
         messageID: MessageID.make(`msg_queue_${entry.id}`),
@@ -1824,7 +1845,7 @@ const layer = Layer.effect(
           modelID: ModelV2.ID.make(payload.model.modelID),
         },
         variant: payload.variant,
-        selection: payload.selection ? { ...payload.selection, inheritActive: false } : undefined,
+        selection: selection ? { ...selection, inheritActive: false } : undefined,
         noReply: true,
       }
       if (payload.kind === "prompt") {
@@ -2094,8 +2115,10 @@ const layer = Layer.effect(
     const validateQueueSelection = Effect.fn("SessionPrompt.validateQueueSelection")(function* (
       sessionID: SessionID,
       payload: SessionQueueV1.Payload,
+      origin?: SessionV1.ScheduledOrigin,
     ) {
-      if ((payload.kind !== "prompt" && payload.kind !== "command") || !payload.selection) return
+      const selection = queueSelection(payload, origin)
+      if ((payload.kind !== "prompt" && payload.kind !== "command") || !selection) return
       const commandModel =
         payload.kind === "command"
           ? yield* Effect.gen(function* () {
@@ -2107,13 +2130,13 @@ const layer = Layer.effect(
               return yield* commandDefaultModel(cmd)
             })
           : undefined
-      const selected = payload.selection.model ?? commandModel ?? payload.model
+      const selected = selection.model ?? commandModel ?? payload.model
       const model = yield* getModel(
         ProviderV2.ID.make(selected.providerID),
         ModelV2.ID.make(selected.modelID),
         sessionID,
       )
-      const variant = payload.selection.variant
+      const variant = selection.variant
       if (variant !== undefined && variant !== "default" && !Object.hasOwn(model.variants ?? {}, variant))
         return yield* new SessionQueue.QueueError({
           reason: "invalid",
@@ -2156,7 +2179,7 @@ const layer = Layer.effect(
       origin: SessionV1.ScheduledOrigin,
     ) {
       yield* requireManagedRootQueue(sessionID)
-      yield* validateQueueSelection(sessionID, input.payload)
+      yield* validateQueueSelection(sessionID, input.payload, origin)
       yield* queue.enqueueScheduled(sessionID, input, origin)
       yield* wakeQueue(sessionID, false, true)
       return yield* notifyQueue(sessionID)
@@ -2182,7 +2205,9 @@ const layer = Layer.effect(
               .get()
               .pipe(Effect.orDie)
           : undefined
-      const selected = entry && !entry.messageID ? yield* validateQueueSelection(sessionID, entry.payload) : undefined
+      const selected =
+        entry && !entry.messageID ? yield* validateQueueSelection(sessionID, entry.payload, entry.origin) : undefined
+      const selection = entry && queueSelection(entry.payload, entry.origin)
       const prepared =
         entry && !entry.messageID && entry.payload.kind !== "compact"
           ? yield* prepareUserMessage(
@@ -2196,7 +2221,7 @@ const layer = Layer.effect(
                   modelID: ModelV2.ID.make((selected ?? entry.payload.model).modelID),
                 },
                 variant: entry.payload.variant,
-                selection: entry.payload.selection ? { ...entry.payload.selection, inheritActive: false } : undefined,
+                selection: selection ? { ...selection, inheritActive: false } : undefined,
                 parts:
                   entry.payload.kind === "prompt"
                     ? [...entry.payload.parts]

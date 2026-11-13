@@ -9,7 +9,11 @@ import { Server } from "../../../src/server/server"
 const directory = process.env.SCHEDULE_DIRECTORY!
 const stateFile = `${directory}/restart-state.json`
 const text = "Scheduled restart message\nPreserve exactly: <schedule> & whitespace."
-type State = { schedule: SessionScheduleV1.Info; history?: SessionScheduleV1.History }
+type State = {
+  schedule: SessionScheduleV1.Info
+  history: SessionScheduleV1.History
+  queued: { payload: string; submission: string }
+}
 
 async function poll<T>(read: () => Promise<T | undefined>) {
   const deadline = Date.now() + 20_000
@@ -56,6 +60,19 @@ async function setSelection(
   )
 }
 
+async function queueRecord(id: string) {
+  const { Database } = await import("bun:sqlite")
+  using db = new Database(process.env.OPENCODE_DB!)
+  const row = db
+    .query<
+      { payload: string; submission: string },
+      [string]
+    >("SELECT payload, submission FROM session_queue WHERE id = ?")
+    .get(id)
+  assert(row)
+  return row
+}
+
 try {
   if (process.argv[2] === "accept") {
     const session = (await sdk.session.create({ title: "durable scheduled restart" })).data!
@@ -96,6 +113,21 @@ try {
     assert.equal(queue.items[0].payload.agent, "selected")
     assert.deepEqual(queue.items[0].payload.model, { providerID: "test", modelID: "selected" })
     assert.equal(queue.items[0].payload.variant, "xhigh")
+    assert.deepEqual(queue.items[0].payload.selection, { variant: "xhigh" })
+    // Preserve a pre-fix accepted payload, including its exact retry identity.
+    const { Database } = await import("bun:sqlite")
+    using db = new Database(process.env.OPENCODE_DB!)
+    assert.equal(
+      db
+        .query(
+          `UPDATE session_queue
+      SET payload = json_remove(payload, '$.selection.variant'),
+          submission = json_remove(submission, '$.payload.selection.variant')
+      WHERE id = ?`,
+        )
+        .run(queue.items[0].id).changes,
+      1,
+    )
     await setSelection(session.id, "build", { providerID: "test", id: "test-model", variant: "default" })
     assert.deepEqual((await sdk.session.get({ sessionID: session.id })).data!.model, {
       providerID: "test",
@@ -103,7 +135,7 @@ try {
       variant: "default",
     })
     assert.equal((await request<SessionScheduleV1.Info>(`/session/${session.id}/schedule/${schedule.id}`)).completed, 0)
-    await Bun.write(stateFile, JSON.stringify({ schedule, history }))
+    await Bun.write(stateFile, JSON.stringify({ schedule, history, queued: await queueRecord(queue.items[0].id) }))
   } else {
     const saved = (await Bun.file(stateFile).json()) as State
     const sessionID = saved.schedule.sessionID
@@ -112,56 +144,81 @@ try {
     assert.equal(before.anchor, saved.schedule.anchor)
     assert.deepEqual(before.spec, saved.schedule.spec)
     const persisted = await request<SessionScheduleV1.History>(`${root}/history`)
-    assert.deepEqual(persisted, saved.history)
-    if (process.argv[2] === "deliver") {
-      assert.equal(before.completed, 0)
-      assert.equal(before.next, saved.schedule.anchor + 60_000)
-      const queue = (await sdk.session.queueList({ sessionID })).data!
-      assert.equal(queue.items.length, 1)
-      assert.equal(queue.items[0].id, persisted.items[0].id)
-      await sdk.session.queueUpdate({
-        sessionID,
-        revision: queue.revision,
-        mutation: { action: "pause", paused: false },
+    if (process.argv[2] !== "unavailable") assert.deepEqual(persisted, saved.history)
+    assert.deepEqual(await queueRecord(saved.history.items[0].id), saved.queued)
+    if (process.argv[2] === "unavailable") {
+      const history = await poll(async () => {
+        const value = await request<SessionScheduleV1.History>(`${root}/history`)
+        return value.items[0]?.error?.includes('Variant not found: "xhigh" for test/selected') ? value : undefined
       })
+      assert.equal(history.items[0].state, "accepted")
+      assert.equal(history.items[0].id, saved.history.items[0].id)
+      assert.equal(before.completed, 0)
+      await sdk.session.queueFlush({ sessionID })
+      const queue = await poll(async () => {
+        const value = (await sdk.session.queueList({ sessionID })).data!
+        return value.blocked ? value : undefined
+      })
+      assert.equal(queue.items.length, 1)
+      assert.equal(queue.items[0].state, "pending")
+      assert.deepEqual(queue.items[0].payload.selection, {})
+      assert.deepEqual(await queueRecord(history.items[0].id), saved.queued)
+      assert.equal((await sdk.session.messages({ sessionID })).data!.length, 0)
+      await Bun.write(stateFile, JSON.stringify({ ...saved, history }))
     }
-    const history = await poll(async () => {
-      const value = await request<SessionScheduleV1.History>(`${root}/history`)
-      return value.items[0]?.state === "delivered" ? value : undefined
-    })
-    assert.equal(history.items.length, 1)
-    assert.equal(history.items[0].id, saved.history!.items[0].id)
-    const completed = await request<SessionScheduleV1.Info>(root)
-    assert.equal(completed.status, "completed")
-    assert.equal(completed.completed, 1)
-    assert.equal(completed.next, undefined)
-    await poll(async () => {
-      const status = (await sdk.session.status()).data!
-      return !status[sessionID] || status[sessionID].type === "idle" ? true : undefined
-    })
-    const users = (await sdk.session.messages({ sessionID })).data!.filter(
-      (message) => message.info.role === "user" && message.info.origin?.type === "scheduled",
-    )
-    assert.equal(users.length, 1)
-    assert(users[0].info.role === "user")
-    assert.equal(users[0].info.agent, "selected")
-    assert.deepEqual(users[0].info.model, { providerID: "test", modelID: "selected", variant: "xhigh" })
-    const current = (await sdk.session.get({ sessionID })).data!
-    assert.equal(current.agent, "build")
-    assert.deepEqual(current.model, { providerID: "test", id: "test-model", variant: "default" })
-    assert.equal(users[0].info.id, history.items[0].messageID)
-    assert.deepEqual(users[0].info.origin, {
-      type: "scheduled",
-      scheduleID: saved.schedule.id,
-      occurrenceID: history.items[0].id,
-    })
-    assert.deepEqual(
-      users[0].parts.filter((part) => part.type === "text").map((part) => part.text),
-      [text],
-    )
-    const queue = (await sdk.session.queueList({ sessionID })).data!
-    assert.equal(queue.items.filter((item) => item.state === "pending" || item.state === "claimed").length, 0)
-    await Bun.write(stateFile, JSON.stringify({ schedule: saved.schedule, history }))
+    if (process.argv[2] !== "unavailable") {
+      if (process.argv[2] === "deliver") {
+        assert.equal(before.completed, 0)
+        assert.equal(before.next, saved.schedule.anchor + 60_000)
+        const queue = (await sdk.session.queueList({ sessionID })).data!
+        assert.equal(queue.items.length, 1)
+        assert.equal(queue.items[0].id, persisted.items[0].id)
+        await sdk.session.queueUpdate({
+          sessionID,
+          revision: queue.revision,
+          mutation: { action: "pause", paused: false },
+        })
+      }
+      const history = await poll(async () => {
+        const value = await request<SessionScheduleV1.History>(`${root}/history`)
+        return value.items[0]?.state === "delivered" ? value : undefined
+      })
+      assert.equal(history.items.length, 1)
+      assert.equal(history.items[0].id, saved.history.items[0].id)
+      assert.equal(history.items[0].error, undefined)
+      const completed = await request<SessionScheduleV1.Info>(root)
+      assert.equal(completed.status, "completed")
+      assert.equal(completed.completed, 1)
+      assert.equal(completed.next, undefined)
+      await poll(async () => {
+        const status = (await sdk.session.status()).data!
+        return !status[sessionID] || status[sessionID].type === "idle" ? true : undefined
+      })
+      const users = (await sdk.session.messages({ sessionID })).data!.filter(
+        (message) => message.info.role === "user" && message.info.origin?.type === "scheduled",
+      )
+      assert.equal(users.length, 1)
+      assert(users[0].info.role === "user")
+      assert.equal(users[0].info.agent, "selected")
+      assert.deepEqual(users[0].info.model, { providerID: "test", modelID: "selected", variant: "xhigh" })
+      const current = (await sdk.session.get({ sessionID })).data!
+      assert.equal(current.agent, "build")
+      assert.deepEqual(current.model, { providerID: "test", id: "test-model", variant: "default" })
+      assert.equal(users[0].info.id, history.items[0].messageID)
+      assert.deepEqual(users[0].info.origin, {
+        type: "scheduled",
+        scheduleID: saved.schedule.id,
+        occurrenceID: history.items[0].id,
+      })
+      assert.deepEqual(
+        users[0].parts.filter((part) => part.type === "text").map((part) => part.text),
+        [text],
+      )
+      const queue = (await sdk.session.queueList({ sessionID })).data!
+      assert.equal(queue.items.filter((item) => item.state === "pending" || item.state === "claimed").length, 0)
+      assert.deepEqual(await queueRecord(history.items[0].id), saved.queued)
+      await Bun.write(stateFile, JSON.stringify({ ...saved, history }))
+    }
   }
 } finally {
   await listener.stop(true)

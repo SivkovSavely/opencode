@@ -47,6 +47,7 @@ export interface Interface {
     ids?: ReadonlySet<string>,
   ) => Result<SessionQueueV1.Entry | undefined>
   readonly delivered: (sessionID: SessionID, id: string, messageID?: MessageID) => Result<SessionQueueV1.Entry>
+  readonly releaseClaim: (sessionID: SessionID, id: string) => Result<void>
   readonly block: (sessionID: SessionID) => Result<SessionQueueV1.Snapshot>
   readonly abandon: (sessionID: SessionID) => Result<SessionQueueV1.Snapshot>
   readonly unblock: (sessionID: SessionID) => Result<SessionQueueV1.Snapshot>
@@ -571,6 +572,32 @@ export const layer = Layer.effect(
       )).value
     })
 
+    const releaseClaim = Effect.fn("SessionQueue.releaseClaim")(function* (sessionID: SessionID, id: string) {
+      return (yield* transaction(sessionID, () =>
+        Effect.gen(function* () {
+          const row = yield* requireRow(sessionID, id)
+          if (
+            row.state !== "claimed" ||
+            row.owner !== owner ||
+            row.message_id ||
+            row.origin?.type !== "scheduled" ||
+            row.payload.kind !== "prompt"
+          )
+            return yield* new QueueError({
+              reason: "conflict",
+              message: "Scheduled input is not an unused owned claim",
+            })
+          yield* db
+            .update(SessionQueueTable)
+            .set({ state: "pending", owner: null })
+            .where(eq(SessionQueueTable.id, id))
+            .run()
+            .pipe(Effect.orDie)
+          return { value: undefined, changed: true }
+        }),
+      )).value
+    })
+
     const delivered = Effect.fn("SessionQueue.delivered")(function* (
       sessionID: SessionID,
       id: string,
@@ -644,6 +671,7 @@ export const layer = Layer.effect(
       attachSteer,
       claimSteers,
       claimNext,
+      releaseClaim,
       delivered,
       get,
       block: (sessionID) => setBlocked(sessionID, true),

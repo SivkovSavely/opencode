@@ -74,9 +74,7 @@ describe("legacy session queue store", () => {
       expect(yield* s.queue.enqueueScheduled(s.sessionID, { id: origin.occurrenceID, payload }, origin)).toEqual(
         submitted,
       )
-      const publicRetry = yield* s.queue
-        .enqueue(s.sessionID, { id: origin.occurrenceID, payload })
-        .pipe(Effect.result)
+      const publicRetry = yield* s.queue.enqueue(s.sessionID, { id: origin.occurrenceID, payload }).pipe(Effect.result)
       expect(Result.isFailure(publicRetry) && publicRetry.failure.reason).toBe("conflict")
       const decoded = Schema.decodeUnknownSync(SessionQueueV1.Submit)({ id: "ordinary", payload, origin })
       yield* s.queue.enqueue(s.sessionID, decoded)
@@ -183,6 +181,69 @@ describe("legacy session queue store", () => {
       expect((yield* s.queue.claimNext(s.sessionID))?.id).toBe("two")
     }),
   )
+
+  it.instance("releases an unused scheduled claim without changing its durable snapshot", () =>
+    Effect.gen(function* () {
+      const s = yield* setup
+      const origin = { type: "scheduled" as const, scheduleID: "sch_retry", occurrenceID: "occ_retry" }
+      yield* s.queue.enqueueScheduled(s.sessionID, { id: origin.occurrenceID, payload }, origin)
+      const before = yield* s.db
+        .select()
+        .from(SessionQueueTable)
+        .where(eq(SessionQueueTable.id, origin.occurrenceID))
+        .get()
+      yield* s.queue.claimNext(s.sessionID)
+      yield* s.queue.releaseClaim(s.sessionID, origin.occurrenceID)
+      yield* s.queue.abandon(s.sessionID)
+      const after = yield* s.db
+        .select()
+        .from(SessionQueueTable)
+        .where(eq(SessionQueueTable.id, origin.occurrenceID))
+        .get()
+      expect(after).toMatchObject({
+        state: "pending",
+        owner: null,
+        payload: before?.payload,
+        submission: before?.submission,
+      })
+      expect((yield* s.queue.list(s.sessionID)).blocked).toBe(true)
+      yield* s.queue.unblock(s.sessionID)
+      expect((yield* s.queue.claimNext(s.sessionID))?.id).toBe(origin.occurrenceID)
+    }),
+  )
+
+  for (const invalid of ["foreign", "materialized", "delivered", "uncertain", "ordinary"] as const) {
+    it.instance(`cannot release a ${invalid} scheduled claim`, () =>
+      Effect.gen(function* () {
+        const s = yield* setup
+        const origin = { type: "scheduled" as const, scheduleID: "sch_fenced", occurrenceID: "occ_fenced" }
+        if (invalid === "ordinary") yield* s.queue.enqueue(s.sessionID, { id: origin.occurrenceID, payload })
+        if (invalid !== "ordinary")
+          yield* s.queue.enqueueScheduled(s.sessionID, { id: origin.occurrenceID, payload }, origin)
+        yield* s.queue.claimNext(s.sessionID)
+        if (invalid === "foreign")
+          yield* s.db
+            .update(SessionQueueTable)
+            .set({ owner: "foreign" })
+            .where(eq(SessionQueueTable.id, origin.occurrenceID))
+            .run()
+        if (invalid === "materialized") {
+          const message = yield* bubble(s.sessionID)
+          yield* s.db
+            .update(SessionQueueTable)
+            .set({ message_id: message.messageID })
+            .where(eq(SessionQueueTable.id, origin.occurrenceID))
+            .run()
+        }
+        if (invalid === "delivered") yield* s.queue.delivered(s.sessionID, origin.occurrenceID)
+        if (invalid === "uncertain") yield* s.queue.abandon(s.sessionID)
+        const before = yield* s.queue.get(s.sessionID, origin.occurrenceID)
+        const rejected = yield* s.queue.releaseClaim(s.sessionID, origin.occurrenceID).pipe(Effect.result)
+        expect(Result.isFailure(rejected) && rejected.failure.reason).toBe("conflict")
+        expect(yield* s.queue.get(s.sessionID, origin.occurrenceID)).toEqual(before)
+      }),
+    )
+  }
 
   it.instance("structured output formats round-trip through JSON storage and contract encoding", () =>
     Effect.gen(function* () {

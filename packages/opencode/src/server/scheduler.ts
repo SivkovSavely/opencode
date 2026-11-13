@@ -529,6 +529,22 @@ export const layer = Layer.effect(
     const scope = yield* Scope.Scope
     const signal = yield* Latch.make()
     const startup = { time: 0 }
+    const changed = (sessionID: SessionID) =>
+      Effect.gen(function* () {
+        const session = yield* database.db
+          .select()
+          .from(SessionTable)
+          .where(eq(SessionTable.id, sessionID))
+          .get()
+          .pipe(Effect.orDie)
+        if (session)
+          yield* store.provide(
+            { directory: session.directory },
+            events
+              .publish(Session.Event.Updated, { sessionID, info: Session.fromRow(session) })
+              .pipe(Effect.provideService(WorkspaceRef, session.workspace_id ?? undefined)),
+          )
+      })
     const scheduler = engine({
       database,
       store,
@@ -570,13 +586,19 @@ export const layer = Layer.effect(
           const variant =
             session.model?.variant ??
             (!session.model && !agent.model ? user?.model.variant : undefined) ??
-            (same && agent.variant && full.variants?.[agent.variant] ? agent.variant : "default")
+            (same ? agent.variant : undefined) ??
+            "default"
+          if (variant !== "default" && !Object.hasOwn(full.variants ?? {}, variant))
+            return yield* new SessionQueue.QueueError({
+              reason: "invalid",
+              message: `Variant not found: "${variant}" for ${model.providerID}/${model.modelID}`,
+            })
           return {
             kind: "prompt" as const,
             agent: agent.name,
             model,
             variant,
-            selection: {},
+            selection: { variant },
             parts: [{ type: "text" as const, text: schedule.input.message }],
           }
         }).pipe(Effect.provideService(WorkspaceRef, session.workspace_id ?? undefined)),
@@ -602,22 +624,7 @@ export const layer = Layer.effect(
           )
           return currentBusy ? ("busy" as const) : ("idle" as const)
         }).pipe(Effect.provideService(WorkspaceRef, session.workspace_id ?? undefined)),
-      changed: (sessionID) =>
-        Effect.gen(function* () {
-          const session = yield* database.db
-            .select()
-            .from(SessionTable)
-            .where(eq(SessionTable.id, sessionID))
-            .get()
-            .pipe(Effect.orDie)
-          if (session)
-            yield* store.provide(
-              { directory: session.directory },
-              events
-                .publish(Session.Event.Updated, { sessionID, info: Session.fromRow(session) })
-                .pipe(Effect.provideService(WorkspaceRef, session.workspace_id ?? undefined)),
-            )
-        }),
+      changed,
     })
     // Re-enqueue the exact durable payload only as an idempotent wake, never resolve
     // current agent/model settings again for an already accepted occurrence.
@@ -663,14 +670,47 @@ export const layer = Layer.effect(
                   sql`SELECT state, desired_active, owner_lineage, owner_instance FROM runtime_execution WHERE session_id = ${row.session.id}`,
                 )
                 if (executionBlocked(execution, lifecycle)) return
-                yield* prompt.queueSubmitScheduled(
-                  SessionID.make(row.session.id),
-                  {
-                    id: row.occurrence.id,
-                    payload: Schema.decodeUnknownSync(SessionQueueV1.Payload)(row.queued.payload),
-                  },
-                  { type: "scheduled", scheduleID: row.schedule.id, occurrenceID: row.occurrence.id },
-                )
+                yield* prompt
+                  .queueSubmitScheduled(
+                    SessionID.make(row.session.id),
+                    {
+                      id: row.occurrence.id,
+                      payload: Schema.decodeUnknownSync(SessionQueueV1.Payload)(row.queued.payload),
+                    },
+                    { type: "scheduled", scheduleID: row.schedule.id, occurrenceID: row.occurrence.id },
+                  )
+                  .pipe(
+                    Effect.catchTag("SessionQueueError", (error) =>
+                      Effect.gen(function* () {
+                        if (error.reason !== "invalid") return yield* error
+                        const message = error.message.slice(0, 2000)
+                        const updated = yield* database.db
+                          .update(SessionScheduleOccurrenceTable)
+                          .set({ error: message })
+                          .where(
+                            and(
+                              eq(SessionScheduleOccurrenceTable.id, row.occurrence.id),
+                              eq(SessionScheduleOccurrenceTable.schedule_id, row.schedule.id),
+                              eq(SessionScheduleOccurrenceTable.state, "accepted"),
+                              sql`${SessionScheduleOccurrenceTable.error} IS NOT ${message}`,
+                              sql`EXISTS (SELECT 1 FROM session_queue q WHERE q.id = ${row.occurrence.id}
+                                AND q.session_id = ${row.session.id} AND q.state = 'pending' AND q.message_id IS NULL
+                                AND json_extract(q.origin, '$.type') = 'scheduled'
+                                AND json_extract(q.origin, '$.scheduleID') = ${row.schedule.id}
+                                AND json_extract(q.origin, '$.occurrenceID') = ${row.occurrence.id})`,
+                            ),
+                          )
+                          .returning({ id: SessionScheduleOccurrenceTable.id })
+                          .all()
+                        if (!updated.length) return
+                        yield* changed(SessionID.make(row.session.id))
+                        yield* Effect.logWarning("Scheduled queue wake failed", {
+                          occurrenceID: row.occurrence.id,
+                          error: message,
+                        })
+                      }),
+                    ),
+                  )
               }).pipe(Effect.provideService(WorkspaceRef, row.session.workspace_id ?? undefined)),
             )
             .pipe(Effect.catchCause((cause) => Effect.logWarning("Scheduled queue wake failed", cause)))

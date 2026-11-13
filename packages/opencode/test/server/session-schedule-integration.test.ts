@@ -94,35 +94,35 @@ function json<T>(response: Response) {
 
 describe("scheduled messages over a live listener", () => {
   it.live(
-    "recovers a file-backed accepted occurrence across process restarts exactly once",
+    "recovers an unavailable legacy variant snapshot across process restarts exactly once",
     () =>
       Effect.gen(function* () {
         const llm = yield* TestLLMServer
         const config = testProviderConfig(llm.url)
-        const directory = yield* tmpdirScoped({
-          git: true,
-          config: {
-            ...config,
-            model: "test/test-model",
-            agent: { selected: { mode: "primary", model: "test/test-model" } },
-            provider: {
-              test: {
-                ...config.provider.test,
-                models: {
-                  ...config.provider.test.models,
-                  selected: {
-                    ...config.provider.test.models["test-model"],
-                    id: "selected",
-                    variants: { xhigh: { reasoningEffort: "xhigh" } },
-                  },
+        const projectConfig = {
+          ...config,
+          model: "test/test-model",
+          agent: { selected: { mode: "primary" as const, model: "test/test-model" } },
+          provider: {
+            test: {
+              ...config.provider.test,
+              models: {
+                ...config.provider.test.models,
+                selected: {
+                  ...config.provider.test.models["test-model"],
+                  id: "selected",
+                  variants: { xhigh: { reasoningEffort: "xhigh", disabled: false } },
                 },
               },
             },
           },
-        })
+        }
+        const directory = yield* tmpdirScoped({ git: true, config: projectConfig })
         yield* llm.text("persisted scheduled response")
         // Run, not test: the normal test preload intentionally forces an in-memory DB.
-        for (const phase of ["accept", "deliver", "verify"]) {
+        for (const phase of ["accept", "unavailable", "unavailable", "deliver", "verify"]) {
+          projectConfig.provider.test.models.selected.variants.xhigh.disabled = phase === "unavailable"
+          yield* Effect.promise(() => Bun.write(`${directory}/opencode.json`, JSON.stringify(projectConfig)))
           const child = yield* Effect.acquireRelease(
             Effect.sync(() =>
               Bun.spawn([process.execPath, "run", "./test/server/fixtures/session-schedule-restart.ts", phase], {
@@ -170,8 +170,9 @@ describe("scheduled messages over a live listener", () => {
           )
           expect(result).toMatchObject({ code: 0 })
           expect(result.stdout).toContain(`schedule restart ${phase} verified`)
-          expect(yield* llm.calls).toBe(phase === "accept" ? 0 : 1)
-          if (phase !== "accept") expect((yield* llm.inputs)[0]?.model).toBe("selected")
+          expect(yield* llm.calls).toBe(phase === "accept" || phase === "unavailable" ? 0 : 1)
+          if (phase === "deliver" || phase === "verify")
+            expect((yield* llm.inputs)[0]).toMatchObject({ model: "selected", reasoning_effort: "xhigh" })
         }
         expect(yield* Effect.promise(() => Bun.file(`${directory}/schedule.sqlite`).exists())).toBe(true)
       }),
