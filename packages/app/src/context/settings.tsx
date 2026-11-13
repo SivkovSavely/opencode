@@ -4,6 +4,9 @@ import { createSimpleContext } from "@opencode-ai/ui/context"
 import { persisted } from "@/utils/persist"
 import { usePlatform } from "@/context/platform"
 
+export type TabPosition = "top" | "left"
+export type TabContent = "one-line" | "two-line"
+
 export interface NotificationSettings {
   agent: boolean
   permissions: boolean
@@ -46,6 +49,9 @@ export interface Settings {
     mono: string
     sans: string
     terminal: string
+    tabPosition: TabPosition
+    tabContent: TabContent
+    tabSidebarWidth: number
   }
   keybinds: Record<string, string>
   permissions: {
@@ -203,6 +209,9 @@ const defaultSettings: Settings = {
     mono: "",
     sans: "",
     terminal: "",
+    tabPosition: "top",
+    tabContent: "one-line",
+    tabSidebarWidth: 276,
   },
   keybinds: {},
   permissions: {
@@ -227,12 +236,21 @@ function withFallback<T>(read: () => T | undefined, fallback: T) {
   return createMemo(() => read() ?? fallback)
 }
 
+function resolveTabSidebarWidth(value: unknown) {
+  return typeof value === "number" && Number.isFinite(value) && value >= 196 && value <= 640
+    ? value
+    : defaultSettings.appearance.tabSidebarWidth
+}
+
 export const { use: useSettings, provider: SettingsProvider } = createSimpleContext({
   name: "Settings",
   gate: false,
   init: () => {
     const platform = usePlatform()
-    const [store, setStore, settingsInit, ready] = persisted("settings.v3", createStore<Settings>(defaultSettings))
+    const [store, setStore, settingsInit, ready] = persisted(
+      "settings.v3",
+      createStore<Settings>(structuredClone(defaultSettings)),
+    )
     const [launch, setLaunch, , launchReady] = persisted(
       "app-version.v1",
       createStore<{ version?: string }>({ version: undefined }),
@@ -465,6 +483,20 @@ export const { use: useSettings, provider: SettingsProvider } = createSimpleCont
         customAgents: visible(showCustomAgents),
       },
       appearance: {
+        tabPosition: createMemo<TabPosition>(() => (store.appearance?.tabPosition === "left" ? "left" : "top")),
+        setTabPosition(value: TabPosition) {
+          setStore("appearance", { tabPosition: value })
+        },
+        tabContent: createMemo<TabContent>(() =>
+          store.appearance?.tabContent === "two-line" ? "two-line" : "one-line",
+        ),
+        setTabContent(value: TabContent) {
+          setStore("appearance", { tabContent: value })
+        },
+        tabSidebarWidth: createMemo(() => resolveTabSidebarWidth(store.appearance?.tabSidebarWidth)),
+        setTabSidebarWidth(value: number) {
+          setStore("appearance", { tabSidebarWidth: resolveTabSidebarWidth(value) })
+        },
         fontSize: withFallback(() => store.appearance?.fontSize, defaultSettings.appearance.fontSize),
         setFontSize(value: number) {
           setStore("appearance", "fontSize", value)

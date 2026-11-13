@@ -11,6 +11,7 @@ import {
   untrack,
 } from "solid-js"
 import { createStore } from "solid-js/store"
+import { Portal } from "solid-js/web"
 import { useLocation, useNavigate, useParams } from "@solidjs/router"
 import { IconButton } from "@opencode-ai/ui/icon-button"
 import { Icon } from "@opencode-ai/ui/icon"
@@ -62,7 +63,11 @@ export function useTitlebarRightMount() {
   return mount
 }
 
-export function Titlebar(props: { update?: TitlebarUpdate; debugTools?: { visible: boolean; toggle: () => void } }) {
+export function Titlebar(props: {
+  update?: TitlebarUpdate
+  debugTools?: { visible: boolean; toggle: () => void }
+  tabsMount?: HTMLElement
+}) {
   const layout = useLayout()
   const platform = usePlatform()
   const command = useCommand()
@@ -77,6 +82,9 @@ export function Titlebar(props: { update?: TitlebarUpdate; debugTools?: { visibl
   const useV2Titlebar = createMemo(() => settings.general.newLayoutDesigns())
   const mobile = createMediaQuery("(max-width: 767px)")
   const bottom = createMemo(() => useV2Titlebar() && mobile() && settings.general.mobileTitlebarPosition() === "bottom")
+  const twoLineTop = createMemo(
+    () => useV2Titlebar() && !props.tabsMount && settings.appearance.tabContent() === "two-line",
+  )
 
   const mac = createMemo(() => platform.platform === "desktop" && platform.os === "macos")
   const windows = createMemo(() => platform.platform === "desktop" && platform.os === "windows")
@@ -87,7 +95,7 @@ export function Titlebar(props: { update?: TitlebarUpdate; debugTools?: { visibl
   const titlebarZoom = () => (windows() ? Math.max(zoom(), minTitlebarZoom) : zoom())
   const counterZoom = () => (windows() && titlebarZoom() < 1 ? 1 / titlebarZoom() : 1)
   const minHeight = () => {
-    const height = useV2Titlebar() ? v2TitlebarHeight : legacyTitlebarHeight
+    const height = useV2Titlebar() ? (twoLineTop() ? 52 : v2TitlebarHeight) : legacyTitlebarHeight
     if (mac()) return `${height / zoom()}px`
     if (windows()) return `${height / Math.min(titlebarZoom(), 1)}px`
     return undefined
@@ -181,9 +189,11 @@ export function Titlebar(props: { update?: TitlebarUpdate; debugTools?: { visibl
   return (
     <header
       data-slot={useV2Titlebar() ? "titlebar-v2" : undefined}
+      data-tab-content={twoLineTop() ? "two-line" : "one-line"}
       classList={{
         "shrink-0 relative flex flex-row": true,
-        "h-9 bg-v2-background-bg-deep overflow-visible": useV2Titlebar(),
+        "h-9 bg-v2-background-bg-deep overflow-visible": useV2Titlebar() && !twoLineTop(),
+        "h-[52px] bg-v2-background-bg-deep overflow-visible": twoLineTop(),
         "h-10 bg-background-base overflow-hidden": !useV2Titlebar(),
         "order-last": bottom(),
       }}
@@ -356,9 +366,11 @@ export function Titlebar(props: { update?: TitlebarUpdate; debugTools?: { visibl
             })
 
             const [tabsAreOverflowing, setTabsAreOverflowing] = createSignal(false)
+            let topTabsMount!: HTMLDivElement
 
             return (
               <div
+                data-titlebar-tabs-host
                 class="h-full flex-1 overflow-hidden flex flex-row items-center gap-1.5 px-2 md:pr-3"
                 classList={{
                   "pt-2": !bottom(),
@@ -394,40 +406,54 @@ export function Titlebar(props: { update?: TitlebarUpdate; debugTools?: { visibl
                   />
                 </TooltipV2>
 
-                <TitlebarTabStrip
-                  tabs={tabsStore}
-                  currentTab={currentTab}
-                  forceTruncate={tabsAreOverflowing()}
-                  onOverflowChange={setTabsAreOverflowing}
-                  onNavigate={(tab, el) => {
-                    tabs.select(tab)
-                    el?.scrollIntoView({ behavior: "instant" })
-                  }}
-                  onClose={(tab) => {
-                    const index = tabsStore.findIndex((item) => tabKey(item) === tabKey(tab))
-                    if (index !== -1) tabsStoreActions.closeTab(index)
-                  }}
-                  onReorder={(keys) => tabsStoreActions.reorder(keys)}
-                />
-                <TooltipV2
-                  placement="bottom"
-                  value={
-                    <>
-                      {language.t("command.session.new")}
-                      <KeybindV2 keys={newTabTooltipKeybind(command)} variant="neutral" />
-                    </>
-                  }
-                >
-                  <IconButtonV2
-                    type="button"
-                    variant="ghost-muted"
-                    size="large"
-                    class="shrink-0"
-                    icon={<IconV2 name="plus" />}
-                    onClick={openNewTab}
-                    aria-label={language.t("command.session.new")}
+                <div ref={topTabsMount} class="contents" />
+                <Portal mount={props.tabsMount ?? topTabsMount} ref={(el) => (el.style.display = "contents")}>
+                  <TitlebarTabStrip
+                    tabs={tabsStore}
+                    orientation={props.tabsMount ? "vertical" : "horizontal"}
+                    content={settings.appearance.tabContent()}
+                    currentTab={currentTab}
+                    forceTruncate={tabsAreOverflowing()}
+                    onOverflowChange={setTabsAreOverflowing}
+                    onNavigate={(tab) => tabs.select(tab)}
+                    onClose={(tab) => {
+                      const index = tabsStore.findIndex((item) => tabKey(item) === tabKey(tab))
+                      if (index !== -1) tabsStoreActions.closeTab(index)
+                    }}
+                    onReorder={(keys) => tabsStoreActions.reorder(keys)}
                   />
-                </TooltipV2>
+                  <div
+                    classList={{
+                      contents: !props.tabsMount,
+                      "order-first flex shrink-0 items-center justify-between pb-2": !!props.tabsMount,
+                    }}
+                  >
+                    <Show when={props.tabsMount}>
+                      <span class="px-1 text-[12px] font-medium text-v2-text-text-muted">
+                        {language.t("command.session.new")}
+                      </span>
+                    </Show>
+                    <TooltipV2
+                      placement="bottom"
+                      value={
+                        <>
+                          {language.t("command.session.new")}
+                          <KeybindV2 keys={newTabTooltipKeybind(command)} variant="neutral" />
+                        </>
+                      }
+                    >
+                      <IconButtonV2
+                        type="button"
+                        variant="ghost-muted"
+                        size="large"
+                        class="shrink-0"
+                        icon={<IconV2 name="plus" />}
+                        onClick={openNewTab}
+                        aria-label={language.t("command.session.new")}
+                      />
+                    </TooltipV2>
+                  </div>
+                </Portal>
                 <div data-titlebar-tabs-spacer class="flex-1" />
                 <TitlebarV2Right state={v2RightState()} />
                 <TooltipV2 placement="bottom" value={language.t("transcriptSearch.title")}>

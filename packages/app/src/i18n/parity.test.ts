@@ -66,6 +66,15 @@ const appLocales = [
 ] as const
 const desktopLocales = appLocales
 const appFallbackKeys = new Set([
+  "settings.appearance.tabPosition.title",
+  "settings.appearance.tabPosition.description",
+  "settings.appearance.tabPosition.option.top",
+  "settings.appearance.tabPosition.option.left",
+  "settings.appearance.tabContent.title",
+  "settings.appearance.tabContent.description",
+  "settings.appearance.tabContent.option.oneLine",
+  "settings.appearance.tabContent.option.twoLine",
+  "settings.appearance.tabSidebar.resize",
   "transcriptSearch.title",
   "transcriptSearch.placeholder",
   "transcriptSearch.server",
@@ -233,6 +242,26 @@ const domains = [
 ] as const
 
 describe("i18n parity", () => {
+  test("tab appearance controls and resize label are translated into Russian", async () => {
+    const source = await dictionary("./en.ts")
+    const target = await dictionary("./ru.ts")
+    for (const key of [
+      "settings.appearance.tabPosition.title",
+      "settings.appearance.tabPosition.description",
+      "settings.appearance.tabPosition.option.top",
+      "settings.appearance.tabPosition.option.left",
+      "settings.appearance.tabContent.title",
+      "settings.appearance.tabContent.description",
+      "settings.appearance.tabContent.option.oneLine",
+      "settings.appearance.tabContent.option.twoLine",
+      "settings.appearance.tabSidebar.resize",
+    ]) {
+      expect(source[key]).toBeString()
+      expect(target[key]).toBeString()
+      expect(target[key]).not.toBe(source[key])
+    }
+  })
+
   test("non-English locales have every English key and required plural variants", async () => {
     for (const domain of domains) {
       const source = await dictionary(domain.source)

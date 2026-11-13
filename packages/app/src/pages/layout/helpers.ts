@@ -94,7 +94,7 @@ export function getProjectAvatarSource(id?: string, icon?: { color?: string; url
 }
 
 export function projectForSession<T extends { id?: string; worktree: string; sandboxes?: string[] }>(
-  session: Session,
+  session: Pick<Session, "projectID" | "directory">,
   projects: T[],
   byID: Map<string, T> = new Map(projects.flatMap((project) => (project.id ? [[project.id, project] as const] : []))),
 ) {

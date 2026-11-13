@@ -11,6 +11,7 @@ import { ServerConnection, serverName } from "@/context/server"
 import { displayName, projectForSession } from "@/pages/layout/helpers"
 import { SessionTabAvatar } from "@/pages/layout/session-tab-avatar"
 import type { Session } from "@opencode-ai/sdk/v2"
+import type { TabContent } from "@/context/settings"
 import { canOpenTabRename, forwardTabRef } from "./titlebar-tab-gesture"
 import { TabPreviewPopover } from "./titlebar-tab-popover"
 import "./titlebar-tab-nav.css"
@@ -24,6 +25,9 @@ export function TabNavItem(props: {
   server: ServerConnection.Key
   session: () => Session | undefined
   fallbackTitle?: string
+  fallbackDirectory?: string
+  orientation: "horizontal" | "vertical"
+  content: TabContent
   onRename: (title: string) => Promise<void>
   onClose: () => void
   onNavigate: () => void
@@ -53,15 +57,21 @@ export function TabNavItem(props: {
   })
   const project = createMemo(() => {
     const session = props.session()
-    if (!session) return
-    return projectForSession(session, serverCtx()?.projects.list() ?? [])
+    const directory = session?.directory ?? props.fallbackDirectory
+    if (!directory) return
+    const ctx = serverCtx()
+    const value = session ?? { projectID: "", directory }
+    const open = projectForSession(value, ctx?.projects.list() ?? [])
+    if (open) return open
+    const known = projectForSession(value, ctx?.sync.data.project ?? [])
+    return known ? { ...known, expanded: false } : undefined
   })
   const title = createMemo(() => props.session()?.title ?? props.fallbackTitle)
 
   const projectName = createMemo(() => {
-    const session = props.session()
-    if (!session) return
-    return displayName(project() ?? { worktree: session.directory })
+    const directory = props.session()?.directory ?? props.fallbackDirectory
+    if (!directory) return
+    return displayName(project() ?? { worktree: directory })
   })
   const previewPath = createMemo(() => {
     const session = props.session()
@@ -153,6 +163,8 @@ export function TabNavItem(props: {
       data-titlebar-tab
       data-slot="titlebar-tab-item"
       data-editing={editing()}
+      data-orientation={props.orientation}
+      data-content={props.content}
       class="group relative flex h-7 w-full min-w-0 select-none flex-row items-center overflow-hidden whitespace-nowrap rounded-[6px] [container-type:inline-size]"
       classList={{ invisible: props.hidden }}
       data-active={props.active}
@@ -216,43 +228,52 @@ export function TabNavItem(props: {
             )}
           </Show>
         </span>
-        <span
-          ref={(el) => {
-            titleEl = el
-            titleEl.textContent = title() ?? ""
-          }}
-          data-slot="tab-title"
-          data-titlebar-tab-title
-          class="min-w-0 flex-1 outline-none leading-4"
-          classList={{
-            "overflow-hidden text-clip whitespace-nowrap": !editing(),
-            "select-text": editing(),
-          }}
-          contenteditable={editing() ? true : undefined}
-          onDblClick={openRename}
-          onKeyDown={(event) => {
-            event.stopPropagation()
-            if (event.key === "Enter") {
+        <span data-slot="tab-labels" class="min-w-0 flex-1">
+          <span
+            ref={(el) => {
+              titleEl = el
+              titleEl.textContent = title() ?? ""
+            }}
+            data-slot="tab-title"
+            data-titlebar-tab-title
+            class="block min-w-0 outline-none leading-4"
+            classList={{
+              "overflow-hidden text-clip whitespace-nowrap": !editing(),
+              "select-text": editing(),
+            }}
+            contenteditable={editing() ? true : undefined}
+            onDblClick={openRename}
+            onKeyDown={(event) => {
+              event.stopPropagation()
+              if (event.key === "Enter") {
+                event.preventDefault()
+                void closeRename(true)
+                return
+              }
+              if (event.key !== "Escape") return
               event.preventDefault()
-              void closeRename(true)
-              return
-            }
-            if (event.key !== "Escape") return
-            event.preventDefault()
-            titleEl.textContent = props.session()?.title ?? ""
-            void closeRename(false)
-          }}
-          onBlur={() => void closeRename(true)}
-          onPointerDown={(event) => {
-            if (!editing()) return
-            event.stopPropagation()
-          }}
-          onClick={(event) => {
-            if (!editing()) return
-            event.preventDefault()
-          }}
-        />
-        <TabTitleMeasure title={title()} editing={editing()} />
+              titleEl.textContent = props.session()?.title ?? ""
+              void closeRename(false)
+            }}
+            onBlur={() => void closeRename(true)}
+            onPointerDown={(event) => {
+              if (!editing()) return
+              event.stopPropagation()
+            }}
+            onClick={(event) => {
+              if (!editing()) return
+              event.preventDefault()
+            }}
+          />
+          <Show when={props.content === "two-line"}>
+            <span data-slot="tab-project" dir="auto">
+              {projectName()}
+            </span>
+          </Show>
+        </span>
+        <Show when={props.orientation === "horizontal"}>
+          <TabTitleMeasure title={title()} projectName={projectName()} content={props.content} editing={editing()} />
+        </Show>
       </MenuV2.Context.Trigger>
 
       <div data-slot="tab-close">
@@ -292,6 +313,7 @@ export function TabNavItem(props: {
           path: previewPath(),
           serverName: serverLabel(),
         }}
+        orientation={props.orientation}
       />
       <MenuV2.Context.Portal>
         <MenuV2.Context.Content
@@ -316,6 +338,9 @@ export function DraftTabItem(props: {
   ref?: Ref<HTMLDivElement>
   href: string
   title: string
+  projectName?: string
+  orientation: "horizontal" | "vertical"
+  content: TabContent
   active?: boolean
   onNavigate: () => void
   onClose: () => void
@@ -336,6 +361,8 @@ export function DraftTabItem(props: {
       data-titlebar-tab
       data-slot="titlebar-tab-item"
       data-active={props.active}
+      data-orientation={props.orientation}
+      data-content={props.content}
       data-dragging={props.dragging}
       data-state={props.active || props.pressed ? "pressed" : undefined}
       class="group relative flex h-7 w-full min-w-0 flex-row items-center overflow-hidden rounded-[6px] [container-type:inline-size] whitespace-nowrap"
@@ -377,14 +404,23 @@ export function DraftTabItem(props: {
         <span data-titlebar-tab-icon class="flex shrink-0 items-center justify-center">
           <IconV2 name="edit" />
         </span>
-        <span
-          data-slot="tab-title"
-          data-titlebar-tab-title
-          class="min-w-0 flex-1 overflow-hidden text-clip whitespace-nowrap outline-none leading-4"
-        >
-          {props.title}
+        <span data-slot="tab-labels" class="min-w-0 flex-1">
+          <span
+            data-slot="tab-title"
+            data-titlebar-tab-title
+            class="block min-w-0 overflow-hidden text-clip whitespace-nowrap outline-none leading-4"
+          >
+            {props.title}
+          </span>
+          <Show when={props.content === "two-line"}>
+            <span data-slot="tab-project" dir="auto">
+              {props.projectName}
+            </span>
+          </Show>
         </span>
-        <TabTitleMeasure title={props.title} />
+        <Show when={props.orientation === "horizontal"}>
+          <TabTitleMeasure title={props.title} projectName={props.projectName} content={props.content} />
+        </Show>
       </a>
       <div data-slot="tab-close">
         <IconButtonV2
@@ -408,7 +444,7 @@ export function DraftTabItem(props: {
   )
 }
 
-function TabTitleMeasure(props: { title?: string; editing?: boolean }) {
+function TabTitleMeasure(props: { title?: string; projectName?: string; content: TabContent; editing?: boolean }) {
   let ref!: HTMLSpanElement
   onMount(() => {
     const root = ref.closest<HTMLElement>("[data-titlebar-tab]")!
@@ -431,12 +467,16 @@ function TabTitleMeasure(props: { title?: string; editing?: boolean }) {
     })
     onCleanup(() => {
       observer.disconnect()
+      delete root.dataset.titleOverflow
       if (frame !== undefined) cancelAnimationFrame(frame)
     })
   })
   return (
     <span data-titlebar-tab-size aria-hidden="true" ref={ref}>
-      {props.title}
+      <span>{props.title}</span>
+      <Show when={props.content === "two-line"}>
+        <span data-slot="tab-project-measure">{props.projectName}</span>
+      </Show>
     </span>
   )
 }

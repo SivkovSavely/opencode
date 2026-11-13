@@ -1,4 +1,4 @@
-import { splitProps, type JSX } from "solid-js"
+import { onCleanup, splitProps, type JSX } from "solid-js"
 
 export interface ResizeHandleProps extends Omit<JSX.HTMLAttributes<HTMLDivElement>, "onResize"> {
   direction: "horizontal" | "vertical"
@@ -28,9 +28,13 @@ export function ResizeHandle(props: ResizeHandleProps) {
     "classList",
   ])
 
+  let cancelDrag: (() => void) | undefined
+  onCleanup(() => cancelDrag?.())
+
   const handleMouseDown = (e: MouseEvent) => {
-    if (e.detail > 1) return
+    if (e.button !== 0 || e.detail > 1) return
     e.preventDefault()
+    cancelDrag?.()
     const edge = local.edge ?? (local.direction === "vertical" ? "start" : "end")
     const start = local.direction === "horizontal" ? e.clientX : e.clientY
     const rtl =
@@ -47,6 +51,8 @@ export function ResizeHandle(props: ResizeHandleProps) {
     let current = startSize
     let collapsed = false
 
+    const userSelect = document.body.style.userSelect
+    const overflow = document.body.style.overflow
     document.body.style.userSelect = "none"
     document.body.style.overflow = "hidden"
 
@@ -69,12 +75,17 @@ export function ResizeHandle(props: ResizeHandleProps) {
       onResize(Math.min(max, Math.max(min, current)))
     }
 
-    const onMouseUp = () => {
-      document.body.style.userSelect = ""
-      document.body.style.overflow = ""
+    const cancel = () => {
+      if (cancelDrag !== cancel) return
+      cancelDrag = undefined
+      document.body.style.userSelect = userSelect
+      document.body.style.overflow = overflow
       document.removeEventListener("mousemove", onMouseMove)
       document.removeEventListener("mouseup", onMouseUp)
+    }
 
+    const onMouseUp = () => {
+      cancel()
       if (collapsed) {
         onCollapse?.()
         return
@@ -82,6 +93,7 @@ export function ResizeHandle(props: ResizeHandleProps) {
       onCollapseChange?.(false)
     }
 
+    cancelDrag = cancel
     document.addEventListener("mousemove", onMouseMove)
     document.addEventListener("mouseup", onMouseUp)
   }

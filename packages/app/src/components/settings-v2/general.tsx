@@ -8,7 +8,7 @@ import { useDialog } from "@opencode-ai/ui/context/dialog"
 import { useLanguage } from "@/context/language"
 import { usePlatform } from "@/context/platform"
 import { useUpdaterAction } from "../updater-action"
-import { useSettings } from "@/context/settings"
+import { useSettings, type TabContent, type TabPosition } from "@/context/settings"
 import { ExternalLink } from "../external-link"
 import { SettingsListV2 } from "./parts/list"
 import { SettingsRowV2 } from "./parts/row"
@@ -28,6 +28,8 @@ import {
 import "./settings-v2.css"
 
 const schemeOptions: ("system" | "light" | "dark")[] = ["system", "light", "dark"]
+const tabPositionOptions: TabPosition[] = ["top", "left"]
+const tabContentOptions: TabContent[] = ["one-line", "two-line"]
 const fontSettings = {
   ui: {
     action: "settings-ui-font",
@@ -121,6 +123,7 @@ const ShellSetting: Component<{ controller: ShellSettingsController }> = (props)
 
 const AppearanceSection: Component<{ controller: AppearanceSettingsController }> = (props) => {
   const language = useLanguage()
+  const settings = useSettings()
   return (
     <div class="settings-v2-section">
       <h3 class="settings-v2-section-title">{language.t("settings.general.section.appearance")}</h3>
@@ -166,6 +169,46 @@ const AppearanceSection: Component<{ controller: AppearanceSettingsController }>
             value={(option) => option.id}
             label={(option) => option.name}
             onSelect={props.controller.theme.select}
+          />
+        </SettingsRowV2>
+
+        <SettingsRowV2
+          title={language.t("settings.appearance.tabPosition.title")}
+          description={language.t("settings.appearance.tabPosition.description")}
+        >
+          <SelectV2
+            appearance="inline"
+            data-action="settings-tab-position"
+            options={tabPositionOptions}
+            current={settings.appearance.tabPosition()}
+            placement="bottom-end"
+            gutter={6}
+            label={(option) =>
+              option === "top"
+                ? language.t("settings.appearance.tabPosition.option.top")
+                : language.t("settings.appearance.tabPosition.option.left")
+            }
+            onSelect={(option) => option && settings.appearance.setTabPosition(option)}
+          />
+        </SettingsRowV2>
+
+        <SettingsRowV2
+          title={language.t("settings.appearance.tabContent.title")}
+          description={language.t("settings.appearance.tabContent.description")}
+        >
+          <SelectV2
+            appearance="inline"
+            data-action="settings-tab-content"
+            options={tabContentOptions}
+            current={settings.appearance.tabContent()}
+            placement="bottom-end"
+            gutter={6}
+            label={(option) =>
+              option === "one-line"
+                ? language.t("settings.appearance.tabContent.option.oneLine")
+                : language.t("settings.appearance.tabContent.option.twoLine")
+            }
+            onSelect={(option) => option && settings.appearance.setTabContent(option)}
           />
         </SettingsRowV2>
 
