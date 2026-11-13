@@ -93,6 +93,10 @@
     text-underline-offset: 2px;
   }
 
+  a[data-local-link] {
+    cursor: pointer;
+  }
+
   /* Lists */
   ul,
   ol {

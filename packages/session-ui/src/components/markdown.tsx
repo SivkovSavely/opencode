@@ -32,6 +32,9 @@ import { markdownBlockKey, type MarkdownToken } from "./markdown-worker-protocol
 import { shouldResetCodeTokens, type RenderedCodeState } from "./markdown-code-state"
 import { getCachedMarkdown, sanitizeMarkdown, touchCachedMarkdown, type MarkdownCacheEntry } from "./markdown-cache"
 import { inlineCodeKind } from "./markdown-inline-code-kind"
+import { resolveLocalLink } from "./markdown-link"
+import { showToast } from "@opencode-ai/ui/toast"
+import { showToastV2 } from "@opencode-ai/ui/v2/toast-v2"
 
 type RenderedBlock =
   | (MarkdownCacheEntry & { key: string; mode: Exclude<Block["mode"], "code"> })
@@ -239,6 +242,7 @@ function ensureCodeWrapper(block: HTMLPreElement, labels: CopyLabels) {
 function markCodeLinks(root: HTMLDivElement) {
   const codeNodes = Array.from(root.querySelectorAll(":not(pre) > code"))
   for (const code of codeNodes) {
+    if (code.closest("a[data-local-link]")) continue
     const href = codeUrl(code.textContent ?? "")
     const parentLink =
       code.parentElement instanceof HTMLAnchorElement && code.parentElement.classList.contains("external-link")
@@ -366,11 +370,12 @@ export function Markdown(
     text: string
     cacheKey?: string
     streaming?: boolean
+    directory?: string
     class?: string
     classList?: Record<string, boolean>
   },
 ) {
-  const [local, others] = splitProps(props, ["text", "cacheKey", "streaming", "class", "classList"])
+  const [local, others] = splitProps(props, ["text", "cacheKey", "streaming", "directory", "class", "classList"])
   const i18n = useI18n()
   const [root, setRoot] = createSignal<HTMLDivElement>()
   const owner = createUniqueId()
@@ -491,6 +496,39 @@ export function Markdown(
   )
 
   let copyCleanup: (() => void) | undefined
+  let disposed = false
+
+  const copyLocalLink = async (event: MouseEvent | KeyboardEvent) => {
+    if (event instanceof KeyboardEvent && (event.key !== "Enter" || event.repeat)) return
+    const target = event.target
+    if (!(target instanceof Element)) return
+    const link = target.closest<HTMLAnchorElement>("a[data-local-link]")
+    if (!link || !root()?.contains(link)) return
+    event.preventDefault()
+    event.stopPropagation()
+    if (event instanceof MouseEvent && (event.button !== 0 || window.getSelection()?.isCollapsed === false)) return
+    const path = resolveLocalLink(link.dataset.localLink!, local.directory)
+    if (!path) return
+    const copied = await (async () => {
+      try {
+        if (!navigator.clipboard?.writeText) return false
+        await navigator.clipboard.writeText(path)
+        return true
+      } catch {
+        return false
+      }
+    })()
+    if (disposed) return
+    const options = {
+      title: i18n.t(copied ? "ui.message.copied" : "ui.messagePart.diagnostic.error"),
+      variant: copied ? ("success" as const) : ("error" as const),
+    }
+    if (document.body.hasAttribute("data-new-layout")) {
+      showToastV2(options)
+      return
+    }
+    showToast(options)
+  }
 
   createEffect(() => {
     const container = root()
@@ -533,6 +571,7 @@ export function Markdown(
   })
 
   onCleanup(() => {
+    disposed = true
     if (copyCleanup) copyCleanup()
     disposeMarkdownProjection(owner)
     activeCodeKeys.forEach(disposeCode)
@@ -549,6 +588,9 @@ export function Markdown(
       }}
       ref={setRoot}
       {...others}
+      onClick={copyLocalLink}
+      onAuxClick={copyLocalLink}
+      onKeyDown={copyLocalLink}
     />
   )
 }
