@@ -1,5 +1,6 @@
 import { afterEach, describe, expect } from "bun:test"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
+import type { ConfigV1 } from "@opencode-ai/core/v1/config/config"
 import { Database } from "@opencode-ai/core/database/database"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
@@ -101,12 +102,19 @@ const modelConfig = {
           name: "Override",
           variants: { low: { reasoningEffort: "low" }, high: { reasoningEffort: "high" } },
         },
-        "plain-model": { name: "Plain" },
+        "plain-model": {
+          name: "Plain",
+          tool_call: false,
+          modalities: { input: ["text"], output: ["text"] },
+        },
+        "image-output-model": { name: "Image output", modalities: { input: ["text"], output: ["image"] } },
+        "image-input-model": { name: "Image input", modalities: { input: ["image"], output: ["text"] } },
+        "image-only-model": { name: "Image only", modalities: { input: ["image"], output: ["image"] } },
         "unavailable-model": { name: "Unavailable" },
       },
     },
   },
-}
+} satisfies ConfigV1.Info
 
 function defer<T>() {
   let resolve!: (value: T | PromiseLike<T>) => void
@@ -241,6 +249,46 @@ describe("tool.task", () => {
         savedVariant: "xhigh",
         effort: "xhigh",
         inheritVariant: true,
+      },
+      {
+        name: "empty model preserves the configured model and variant",
+        agent: "configured",
+        model: "",
+        modelID: "configured-model",
+        variant: undefined,
+        savedVariant: "high",
+        effort: "high",
+        inheritVariant: false,
+      },
+      {
+        name: "empty model inherits the parent model and variant without a configured model",
+        agent: "inherited",
+        model: "",
+        modelID: "test-model",
+        variant: "xhigh",
+        savedVariant: "xhigh",
+        effort: "xhigh",
+        inheritVariant: true,
+      },
+      {
+        name: "omitted model preserves configured non-chat model selection",
+        agent: "nonchat",
+        model: undefined,
+        modelID: "image-only-model",
+        variant: undefined,
+        savedVariant: undefined,
+        effort: undefined,
+        inheritVariant: false,
+      },
+      {
+        name: "explicit text model without tool-call support is accepted",
+        agent: "configured",
+        model: "test/plain-model",
+        modelID: "plain-model",
+        variant: "",
+        savedVariant: "",
+        effort: undefined,
+        inheritVariant: false,
       },
       {
         name: "model-only override of a configured model",
@@ -395,6 +443,7 @@ describe("tool.task", () => {
             ...modelConfig,
             agent: {
               inherited: { mode: "subagent", variant: "high" },
+              nonchat: { mode: "subagent", model: "test/image-only-model" },
               ...(source === "json"
                 ? { configured: { mode: "subagent", model: "test/configured-model", variant: "high" } }
                 : {}),
@@ -415,7 +464,7 @@ describe("tool.task", () => {
   }
 
   for (const [model, error] of [
-    ["", "Invalid model"],
+    [" ", "Invalid model"],
     ["test-model", "Invalid model"],
     ["/test-model", "Invalid model"],
     ["test/", "Invalid model"],
@@ -434,12 +483,17 @@ describe("tool.task", () => {
     ["test/org/override-model#unsupported", 'Variant "unsupported"'],
     ["test/org/override-model#toString", 'Variant "toString"'],
     ["test/plain-model#high", "has no variants"],
+    ["test/image-output-model", 'Model "test/image-output-model" must support both text input and text output.'],
+    ["test/image-input-model", 'Model "test/image-input-model" must support both text input and text output.'],
+    ["test/image-only-model", 'Model "test/image-only-model" must support both text input and text output.'],
   ]) {
     it.instance(
       `rejects explicit model ${JSON.stringify(model)} before creating or resuming a child`,
       () =>
         Effect.gen(function* () {
           const sessions = yield* Session.Service
+          const agents = yield* Agent.Service
+          const before = yield* agents.get("general")
           const { chat, assistant } = yield* seed()
           const child = yield* sessions.create({ parentID: chat.id, title: "Existing child" })
           const tool = yield* TaskTool.pipe(Effect.flatMap((tool) => tool.init()))
@@ -468,13 +522,16 @@ describe("tool.task", () => {
           expect(metadata).toBe(0)
           expect((yield* sessions.children(chat.id)).map((session) => session.id)).toEqual([child.id])
           expect(yield* sessions.get(child.id)).toEqual(child)
+          expect(yield* sessions.get(chat.id)).toEqual(chat)
+          expect(yield* agents.get("general")).toEqual(before)
+          expect((yield* MessageV2.get({ sessionID: chat.id, messageID: assistant.id })).info).toEqual(assistant)
         }),
       { config: modelConfig },
     )
   }
 
   it.instance(
-    "task_id model overrides are per-call and omission restores V1 agent selection",
+    "task_id model overrides are per-call and omitted or empty model restores V1 agent selection",
     () =>
       Effect.gen(function* () {
         const sessions = yield* Session.Service
@@ -487,6 +544,7 @@ describe("tool.task", () => {
           { model: undefined, modelID: "configured-model", variant: "high" },
           { model: "test/configured-model", modelID: "configured-model", variant: "" },
           { model: "test/configured-model#low", modelID: "configured-model", variant: "low" },
+          { model: "", modelID: "configured-model", variant: "high" },
         ].entries()) {
           const result = yield* tool.execute(
             {

@@ -132,6 +132,8 @@ export const TaskTool = Tool.define(
           ),
         )
       }
+      if (!model.capabilities.input.text || !model.capabilities.output.text)
+        return yield* Effect.fail(new Error(`Model "${value}" must support both text input and text output.`))
       // Empty bypasses SessionPrompt's nullish agent fallback without selecting a named variant.
       return { model: selected, variant: variant ?? "" }
     })
@@ -231,7 +233,7 @@ export const TaskTool = Tool.define(
       )
       if (msg.info.role !== "assistant") return yield* Effect.fail(new Error("Not an assistant message"))
       const variant = msg.info.variant
-      const override = params.model === undefined ? undefined : yield* resolveModel(params.model)
+      const override = params.model ? yield* resolveModel(params.model) : undefined
       const model = override?.model ??
         next.model ?? {
           modelID: msg.info.modelID,
