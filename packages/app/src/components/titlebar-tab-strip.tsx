@@ -1,6 +1,5 @@
 import { createEffect, createMemo, createResource, createRoot, For, onCleanup, onMount, Show } from "solid-js"
 import { createStore } from "solid-js/store"
-import { createResizeObserver } from "@solid-primitives/resize-observer"
 import { DragDropProvider, PointerSensor } from "@dnd-kit/solid"
 import { isSortable, useSortable } from "@dnd-kit/solid/sortable"
 import { Accessibility, AutoScroller, Feedback, PointerActivationConstraints } from "@dnd-kit/dom"
@@ -19,6 +18,7 @@ import { base64Encode } from "@opencode-ai/core/util/encode"
 import { showToast } from "@/utils/toast"
 import { canStartTabDrag, isTabCloseTarget } from "./titlebar-tab-gesture"
 import { adjacentTabKey, mergeVisibleTabOrder } from "./titlebar-tab-order"
+import { distributeTabWidths } from "./titlebar-tab-width"
 import type { Session } from "@opencode-ai/sdk/v2"
 
 function SessionTabSlot(props: {
@@ -49,7 +49,7 @@ function SessionTabSlot(props: {
       data-titlebar-tab-slot
       data-tab-key={props.id}
       data-active={props.active()}
-      class="relative flex w-56 min-w-7 max-w-56 flex-shrink"
+      class="relative flex min-w-7 shrink-0"
     >
       <TabNavItem
         ref={(el) => {
@@ -192,7 +192,7 @@ function DraftTabSlot(props: {
       data-titlebar-tab-slot
       data-tab-key={props.id}
       data-active={props.active()}
-      class="relative flex w-56 min-w-7 max-w-56 flex-shrink"
+      class="relative flex min-w-7 shrink-0"
     >
       <DraftTabItem
         ref={(el) => {
@@ -221,9 +221,14 @@ export function TitlebarTabStrip(props: {
   const global = useGlobal()
   const language = useLanguage()
   const command = useCommand()
+  let stripRef!: HTMLDivElement
   let scrollRef!: HTMLDivElement
   let listRef!: HTMLDivElement
+  let spacer: HTMLElement | null = null
+  let observer: ResizeObserver | undefined
   let resizeFrame: number | undefined
+  let dragging = false
+  const measured = new Set<HTMLElement>()
   const [visibility, setVisibility] = createStore<Record<string, boolean>>({})
   const visibleTabs = createMemo(() => props.tabs.filter((tab) => tab.type === "draft" || visibility[tabKey(tab)]))
   const visibleTabIds = () => visibleTabs().map(tabKey)
@@ -259,33 +264,74 @@ export function TitlebarTabStrip(props: {
     props.onOverflowChange(scrollRef.scrollWidth > scrollRef.clientWidth)
   }
 
-  createResizeObserver(
-    () => [scrollRef, listRef],
-    () => {
-      if (resizeFrame !== undefined) return
-      resizeFrame = requestAnimationFrame(() => {
-        resizeFrame = undefined
-        refreshOverflow()
-      })
-    },
-  )
+  function resizeTabs() {
+    if (!stripRef || dragging) return
+    const slots = Array.from(listRef.querySelectorAll<HTMLElement>("[data-titlebar-tab-slot]"))
+    const sizes = slots.map((slot) => slot.querySelector<HTMLElement>("[data-titlebar-tab-size]")!)
+    const minimum = slots.length ? parseFloat(getComputedStyle(slots[0]).minWidth) : 0
+    const gap = parseFloat(getComputedStyle(listRef).columnGap) || 0
+    const gaps = Math.max(0, slots.length - 1) * gap
+    // The spacer is unused tab capacity, including when the strip is currently compact.
+    const available =
+      parseFloat(getComputedStyle(stripRef).width) + (spacer ? parseFloat(getComputedStyle(spacer).width) : 0)
+    // Preserve full glyphs at natural width; round shrinking caps down to layout units.
+    const natural = sizes.map((size) => Math.ceil(parseFloat(getComputedStyle(size).width) * 64) / 64)
+    const widths = distributeTabWidths(natural, available - gaps, minimum).map((width) => Math.floor(width * 64) / 64)
+    const width = `${Math.min(
+      available,
+      widths.reduce((sum, width) => sum + width, gaps),
+    )}px`
+
+    for (const size of measured) {
+      if (sizes.includes(size)) continue
+      observer?.unobserve(size)
+      measured.delete(size)
+    }
+    for (const size of sizes) {
+      if (measured.has(size)) continue
+      observer?.observe(size, { box: "border-box" })
+      measured.add(size)
+    }
+    slots.forEach((slot, index) => {
+      const width = `${widths[index]}px`
+      if (slot.style.width !== width) slot.style.width = width
+      const shrunk = String(widths[index] < natural[index])
+      if (slot.dataset.shrunk !== shrunk) slot.dataset.shrunk = shrunk
+    })
+    if (stripRef.style.width !== width) stripRef.style.width = width
+  }
+
+  function scheduleResize() {
+    if (resizeFrame !== undefined) return
+    resizeFrame = requestAnimationFrame(() => {
+      resizeFrame = undefined
+      refreshOverflow()
+      resizeTabs()
+    })
+  }
 
   onMount(() => {
-    refreshOverflow()
+    spacer = stripRef.parentElement!.querySelector<HTMLElement>("[data-titlebar-tabs-spacer]")
+    observer = new ResizeObserver(scheduleResize)
+    for (const element of [stripRef, scrollRef, listRef, spacer]) {
+      if (element) observer.observe(element)
+    }
+    scheduleResize()
   })
 
   onCleanup(() => {
+    observer?.disconnect()
     if (resizeFrame !== undefined) cancelAnimationFrame(resizeFrame)
   })
 
   createEffect(() => {
     props.tabs.length
     visibleTabIds()
-    refreshOverflow()
+    scheduleResize()
   })
 
   return (
-    <div data-slot="titlebar-tabs" class="relative min-w-0">
+    <div data-slot="titlebar-tabs" class="relative min-w-0" ref={stripRef}>
       <div
         data-slot="titlebar-tabs-scroll"
         class="flex min-w-0 flex-row items-center gap-1.5 overflow-x-auto no-scrollbar [app-region:no-drag]"
@@ -308,6 +354,7 @@ export function TitlebarTabStrip(props: {
             Feedback.configure({ dropAnimation: null }),
           ]}
           onDragStart={(event) => {
+            dragging = true
             const source = event.operation.source
             if (!source) return
             const tab = props.tabs.find((item) => tabKey(item) === source.id.toString())
@@ -316,6 +363,8 @@ export function TitlebarTabStrip(props: {
             props.onNavigate(tab, tabEl ?? undefined)
           }}
           onDragEnd={(event) => {
+            dragging = false
+            scheduleResize()
             const current = visibleTabIds()
             const source = event.operation.source
             if (event.canceled || !isSortable(source)) return

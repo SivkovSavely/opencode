@@ -1,7 +1,6 @@
-import { createEffect, createMemo, createSignal, onCleanup, Show, type Ref } from "solid-js"
+import { createEffect, createMemo, createSignal, onCleanup, onMount, Show, type Ref } from "solid-js"
 import { createStore } from "solid-js/store"
 import { makeEventListener } from "@solid-primitives/event-listener"
-import { createResizeObserver } from "@solid-primitives/resize-observer"
 import { createMutation } from "@tanstack/solid-query"
 import { IconButtonV2 } from "@opencode-ai/ui/v2/icon-button-v2"
 import { Icon as IconV2 } from "@opencode-ai/ui/v2/icon"
@@ -38,10 +37,8 @@ export function TabNavItem(props: {
   const language = useLanguage()
   const [menu, setMenu] = createStore({ open: false, rename: false })
   const [editing, setEditing] = createSignal(false)
-  const [titleOverflowing, setTitleOverflowing] = createSignal(false)
   let tabRoot!: HTMLDivElement
   let titleEl!: HTMLSpanElement
-  let measureFrame: number | undefined
   const rename = createMutation(() => ({ mutationFn: props.onRename }))
 
   const closeTab = (event: MouseEvent) => {
@@ -81,34 +78,6 @@ export function TabNavItem(props: {
 
   const [popoverOpen, setPopoverOpen] = createSignal(false)
   const previewBlocked = () => !!props.dragging || editing() || menu.open || !!props.pressed || !props.session()
-
-  const measureTitleOverflow = () => {
-    if (!titleEl || editing()) {
-      setTitleOverflowing(false)
-      return
-    }
-    setTitleOverflowing(titleEl.scrollWidth > titleEl.clientWidth)
-  }
-
-  const scheduleTitleOverflow = () => {
-    if (measureFrame !== undefined) return
-    measureFrame = requestAnimationFrame(() => {
-      measureFrame = undefined
-      measureTitleOverflow()
-    })
-  }
-
-  createEffect(() => {
-    title()
-    props.forceTruncate
-    editing()
-    scheduleTitleOverflow()
-  })
-
-  createResizeObserver(() => tabRoot, scheduleTitleOverflow)
-  onCleanup(() => {
-    if (measureFrame !== undefined) cancelAnimationFrame(measureFrame)
-  })
 
   const selectTitle = () => {
     const range = document.createRange()
@@ -183,9 +152,8 @@ export function TabNavItem(props: {
       }}
       data-titlebar-tab
       data-slot="titlebar-tab-item"
-      data-title-overflow={titleOverflowing()}
       data-editing={editing()}
-      class="group relative flex h-7 w-full min-w-0 select-none flex-row items-center gap-1.5 overflow-hidden whitespace-nowrap rounded-[6px] px-1.5 [container-type:inline-size]"
+      class="group relative flex h-7 w-full min-w-0 select-none flex-row items-center overflow-hidden whitespace-nowrap rounded-[6px] [container-type:inline-size]"
       classList={{ invisible: props.hidden }}
       data-active={props.active}
       data-dragging={props.dragging}
@@ -228,9 +196,9 @@ export function TabNavItem(props: {
           if (props.suppressNavigation?.()) return
           props.onNavigate()
         }}
-        class="flex h-full min-w-0 flex-1 flex-row items-center gap-1.5 text-[13px] font-medium text-v2-text-text-faint group-data-[active='true']:text-v2-text-text-base group-data-[editing='true']:text-v2-text-text-base [-webkit-user-drag:none]"
+        class="flex h-full min-w-0 flex-1 flex-row items-center text-[13px] font-medium text-v2-text-text-faint group-data-[active='true']:text-v2-text-text-base group-data-[editing='true']:text-v2-text-text-base [-webkit-user-drag:none]"
       >
-        <span data-slot="project-avatar-slot" class="flex size-4 shrink-0 items-center justify-center">
+        <span data-slot="project-avatar-slot" data-titlebar-tab-icon class="flex shrink-0 items-center justify-center">
           <Show
             when={props.session()}
             keyed
@@ -284,6 +252,7 @@ export function TabNavItem(props: {
             event.preventDefault()
           }}
         />
+        <TabTitleMeasure title={title()} editing={editing()} />
       </MenuV2.Context.Trigger>
 
       <div data-slot="tab-close">
@@ -369,7 +338,7 @@ export function DraftTabItem(props: {
       data-active={props.active}
       data-dragging={props.dragging}
       data-state={props.active || props.pressed ? "pressed" : undefined}
-      class="group relative flex h-7 w-full min-w-0 flex-row items-center gap-1.5 overflow-hidden rounded-[6px] px-1.5 [container-type:inline-size] whitespace-nowrap"
+      class="group relative flex h-7 w-full min-w-0 flex-row items-center overflow-hidden rounded-[6px] [container-type:inline-size] whitespace-nowrap"
       classList={{ invisible: props.hidden }}
       onMouseDown={(event) => {
         if (event.button !== MIDDLE_MOUSE_BUTTON) return
@@ -403,17 +372,19 @@ export function DraftTabItem(props: {
           if (props.suppressNavigation?.()) return
           props.onNavigate()
         }}
-        class="flex h-full min-w-0 flex-1 flex-row items-center gap-1.5 text-[13px] font-medium text-v2-text-text-faint group-data-[active='true']:text-v2-text-text-base [-webkit-user-drag:none]"
+        class="flex h-full min-w-0 flex-1 flex-row items-center text-[13px] font-medium text-v2-text-text-faint group-data-[active='true']:text-v2-text-text-base [-webkit-user-drag:none]"
       >
-        <span class="flex size-4 shrink-0 items-center justify-center">
+        <span data-titlebar-tab-icon class="flex shrink-0 items-center justify-center">
           <IconV2 name="edit" />
         </span>
         <span
+          data-slot="tab-title"
           data-titlebar-tab-title
           class="min-w-0 flex-1 overflow-hidden text-clip whitespace-nowrap outline-none leading-4"
         >
           {props.title}
         </span>
+        <TabTitleMeasure title={props.title} />
       </a>
       <div data-slot="tab-close">
         <IconButtonV2
@@ -434,5 +405,38 @@ export function DraftTabItem(props: {
         />
       </div>
     </div>
+  )
+}
+
+function TabTitleMeasure(props: { title?: string; editing?: boolean }) {
+  let ref!: HTMLSpanElement
+  onMount(() => {
+    const root = ref.closest<HTMLElement>("[data-titlebar-tab]")!
+    const title = root.querySelector<HTMLElement>("[data-titlebar-tab-title]")!
+    let frame: number | undefined
+    const schedule = () => {
+      if (frame !== undefined) return
+      frame = requestAnimationFrame(() => {
+        frame = undefined
+        root.dataset.titleOverflow = String(!props.editing && title.scrollWidth > title.clientWidth)
+      })
+    }
+    const observer = new ResizeObserver(schedule)
+    observer.observe(ref, { box: "border-box" })
+    observer.observe(title)
+    createEffect(() => {
+      props.title
+      props.editing
+      schedule()
+    })
+    onCleanup(() => {
+      observer.disconnect()
+      if (frame !== undefined) cancelAnimationFrame(frame)
+    })
+  })
+  return (
+    <span data-titlebar-tab-size aria-hidden="true" ref={ref}>
+      {props.title}
+    </span>
   )
 }
