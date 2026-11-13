@@ -88,7 +88,15 @@ async function mockServers(page: Page, requests: string[]) {
     if (url.pathname === "/global/event" || url.pathname === "/event" || url.pathname === "/api/event")
       return sse(route)
     if (url.pathname === "/global/health") return json(route, {}, 404)
-    if (url.pathname === "/api/health") return json(route, { pid: 1 })
+    if (url.pathname === "/api/health") return json(route, { healthy: true, version: "2.0.0", pid: 1 })
+    if (url.pathname === "/api/location")
+      return json(route, {
+        directory: current.directory,
+        project: { id: current.projectID, directory: current.directory },
+      })
+    if (url.pathname === "/api/project")
+      return json(route, [{ id: current.projectID, worktree: current.directory, time: current.time, sandboxes: [] }])
+    if (url.pathname === "/api/model/default") return json(route, { data: null })
     if (url.pathname === "/api/session") return json(route, { data: [currentSession(current)], cursor: {} })
     if (url.pathname === "/api/session/active") return json(route, { data: {} })
     if (url.pathname === `/api/session/${current.id}`) return json(route, { data: currentSession(current) })

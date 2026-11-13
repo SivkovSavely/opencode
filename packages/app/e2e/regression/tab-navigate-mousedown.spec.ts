@@ -92,6 +92,7 @@ async function mockServer(page: Page) {
     if (url.pathname === "/global/event" || url.pathname === "/event" || url.pathname === "/api/event")
       return sse(route)
     if (url.pathname === "/global/health") return json(route, { healthy: true })
+    if (["/api/location", "/api/project", "/api/model/default"].includes(url.pathname)) return json(route, {}, 404)
     if (url.pathname === "/api/session") return json(route, { data: sessions.map(currentSession), cursor: {} })
     if (url.pathname === "/api/session/active") return json(route, { data: {} })
     const currentSessionInfo = sessions.find((item) => url.pathname === `/api/session/${item.id}`)
