@@ -7,6 +7,7 @@ import { MessageV2 } from "@/session/message-v2"
 import { SessionPrompt } from "@/session/prompt"
 import { SessionQueueV1 } from "@opencode-ai/schema/v1/session-queue"
 import { SessionHandoffV1 } from "@opencode-ai/schema/v1/session-handoff"
+import { SessionDcpV1 } from "@opencode-ai/schema/v1/session-dcp"
 import { HandoffErrors } from "../handoff-errors"
 import { SessionRevert } from "@/session/revert"
 import { SessionStatus } from "@/session/status"
@@ -96,6 +97,7 @@ export const SessionPaths = {
   list: root,
   status: `${root}/status`,
   get: `${root}/:sessionID`,
+  dcp: `${root}/:sessionID/dcp`,
   children: `${root}/:sessionID/children`,
   todo: `${root}/:sessionID/todo`,
   diff: `${root}/:sessionID/diff`,
@@ -134,6 +136,12 @@ export const SessionApi = HttpApi.make("session")
   .add(
     HttpApiGroup.make("session")
       .add(
+        HttpApiEndpoint.get("dcp", SessionPaths.dcp, {
+          params: { sessionID: SessionID.check(Schema.isPattern(/^ses_[A-Za-z0-9_-]{1,124}$/)) },
+          query: WorkspaceRoutingQuery,
+          success: SessionDcpV1.Snapshot,
+          error: [HttpApiError.BadRequest, ApiNotFoundError, ForbiddenError, InvalidRequestError],
+        }).annotateMerge(OpenApi.annotations({ identifier: "session.dcp", summary: "Get saved DCP context state" })),
         HttpApiEndpoint.get("execution", SessionPaths.execution, {
           params: { sessionID: SessionID },
           query: ExecutionQuery,

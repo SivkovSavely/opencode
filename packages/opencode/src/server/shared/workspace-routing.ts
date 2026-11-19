@@ -9,6 +9,7 @@ const RULES: Array<Rule> = [
 ]
 
 export function isLocalWorkspaceRoute(method: string, path: string) {
+  if (method === "GET" && /^\/session\/[^/]+\/dcp$/.test(path)) return false
   for (const rule of RULES) {
     if (rule.method && rule.method !== method) continue
     const match = rule.exact ? path === rule.path : path === rule.path || path.startsWith(rule.path + "/")

@@ -30,7 +30,7 @@ export const managedWorkspaceMiddleware = HttpRouter.middleware(
               "/question",
               "/maintenance/historical-fence/identity",
             ]).has(path) ||
-            /^\/session\/[^/%]+(?:\/children|\/execution|\/handoff\/(?:[^/%]|%[\da-fA-F]{2})+|\/message(?:\/[^/%]+)?)?$/.test(
+            /^\/session\/[^/%]+(?:\/children|\/execution|\/dcp|\/handoff\/(?:[^/%]|%[\da-fA-F]{2})+|\/message(?:\/[^/%]+)?)?$/.test(
               path,
             )
           : request.method === "POST" &&

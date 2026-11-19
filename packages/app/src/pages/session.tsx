@@ -39,7 +39,7 @@ import { Button } from "@opencode-ai/ui/button"
 import { showToast } from "@/utils/toast"
 import { base64Encode, checksum } from "@opencode-ai/core/util/encode"
 import { useLocation, useNavigate, useParams, useSearchParams } from "@solidjs/router"
-import { NewSessionView, SessionHeader } from "@/components/session"
+import { NewSessionView, SessionContextTab, SessionHeader } from "@/components/session"
 import { ErrorPage } from "@/pages/error"
 import { CommentsProvider, useComments } from "@/context/comments"
 import { useCommand } from "@/context/command"
@@ -117,7 +117,7 @@ type VcsMode = "git" | "branch"
 
 const sessionViewState = () => ({
   messageId: undefined as string | undefined,
-  mobileTab: "session" as "session" | "changes",
+  mobileTab: "session" as "session" | "changes" | "context",
 })
 
 function isCurrentSessionNotFoundError(error: unknown, sessionID: string | undefined) {
@@ -673,6 +673,7 @@ export default function Page() {
     return list
   })
   const mobileChanges = createMemo(() => !isDesktop() && store.mobileTab === "changes")
+  const mobileContext = createMemo(() => !isDesktop() && store.mobileTab === "context")
   const wantsReview = createMemo(() =>
     isDesktop()
       ? desktopFileTreeOpen() ||
@@ -2022,7 +2023,7 @@ export default function Page() {
         <Tabs.Trigger
           value="session"
           classList={{
-            "!w-1/2 !max-w-none": true,
+            "!w-1/3 !max-w-none": true,
             "!border-b-0 !border-t !border-border-weak-base [&:has([data-selected])]:!border-t-transparent": bottom,
           }}
           classes={{ button: compact ? "w-full !py-2" : "w-full" }}
@@ -2033,7 +2034,7 @@ export default function Page() {
         <Tabs.Trigger
           value="changes"
           classList={{
-            "!w-1/2 !max-w-none !border-r-0": true,
+            "!w-1/3 !max-w-none": true,
             "!border-b-0 !border-t !border-border-weak-base [&:has([data-selected])]:!border-t-transparent": bottom,
           }}
           classes={{ button: compact ? "w-full !py-2" : "w-full" }}
@@ -2042,6 +2043,17 @@ export default function Page() {
           {hasReview()
             ? language.t("session.review.filesChanged", { count: reviewCount() })
             : language.t("session.review.change.other")}
+        </Tabs.Trigger>
+        <Tabs.Trigger
+          value="context"
+          classList={{
+            "!w-1/3 !max-w-none !border-e-0": true,
+            "!border-b-0 !border-t !border-border-weak-base [&:has([data-selected])]:!border-t-transparent": bottom,
+          }}
+          classes={{ button: compact ? "w-full !py-2" : "w-full" }}
+          onClick={() => setStore("mobileTab", "context")}
+        >
+          {language.t("session.tab.context")}
         </Tabs.Trigger>
       </Tabs.List>
     </Tabs>
@@ -2063,6 +2075,11 @@ export default function Page() {
       </Show>
       <div class="flex-1 min-h-0 overflow-hidden">
         <Switch>
+          <Match when={params.id && mobileContext()}>
+            <div class="h-full min-h-0 flex flex-col">
+              <SessionContextTab />
+            </div>
+          </Match>
           <Match when={params.id && mobileChanges()}>
             <div class="relative h-full overflow-hidden">
               {reviewContent({
@@ -2168,7 +2185,7 @@ export default function Page() {
         </Switch>
       </div>
 
-      <Show when={(params.id || !newSessionDesign()) && !mobileChanges()}>
+      <Show when={(params.id || !newSessionDesign()) && !mobileChanges() && !mobileContext()}>
         {(_) => {
           const controller = createSessionComposerRegionController({
             state: composer,

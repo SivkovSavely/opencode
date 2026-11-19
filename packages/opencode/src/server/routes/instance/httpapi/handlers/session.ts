@@ -12,6 +12,7 @@ import { Command } from "@/command"
 import { Permission } from "@/permission"
 import { SessionShare } from "@/share/session"
 import { Session } from "@/session/session"
+import { SessionDcp } from "@/session/dcp"
 import { SessionCompaction } from "@/session/compaction"
 import { MessageV2 } from "@/session/message-v2"
 import { SessionPrompt } from "@/session/prompt"
@@ -200,6 +201,17 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
 
     const get = Effect.fn("SessionHttpApi.get")(function* (ctx: { params: { sessionID: SessionID } }) {
       return yield* requireSession(ctx.params.sessionID)
+    })
+
+    const dcp = Effect.fn("SessionHttpApi.dcp")(function* (ctx: { params: { sessionID: SessionID } }) {
+      const current = yield* requireSession(ctx.params.sessionID)
+      if (
+        (yield* InstanceState.directory) !== current.directory ||
+        (yield* InstanceState.workspaceID) !== current.workspaceID
+      )
+        return yield* new ForbiddenError({ message: "Session is outside the requested directory/workspace" })
+      const result = yield* SessionDcp.read(current.id)
+      return HttpServerResponse.jsonUnsafe(result, { headers: { "cache-control": "no-store" } })
     })
 
     const children = Effect.fn("SessionHttpApi.children")(function* (ctx: { params: { sessionID: SessionID } }) {
@@ -714,6 +726,7 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       .handle("list", list)
       .handle("status", status)
       .handle("get", get)
+      .handle("dcp", dcp)
       .handle("children", children)
       .handle("todo", todo)
       .handle("diff", diff)

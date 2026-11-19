@@ -12,8 +12,10 @@ import { Context, Data, Effect, Layer, Option, Schema } from "effect"
 import { HttpClient, HttpServerRequest, HttpServerResponse } from "effect/unstable/http"
 import { HttpApiMiddleware } from "effect/unstable/httpapi"
 import * as Socket from "effect/unstable/socket/Socket"
-import { InvalidRequestError } from "../errors"
+import { ForbiddenError, InvalidRequestError } from "../errors"
 import { ManagedWorkspace } from "@/server/managed-workspace"
+import { realpath } from "node:fs/promises"
+import path from "node:path"
 
 // Query fields this middleware reads from the URL. Spread into every
 // endpoint query schema in groups that apply WorkspaceRoutingMiddleware,
@@ -258,6 +260,37 @@ function routeHttpApiWorkspace<E>(
       : undefined
     if (ManagedWorkspace.directory && session && (session.workspaceID || !ManagedWorkspace.allows(session.directory))) {
       return HttpServerResponse.text("Forbidden", { status: 403 })
+    }
+    if (session && request.method === "GET" && /^\/session\/[^/]+\/dcp$/.test(url.pathname)) {
+      const header = request.headers["x-opencode-directory"]
+      const decoded =
+        header === undefined
+          ? undefined
+          : yield* Effect.try({
+              try: () => decodeURIComponent(header),
+              catch: () => undefined,
+            }).pipe(Effect.catch(() => Effect.void))
+      if (header !== undefined && decoded === undefined)
+        return HttpServerResponse.jsonUnsafe(new InvalidRequestError({ message: "Invalid directory encoding" }), {
+          status: 400,
+        })
+      const denied = HttpServerResponse.jsonUnsafe(
+        new ForbiddenError({
+          message: "Session is outside the requested directory/workspace",
+        }),
+        { status: 403 },
+      )
+      const workspaces = [
+        ...url.searchParams.getAll("workspace"),
+        ...(request.headers["x-opencode-workspace"] === undefined ? [] : [request.headers["x-opencode-workspace"]]),
+      ]
+      if (workspaces.some((workspace) => workspace !== session.workspaceID)) return denied
+      for (const directory of [...url.searchParams.getAll("directory"), ...(decoded === undefined ? [] : [decoded])]) {
+        const canonical = yield* Effect.tryPromise(() => realpath(path.resolve(directory))).pipe(
+          Effect.catch(() => Effect.void),
+        )
+        if (canonical !== session.directory) return denied
+      }
     }
     const plan = yield* planRequest(request, session)
     return yield* routeWorkspace(client, effect, plan)
