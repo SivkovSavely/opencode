@@ -1,5 +1,6 @@
 import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import path from "node:path"
+import { realpath } from "node:fs/promises"
 import { Agent } from "@/agent/agent"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { SessionV2 } from "@opencode-ai/core/session"
@@ -16,6 +17,9 @@ import { MessageV2 } from "@/session/message-v2"
 import { SessionPrompt } from "@/session/prompt"
 import { SessionQueue } from "@/session/queue"
 import { SessionQueueV1 } from "@opencode-ai/schema/v1/session-queue"
+import { SessionHandoffV1 } from "@opencode-ai/schema/v1/session-handoff"
+import { SessionHandoff } from "@/session/handoff"
+import { handoffError, HandoffBadRequest, HandoffNotFound, HandoffConflict } from "../handoff-errors"
 import { SessionRevert } from "@/session/revert"
 import { SessionRunState } from "@/session/run-state"
 import { SessionStatus } from "@/session/status"
@@ -34,6 +38,7 @@ import { InstanceHttpApi } from "../api"
 import {
   CommandPayload,
   DiffQuery,
+  ExecutionQuery,
   ForkPayload,
   InitPayload,
   ListQuery,
@@ -103,6 +108,94 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
 
     const requireSession = Effect.fn("SessionHttpApi.requireSession")(function* (sessionID: SessionID) {
       return yield* SessionError.mapStorageNotFound(session.get(sessionID))
+    })
+
+    const requireHandoffSession = Effect.fn("SessionHttpApi.requireHandoffSession")(function* (sessionID: SessionID) {
+      const current = yield* requireSession(sessionID).pipe(
+        Effect.mapError(() => new HandoffNotFound({ code: "not_found", message: "Session not found" })),
+      )
+      const directory = yield* InstanceState.directory
+      if (current.directory !== directory)
+        return yield* new HandoffConflict({ code: "wrong_directory", message: "Session directory does not match" })
+      // Workspace routing may select the session directory over an explicit caller selector.
+      const request = yield* HttpServerRequest.HttpServerRequest
+      const queryDirectory = new URL(request.url, "http://localhost").searchParams.get("directory")
+      const supplied = queryDirectory ?? request.headers["x-opencode-directory"]
+      if (supplied !== undefined && supplied !== null) {
+        const canonical = yield* Effect.tryPromise({
+          try: () => realpath(path.resolve(queryDirectory ?? decodeURIComponent(supplied))),
+          catch: () => new HandoffConflict({ code: "wrong_directory", message: "Session directory does not match" }),
+        })
+        if (canonical !== current.directory)
+          return yield* new HandoffConflict({ code: "wrong_directory", message: "Session directory does not match" })
+      }
+    })
+
+    const execution = Effect.fn("SessionHttpApi.execution")(function* (ctx: {
+      params: { sessionID: SessionID }
+      query: typeof ExecutionQuery.Type
+    }) {
+      if ((ctx.query.queueID === undefined) !== (ctx.query.userMessageID === undefined))
+        return yield* new HandoffBadRequest({
+          code: "incomplete_action_selector",
+          message: "queueID and userMessageID must be provided together",
+        })
+      yield* requireHandoffSession(ctx.params.sessionID)
+      return yield* SessionHandoff.execution(
+        ctx.params.sessionID,
+        ctx.query.queueID !== undefined && ctx.query.userMessageID !== undefined
+          ? { queueID: ctx.query.queueID, userMessageID: ctx.query.userMessageID }
+          : undefined,
+      ).pipe(Effect.mapError(handoffError))
+    })
+
+    const handoffReceipt = Effect.fn("SessionHttpApi.handoffReceipt")(function* (ctx: {
+      params: { sessionID: SessionID; requestID: string }
+    }) {
+      yield* requireHandoffSession(ctx.params.sessionID)
+      return yield* SessionHandoff.receipt(ctx.params.sessionID, ctx.params.requestID).pipe(
+        Effect.mapError(handoffError),
+      )
+    })
+
+    const enrollQueueAction = Effect.fn("SessionHttpApi.enrollQueueAction")(function* (ctx: {
+      params: { sessionID: SessionID }
+      request: HttpServerRequest.HttpServerRequest
+    }) {
+      const payload = yield* ctx.request.json.pipe(
+        Effect.flatMap(Schema.decodeUnknownEffect(SessionHandoffV1.EnrollRequest)),
+        Effect.mapError(
+          () => new HandoffBadRequest({ code: "invalid_request", message: "Invalid enrollment request" }),
+        ),
+      )
+      yield* requireHandoffSession(ctx.params.sessionID)
+      return yield* SessionHandoff.enroll(ctx.params.sessionID, payload).pipe(Effect.mapError(handoffError))
+    })
+
+    const modelControl = Effect.fn("SessionHttpApi.modelControl")(function* (ctx: {
+      params: { sessionID: SessionID }
+      request: HttpServerRequest.HttpServerRequest
+    }) {
+      const payload = yield* ctx.request.json.pipe(
+        Effect.flatMap(Schema.decodeUnknownEffect(SessionHandoffV1.ControlRequest)),
+        Effect.mapError(
+          () => new HandoffBadRequest({ code: "invalid_request", message: "Invalid model control request" }),
+        ),
+      )
+      yield* requireHandoffSession(ctx.params.sessionID)
+      return yield* SessionHandoff.modelControl(ctx.params.sessionID, payload).pipe(Effect.mapError(handoffError))
+    })
+
+    const recoverQueueAction = Effect.fn("SessionHttpApi.recoverQueueAction")(function* (ctx: {
+      params: { sessionID: SessionID }
+      request: HttpServerRequest.HttpServerRequest
+    }) {
+      const payload = yield* ctx.request.json.pipe(
+        Effect.flatMap(Schema.decodeUnknownEffect(SessionHandoffV1.RecoveryRequest)),
+        Effect.mapError(() => new HandoffBadRequest({ code: "invalid_request", message: "Invalid recovery request" })),
+      )
+      yield* requireHandoffSession(ctx.params.sessionID)
+      return yield* SessionHandoff.recover(ctx.params.sessionID, payload).pipe(Effect.mapError(handoffError))
     })
 
     const get = Effect.fn("SessionHttpApi.get")(function* (ctx: { params: { sessionID: SessionID } }) {
@@ -613,6 +706,11 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
     })
 
     return handlers
+      .handle("execution", execution)
+      .handle("handoffReceipt", handoffReceipt)
+      .handleRaw("enrollQueueAction", enrollQueueAction)
+      .handleRaw("modelControl", modelControl)
+      .handleRaw("recoverQueueAction", recoverQueueAction)
       .handle("list", list)
       .handle("status", status)
       .handle("get", get)

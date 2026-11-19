@@ -12,6 +12,8 @@ for (const change of ["logout", "login"] as const) {
     Effect.gen(function* () {
       const auth = yield* Auth.Service
       const key = `synthetic-oauth-race-${change}`
+      const previous = yield* auth.get(key)
+      yield* Effect.addFinalizer(() => (previous ? auth.set(key, previous) : auth.remove(key)).pipe(Effect.orDie))
       const initial: Auth.Oauth = {
         type: "oauth",
         access: "synthetic-expired-access",
@@ -48,6 +50,10 @@ for (const change of ["logout", "login"] as const) {
 it.live("uses internal auth CAS by default and returns only persisted refresh credentials", () =>
   Effect.gen(function* () {
     const auth = yield* Auth.Service
+    const previous = yield* auth.get("openai")
+    yield* Effect.addFinalizer(() =>
+      (previous ? auth.set("openai", previous) : auth.remove("openai")).pipe(Effect.orDie),
+    )
     yield* auth.set("openai", {
       type: "oauth",
       access: "synthetic-default-expired-access",

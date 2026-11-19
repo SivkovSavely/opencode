@@ -15,6 +15,8 @@ import { Cause, Effect, Exit, Fiber, Schema, Scope } from "effect"
 import { EffectBridge } from "@/effect/bridge"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { Database } from "@opencode-ai/core/database/database"
+import { SessionHandoffNotification } from "@opencode-ai/core/session/handoff-notification"
+import { SessionHandoffRecovery } from "@opencode-ai/core/session/handoff-recovery"
 
 export interface TaskPromptOps {
   cancel(sessionID: SessionID): Effect.Effect<void>
@@ -26,6 +28,7 @@ export interface TaskPromptOps {
       parentCallID?: string
       parentMode?: "foreground" | "background"
       notification?: boolean
+      notificationLink?: SessionHandoffNotification.Link
       managedChildAuthorization?: { prompt: object; runner: object }
     },
   ): Effect.Effect<SessionV1.WithParts>
@@ -323,25 +326,39 @@ export const TaskTool = Tool.define(
           ? [{ type: "text" as const, text: params.prompt }]
           : yield* ops.resolvePromptParts(params.prompt)
         const job = managed ? undefined : yield* background.get(nextSession.id)
-        const result = yield* ops.prompt(
-          {
-            messageID: childMessageID,
-            sessionID: nextSession.id,
-            model: {
-              modelID: model.modelID,
-              providerID: model.providerID,
+        const result = yield* ops
+          .prompt(
+            {
+              messageID: childMessageID,
+              sessionID: nextSession.id,
+              model: {
+                modelID: model.modelID,
+                providerID: model.providerID,
+              },
+              variant: childVariant,
+              agent: next.name,
+              parts,
             },
-            variant: childVariant,
-            agent: next.name,
-            parts,
-          },
-          {
-            parentMessageID: ctx.messageID,
-            parentCallID: ctx.callID,
-            parentMode: runInBackground || job?.metadata?.background === true ? "background" : "foreground",
-            managedChildAuthorization,
-          },
-        )
+            {
+              parentMessageID: ctx.messageID,
+              parentCallID: ctx.callID,
+              parentMode: runInBackground || job?.metadata?.background === true ? "background" : "foreground",
+              managedChildAuthorization,
+            },
+          )
+          .pipe(
+            Effect.provideService(
+              SessionHandoffRecovery.CurrentNewTask,
+              !session && !runInBackground && ctx.executionFence !== undefined && ctx.callID
+                ? {
+                    sessionID: nextSession.id,
+                    parentMessageID: ctx.messageID,
+                    parentCallID: ctx.callID,
+                    parentFence: ctx.executionFence,
+                  }
+                : undefined,
+            ),
+          )
         const text = result.parts.findLast((item) => item.type === "text")?.text ?? ""
         const assistant = result.info.role === "assistant" ? result.info : undefined
         yield* taskDiagnostic("child prompt returned", {
@@ -399,6 +416,13 @@ export const TaskTool = Tool.define(
         text: string,
       ) {
         const currentParent = yield* sessions.get(ctx.sessionID)
+        const childResult = (yield* sessions.messages({ sessionID: nextSession.id })).findLast(
+          (message) =>
+            message.info.role === "assistant" &&
+            message.info.parentID === childMessageID &&
+            message.info.time.completed !== undefined,
+        )
+        const parentCallID = ctx.callID
         const notification = {
           sessionID: ctx.sessionID,
           messageID: MessageID.ascending(`msg_task_notification_${nextSession.id}`),
@@ -433,9 +457,24 @@ export const TaskTool = Tool.define(
             return
           }
           const delivered = yield* Effect.exit(
-            ops
-              .prompt(notification, { notification: true })
-              .pipe(Effect.tap(() => ops.acknowledgeParentNotification?.(nextSession.id, ctx.callID) ?? Effect.void)),
+            Effect.gen(function* () {
+              // Claiming a completed child's notification advances its fence.
+              // Missing proof is held by prompt admission, never inferred from old child metadata.
+              const notificationLink =
+                childResult && parentCallID
+                  ? yield* SessionHandoffNotification.link(database, {
+                      parentSessionID: ctx.sessionID,
+                      parentMessageID: ctx.messageID,
+                      parentCallID,
+                      childSessionID: nextSession.id,
+                      childUserMessageID: childMessageID,
+                      childResultMessageID: childResult.info.id,
+                    }).pipe(Effect.catchTag("SessionHandoffNotificationError", () => Effect.succeed(undefined)))
+                  : undefined
+              return yield* ops
+                .prompt(notification, { notification: true, notificationLink })
+                .pipe(Effect.tap(() => ops.acknowledgeParentNotification?.(nextSession.id, ctx.callID) ?? Effect.void))
+            }),
           )
           if (Exit.isSuccess(delivered)) return
           yield* ops.releaseParentNotificationClaim?.(nextSession.id, ctx.callID) ?? Effect.void

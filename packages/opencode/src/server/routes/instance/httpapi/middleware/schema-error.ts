@@ -23,6 +23,14 @@ export class SchemaErrorMiddleware extends HttpApiMiddleware.Service<SchemaError
 ) {}
 
 export const schemaErrorLayer = HttpApiMiddleware.layerSchemaErrorTransform(SchemaErrorMiddleware, (error, context) => {
+  if (
+    /^\/session\/:sessionID\/(?:execution|enrollment|model-control|recovery|handoff\/:requestID)$/.test(
+      context.endpoint.path,
+    )
+  )
+    return Effect.succeed(
+      HttpServerResponse.jsonUnsafe({ code: "invalid_request", message: "Invalid handoff request" }, { status: 400 }),
+    )
   const reason = truncateReason(error.cause.message)
   const response = context.endpoint.path.startsWith("/api/")
     ? Effect.fail(

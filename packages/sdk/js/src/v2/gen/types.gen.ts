@@ -2199,6 +2199,7 @@ export type Provider = {
 
 export type ExperimentalCapabilities = {
   backgroundSubagents: boolean
+  legacyQueuePromptHandoffRecovery?: SessionHandoffV1Capability
 }
 
 export type ConsoleState = {
@@ -2614,6 +2615,26 @@ export type ProviderAuthError1 = {
     message?: string
     kind?: string
   }
+}
+
+export type HandoffBadRequest = {
+  code: SessionHandoffV1ErrorCode
+  message: string
+}
+
+export type HandoffNotFound = {
+  code: SessionHandoffV1ErrorCode
+  message: string
+}
+
+export type HandoffConflict = {
+  code: SessionHandoffV1ErrorCode
+  message: string
+}
+
+export type HandoffUnsupported = {
+  code: SessionHandoffV1ErrorCode
+  message: string
 }
 
 export type NotFoundError = {
@@ -3945,6 +3966,20 @@ export type ConfigV2ExperimentalPolicy = {
   resource: string
 }
 
+export type SessionHandoffV1Capability = {
+  version: "legacy-queue-prompt-handoff-recovery/4"
+  enrollment: true
+  modelControl: true
+  guardedRecovery: true
+  applicationMarker: true
+  assistantProvenance: true
+  interruptedResources: true
+  startupHold: "enrolled_only"
+  ownerDeathRequired: true
+  taskDescendantRecovery: true
+  historicalExecution: true
+}
+
 export type ProjectDirectories = Array<{
   directory: string
   strategy?: string
@@ -3954,6 +3989,261 @@ export type PtyTicketConnectToken = {
   ticket: string
   expires_in: number
 }
+
+export type SessionHandoffV1Identity = {
+  queueID: string
+  userMessageID: string
+  ownerLineage: string
+  ownerInstance: string
+  fence: number
+  revision: number
+  contextDigest: string
+}
+
+export type SessionHandoffV1Selection = {
+  providerID: string
+  modelID: string
+  variant: string
+}
+
+export type SessionHandoffV1Boundary = {
+  sequence: number
+  requestID: string
+  kind: "model_control" | "recovery"
+  priorSelection: SessionHandoffV1Selection
+  selection: SessionHandoffV1Selection
+  afterAssistantMessageID: string | null
+  firstOrdinaryAssistantMessageID: string | null
+  appliedAt: number
+}
+
+export type SessionHandoffV1AssistantProvenance = {
+  messageID: string
+  parentUserMessageID: string
+  queueID: string
+  authorizationUserMessageID: string
+  epochSequence: number
+  controlRequestID: string | null
+  selection: SessionHandoffV1Selection
+  selectionEvidence: "persisted_message" | "normalized_dispatch"
+  dispatch: "none" | "prepared" | "started_or_unknown" | "completed" | "unknown"
+}
+
+export type SessionHandoffV1SummarySelection = {
+  providerID: string
+  modelID: string
+  variant: string | null
+}
+
+export type SessionHandoffV1SummaryProvenance = {
+  messageID: string
+  parentUserMessageID: string
+  queueID: string
+  epochSequence: number
+  configuredCompactionSelection: SessionHandoffV1SummarySelection | null
+  dispatchSelection: SessionHandoffV1SummarySelection | null
+  selectionEvidence: "persisted_message" | "normalized_dispatch" | "unknown"
+  dispatch: "none" | "prepared" | "started_or_unknown" | "completed" | "unknown"
+}
+
+export type SessionHandoffV1InterruptedResource = {
+  assistantMessageID: string
+  partID: string
+  callID: string
+  tool: string
+  resourceKind: "process" | "task" | "output" | "other" | "unknown"
+  resourceRef: string | null
+  liveness: "live" | "dead" | "unknown" | "not_applicable"
+  effect: "uncertain"
+  evidence: string | null
+}
+
+export type SessionHandoffV1TaskLink = {
+  parentSessionID: string
+  parentAssistantMessageID: string
+  parentCallID: string
+  childSessionID: string
+  childUserMessageID: string
+  mode: "foreground" | "background"
+}
+
+export type SessionHandoffV1TaskDescendant = {
+  link: SessionHandoffV1TaskLink | null
+  childSessionID: string
+  parentSessionID: string | null
+  proof: "verified" | "ambiguous_lineage" | "ambiguous_input" | "unsupported_child"
+  state: "active" | "held" | "terminal" | "ambiguous"
+  selection: SessionHandoffV1Selection | null
+  agent: string | null
+  inputDigest: string | null
+  ownerLineage: string | null
+  ownerInstance: string | null
+  fence: number | null
+  recoveryRevision: number | null
+  ownerLiveness: "live" | "dead" | "unknown"
+  resultAssistantMessageID: string | null
+  resultState: "none" | "completed" | "error" | "uncertain"
+  interruptedResources: Array<SessionHandoffV1InterruptedResource>
+}
+
+export type SessionHandoffV1EnrollmentCandidate = {
+  queueID: string
+  userMessageID: string
+  ownerLineage: string
+  ownerInstance: string
+  fence: number
+  historyDigest: string
+}
+
+export type SessionHandoffV1TaskNotification = {
+  messageID: string
+  link: SessionHandoffV1TaskLink
+  queueID: string
+  authorizationUserMessageID: string
+  classification: "in_action" | "later_input"
+  epochSequence: number | null
+  state: "pending" | "delivered" | "held"
+}
+
+export type SessionHandoffV1ExecutionView = {
+  sessionID: string
+  directory: string
+  enrolled: boolean
+  identity: SessionHandoffV1Identity | null
+  state: "not_enrolled" | "active" | "held" | "terminal" | "invalidated" | "ambiguous"
+  ownerLiveness: "live" | "dead" | "unknown"
+  recoveryRevision: number | null
+  effectiveSelection: SessionHandoffV1Selection | null
+  baselineSelection: SessionHandoffV1Selection | null
+  pendingRequestID: string | null
+  boundaries: Array<SessionHandoffV1Boundary>
+  assistants: Array<SessionHandoffV1AssistantProvenance>
+  summaries: Array<SessionHandoffV1SummaryProvenance>
+  interruptedResources: Array<SessionHandoffV1InterruptedResource>
+  eligibility:
+    | "eligible"
+    | "not_enrolled"
+    | "terminal"
+    | "stale"
+    | "owner_live"
+    | "owner_unknown"
+    | "ambiguous_lineage"
+    | "ambiguous_input"
+    | "unsupported_child"
+    | "unresolved_resource"
+    | "ambiguous_history"
+    | "unsupported"
+  descendants: Array<SessionHandoffV1TaskDescendant>
+  descendantDigest: string | null
+  candidate: SessionHandoffV1EnrollmentCandidate | null
+  taskNotifications: Array<SessionHandoffV1TaskNotification>
+  viewKind: "current" | "historical"
+  isCurrent: boolean
+}
+
+export type SessionHandoffV1ErrorCode =
+  | "invalid_request"
+  | "incomplete_action_selector"
+  | "not_found"
+  | "history_unavailable"
+  | "request_id_conflict"
+  | "not_enrolled"
+  | "wrong_session"
+  | "wrong_directory"
+  | "wrong_queue"
+  | "wrong_user"
+  | "stale_context"
+  | "stale_fence"
+  | "owner_live"
+  | "owner_unknown"
+  | "terminal_action"
+  | "pending_conflict"
+  | "invalidated"
+  | "ambiguous_history"
+  | "ambiguous_lineage"
+  | "ambiguous_input"
+  | "unsupported_child"
+  | "unresolved_resource"
+  | "unsupported_recovery"
+  | "unsupported_model"
+  | "unsupported_variant"
+  | "unsupported_dispatch"
+
+export type SessionHandoffV1EnrollRequest = {
+  requestID: string
+  queueID: string
+  userMessageID: string
+  ownerLineage: string
+  ownerInstance: string
+  fence: number
+  historyDigest: string
+}
+
+export type SessionHandoffV1EnrollmentReceipt = {
+  kind: "enrollment"
+  requestID: string
+  sessionID: string
+  directory: string
+  queueID: string
+  userMessageID: string
+  state: "enrolled" | "expired"
+  identity: SessionHandoffV1Identity | null
+  createdAt: number
+}
+
+export type SessionHandoffV1ControlRequest = {
+  requestID: string
+  expected: SessionHandoffV1Identity
+  target: SessionHandoffV1Selection
+}
+
+export type SessionHandoffV1ChildRecoveryStatus = {
+  link: SessionHandoffV1TaskLink
+  priorFence: number
+  recoveryFence: number
+  state: "claimed" | "reconciling" | "continuing" | "terminal" | "held" | "failed"
+  resultAssistantMessageID: string | null
+  resultState: "none" | "completed" | "error" | "uncertain"
+  interruptedResources: Array<SessionHandoffV1InterruptedResource>
+}
+
+export type SessionHandoffV1ControlReceipt = {
+  kind: "model_control" | "recovery"
+  requestID: string
+  sessionID: string
+  directory: string
+  expected: SessionHandoffV1Identity
+  target: SessionHandoffV1Selection
+  state: "pending" | "applied" | "expired" | "no_effect"
+  reason: string | null
+  boundary: SessionHandoffV1Boundary | null
+  dispatch: "none" | "prepared" | "started_or_unknown" | "completed" | "unknown"
+  recoveryFence: number | null
+  interruptedResources: Array<SessionHandoffV1InterruptedResource>
+  createdAt: number
+  updatedAt: number
+  children: Array<SessionHandoffV1ChildRecoveryStatus>
+}
+
+export type SessionHandoffV1ChildExpectation = {
+  link: SessionHandoffV1TaskLink
+  inputDigest: string
+  ownerLineage: string
+  ownerInstance: string
+  fence: number
+  recoveryRevision: number
+}
+
+export type SessionHandoffV1RecoveryRequest = {
+  requestID: string
+  expected: SessionHandoffV1Identity
+  expectedRecoveryRevision: number
+  target: SessionHandoffV1Selection
+  expectedDescendantDigest: string
+  children: Array<SessionHandoffV1ChildExpectation>
+}
+
+export type SessionHandoffV1Receipt = SessionHandoffV1EnrollmentReceipt | SessionHandoffV1ControlReceipt
 
 export type SessionQueueV1Delivery = "queue" | "steer"
 
@@ -10264,6 +10554,221 @@ export type ProviderOauthCallbackResponses = {
 }
 
 export type ProviderOauthCallbackResponse = ProviderOauthCallbackResponses[keyof ProviderOauthCallbackResponses]
+
+export type SessionExecutionData = {
+  body?: never
+  path: {
+    sessionID: string
+  }
+  query?: {
+    directory?: string
+    workspace?: string
+    queueID?: string
+    userMessageID?: string
+  }
+  url: "/session/{sessionID}/execution"
+}
+
+export type SessionExecutionErrors = {
+  /**
+   * HandoffBadRequest | InvalidRequestError
+   */
+  400: HandoffBadRequest | InvalidRequestError
+  /**
+   * HandoffNotFound
+   */
+  404: HandoffNotFound
+  /**
+   * HandoffConflict
+   */
+  409: HandoffConflict
+  /**
+   * HandoffUnsupported
+   */
+  422: HandoffUnsupported
+}
+
+export type SessionExecutionError = SessionExecutionErrors[keyof SessionExecutionErrors]
+
+export type SessionExecutionResponses = {
+  /**
+   * SessionHandoffV1.ExecutionView
+   */
+  200: SessionHandoffV1ExecutionView
+}
+
+export type SessionExecutionResponse = SessionExecutionResponses[keyof SessionExecutionResponses]
+
+export type SessionEnrollQueueActionData = {
+  body?: SessionHandoffV1EnrollRequest
+  path: {
+    sessionID: string
+  }
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/session/{sessionID}/enrollment"
+}
+
+export type SessionEnrollQueueActionErrors = {
+  /**
+   * HandoffBadRequest | InvalidRequestError
+   */
+  400: HandoffBadRequest | InvalidRequestError
+  /**
+   * HandoffNotFound
+   */
+  404: HandoffNotFound
+  /**
+   * HandoffConflict
+   */
+  409: HandoffConflict
+  /**
+   * HandoffUnsupported
+   */
+  422: HandoffUnsupported
+}
+
+export type SessionEnrollQueueActionError = SessionEnrollQueueActionErrors[keyof SessionEnrollQueueActionErrors]
+
+export type SessionEnrollQueueActionResponses = {
+  /**
+   * SessionHandoffV1.EnrollmentReceipt
+   */
+  200: SessionHandoffV1EnrollmentReceipt
+}
+
+export type SessionEnrollQueueActionResponse =
+  SessionEnrollQueueActionResponses[keyof SessionEnrollQueueActionResponses]
+
+export type SessionModelControlData = {
+  body?: SessionHandoffV1ControlRequest
+  path: {
+    sessionID: string
+  }
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/session/{sessionID}/model-control"
+}
+
+export type SessionModelControlErrors = {
+  /**
+   * HandoffBadRequest | InvalidRequestError
+   */
+  400: HandoffBadRequest | InvalidRequestError
+  /**
+   * HandoffNotFound
+   */
+  404: HandoffNotFound
+  /**
+   * HandoffConflict
+   */
+  409: HandoffConflict
+  /**
+   * HandoffUnsupported
+   */
+  422: HandoffUnsupported
+}
+
+export type SessionModelControlError = SessionModelControlErrors[keyof SessionModelControlErrors]
+
+export type SessionModelControlResponses = {
+  /**
+   * SessionHandoffV1.ControlReceipt
+   */
+  200: SessionHandoffV1ControlReceipt
+}
+
+export type SessionModelControlResponse = SessionModelControlResponses[keyof SessionModelControlResponses]
+
+export type SessionRecoverQueueActionData = {
+  body?: SessionHandoffV1RecoveryRequest
+  path: {
+    sessionID: string
+  }
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/session/{sessionID}/recovery"
+}
+
+export type SessionRecoverQueueActionErrors = {
+  /**
+   * HandoffBadRequest | InvalidRequestError
+   */
+  400: HandoffBadRequest | InvalidRequestError
+  /**
+   * HandoffNotFound
+   */
+  404: HandoffNotFound
+  /**
+   * HandoffConflict
+   */
+  409: HandoffConflict
+  /**
+   * HandoffUnsupported
+   */
+  422: HandoffUnsupported
+}
+
+export type SessionRecoverQueueActionError = SessionRecoverQueueActionErrors[keyof SessionRecoverQueueActionErrors]
+
+export type SessionRecoverQueueActionResponses = {
+  /**
+   * SessionHandoffV1.ControlReceipt
+   */
+  200: SessionHandoffV1ControlReceipt
+}
+
+export type SessionRecoverQueueActionResponse =
+  SessionRecoverQueueActionResponses[keyof SessionRecoverQueueActionResponses]
+
+export type SessionHandoffReceiptData = {
+  body?: never
+  path: {
+    sessionID: string
+    requestID: string
+  }
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/session/{sessionID}/handoff/{requestID}"
+}
+
+export type SessionHandoffReceiptErrors = {
+  /**
+   * HandoffBadRequest | InvalidRequestError
+   */
+  400: HandoffBadRequest | InvalidRequestError
+  /**
+   * HandoffNotFound
+   */
+  404: HandoffNotFound
+  /**
+   * HandoffConflict
+   */
+  409: HandoffConflict
+  /**
+   * HandoffUnsupported
+   */
+  422: HandoffUnsupported
+}
+
+export type SessionHandoffReceiptError = SessionHandoffReceiptErrors[keyof SessionHandoffReceiptErrors]
+
+export type SessionHandoffReceiptResponses = {
+  /**
+   * SessionHandoffV1.Receipt
+   */
+  200: SessionHandoffV1Receipt
+}
+
+export type SessionHandoffReceiptResponse = SessionHandoffReceiptResponses[keyof SessionHandoffReceiptResponses]
 
 export type SessionListData = {
   body?: never

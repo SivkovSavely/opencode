@@ -1,12 +1,13 @@
 import { ConfigV1 } from "@opencode-ai/core/v1/config/config"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { Database } from "@opencode-ai/core/database/database"
+import { Global } from "@opencode-ai/core/global"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { eq, sql } from "drizzle-orm"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { expect } from "bun:test"
-import { Cause, Deferred, Duration, Effect, Exit, Fiber, Layer, Logger, Scope } from "effect"
+import { Cause, Deferred, Duration, Effect, Exit, Fiber, Layer, Logger, Scope, Schema } from "effect"
 import path from "path"
 import { fileURLToPath } from "url"
 import { randomUUID } from "node:crypto"
@@ -21,6 +22,8 @@ import { Permission } from "../../src/permission"
 import { Plugin } from "../../src/plugin"
 import { Provider as ProviderSvc } from "@/provider/provider"
 import { Env } from "../../src/env"
+import { Auth } from "../../src/auth"
+import { CodexAuthPlugin } from "../../src/plugin/openai/codex"
 import { Git } from "../../src/git"
 import { Image } from "../../src/image/image"
 
@@ -57,10 +60,15 @@ import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { Ripgrep } from "@opencode-ai/core/ripgrep"
 import { Format } from "../../src/format"
 import { provideTmpdirServer, TestInstance, tmpdirScoped } from "../fixture/fixture"
+import { markPluginDependenciesReady } from "../fixture/plugin"
 import { awaitWithTimeout, pollWithTimeout, testEffect } from "../lib/effect"
 import { reply, TestLLMServer } from "../lib/llm-server"
+import { createCodexServer } from "../lib/codex-server"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { RuntimeLifecycle } from "@/server/runtime-lifecycle"
+import { SessionHandoff } from "@/session/handoff"
+import { SessionHandoffStore } from "@opencode-ai/core/session/handoff-store"
+import { SessionHandoffControl } from "@opencode-ai/core/session/handoff-control"
 import { ServerRecovery } from "@/server/recovery"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
@@ -257,6 +265,7 @@ function makeHttp(input?: {
   snapshot?: Layer.Layer<Snapshot.Service>
   plugin?: Layer.Layer<Plugin.Service>
   instruction?: Layer.Layer<Instruction.Service>
+  backgroundSubagents?: boolean
 }) {
   const root = LayerNode.group([promptRoot, testLLMServerNode])
   const snapshotReplacement = input?.snapshot ? [[Snapshot.node, input.snapshot] as const] : []
@@ -264,7 +273,12 @@ function makeHttp(input?: {
     [SessionSummary.node, summary],
     [LSP.node, lsp],
     [MCP.node, makeMcp(input?.mcpInstructions)],
-    [RuntimeFlags.node, runtimeFlags],
+    [
+      RuntimeFlags.node,
+      input?.backgroundSubagents
+        ? RuntimeFlags.layer({ experimentalEventSystem: true, experimentalBackgroundSubagents: true })
+        : runtimeFlags,
+    ],
     ...(input?.instruction ? [[Instruction.node, input.instruction] as const] : []),
     ...snapshotReplacement,
   ] as const
@@ -318,8 +332,10 @@ const makeOwnedRuntime = (
   snapshot?: Layer.Layer<Snapshot.Service>,
   failInterruptedReleaseOnce = false,
   plugin?: Layer.Layer<Plugin.Service>,
+  instruction?: Layer.Layer<Instruction.Service>,
+  backgroundSubagents = false,
 ) =>
-  makeHttp({ processor, snapshot, plugin }).pipe(
+  makeHttp({ processor, snapshot, plugin, instruction, backgroundSubagents }).pipe(
     Layer.provideMerge(
       Layer.effect(
         RuntimeLifecycle.Service,
@@ -372,6 +388,8 @@ ownedRuntime.instance("optional custom tool import failures do not block prompt 
     const sessions = yield* Session.Service
     const events = yield* EventV2Bridge.Service
     const tool = path.join(dir, ".opencode", "tool")
+    yield* Effect.promise(() => markPluginDependenciesReady(path.join(dir, ".opencode")))
+    yield* Effect.promise(() => markPluginDependenciesReady(Global.Path.config))
     yield* writeText(path.join(dir, ".opencode", "plugin-v2.ts"), "export const Plugin = {}\n")
     yield* writeText(
       path.join(tool, "broken.ts"),
@@ -1103,6 +1121,30 @@ const retryCommandRuntime = testEffect(
   ),
 )
 const ownedBlockingRuntime = testEffect(makeOwnedRuntime(false, "blocking"))
+const competingHandoffEntered = Deferred.makeUnsafe<void>()
+const competingHandoffRelease = Deferred.makeUnsafe<void>()
+const competingHandoffRuntime = testEffect(
+  makeOwnedRuntime(
+    false,
+    undefined,
+    undefined,
+    false,
+    Layer.succeed(
+      Plugin.Service,
+      Plugin.Service.of({
+        trigger: (name, _input, output) =>
+          name === "chat.message" && JSON.stringify(output).includes("blocked competing input")
+            ? Deferred.succeed(competingHandoffEntered, undefined).pipe(
+                Effect.andThen(Deferred.await(competingHandoffRelease)),
+                Effect.as(output),
+              )
+            : Effect.succeed(output),
+        list: () => Effect.succeed([]),
+        init: () => Effect.void,
+      }),
+    ),
+  ),
+)
 const archivingRuntime = testEffect(makeOwnedRuntime(true))
 const interruptedReleaseRetryRuntime = testEffect(makeOwnedRuntime(false, undefined, interruptedSnapshot, true))
 const recoveryFailureRuntime = testEffect(
@@ -2002,6 +2044,1341 @@ it.instance("composer skills use tool permissions and late admission falls back 
     yield* prompt.loop({ sessionID: chat.id })
     expect(JSON.stringify((yield* llm.hits).at(-1)?.body)).not.toContain("skill:composer-probe")
     expect(JSON.stringify((yield* llm.hits).at(-1)?.body)).toContain("composer-probe skill instructions")
+  }),
+)
+
+for (const mode of [
+  "compatible",
+  "xhigh",
+  "max",
+  "oauth-http-xhigh",
+  "oauth-http-max",
+  "oauth-ws-xhigh",
+  "oauth-ws-max",
+  "oauth-ws-max-alias",
+]) {
+  const oauth = mode.startsWith("oauth-")
+  const websocket = mode.startsWith("oauth-ws-")
+  const alias = mode.endsWith("-alias")
+  const variant = mode.includes("max") ? "max" : mode === "compatible" ? "compatible" : "xhigh"
+  const native = mode !== "compatible"
+  const wireEffort = alias ? "xhigh" : variant
+  const expectedAuthObservation = {
+    transport: websocket ? "ws" : "http",
+    authorized: true,
+    accountMatched: true,
+    internalHeaderPresent: false,
+  } as const
+  testEffect(makeOwnedRuntime().pipe(Layer.provideMerge(LayerNode.compile(Auth.node)))).instance(
+    `handoff live Bash ${oauth ? mode : native ? `OpenAI Responses ${variant}` : "compatible"} reaches a natural boundary without retargeting queued input`,
+    () =>
+      Effect.gen(function* () {
+        const upstream = yield* TestLLMServer
+        const codex = oauth
+          ? yield* Effect.acquireRelease(
+              Effect.promise(() => createCodexServer(upstream.url)),
+              (server) => Effect.promise(() => server.close()),
+            )
+          : undefined
+        const auth = yield* Auth.Service
+        if (codex) {
+          yield* auth.set("openai", {
+            type: "oauth",
+            access: "fixture-expired-access",
+            refresh: "fixture-old-refresh",
+            expires: 0,
+            accountId: "fixture-account",
+            enterpriseUrl: "https://isolated.invalid",
+          })
+          yield* Effect.addFinalizer(() => auth.remove("openai").pipe(Effect.orDie))
+        }
+        const { llm, dir } = yield* useServerConfig((url): Partial<ConfigV1.Info> => {
+          const config = composerConfig(url)
+          if (native)
+            return {
+              enabled_providers: ["openai"],
+              model: "openai/gpt-6.1-sol",
+              snapshot: false,
+              agent: { build: { permission: { bash: "allow" } } },
+              provider: {
+                openai: {
+                  npm: "@ai-sdk/openai",
+                  env: [],
+                  options: { ...(oauth ? {} : { apiKey: "synthetic-live-bash-r2" }), baseURL: url },
+                  models: Object.fromEntries(
+                    ["gpt-6.1-sol", "gpt-6.1-terra"].map((id) => [
+                      id,
+                      {
+                        ...cfg.provider.test.models["test-model"],
+                        id,
+                        reasoning: true,
+                        variants: {
+                          xhigh: {
+                            reasoningEffort: "xhigh",
+                            reasoningSummary: "auto",
+                            include: ["reasoning.encrypted_content"],
+                          },
+                          max: {
+                            reasoningEffort: alias ? "xhigh" : "max",
+                            reasoningSummary: "auto",
+                            include: ["reasoning.encrypted_content"],
+                          },
+                        },
+                      },
+                    ]),
+                  ),
+                },
+              },
+            }
+          return {
+            ...config,
+            snapshot: false,
+            agent: { build: { permission: { bash: "allow" } } },
+            provider: {
+              test: {
+                ...config.provider.test,
+                models: {
+                  ...config.provider.test.models,
+                  luna: { ...config.provider.test.models.luna, variants: { xhigh: { reasoningEffort: "xhigh" } } },
+                },
+              },
+            },
+          }
+        })
+        if (codex) {
+          const plugin = yield* Plugin.Service
+          const hooks = yield* plugin.list()
+          const builtin = yield* Effect.promise(() =>
+            CodexAuthPlugin({} as never, {
+              issuer: codex.issuer,
+              codexApiEndpoint: codex.endpoint,
+              experimentalWebSockets: websocket,
+            }),
+          )
+          const index = hooks.findIndex((hook) => hook.auth?.provider === "openai")
+          expect(index >= 0).toBe(true)
+          hooks.splice(index, 1, builtin)
+          yield* Effect.addFinalizer(() =>
+            Effect.promise(async () => {
+              await builtin.dispose?.()
+            }),
+          )
+        }
+        const { prompt, sessions, chat } = yield* boot()
+        const database = yield* Database.Service
+        const queue = yield* SessionQueue.Service
+        const schema = {
+          type: "object",
+          properties: { value: { type: "string" } },
+          required: ["value"],
+          additionalProperties: false,
+        }
+        const format = new SessionV1.OutputFormatJsonSchema({ type: "json_schema", retryCount: 0, schema })
+        const ready = path.join(dir, "bash-ready.pid")
+        const release = path.join(dir, "bash-release")
+        const controlled = yield* Deferred.make<void>()
+        const following = yield* Deferred.make<void>()
+        const identity = Effect.promise(async () => {
+          const text = (await Bun.file(ready).text()).trim()
+          if (!/^[1-9][0-9]*$/.test(text)) throw new Error("Invalid owned Bash PID")
+          const stat = await Bun.file(`/proc/${text}/stat`).text()
+          const fields = stat.slice(stat.lastIndexOf(") ") + 2).split(" ")
+          if (!fields[19] || fields[0] === "Z") throw new Error("Owned Bash is not alive")
+          return { pid: Number(text), starttime: fields[19] }
+        })
+        yield* Effect.addFinalizer(() =>
+          Effect.gen(function* () {
+            yield* Effect.promise(() => Bun.write(release, "release\n"))
+            yield* Deferred.succeed(controlled, undefined)
+            yield* Deferred.succeed(following, undefined)
+            if (!(yield* Effect.promise(() => Bun.file(ready).exists()))) return
+            const pid = (yield* Effect.promise(() => Bun.file(ready).text())).trim()
+            if (!/^[1-9][0-9]*$/.test(pid)) return
+            yield* pollWithTimeout(
+              Effect.promise(async () => (!(await Bun.file(`/proc/${pid}/stat`).exists()) ? true : undefined)),
+              "owned Bash did not exit after release",
+              "5 seconds",
+            )
+          }).pipe(Effect.orDie),
+        )
+        yield* llm.push(
+          reply().tool("bash", {
+            command: `bash -c 'printf "%s\\n" "$$" > "$1"; while [ ! -e "$2" ]; do sleep 0.05; done; printf "natural-tool-result\\n"' handoff-bash ${JSON.stringify(ready)} ${JSON.stringify(release)}`,
+            workdir: dir,
+            timeout: 30_000,
+          }),
+        )
+        if (native)
+          yield* llm.push(
+            reply()
+              .wait(deferredAsPromise(controlled))
+              .tool("StructuredOutput", { value: "controlled root complete" })
+              .stop(),
+          )
+        if (!native) yield* llm.hold("controlled root complete", deferredAsPromise(controlled))
+        yield* llm.hold("following baseline complete", deferredAsPromise(following))
+        const baseline = {
+          providerID: native ? ProviderV2.ID.make("openai") : ref.providerID,
+          modelID: ModelV2.ID.make(native ? "gpt-6.1-sol" : "sol"),
+        }
+        yield* prompt.queueSubmit(chat.id, {
+          id: "live-bash-root",
+          payload: {
+            kind: "prompt",
+            agent: "build",
+            model: baseline,
+            variant: "default",
+            ...(native ? { format } : {}),
+            parts: [{ type: "text", text: "run the Bash handshake" }],
+          },
+        })
+        yield* pollWithTimeout(
+          Effect.promise(async () => ((await Bun.file(ready).exists()) ? true : undefined)),
+          "Bash did not publish readiness",
+          "10 seconds",
+        )
+        const process = yield* identity
+        const toolMessage = (yield* sessions.messages({ sessionID: chat.id })).find((message) =>
+          message.parts.some((part) => part.type === "tool" && part.tool === "bash"),
+        )
+        expect(toolMessage?.parts.find((part) => part.type === "tool")?.state.status).toBe("running")
+        yield* prompt.queueSubmit(chat.id, {
+          id: "after-live-bash",
+          payload: {
+            kind: "prompt",
+            agent: "build",
+            model: baseline,
+            variant: "default",
+            parts: [{ type: "text", text: "following input keeps its baseline" }],
+          },
+        })
+        const queued = yield* queue.get(chat.id, "after-live-bash")
+        expect(queued.state).toBe("pending")
+        const candidate = yield* SessionHandoff.candidate(chat.id)
+        if (!candidate) throw new Error("Missing candidate while actual Bash runs")
+        const original = (yield* sessions.messages({ sessionID: chat.id })).find(
+          (message) => message.info.id === candidate.userMessageID,
+        )
+        const preference = yield* sessions.get(chat.id)
+        const runtime = yield* database.db.get(
+          sql`SELECT owner_lineage,owner_instance,fence,state,desired_active FROM runtime_execution WHERE session_id = ${chat.id}`,
+        )
+        yield* SessionHandoff.enroll(chat.id, { ...candidate, requestID: randomUUID() })
+        const view = yield* SessionHandoff.execution(chat.id)
+        if (!view.identity) throw new Error("Missing enrolled Bash root identity")
+        const request = {
+          requestID: randomUUID(),
+          expected: view.identity,
+          target: {
+            providerID: native ? "openai" : "test",
+            modelID: native ? "gpt-6.1-terra" : "luna",
+            variant: native ? variant : "xhigh",
+          },
+        }
+        const pending = yield* SessionHandoff.modelControl(chat.id, request)
+        expect(pending).toMatchObject({ state: "pending", boundary: null, dispatch: "none" })
+        expect(yield* SessionHandoff.modelControl(chat.id, request)).toEqual(pending)
+        expect(yield* identity).toEqual(process)
+        expect(yield* llm.calls).toBe(1)
+        expect((yield* llm.hits)[0].body).toMatchObject({ model: baseline.modelID })
+        expect((yield* llm.hits)[0].body.reasoning_effort).toBeUndefined()
+        if (codex) {
+          expect(codex.refreshes()).toBe(1)
+          expect(codex.frames.length).toBe(1)
+          expect(codex.observations).toEqual([expectedAuthObservation])
+          const stored = yield* auth.get("openai")
+          expect(stored?.type === "oauth" && stored.access !== "fixture-expired-access").toBe(true)
+          expect(stored?.type === "oauth" && stored.refresh !== "fixture-old-refresh").toBe(true)
+          expect(stored?.type === "oauth" && stored.accountId === "fixture-account").toBe(true)
+          expect(stored?.type === "oauth" && stored.enterpriseUrl === "https://isolated.invalid").toBe(true)
+          expect(stored?.type === "oauth" && stored.expires > Date.now()).toBe(true)
+          expect(codex.frames[0].type === "response.create").toBe(websocket)
+          if (!stored || stored.type !== "oauth") throw new Error("Missing fabricated refreshed OAuth state")
+          yield* auth.set("openai", { ...stored, expires: 0 })
+        }
+        if (native) {
+          expect((yield* llm.hits)[0].url.pathname).toBe("/v1/responses")
+          expect((yield* llm.hits)[0].body.reasoning).toBeUndefined()
+          const provider = yield* ProviderSvc.Service
+          const model = yield* provider.getModel(baseline.providerID, baseline.modelID)
+          expect(model.api.npm).toBe("@ai-sdk/openai")
+          expect(model.capabilities.reasoning).toBe(true)
+          const hooks = yield* Plugin.Service
+          expect((yield* hooks.list()).some((hook) => hook.auth?.provider === "openai")).toBe(true)
+        }
+        expect(yield* queue.get(chat.id, "after-live-bash")).toEqual(queued)
+        expect(
+          yield* database.db.get(
+            sql`SELECT owner_lineage,owner_instance,fence,state,desired_active FROM runtime_execution WHERE session_id = ${chat.id}`,
+          ),
+        ).toEqual(runtime)
+        const stillRunning = (yield* sessions.messages({ sessionID: chat.id })).find(
+          (message) => message.info.id === toolMessage?.info.id,
+        )
+        expect(stillRunning?.parts.find((part) => part.type === "tool")?.state.status).toBe("running")
+        expect((yield* SessionHandoff.execution(chat.id)).boundaries).toEqual([])
+        if (codex) expect(codex.refreshes()).toBe(1)
+        yield* Effect.promise(() => Bun.write(release, "release\n"))
+        yield* awaitWithTimeout(
+          codex
+            ? Effect.raceFirst(
+                llm.wait(2),
+                pollWithTimeout(
+                  SessionHandoff.receipt(chat.id, request.requestID).pipe(
+                    Effect.map((receipt) => (receipt.state === "expired" ? receipt : undefined)),
+                  ),
+                  "controlled OAuth dispatch neither started nor failed closed",
+                ),
+              )
+            : llm.wait(2),
+          "natural Bash boundary did not dispatch target",
+          "10 seconds",
+        )
+        if (codex)
+          expect(yield* SessionHandoff.receipt(chat.id, request.requestID)).toMatchObject({
+            state: "applied",
+            reason: null,
+          })
+        const body = (yield* llm.hits)[1].body
+        expect(body).toMatchObject(
+          native
+            ? {
+                model: "gpt-6.1-terra",
+                reasoning: { effort: wireEffort, summary: "auto" },
+                include: ["reasoning.encrypted_content"],
+              }
+            : { model: "luna", reasoning_effort: "xhigh" },
+        )
+        if (native) {
+          expect((yield* llm.hits)[1].url.pathname).toBe("/v1/responses")
+          const tools = Schema.decodeUnknownSync(
+            Schema.Array(Schema.Struct({ name: Schema.String, parameters: Schema.Json })),
+          )
+          const initialSchema = tools((yield* llm.hits)[0].body.tools).find(
+            (tool) => tool.name === "StructuredOutput",
+          )?.parameters
+          const controlledSchema = tools(body.tools).find((tool) => tool.name === "StructuredOutput")?.parameters
+          expect(initialSchema).toEqual(schema)
+          expect(controlledSchema).toEqual(initialSchema)
+          expect(body.tool_choice).toBe("required")
+          expect((yield* llm.hits)[0].body.tool_choice).toBe("required")
+        }
+        if (codex) {
+          expect(codex.refreshes()).toBe(2)
+          const stored = yield* auth.get("openai")
+          expect(
+            stored?.type === "oauth" && stored.expires > Date.now() && stored.accountId === "fixture-account",
+          ).toBe(true)
+          expect(codex.frames.length).toBe(2)
+          expect(codex.observations).toEqual([expectedAuthObservation, expectedAuthObservation])
+          expect(codex.frames[1]).toMatchObject({ model: "gpt-6.1-terra", reasoning: { effort: wireEffort } })
+          expect(codex.frames[1].type === "response.create").toBe(websocket)
+        }
+        expect(JSON.stringify(body)).toContain("natural-tool-result")
+        const completed = (yield* sessions.messages({ sessionID: chat.id }))
+          .find((message) => message.info.id === toolMessage?.info.id)
+          ?.parts.find((part) => part.type === "tool")
+        expect(completed?.state.status).toBe("completed")
+        if (!completed || completed.state.status !== "completed") throw new Error("Bash did not complete naturally")
+        expect(completed.state.output).toContain("natural-tool-result")
+        expect(completed.state.metadata?.interrupted).not.toBe(true)
+        const applied = yield* SessionHandoff.receipt(chat.id, request.requestID)
+        expect(applied).toMatchObject({
+          state: "applied",
+          dispatch: "started_or_unknown",
+          boundary: { sequence: 1, firstOrdinaryAssistantMessageID: expect.any(String) },
+        })
+        const proof = yield* SessionHandoff.execution(chat.id)
+        expect(proof.boundaries).toMatchObject([{ sequence: 1, selection: request.target }])
+        expect(proof.assistants.at(-1)).toMatchObject({
+          selection: request.target,
+          epochSequence: 1,
+          selectionEvidence: "normalized_dispatch",
+          dispatch: "started_or_unknown",
+        })
+        expect(
+          (yield* sessions.messages({ sessionID: chat.id })).find(
+            (message) => message.info.id === candidate.userMessageID,
+          ),
+        ).toEqual(original)
+        expect(yield* queue.get(chat.id, "after-live-bash")).toEqual(queued)
+        yield* Deferred.succeed(controlled, undefined)
+        yield* awaitWithTimeout(llm.wait(3), "following queued input did not start", "10 seconds")
+        expect((yield* llm.hits)[2].body.model).toBe(baseline.modelID)
+        expect((yield* llm.hits)[2].body.reasoning_effort).toBeUndefined()
+        if (codex) {
+          expect(codex.frames.length).toBe(3)
+          expect(codex.observations).toEqual([
+            expectedAuthObservation,
+            expectedAuthObservation,
+            expectedAuthObservation,
+          ])
+          expect(codex.frames[2]).toMatchObject({ model: "gpt-6.1-sol" })
+          expect(codex.frames[2].reasoning).toBeUndefined()
+          expect(codex.refreshes()).toBe(2)
+          expect(
+            codex.frames.every(
+              (frame) =>
+                !JSON.stringify(frame).includes("fixture-expired-access") &&
+                !JSON.stringify(frame).includes("fixture-old-refresh") &&
+                !JSON.stringify(frame).includes("fixture-refreshed-access") &&
+                !JSON.stringify(frame).includes("fixture-refreshed-refresh") &&
+                !JSON.stringify(frame).includes("fixture-account"),
+            ),
+          ).toBe(true)
+        }
+        if (native) {
+          const reasoning = Schema.decodeUnknownSync(
+            Schema.Struct({ reasoning: Schema.optional(Schema.Struct({ effort: Schema.optional(Schema.String) })) }),
+          )
+          expect(reasoning((yield* llm.hits)[2].body).reasoning?.effort).toEqual(
+            reasoning((yield* llm.hits)[0].body).reasoning?.effort,
+          )
+          expect((yield* llm.hits)[2].body.tool_choice).not.toBe("required")
+          expect((yield* llm.hits)[2].body.reasoning).toBeUndefined()
+          const completedRoot = (yield* sessions.messages({ sessionID: chat.id })).findLast(
+            (message) => message.info.role === "assistant" && message.info.parentID === candidate.userMessageID,
+          )
+          expect(completedRoot?.info.role === "assistant" && completedRoot.info.structured).toEqual({
+            value: "controlled root complete",
+          })
+        }
+        const delivered = yield* queue.get(chat.id, "after-live-bash")
+        expect(delivered).toMatchObject({ state: "delivered", payload: queued.payload })
+        const next = (yield* sessions.messages({ sessionID: chat.id })).find(
+          (message) => message.info.id === delivered.messageID,
+        )
+        expect(next?.info.role === "user" && next.info.model).toEqual({ ...baseline, variant: "default" })
+        expect(
+          next?.parts.some((part) => part.type === "text" && part.text === "following input keeps its baseline"),
+        ).toBe(true)
+        const unchanged = yield* sessions.get(chat.id)
+        expect({ agent: unchanged.agent, model: unchanged.model, permission: unchanged.permission }).toEqual({
+          agent: preference.agent,
+          model: preference.model,
+          permission: preference.permission,
+        })
+        const historical = yield* SessionHandoff.execution(chat.id, {
+          queueID: candidate.queueID,
+          userMessageID: candidate.userMessageID,
+        })
+        expect(historical.boundaries).toHaveLength(1)
+        expect(historical.isCurrent).toBe(false)
+        yield* Deferred.succeed(following, undefined)
+        yield* pollWithTimeout(
+          database.db
+            .get<{ state: string }>(sql`SELECT state FROM runtime_execution WHERE session_id = ${chat.id}`)
+            .pipe(Effect.map((row) => (row?.state === "completed" ? true : undefined))),
+          "following root did not finish",
+        )
+        expect(yield* llm.calls).toBe(3)
+      }),
+  )
+}
+
+for (const enrolled of [false, true]) {
+  for (const mode of ["failed", "denied", "denied-stop", "denied-continue"]) {
+    const denied = mode !== "failed"
+    const continues = !denied || mode === "denied-continue"
+    const stopFinish = mode !== "denied"
+    testEffect(makeOwnedRuntime()).instance(
+      `handoff ${enrolled ? "enrolled" : "unenrolled"} ${!denied ? "failed local tool continues" : continues ? "permission denial configured continuation" : `permission denial stops ${stopFinish ? "stop" : "tool-calls"}`}`,
+      () =>
+        Effect.gen(function* () {
+          const { llm, dir } = yield* useServerConfig((url) => ({
+            ...composerConfig(url),
+            snapshot: false,
+            ...(denied ? { agent: { build: { permission: { read: "ask" } } } } : {}),
+            ...(mode === "denied-continue" ? { experimental: { continue_loop_on_deny: true } } : {}),
+          }))
+          const { prompt, sessions, chat } = yield* boot()
+          const database = yield* Database.Service
+          const toolTurn = yield* Deferred.make<void>()
+          const continuation = yield* Deferred.make<void>()
+          yield* Effect.gen(function* () {
+            const response = reply()
+              .wait(deferredAsPromise(toolTurn))
+              .tool("read", { filePath: path.join(dir, "missing-tool-input.txt") })
+            yield* llm.push(stopFinish ? response.stop() : response)
+            yield* llm.hold("handled actual tool error", deferredAsPromise(continuation))
+            yield* prompt.queueSubmit(chat.id, {
+              id: "failed-tool-root",
+              payload: {
+                kind: "prompt",
+                agent: "build",
+                model: { providerID: ref.providerID, modelID: ModelV2.ID.make("sol") },
+                variant: "xhigh",
+                parts: [{ type: "text", text: "read missing-tool-input.txt" }],
+              },
+            })
+            yield* awaitWithTimeout(llm.wait(1), "failed tool fixture did not reach provider", "5 seconds")
+            yield* pollWithTimeout(
+              sessions
+                .messages({ sessionID: chat.id })
+                .pipe(
+                  Effect.map((messages) =>
+                    messages.some(
+                      (message) =>
+                        message.info.role === "assistant" && message.parts.some((part) => part.type === "step-start"),
+                    )
+                      ? true
+                      : undefined,
+                  ),
+                ),
+              "held tool turn did not persist its step boundary",
+            )
+            const candidate = yield* SessionHandoff.candidate(chat.id)
+            if (!candidate) throw new Error("Missing candidate before tool failure")
+            const original = (yield* sessions.messages({ sessionID: chat.id })).find(
+              (message) => message.info.id === candidate.userMessageID,
+            )
+            const preference = (yield* sessions.get(chat.id)).model
+            if (enrolled) {
+              yield* SessionHandoff.enroll(chat.id, { ...candidate, requestID: randomUUID() })
+              const view = yield* SessionHandoffControl.execution(database, chat.id, dir).pipe(Effect.orDie)
+              if (!view?.identity) throw new Error("Missing enrolled identity")
+              yield* SessionHandoffControl.admit(database, chat.id, dir, {
+                requestID: "failed-tool-control",
+                expected: view.identity,
+                target: { providerID: "test", modelID: "luna", variant: "high" },
+              }).pipe(Effect.orDie)
+            }
+            const settled = pollWithTimeout(
+              database.db
+                .get<{ state: string }>(sql`SELECT state FROM runtime_execution WHERE session_id = ${chat.id}`)
+                .pipe(Effect.map((row) => (row?.state === "completed" ? true : undefined))),
+              "failed tool root did not finish",
+            )
+            yield* Deferred.succeed(toolTurn, undefined)
+            if (denied) {
+              const permission = yield* Permission.Service
+              const request = yield* pollWithTimeout(
+                permission
+                  .list()
+                  .pipe(Effect.map((requests) => requests.find((request) => request.permission === "read"))),
+                "read permission was not requested",
+              )
+              yield* permission.reply({ requestID: request.id, reply: "reject" })
+            }
+            yield* awaitWithTimeout(Effect.raceFirst(llm.wait(2), settled), "failed tool did not settle", "10 seconds")
+            const messages = yield* sessions.messages({ sessionID: chat.id })
+            const assistant = messages.find((message) => message.info.role === "assistant")
+            const tool = assistant?.parts.find((part) => part.type === "tool")
+            expect(assistant?.info.role === "assistant" && assistant.info.finish).toBe(
+              stopFinish ? "stop" : "tool-calls",
+            )
+            expect(tool?.state.status).toBe("error")
+            if (!tool || tool.state.status !== "error") throw new Error("Missing actual read failure")
+            expect(tool.state.metadata?.interrupted).not.toBe(true)
+            expect(yield* llm.calls).toBe(continues ? 2 : 1)
+            if (continues) {
+              if (!denied) expect(tool.state.error).toContain("File not found")
+              const body = (yield* llm.hits)[1].body
+              expect(JSON.stringify(body)).toContain(tool.state.error)
+              expect(body.model).toBe(enrolled ? "luna" : "sol")
+              expect(body.reasoning_effort).toBe(enrolled ? "high" : "xhigh")
+            }
+            if (enrolled) {
+              expect(
+                yield* SessionHandoffStore.receipt(database, chat.id, "failed-tool-control").pipe(Effect.orDie),
+              ).toMatchObject(
+                !continues
+                  ? { state: "expired", reason: "terminal_action", boundary: null, dispatch: "none" }
+                  : {
+                      state: "applied",
+                      dispatch: "started_or_unknown",
+                      boundary: { sequence: 1, firstOrdinaryAssistantMessageID: expect.any(String) },
+                    },
+              )
+              if (!continues)
+                expect(
+                  (yield* SessionHandoffStore.lookup(database, {
+                    sessionID: chat.id,
+                    queueID: candidate.queueID,
+                    userMessageID: candidate.userMessageID,
+                  }).pipe(Effect.orDie))?.boundaries,
+                ).toEqual([])
+            }
+            const persisted = messages.find((message) => message.info.id === candidate.userMessageID)
+            expect(persisted?.info.role === "user" && persisted.info.model).toEqual(
+              original?.info.role === "user" && original.info.model,
+            )
+            expect((yield* sessions.get(chat.id)).model).toEqual(preference)
+            yield* Deferred.succeed(continuation, undefined)
+            yield* settled
+          }).pipe(
+            Effect.ensuring(
+              Effect.all([Deferred.succeed(toolTurn, undefined), Deferred.succeed(continuation, undefined)]),
+            ),
+          )
+        }),
+    )
+  }
+}
+
+for (const mode of ["ordinary", "default", "baseline-default", "compaction", "unsupported"]) {
+  const compact = mode === "compaction"
+  const target = {
+    providerID: "test",
+    modelID: mode === "baseline-default" ? "sol" : "luna",
+    variant: mode === "default" || mode === "baseline-default" ? "default" : "high",
+  }
+  const conflictingOptions =
+    mode === "unsupported"
+      ? Layer.succeed(
+          Plugin.Service,
+          Plugin.Service.of({
+            trigger: (name, input, output) =>
+              Effect.sync(() => {
+                if (
+                  name === "chat.params" &&
+                  Schema.is(Schema.Struct({ model: Schema.Struct({ id: Schema.Literal("luna") }) }))(input) &&
+                  Schema.is(Schema.Struct({ options: Schema.Record(Schema.String, Schema.Unknown) }))(output)
+                )
+                  Object.assign(output.options, { reasoningEffort: "low" })
+                return output
+              }),
+            list: () => Effect.succeed([]),
+            init: () => Effect.void,
+          }),
+        )
+      : undefined
+  testEffect(makeOwnedRuntime(false, undefined, undefined, false, conflictingOptions)).instance(
+    `handoff model control applies after a real tool turn ${mode}`,
+    () =>
+      Effect.gen(function* () {
+        const { llm, dir } = yield* useServerConfig((url) => ({
+          ...composerConfig(url),
+          agent: { compaction: { model: "test/sol", variant: "xhigh" } },
+        }))
+        const database = yield* Database.Service
+        const { prompt, sessions, chat } = yield* boot()
+        const originalModel = { providerID: ref.providerID, modelID: ModelV2.ID.make("sol") }
+        const release = yield* Deferred.make<void>()
+        const rootTurn = yield* Deferred.make<void>()
+        const done = yield* Deferred.make<void>()
+        yield* Effect.gen(function* () {
+          yield* Effect.promise(() => Bun.write(path.join(dir, "control.txt"), "fixture"))
+          yield* llm.hold("initial", deferredAsPromise(release))
+          yield* llm.push(
+            reply()
+              .wait(deferredAsPromise(rootTurn))
+              .tool("read", { filePath: path.join(dir, "control.txt") }),
+          )
+          if (compact) yield* llm.text("compacted summary")
+          yield* llm.hold("controlled result", deferredAsPromise(done))
+          const running = yield* prompt
+            .prompt({
+              sessionID: chat.id,
+              agent: "build",
+              model: originalModel,
+              variant: "xhigh",
+              parts: [{ type: "text", text: "initial" }],
+            })
+            .pipe(Effect.forkChild)
+          yield* awaitWithTimeout(
+            Effect.raceFirst(llm.wait(1), Fiber.join(running)),
+            "initial control fixture did not reach provider",
+            "5 seconds",
+          )
+          yield* prompt.queueSubmit(chat.id, {
+            id: "controlled-root",
+            payload: {
+              kind: "prompt",
+              agent: "build",
+              model: originalModel,
+              variant: "xhigh",
+              system: "original system",
+              parts: [{ type: "text", text: "read control.txt" }],
+            },
+          })
+          yield* Deferred.succeed(release, undefined)
+          yield* awaitWithTimeout(llm.wait(2), "queue control fixture did not reach provider", "5 seconds")
+          const candidate = yield* SessionHandoff.candidate(chat.id)
+          if (!candidate) throw new Error("Missing candidate")
+          yield* SessionHandoff.enroll(chat.id, { ...candidate, requestID: randomUUID() })
+          const view = yield* SessionHandoffControl.execution(database, chat.id, dir).pipe(Effect.orDie)
+          if (!view?.identity) throw new Error("Missing identity")
+          const original = (yield* sessions.messages({ sessionID: chat.id })).find(
+            (item) => item.info.id === candidate.userMessageID,
+          )
+          const fallback = (yield* sessions.get(chat.id)).model
+          yield* SessionHandoffControl.admit(database, chat.id, dir, {
+            requestID: "control-test",
+            expected: view.identity,
+            target,
+          }).pipe(Effect.orDie)
+          if (compact) {
+            const compaction = yield* SessionCompaction.Service
+            yield* compaction.create({
+              sessionID: chat.id,
+              agent: "build",
+              model: originalModel,
+              auto: true,
+              sourceUserMessageID: MessageID.make(candidate.userMessageID),
+            })
+          }
+          yield* Deferred.succeed(rootTurn, undefined)
+          if (mode === "unsupported") {
+            yield* awaitWithTimeout(Fiber.join(running), "unsupported dispatch did not stop", "10 seconds")
+            expect(yield* llm.calls).toBe(2)
+            expect(
+              yield* SessionHandoffStore.receipt(database, chat.id, "control-test").pipe(Effect.orDie),
+            ).toMatchObject({ state: "expired", reason: "unsupported_dispatch", dispatch: "none" })
+            const rejected = yield* SessionHandoffControl.execution(database, chat.id, dir).pipe(Effect.orDie)
+            expect(rejected?.assistants.at(-1)).toMatchObject({
+              epochSequence: 1,
+              selectionEvidence: "persisted_message",
+              dispatch: "none",
+            })
+            return
+          }
+          yield* awaitWithTimeout(
+            Effect.raceFirst(llm.wait(compact ? 4 : 3), Fiber.join(running)),
+            "controlled continuation did not reach provider",
+            "10 seconds",
+          )
+          yield* Effect.gen(function* () {
+            const hits = yield* llm.hits
+            expect(hits[compact ? 3 : 2].body.model).toBe(target.modelID)
+            expect(hits[compact ? 3 : 2].body.reasoning_effort).toBe(target.variant === "default" ? undefined : "high")
+            const proof = yield* SessionHandoffStore.lookup(database, {
+              sessionID: chat.id,
+              queueID: candidate.queueID,
+              userMessageID: candidate.userMessageID,
+            }).pipe(Effect.orDie)
+            expect(proof?.boundaries).toMatchObject([{ sequence: 1, selection: target }])
+            expect(proof?.assistants.at(-1)).toMatchObject({
+              epochSequence: 1,
+              selectionEvidence: "normalized_dispatch",
+              dispatch: "started_or_unknown",
+              selection: target,
+            })
+            if (compact) {
+              expect(hits[2].body.model).toBe("sol")
+              expect(hits[2].body.reasoning_effort).toBe("xhigh")
+              expect(proof?.summaries).toMatchObject([
+                {
+                  epochSequence: 1,
+                  configuredCompactionSelection: { modelID: "sol", variant: "xhigh" },
+                  dispatchSelection: { modelID: "sol", variant: "xhigh" },
+                  selectionEvidence: "normalized_dispatch",
+                },
+              ])
+              const internal = (yield* sessions.messages({ sessionID: chat.id })).filter((message) =>
+                message.parts.some(
+                  (part) => part.type === "compaction" || (part.type === "text" && part.metadata?.compaction_continue),
+                ),
+              )
+              expect(internal).toHaveLength(2)
+              expect(
+                internal.every(
+                  (message) =>
+                    message.info.role === "user" &&
+                    message.info.model.modelID === "sol" &&
+                    message.info.model.variant === "xhigh",
+                ),
+              ).toBe(true)
+            }
+            expect(
+              (yield* sessions.messages({ sessionID: chat.id })).find(
+                (item) => item.info.id === candidate.userMessageID,
+              ),
+            ).toEqual(original)
+            expect((yield* sessions.get(chat.id)).model).toEqual(fallback)
+          }).pipe(Effect.ensuring(Deferred.succeed(done, undefined)))
+          yield* Fiber.join(running)
+        }).pipe(
+          Effect.ensuring(
+            Effect.all([
+              Deferred.succeed(release, undefined),
+              Deferred.succeed(rootTurn, undefined),
+              Deferred.succeed(done, undefined),
+            ]),
+          ),
+        )
+      }),
+  )
+}
+
+testEffect(makeOwnedRuntime()).instance(
+  "handoff enrollment binds an actual queue delivery and closes at terminal output",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const { prompt, chat } = yield* boot()
+      const first = yield* Deferred.make<void>()
+      const second = yield* Deferred.make<void>()
+      yield* llm.hold("initial result", deferredAsPromise(first))
+      yield* llm.hold("queued result", deferredAsPromise(second))
+      const running = yield* prompt
+        .prompt({ sessionID: chat.id, agent: "build", model: ref, parts: [{ type: "text", text: "initial" }] })
+        .pipe(Effect.forkChild)
+      yield* llm.wait(1)
+      expect(yield* SessionHandoff.candidate(chat.id)).toBeNull()
+      yield* prompt.queueSubmit(chat.id, { id: "enroll-root", payload: queuedPrompt("enrolled input") })
+      yield* Deferred.succeed(first, undefined)
+      yield* llm.wait(2)
+      const candidate = yield* SessionHandoff.candidate(chat.id)
+      expect(candidate).toMatchObject({ queueID: "enroll-root", userMessageID: "msg_queue_enroll-root" })
+      if (!candidate) throw new Error("Missing live candidate")
+      const request = { requestID: randomUUID(), ...candidate }
+      const receipt = yield* SessionHandoff.enroll(chat.id, request)
+      expect(receipt.state).toBe("enrolled")
+      yield* Deferred.succeed(second, undefined)
+      yield* Fiber.join(running)
+      expect(yield* SessionHandoff.candidate(chat.id)).toBeNull()
+      expect(yield* SessionHandoff.enroll(chat.id, request)).toEqual(receipt)
+    }),
+)
+
+testEffect(makeOwnedRuntime(false, undefined, undefined, false, undefined, undefined, true)).instance(
+  "handoff leaves reused unenrolled background Tasks deliverable while invalidating an unprovable candidate",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const { prompt, sessions, chat } = yield* boot()
+      const database = yield* Database.Service
+      const root = (hit: { body: Record<string, unknown> }) => JSON.stringify(hit.body).includes("reuse root system")
+      yield* llm.pushMatch(
+        root,
+        reply().tool("task", {
+          description: "original child",
+          prompt: "first child input",
+          subagent_type: "general",
+        }),
+      )
+      yield* llm.pushMatch((hit) => !root(hit), reply().text("first child answer").stop())
+      yield* llm.pushMatch(root, reply().text("first root answer").stop())
+      yield* prompt.prompt({
+        sessionID: chat.id,
+        agent: "build",
+        model: ref,
+        system: "reuse root system",
+        parts: [{ type: "text", text: "first root input" }],
+      })
+      const child = (yield* sessions.children(chat.id))[0]
+      if (!child) throw new Error("Missing foreground Task child")
+      const original = yield* sessions.get(child.id)
+      const releaseChild = yield* Deferred.make<void>()
+      const releaseParent = yield* Deferred.make<void>()
+      yield* Effect.gen(function* () {
+        yield* llm.pushMatch(
+          root,
+          reply().tool("task", {
+            description: "reuse child",
+            prompt: "second child input",
+            subagent_type: "general",
+            task_id: child.id,
+            background: true,
+          }),
+        )
+        yield* llm.pushMatch(
+          (hit) => !root(hit),
+          reply().wait(deferredAsPromise(releaseChild)).text("reused child answer").stop(),
+        )
+        yield* llm.pushMatch(root, reply().wait(deferredAsPromise(releaseParent)).text("second root answer").stop())
+        yield* llm.pushMatch(root, reply().text("notification consumed").stop())
+        yield* prompt.queueSubmit(chat.id, {
+          id: "reuse-queue",
+          payload: {
+            kind: "prompt",
+            agent: "build",
+            model: ref,
+            system: "reuse root system",
+            parts: [{ type: "text", text: "reuse child" }],
+          },
+        })
+        yield* awaitWithTimeout(llm.wait(6), "reused background child did not start", "10 seconds")
+        expect(yield* SessionHandoff.candidate(chat.id)).not.toBeNull()
+        yield* Deferred.succeed(releaseChild, undefined)
+        yield* pollWithTimeout(
+          sessions
+            .messages({ sessionID: chat.id })
+            .pipe(
+              Effect.map((messages) =>
+                messages.find((message) => message.info.id === `msg_task_notification_${child.id}`),
+              ),
+            ),
+          "reused child notification was not delivered",
+        )
+        expect(yield* SessionHandoff.candidate(chat.id)).toBeNull()
+        expect(
+          yield* database.db.get(sql`SELECT 1 FROM session_handoff_notification WHERE session_id = ${chat.id}`),
+        ).toBeUndefined()
+        expect((yield* sessions.get(child.id)).metadata).toEqual(original.metadata)
+        expect((yield* sessions.get(child.id)).permission).toEqual(original.permission)
+        expect(
+          (yield* sessions.messages({ sessionID: child.id })).filter((message) => message.info.role === "user"),
+        ).toHaveLength(2)
+      }).pipe(
+        Effect.ensuring(
+          Effect.all([Deferred.succeed(releaseChild, undefined), Deferred.succeed(releaseParent, undefined)]),
+        ),
+      )
+      yield* prompt.cancel(chat.id)
+    }),
+)
+
+for (const scenario of ["in_action", "later", "terminal_pending_control", "applied_control"]) {
+  const terminalFirst = scenario === "later"
+  const controlled = scenario === "terminal_pending_control"
+  const applied = scenario === "applied_control"
+  testEffect(makeOwnedRuntime(false, undefined, undefined, false, undefined, undefined, true)).instance(
+    `handoff verified live Task notification ${scenario}`,
+    () =>
+      Effect.gen(function* () {
+        const { llm, dir } = yield* useServerConfig((url) => ({
+          ...providerCfg(url),
+          provider: {
+            test: {
+              ...providerCfg(url).provider.test,
+              models: {
+                "test-model": {
+                  ...cfg.provider.test.models["test-model"],
+                  variants: { high: { reasoningEffort: "high" } },
+                },
+              },
+            },
+          },
+        }))
+        const { prompt, sessions, chat } = yield* boot()
+        const database = yield* Database.Service
+        const childRelease = yield* Deferred.make<void>()
+        const parentRelease = yield* Deferred.make<void>()
+        const taskRelease = yield* Deferred.make<void>()
+        yield* Effect.addFinalizer(() => Deferred.succeed(childRelease, undefined))
+        yield* Effect.addFinalizer(() => Deferred.succeed(parentRelease, undefined))
+        yield* Effect.gen(function* () {
+          const root = (hit: { body: Record<string, unknown> }) =>
+            JSON.stringify(hit.body).includes("handoff root system")
+          yield* llm.pushMatch(
+            root,
+            (applied ? reply().wait(deferredAsPromise(taskRelease)) : reply()).tool("task", {
+              description: "notification fixture",
+              prompt: "child fixture",
+              subagent_type: "general",
+              background: true,
+            }),
+          )
+          yield* llm.pushMatch(
+            (hit) => !root(hit),
+            reply().wait(deferredAsPromise(childRelease)).text("actual child result").stop(),
+          )
+          yield* llm.pushMatch(
+            root,
+            reply().wait(deferredAsPromise(parentRelease)).tool("StructuredOutput", { value: "first" }).stop(),
+          )
+          yield* llm.pushMatch(root, reply().tool("StructuredOutput", { value: "notification consumed" }).stop())
+          yield* prompt.queueSubmit(chat.id, {
+            id: `notification-${terminalFirst}`,
+            payload: {
+              kind: "prompt",
+              agent: "build",
+              model: ref,
+              parts: [{ type: "text", text: "root fixture" }],
+              system: "handoff root system",
+              tools: { bash: false },
+              format: new SessionV1.OutputFormatJsonSchema({
+                type: "json_schema",
+                retryCount: 0,
+                schema: { type: "object", properties: { value: { type: "string" } }, required: ["value"] },
+              }),
+            },
+          })
+          const admitted = applied
+            ? yield* Effect.gen(function* () {
+                yield* llm.wait(1)
+                const candidate = yield* SessionHandoff.candidate(chat.id)
+                if (!candidate) throw new Error("Missing pre-Task enrollment candidate")
+                yield* SessionHandoff.enroll(chat.id, { ...candidate, requestID: randomUUID() })
+                const view = yield* SessionHandoffControl.execution(database, chat.id, dir).pipe(Effect.orDie)
+                if (!view?.identity) throw new Error("Missing pre-Task identity")
+                yield* SessionHandoffControl.admit(database, chat.id, dir, {
+                  requestID: "notification-applied",
+                  expected: view.identity,
+                  target: { providerID: "test", modelID: "test-model", variant: "high" },
+                }).pipe(Effect.orDie)
+                yield* Deferred.succeed(taskRelease, undefined)
+                return candidate
+              })
+            : undefined
+          const ready = yield* llm.wait(3).pipe(Effect.timeout("10 seconds"), Effect.exit)
+          if (Exit.isFailure(ready))
+            throw new Error(
+              `Task fixture did not reach three provider calls: ${JSON.stringify({ hits: yield* llm.hits, transcript: yield* sessions.messages({ sessionID: chat.id }) })}`,
+            )
+          const before = admitted ?? (yield* SessionHandoff.candidate(chat.id))
+          if (!before) throw new Error("Missing active root with a normal Task child")
+          if (!applied) yield* SessionHandoff.enroll(chat.id, { ...before, requestID: randomUUID() })
+          if (controlled) {
+            const view = yield* SessionHandoffControl.execution(database, chat.id, dir).pipe(Effect.orDie)
+            if (!view?.identity) throw new Error("Missing enrolled identity")
+            yield* SessionHandoffControl.admit(database, chat.id, dir, {
+              requestID: "notification-control",
+              expected: view.identity,
+              target: { providerID: "test", modelID: "test-model", variant: "high" },
+            }).pipe(Effect.orDie)
+          }
+          const child = (yield* sessions.children(chat.id))[0]
+          if (!child) throw new Error("Missing actual Task child")
+          const originalChild = yield* sessions.get(child.id)
+          if (!terminalFirst)
+            yield* sessions.setAgentModel({
+              sessionID: chat.id,
+              agent: "plan",
+              model: { providerID: ref.providerID, id: ref.modelID, variant: "default" },
+              time: Date.now(),
+            })
+          if (terminalFirst) {
+            yield* Deferred.succeed(parentRelease, undefined)
+            yield* pollWithTimeout(
+              database.db.get<{ state: string }>(
+                sql`SELECT state FROM session_handoff_root WHERE session_id = ${chat.id} AND state = 'terminal'`,
+              ),
+              "root did not terminalize",
+            )
+          }
+          yield* Deferred.succeed(childRelease, undefined)
+          const notification = yield* pollWithTimeout(
+            database.db.get<{ classification: string; user_message_id: string }>(
+              sql`SELECT classification, user_message_id FROM session_handoff_notification WHERE session_id = ${chat.id}`,
+            ),
+            "notification was not classified",
+          )
+          expect(notification.classification).toBe(terminalFirst ? "later" : "in_action")
+          if (!terminalFirst) yield* Deferred.succeed(parentRelease, undefined)
+          yield* pollWithTimeout(
+            sessions
+              .messages({ sessionID: chat.id })
+              .pipe(
+                Effect.map((messages) =>
+                  messages.findLast(
+                    (message) =>
+                      message.info.role === "assistant" &&
+                      message.info.parentID === `msg_task_notification_${child.id}` &&
+                      message.info.time.completed,
+                  ),
+                ),
+              ),
+            "notification continuation did not finish",
+          )
+          const transcript = yield* sessions.messages({ sessionID: chat.id })
+          const user = transcript.find((message) => message.info.id === `msg_task_notification_${child.id}`)
+          expect(user?.info.role === "user" && user.info.format).toBeUndefined()
+          expect(user?.info.role === "user" && user.info.system).toBeUndefined()
+          expect(user?.parts.some((part) => part.type === "text" && part.metadata?.opencode_queue)).toBe(false)
+          const continuation = transcript.findLast((message) => message.info.role === "assistant")
+          if (!terminalFirst) {
+            expect(user?.info.role === "user" && user.info.agent).toBe("plan")
+            expect(continuation?.info.role === "assistant" && continuation.info.agent).toBe("build")
+            expect(continuation?.info.role === "assistant" && continuation.info.structured).toEqual({
+              value: "notification consumed",
+            })
+            const history = yield* SessionHandoffStore.lookup(database, {
+              sessionID: chat.id,
+              queueID: before.queueID,
+              userMessageID: before.userMessageID,
+            })
+            expect(history?.assistants.find((record) => record.messageID === continuation?.info.id)).toMatchObject({
+              parentUserMessageID: `msg_task_notification_${child.id}`,
+              authorizationUserMessageID: before.userMessageID,
+              epochSequence: applied ? 1 : 0,
+            })
+            const body = (yield* llm.hits).at(-1)?.body
+            expect(JSON.stringify(body)).toContain("handoff root system")
+            expect(JSON.stringify(body?.tools)).not.toContain('"name":"bash"')
+            expect(body?.tool_choice).toBe("required")
+            if (controlled) {
+              expect(
+                yield* SessionHandoffStore.receipt(database, chat.id, "notification-control").pipe(Effect.orDie),
+              ).toMatchObject({ state: "expired", reason: "terminal_action", boundary: null })
+              expect(history?.boundaries).toEqual([])
+              expect(body?.reasoning_effort).not.toBe("high")
+            }
+            if (applied) {
+              expect(body?.reasoning_effort).toBe("high")
+              expect(
+                (yield* llm.hits).filter((hit) => !root(hit)).every((hit) => hit.body.reasoning_effort !== "high"),
+              ).toBe(true)
+              expect(history?.boundaries).toHaveLength(1)
+              expect(
+                yield* SessionHandoffStore.receipt(database, chat.id, "notification-applied").pipe(Effect.orDie),
+              ).toMatchObject({ state: "applied", dispatch: "started_or_unknown" })
+            }
+          }
+          if (terminalFirst) expect((yield* llm.hits).at(-1)?.body.tool_choice).not.toBe("required")
+          expect((yield* sessions.get(child.id)).metadata).toEqual(originalChild.metadata)
+          expect((yield* sessions.get(child.id)).permission).toEqual(originalChild.permission)
+          expect(
+            (yield* sessions.messages({ sessionID: child.id })).filter((message) => message.info.role === "user"),
+          ).toHaveLength(1)
+        }).pipe(
+          Effect.ensuring(
+            Effect.all([
+              Deferred.succeed(childRelease, undefined),
+              Deferred.succeed(parentRelease, undefined),
+              Deferred.succeed(taskRelease, undefined),
+            ]),
+          ),
+        )
+      }),
+  )
+}
+
+for (const scenario of ["rejected preparation", "unverified notification"] as const) {
+  testEffect(makeOwnedRuntime()).instance(
+    `handoff lifecycle handles ${scenario} without trusting notification flags`,
+    () =>
+      Effect.gen(function* () {
+        const { llm } = yield* useServerConfig(providerCfg)
+        const { prompt, sessions, chat } = yield* boot()
+        const release = yield* Deferred.make<void>()
+        yield* llm.hold("queued result", deferredAsPromise(release))
+        yield* prompt.queueSubmit(chat.id, { id: `review-${scenario}`, payload: queuedPrompt("root") })
+        yield* llm.wait(1)
+        const before = yield* SessionHandoff.candidate(chat.id)
+        expect(before).not.toBeNull()
+        if (!before) throw new Error("Missing queue root")
+        if (scenario === "rejected preparation") {
+          const rejected = yield* prompt
+            .prompt({
+              sessionID: chat.id,
+              agent: "missing-agent",
+              model: ref,
+              noReply: true,
+              parts: [{ type: "text", text: "invalid" }],
+            })
+            .pipe(Effect.exit)
+          expect(Exit.isFailure(rejected)).toBe(true)
+          expect(yield* SessionHandoff.candidate(chat.id)).toEqual(before)
+        }
+        if (scenario === "unverified notification") {
+          yield* SessionHandoff.enroll(chat.id, { requestID: randomUUID(), ...before })
+          const database = yield* Database.Service
+          const child = yield* sessions.create({ parentID: chat.id })
+          const rejected = yield* prompt
+            .prompt(
+              {
+                sessionID: chat.id,
+                agent: "build",
+                model: ref,
+                noReply: true,
+                parts: [{ type: "text", text: "old action result" }],
+              },
+              { notification: true, parentCallID: "prior-action" },
+            )
+            .pipe(Effect.exit)
+          expect(Exit.isFailure(rejected)).toBe(true)
+          expect(
+            yield* database.db.get(
+              sql`SELECT state FROM session_handoff_root WHERE session_id = ${chat.id} AND queue_id = ${before.queueID}`,
+            ),
+          ).toEqual({ state: "active" })
+          expect((yield* sessions.get(child.id)).parentID).toBe(chat.id)
+        }
+        yield* prompt.cancel(chat.id)
+        yield* Deferred.succeed(release, undefined)
+      }),
+  )
+}
+
+for (const denied of [false, true]) {
+  const persisted = Deferred.makeUnsafe<void>()
+  const release = Deferred.makeUnsafe<void>()
+  const instruction = Layer.effect(
+    Instruction.Service,
+    Effect.gen(function* () {
+      const base = yield* Instruction.Service
+      let clears = 0
+      return Instruction.Service.of({
+        ...base,
+        clear: (messageID) =>
+          base.clear(messageID).pipe(
+            Effect.andThen(
+              Effect.gen(function* () {
+                if (++clears !== 2) return
+                yield* Deferred.succeed(persisted, undefined)
+                yield* Deferred.await(release)
+              }),
+            ),
+          ),
+      })
+    }),
+  ).pipe(Layer.provide(LayerNode.compile(Instruction.node, [[RuntimeFlags.node, runtimeFlags]])))
+  testEffect(makeOwnedRuntime(false, undefined, undefined, false, undefined, instruction)).instance(
+    `handoff recognizes real ${denied ? "denied tool-call stop" : "local tool stop continuation"}`,
+    () =>
+      Effect.gen(function* () {
+        yield* Effect.addFinalizer(() => Deferred.succeed(release, undefined))
+        const { llm } = yield* useServerConfig((url) => ({
+          ...providerCfg(url),
+          ...(denied ? { agent: { build: { permission: { read: "ask" } } } } : {}),
+        }))
+        const { prompt, chat } = yield* boot()
+        const instance = yield* TestInstance
+        yield* Effect.promise(() => Bun.write(path.join(instance.directory, "handoff-input.txt"), "fixture"))
+        const response = reply().tool("read", { filePath: path.join(instance.directory, "handoff-input.txt") })
+        yield* llm.push(denied ? response : response.stop())
+        if (!denied) yield* llm.text("continued")
+        yield* prompt.queueSubmit(chat.id, { id: `tool-${denied}`, payload: queuedPrompt("read fixture") })
+        if (denied) {
+          const permission = yield* Permission.Service
+          const request = yield* pollWithTimeout(
+            permission.list().pipe(Effect.map((requests) => requests.find((request) => request.permission === "read"))),
+            "read permission was not requested",
+          )
+          yield* permission.reply({ requestID: request.id, reply: "reject" })
+        }
+        yield* Deferred.await(persisted).pipe(Effect.timeout("10 seconds"))
+        yield* Effect.gen(function* () {
+          const sessions = yield* Session.Service
+          const assistant = (yield* sessions.messages({ sessionID: chat.id })).findLast(
+            (message) => message.info.role === "assistant",
+          )
+          expect(assistant?.info.role === "assistant" && assistant.info.finish).toBe(denied ? "tool-calls" : "stop")
+          expect(assistant?.parts.find((part) => part.type === "tool")?.state.status).toBe(
+            denied ? "error" : "completed",
+          )
+          const candidate = yield* SessionHandoff.candidate(chat.id)
+          if (denied) expect(candidate).toBeNull()
+          if (!denied) expect(candidate).toMatchObject({ queueID: "tool-false" })
+        }).pipe(Effect.ensuring(Deferred.succeed(release, undefined)))
+        yield* Deferred.succeed(release, undefined)
+        yield* prompt.loop({ sessionID: chat.id })
+        expect(yield* llm.calls).toBe(denied ? 1 : 2)
+      }),
+  )
+}
+
+const reviewPrepEntered = Deferred.makeUnsafe<void>()
+const reviewPrepRelease = Deferred.makeUnsafe<void>()
+testEffect(
+  makeOwnedRuntime(
+    false,
+    undefined,
+    undefined,
+    false,
+    Layer.succeed(
+      Plugin.Service,
+      Plugin.Service.of({
+        trigger: (name, _input, output) =>
+          name === "chat.message" && JSON.stringify(output).includes("review paused preparation")
+            ? Deferred.succeed(reviewPrepEntered, undefined).pipe(
+                Effect.andThen(Deferred.await(reviewPrepRelease)),
+                Effect.as(output),
+              )
+            : Effect.succeed(output),
+        init: () => Effect.void,
+        list: () => Effect.succeed([]),
+      }),
+    ),
+  ),
+).instance("handoff cannot enroll queue B while prompt A is preparing or after A resumes its save", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const { prompt, chat } = yield* boot()
+    const first = yield* Deferred.make<void>()
+    const second = yield* Deferred.make<void>()
+    yield* llm.hold("first queue", deferredAsPromise(first))
+    yield* llm.hold("queue B", deferredAsPromise(second))
+    yield* Effect.gen(function* () {
+      yield* prompt.queueSubmit(chat.id, { id: "review-first", payload: queuedPrompt("initial") })
+      yield* llm.wait(1)
+      const initial = yield* SessionHandoff.candidate(chat.id)
+      if (!initial) throw new Error("Missing initial root")
+      const preparing = yield* prompt
+        .prompt({
+          sessionID: chat.id,
+          model: ref,
+          noReply: true,
+          parts: [{ type: "text", text: "review paused preparation" }],
+        })
+        .pipe(Effect.forkChild)
+      yield* Deferred.await(reviewPrepEntered).pipe(Effect.timeout("10 seconds"))
+      yield* prompt.queueSubmit(chat.id, { id: "review-B", payload: queuedPrompt("B") })
+      yield* Deferred.succeed(first, undefined)
+      yield* llm.wait(2)
+      const database = yield* Database.Service
+      expect(
+        yield* database.db.get(
+          sql`SELECT state FROM session_handoff_root WHERE session_id = ${chat.id} AND queue_id = 'review-B'`,
+        ),
+      ).toEqual({ state: "active" })
+      expect(yield* SessionHandoff.candidate(chat.id)).toBeNull()
+      expect(
+        yield* SessionHandoff.enroll(chat.id, {
+          ...initial,
+          queueID: "review-B",
+          userMessageID: "msg_queue_review-B",
+          requestID: randomUUID(),
+        }).pipe(Effect.flip),
+      ).toMatchObject({ code: "ambiguous_history" })
+      yield* Deferred.succeed(reviewPrepRelease, undefined)
+      yield* Fiber.join(preparing)
+      expect(
+        yield* database.db.get(
+          sql`SELECT state FROM session_handoff_root WHERE session_id = ${chat.id} AND queue_id = 'review-B'`,
+        ),
+      ).toEqual({ state: "competing" })
+      expect(yield* SessionHandoff.candidate(chat.id)).toBeNull()
+      yield* prompt.cancel(chat.id)
+    }).pipe(
+      Effect.ensuring(
+        Effect.all([
+          Deferred.succeed(first, undefined),
+          Deferred.succeed(second, undefined),
+          Deferred.succeed(reviewPrepRelease, undefined),
+        ]),
+      ),
+    )
+  }),
+)
+
+competingHandoffRuntime.instance("handoff enrollment is fenced before a competing prompt plugin runs", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const { prompt, sessions, chat } = yield* boot()
+    const first = yield* Deferred.make<void>()
+    const second = yield* Deferred.make<void>()
+    yield* llm.hold("initial result", deferredAsPromise(first))
+    yield* llm.hold("queued result", deferredAsPromise(second))
+    const running = yield* prompt
+      .prompt({ sessionID: chat.id, agent: "build", model: ref, parts: [{ type: "text", text: "initial" }] })
+      .pipe(Effect.forkChild)
+    yield* llm.wait(1)
+    yield* prompt.queueSubmit(chat.id, { id: "competing-enroll-root", payload: queuedPrompt("enrolled input") })
+    yield* Deferred.succeed(first, undefined)
+    yield* llm.wait(2)
+    const candidate = yield* SessionHandoff.candidate(chat.id)
+    expect(candidate).not.toBeNull()
+    if (!candidate) throw new Error("Missing live candidate")
+    // Ordinary Task children, including racing creation, do not invalidate this root.
+    const child = yield* sessions.create({ parentID: chat.id })
+    expect(child.parentID).toBe(chat.id)
+    expect(yield* SessionHandoff.candidate(chat.id)).toEqual(candidate)
+    const competing = yield* prompt
+      .prompt({
+        sessionID: chat.id,
+        agent: "build",
+        model: ref,
+        noReply: true,
+        parts: [{ type: "text", text: "blocked competing input" }],
+      })
+      .pipe(Effect.forkChild)
+    yield* Deferred.await(competingHandoffEntered).pipe(Effect.timeout("5 seconds"))
+    expect(yield* SessionHandoff.candidate(chat.id)).toBeNull()
+    expect(
+      yield* SessionHandoff.enroll(chat.id, { requestID: randomUUID(), ...candidate }).pipe(Effect.flip),
+    ).toMatchObject({ code: "ambiguous_history" })
+    expect(
+      (yield* sessions.messages({ sessionID: chat.id })).filter((message) => message.info.role === "user"),
+    ).toHaveLength(2)
+    yield* Deferred.succeed(competingHandoffRelease, undefined)
+    yield* Fiber.join(competing)
+    yield* prompt.cancel(chat.id)
+    yield* Deferred.succeed(second, undefined)
+    yield* Fiber.join(running)
   }),
 )
 

@@ -70,6 +70,55 @@ function isBuiltInEndpointError(name: string) {
 }
 
 describe("PublicApi OpenAPI v2 errors", () => {
+  test("preserves required nullable handoff fields for generated clients", () => {
+    const spec = OpenApi.fromApi(PublicApi) as OpenApiSpec
+
+    for (const [name, fields] of [
+      [
+        "ExecutionView",
+        [
+          "identity",
+          "recoveryRevision",
+          "effectiveSelection",
+          "baselineSelection",
+          "pendingRequestID",
+          "descendantDigest",
+          "candidate",
+        ],
+      ],
+      ["ControlReceipt", ["reason", "boundary", "recoveryFence"]],
+      ["EnrollmentReceipt", ["identity"]],
+      ["Boundary", ["afterAssistantMessageID", "firstOrdinaryAssistantMessageID"]],
+      ["AssistantProvenance", ["controlRequestID"]],
+      ["SummarySelection", ["variant"]],
+      ["SummaryProvenance", ["configuredCompactionSelection", "dispatchSelection"]],
+      ["InterruptedResource", ["resourceRef", "evidence"]],
+      [
+        "TaskDescendant",
+        [
+          "link",
+          "parentSessionID",
+          "selection",
+          "agent",
+          "inputDigest",
+          "ownerLineage",
+          "ownerInstance",
+          "fence",
+          "recoveryRevision",
+          "resultAssistantMessageID",
+        ],
+      ],
+      ["ChildRecoveryStatus", ["resultAssistantMessageID"]],
+      ["TaskNotification", ["epochSequence"]],
+    ] as const) {
+      const schema = spec.components.schemas[`SessionHandoffV1${name}`]
+      for (const field of fields) {
+        expect(schema.required, `${name}.${field}`).toContain(field)
+        expect(schema.properties?.[field]?.anyOf ?? [], `${name}.${field}`).toContainEqual({ type: "null" })
+      }
+    }
+  })
+
   test("includes plugin-facing core schemas", () => {
     const spec = OpenApi.fromApi(PublicApi) as OpenApiSpec
 

@@ -29,11 +29,16 @@ export const managedWorkspaceMiddleware = HttpRouter.middleware(
               "/permission",
               "/question",
               "/maintenance/historical-fence/identity",
-            ]).has(path) || /^\/session\/[^/%]+(?:\/children|\/message(?:\/[^/%]+)?)?$/.test(path)
+            ]).has(path) ||
+            /^\/session\/[^/%]+(?:\/children|\/execution|\/handoff\/(?:[^/%]|%[\da-fA-F]{2})+|\/message(?:\/[^/%]+)?)?$/.test(
+              path,
+            )
           : request.method === "POST" &&
             (path === "/session" ||
               path === "/maintenance/historical-fence" ||
-              /^\/session\/[^/%]+\/(?:prompt_async|message|abort|retire|summarize)$/.test(path) ||
+              /^\/session\/[^/%]+\/(?:prompt_async|message|abort|retire|summarize|enrollment|model-control|recovery)$/.test(
+                path,
+              ) ||
               /^\/permission\/[^/%]+\/reply$/.test(path) ||
               /^\/question\/[^/%]+\/(?:reply|reject)$/.test(path))
       if (allowed) return yield* effect

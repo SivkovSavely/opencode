@@ -1,6 +1,8 @@
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { Cause, Context, Effect, Exit, Layer } from "effect"
 import { Database } from "@opencode-ai/core/database/database"
+import { SessionHandoffNotification } from "@opencode-ai/core/session/handoff-notification"
+import { SessionHandoffRecovery } from "@opencode-ai/core/session/handoff-recovery"
 import { InstanceStore } from "../project/instance-store"
 import { Session } from "../session/session"
 import { SessionPrompt } from "../session/prompt"
@@ -78,6 +80,7 @@ export const foregroundSettlementComplete = Effect.fn("ServerRecovery.foreground
     !matchingMetadata(part.state.metadata, record)
   )
     return false
+  if (part.state.metadata?.handoffRecovery === true) return true
   const command = part.state.input.command
   if (typeof command !== "string" || command.length === 0) return true
   const summary = yield* getMessage(MessageID.ascending(`msg_task_summary_${record.parentCallID}`))
@@ -118,6 +121,11 @@ export const settleForeground = Effect.fn("ServerRecovery.settleForeground")(fun
         const parentExecution = yield* database.db.get<{ state: string }>(sql`
           SELECT state FROM runtime_execution WHERE session_id = ${parentID}
         `)
+        if (
+          (yield* SessionHandoffRecovery.held(database, parentID)) ||
+          (yield* SessionHandoffRecovery.held(database, record.sessionID))
+        )
+          return
         if (parentExecution?.state === "cancelled") {
           yield* Effect.logInfo("foreground Task result not delivered to cancelled parent", {
             childSessionID: record.sessionID,
@@ -159,6 +167,8 @@ export const settleForeground = Effect.fn("ServerRecovery.settleForeground")(fun
           })
           return
         }
+        // Guarded reconciliation is permanent evidence, not an unfinished foreground settlement.
+        if (part.state.metadata?.handoffRecovery === true) return
         const repair =
           part.state.metadata?.sessionId === undefined && !(part.state.metadata && "sessionId" in part.state.metadata)
         if (repair) {
@@ -321,6 +331,9 @@ export const layer = Layer.effect(
     runtime.bindDatabase(database)
     return Service.of({
       initialize: Effect.gen(function* () {
+        const protectedIDs = new Set(
+          yield* SessionHandoffRecovery.installStartupHolds(database, runtime.identity.instance, runtime.verifyOwner),
+        )
         const { SessionID, MessageID, PartID } = yield* Effect.promise(() => import("../session/schema"))
         const { sql } = yield* Effect.promise(() => import("drizzle-orm"))
         const { renderOutput } = yield* Effect.promise(() => import("../tool/task"))
@@ -337,6 +350,8 @@ export const layer = Layer.effect(
         `)
         let reconstructed = 0
         for (const parent of staleParents) {
+          if (protectedIDs.has(parent.session_id) || (yield* SessionHandoffRecovery.held(database, parent.session_id)))
+            continue
           if ((yield* runtime.verifyOwner(parent.session_id)) !== "dead") continue
           reconstructed += yield* store
             .provide({ directory: parent.directory }, reconstructChildren(parent.session_id))
@@ -379,6 +394,8 @@ export const layer = Layer.effect(
             AND parent_mode = ${"foreground"}
         `)
         for (const child of children) {
+          if (protectedIDs.has(child.session_id) || (yield* SessionHandoffRecovery.held(database, child.session_id)))
+            continue
           const record = {
             sessionID: child.session_id,
             directory: child.directory,
@@ -454,6 +471,7 @@ export const layer = Layer.effect(
 
         function reconstructChildren(parentSessionID: string) {
           return Effect.gen(function* () {
+            if (yield* SessionHandoffRecovery.held(database, parentSessionID)) return 0
             const parentID = SessionID.make(parentSessionID)
             const messages = yield* sessions.messages({ sessionID: parentID }).pipe(Effect.orDie)
             let count = 0
@@ -467,6 +485,11 @@ export const layer = Layer.effect(
                 if (part.state.status === "completed" && metadata.background !== true) continue
                 const childSessionID = metadata.sessionId
                 const childMessageID = metadata.messageID
+                if (
+                  typeof childSessionID === "string" &&
+                  (yield* SessionHandoffRecovery.held(database, childSessionID))
+                )
+                  continue
                 const model = metadata.model
                 const taskInput = part.state.input
                 if (
@@ -578,7 +601,21 @@ export const layer = Layer.effect(
           result: SessionV1.WithParts,
         ) {
           return Effect.gen(function* () {
-            if (!record.parentSessionID || !record.parentCallID) return
+            if (
+              !record.parentSessionID ||
+              !record.parentMessageID ||
+              !record.parentCallID ||
+              result.info.role !== "assistant"
+            )
+              return
+            const taskLink = {
+              parentSessionID: record.parentSessionID,
+              parentMessageID: record.parentMessageID,
+              parentCallID: record.parentCallID,
+              childSessionID: record.sessionID,
+              childUserMessageID: result.info.parentID,
+              childResultMessageID: result.info.id,
+            }
             const outcome = taskOutcome(record.sessionID, result)
             const parentSessionID = SessionID.make(record.parentSessionID)
             for (let attempt = 0; attempt < 3; attempt++) {
@@ -593,6 +630,7 @@ export const layer = Layer.effect(
               }
               const delivered = yield* Effect.exit(
                 Effect.gen(function* () {
+                  const notificationLink = yield* SessionHandoffNotification.link(database, taskLink)
                   const messages = yield* sessions.messages({ sessionID: parentSessionID }).pipe(Effect.orDie)
                   const parentMessage = messages.find((item) => item.info.id === record.parentMessageID)
                   const variant = parentMessage?.info.role === "assistant" ? parentMessage.info.variant : undefined
@@ -624,7 +662,7 @@ export const layer = Layer.effect(
                           },
                         ],
                       },
-                      { notification: true },
+                      { notification: true, notificationLink },
                     )
                     .pipe(
                       Effect.tap(() => runtime.acknowledgeParentNotification(record.sessionID, record.parentCallID)),

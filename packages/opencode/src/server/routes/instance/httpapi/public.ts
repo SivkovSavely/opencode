@@ -93,9 +93,9 @@ function matchLegacyOpenApi(input: Record<string, unknown>) {
   // but the legacy SDK expected plain `T` for optional fields. Strip null
   // from all component schemas so both request and response types match.
   for (const [name, schema] of Object.entries(spec.components?.schemas ?? {})) {
-    // Signed maintenance payloads distinguish explicit null from omission.
+    // These contracts distinguish required null values from omitted fields.
     if (name.startsWith("HistoricalFence")) continue
-    spec.components!.schemas![name] = stripOptionalNull(structuredClone(schema))
+    spec.components!.schemas![name] = stripOptionalNull(structuredClone(schema), name.startsWith("SessionHandoffV1"))
   }
   normalizeComponentNames(spec)
   collapseDuplicateComponents(spec)
@@ -462,22 +462,22 @@ function fixSelfReferencingComponents(spec: OpenApiSpec) {
 }
 
 /** Strip `{type:"null"}` arms that Effect's `Schema.optional` adds to OpenAPI unions. */
-function stripOptionalNull(schema: OpenApiSchema): OpenApiSchema {
+function stripOptionalNull(schema: OpenApiSchema, preserveNull = false): OpenApiSchema {
   if (schema.allOf?.length === 1) {
     const [constraint] = schema.allOf
     delete schema.allOf
-    return stripOptionalNull({ ...schema, ...constraint })
+    return stripOptionalNull({ ...schema, ...constraint }, preserveNull)
   }
   if (isEmptyObjectUnion(schema)) return { type: "object", properties: {} }
   const options = flattenOptions(schema.anyOf ?? schema.oneOf)
   if (options) {
-    const withoutNull = options.filter((item) => item.type !== "null")
-    if (withoutNull.length === 1) return stripOptionalNull(withoutNull[0])
-    if (schema.anyOf) schema.anyOf = withoutNull.map(stripOptionalNull)
-    if (schema.oneOf) schema.oneOf = withoutNull.map(stripOptionalNull)
+    const normalized = preserveNull ? options : options.filter((item) => item.type !== "null")
+    if (normalized.length === 1) return stripOptionalNull(normalized[0], preserveNull)
+    if (schema.anyOf) schema.anyOf = normalized.map((item) => stripOptionalNull(item, preserveNull))
+    if (schema.oneOf) schema.oneOf = normalized.map((item) => stripOptionalNull(item, preserveNull))
   }
   if (schema.allOf) {
-    const allOf = schema.allOf.map(stripOptionalNull)
+    const allOf = schema.allOf.map((item) => stripOptionalNull(item, preserveNull))
     if (schema.type) {
       delete schema.allOf
       for (const item of allOf) Object.assign(schema, item)
@@ -486,14 +486,14 @@ function stripOptionalNull(schema: OpenApiSchema): OpenApiSchema {
     }
   }
   if (schema.prefixItems && schema.items) delete schema.prefixItems
-  if (schema.items) schema.items = stripOptionalNull(schema.items)
+  if (schema.items) schema.items = stripOptionalNull(schema.items, preserveNull)
   if (schema.properties) {
     for (const [key, value] of Object.entries(schema.properties)) {
-      schema.properties[key] = stripOptionalNull(value)
+      schema.properties[key] = stripOptionalNull(value, preserveNull)
     }
   }
   if (schema.additionalProperties && typeof schema.additionalProperties === "object") {
-    schema.additionalProperties = stripOptionalNull(schema.additionalProperties)
+    schema.additionalProperties = stripOptionalNull(schema.additionalProperties, preserveNull)
   }
   return schema
 }

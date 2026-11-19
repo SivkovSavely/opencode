@@ -8,6 +8,7 @@ import { OpenAIWebSocketPool } from "./ws-pool"
 import { OauthCallbackPage } from "@opencode-ai/core/oauth/page"
 import { CodexOAuth } from "./oauth"
 import { extractAccountId, extractResidency } from "./oauth"
+import { DispatchTransport } from "../../provider/dispatch-transport"
 export {
   parseJwtClaims,
   extractAccountIdFromClaims,
@@ -23,6 +24,17 @@ const OAUTH_PORT = 1455
 const OAUTH_POLLING_SAFETY_MARGIN_MS = 3000
 const ALLOWED_MODELS = new Set(["gpt-5.5", "gpt-5.3-codex-spark", "gpt-5.4", "gpt-5.4-mini"])
 const DISALLOWED_MODELS = new Set(["gpt-5.5-pro"])
+const controlledTransports = new WeakMap<
+  object,
+  {
+    builtin: "codex-oauth" | "codex-websocket"
+    bind: (boundary: DispatchTransport.Boundary, httpFetch: DispatchTransport.Fetch) => DispatchTransport.Fetch
+  }
+>()
+
+export function controlledTransport(value: unknown) {
+  return typeof value === "function" ? controlledTransports.get(value) : undefined
+}
 
 interface PkceCodes {
   verifier: string
@@ -280,66 +292,102 @@ export async function CodexAuthPlugin(input: PluginInput, options: CodexAuthPlug
           websocketFetches.push(websocketFetch)
           websocketFetchInstalled = true
         }
-        if (auth.type !== "oauth") return websocketFetch ? { fetch: websocketFetch } : {}
-
-        return {
-          apiKey: OAUTH_DUMMY_KEY,
-          async fetch(requestInput: RequestInfo | URL, init?: RequestInit) {
-            if (init?.headers) {
-              if (init.headers instanceof Headers) {
-                init.headers.delete("authorization")
-                init.headers.delete("Authorization")
-              } else if (Array.isArray(init.headers)) {
-                init.headers = init.headers.filter(([key]) => key.toLowerCase() !== "authorization")
-              } else {
-                delete init.headers["authorization"]
-                delete init.headers["Authorization"]
-              }
-            }
-
-            const currentAuth = await CodexOAuth.resolve(getAuth, options.compareAndSet, { issuer })
-            if (!currentAuth) return websocketFetch ? websocketFetch(requestInput, init) : fetch(requestInput, init)
-
-            const headers = new Headers()
-            if (init?.headers) {
-              if (init.headers instanceof Headers) {
-                init.headers.forEach((value, key) => headers.set(key, value))
-              } else if (Array.isArray(init.headers)) {
-                for (const [key, value] of init.headers) {
-                  if (value !== undefined) headers.set(key, String(value))
-                }
-              } else {
-                for (const [key, value] of Object.entries(init.headers)) {
-                  if (value !== undefined) headers.set(key, String(value))
-                }
-              }
-            }
-            headers.set("authorization", `Bearer ${currentAuth.access}`)
-            if (currentAuth.accountId) {
-              headers.set("ChatGPT-Account-Id", currentAuth.accountId)
-            }
-
-            const parsed =
-              requestInput instanceof URL
-                ? requestInput
-                : new URL(typeof requestInput === "string" ? requestInput : requestInput.url)
-            const rewrite = parsed.pathname.includes("/v1/responses") || parsed.pathname.includes("/chat/completions")
-            const url = rewrite ? new URL(codexApiEndpoint) : parsed
-            if (rewrite) {
-              const residency = extractResidency(currentAuth.access)
-              if (residency) headers.set("x-openai-internal-codex-residency", residency)
-            }
-
-            const requestInit = {
-              ...init,
-              redirect: "error" as const,
-              body: init?.body,
-              headers,
-            }
-            if (websocketFetch && parsed.pathname.endsWith("/responses")) return websocketFetch(url, requestInit)
-            return fetch(url, OpenAIWebSocketPool.withoutInternalHeaders(requestInit))
-          },
+        if (auth.type !== "oauth") {
+          if (!websocketFetch) return {}
+          controlledTransports.set(websocketFetch, {
+            builtin: "codex-websocket",
+            bind: (boundary, httpFetch) => websocketFetch.controlled(boundary, httpFetch),
+          })
+          return { fetch: websocketFetch }
         }
+
+        async function request(
+          requestInput: RequestInfo | URL,
+          init?: RequestInit,
+          boundary?: DispatchTransport.Boundary,
+          httpFetch: DispatchTransport.Fetch = fetch,
+        ) {
+          const body = init?.body
+          if (boundary) {
+            boundary.validateHttp(body)
+            init = { ...init, body, headers: new Headers(init?.headers) }
+          }
+          if (init?.headers) {
+            if (init.headers instanceof Headers) {
+              init.headers.delete("authorization")
+              init.headers.delete("Authorization")
+            } else if (Array.isArray(init.headers)) {
+              init.headers = init.headers.filter(([key]) => key.toLowerCase() !== "authorization")
+            } else {
+              delete init.headers["authorization"]
+              delete init.headers["Authorization"]
+            }
+          }
+
+          const currentAuth = await CodexOAuth.resolve(getAuth, options.compareAndSet, {
+            issuer,
+            ...(boundary ? { fetch: httpFetch } : {}),
+          })
+          if (!currentAuth) {
+            if (boundary) throw new DispatchTransport.UnsupportedDispatch()
+            return websocketFetch ? websocketFetch(requestInput, init) : fetch(requestInput, init)
+          }
+
+          const headers = new Headers()
+          if (init?.headers) {
+            if (init.headers instanceof Headers) {
+              init.headers.forEach((value, key) => headers.set(key, value))
+            } else if (Array.isArray(init.headers)) {
+              for (const [key, value] of init.headers) {
+                if (value !== undefined) headers.set(key, String(value))
+              }
+            } else {
+              for (const [key, value] of Object.entries(init.headers)) {
+                if (value !== undefined) headers.set(key, String(value))
+              }
+            }
+          }
+          headers.set("authorization", `Bearer ${currentAuth.access}`)
+          if (currentAuth.accountId) {
+            headers.set("ChatGPT-Account-Id", currentAuth.accountId)
+          }
+
+          const parsed =
+            requestInput instanceof URL
+              ? requestInput
+              : new URL(typeof requestInput === "string" ? requestInput : requestInput.url)
+          const rewrite = parsed.pathname.includes("/v1/responses") || parsed.pathname.includes("/chat/completions")
+          const url = rewrite ? new URL(codexApiEndpoint) : parsed
+          if (rewrite) {
+            const residency = extractResidency(currentAuth.access)
+            if (residency) headers.set("x-openai-internal-codex-residency", residency)
+          }
+
+          const requestInit = {
+            ...init,
+            redirect: "error" as const,
+            body: init?.body,
+            headers,
+          }
+          if (websocketFetch && parsed.pathname.endsWith("/responses"))
+            return boundary
+              ? websocketFetch.controlled(boundary, httpFetch)(url, requestInit)
+              : websocketFetch(url, requestInit)
+          const finalInit = OpenAIWebSocketPool.withoutInternalHeaders(requestInit)
+          if (boundary) {
+            boundary.validateHttp(finalInit?.body)
+            await boundary.prepared()
+            finalInit?.signal?.throwIfAborted()
+            boundary.validateHttp(finalInit?.body)
+          }
+          return httpFetch(url, finalInit)
+        }
+        const oauthFetch: DispatchTransport.Fetch = (input, init) => request(input, init)
+        controlledTransports.set(oauthFetch, {
+          builtin: "codex-oauth",
+          bind: (boundary, httpFetch) => (input, init) => request(input, init, boundary, httpFetch),
+        })
+        return { apiKey: OAUTH_DUMMY_KEY, fetch: oauthFetch }
       },
       methods: [
         {

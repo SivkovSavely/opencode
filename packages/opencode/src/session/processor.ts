@@ -44,7 +44,9 @@ export interface Handle {
       attachments?: SessionV1.FilePart[]
     }) => Effect.Effect<void>
   }
-  readonly process: (streamInput: LLM.StreamInput) => Effect.Effect<Result>
+  readonly process: (
+    streamInput: LLM.StreamInput & { onUnsupportedDispatch?: () => Effect.Effect<void> },
+  ) => Effect.Effect<Result>
 }
 
 type Input = {
@@ -709,7 +711,9 @@ const layer = Layer.effect(
         yield* status.set(ctx.sessionID, { type: "idle" })
       })
 
-      const process = Effect.fn("SessionProcessor.process")(function* (streamInput: LLM.StreamInput) {
+      const process = Effect.fn("SessionProcessor.process")(function* (
+        streamInput: LLM.StreamInput & { onUnsupportedDispatch?: () => Effect.Effect<void> },
+      ) {
         yield* Effect.logInfo("process", {
           "session.id": input.sessionID,
           messageID: input.assistantMessage.id,
@@ -731,6 +735,11 @@ const layer = Layer.effect(
               Stream.tap((event) => handleEvent(event)),
               Stream.takeUntil(() => ctx.needsCompaction),
               Stream.runDrain,
+              Effect.tapError((error) =>
+                Schema.is(Schema.Struct({ _tag: Schema.Literal("UnsupportedDispatch") }))(error)
+                  ? (streamInput.onUnsupportedDispatch?.() ?? Effect.void)
+                  : Effect.void,
+              ),
             )
           }).pipe(
             Effect.onInterrupt(() =>

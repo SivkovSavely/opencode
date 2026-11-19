@@ -5,6 +5,7 @@ import { WebSocketServer } from "ws"
 import type { Auth } from "../../src/auth"
 import {
   CodexAuthPlugin,
+  controlledTransport,
   parseJwtClaims,
   extractAccountIdFromClaims,
   extractAccountId,
@@ -12,6 +13,8 @@ import {
   renderOAuthError,
   type IdTokenClaims,
 } from "../../src/plugin/openai/codex"
+import { DispatchTransport } from "../../src/provider/dispatch-transport"
+import { isRecord } from "../../src/util/record"
 
 function createTestJwt(payload: object): string {
   const header = Buffer.from(JSON.stringify({ alg: "none" })).toString("base64url")
@@ -20,6 +23,198 @@ function createTestJwt(payload: object): string {
 }
 
 describe("plugin.codex", () => {
+  test("controlled built-in websocket preserves headers and request-local targets across reuse and reconnect", async () => {
+    await using server = await createCodexWebSocketServer()
+    const access = createTestJwt({ chatgpt_account_id: "synthetic-account", chatgpt_compute_residency: "eu" })
+    const hooks = await CodexAuthPlugin({} as never, { codexApiEndpoint: server.url, experimentalWebSockets: true })
+    try {
+      const loaded = await hooks.auth!.loader!(
+        async () => ({ type: "oauth", access, refresh: "synthetic-reuse-refresh", expires: Date.now() + 60_000 }),
+        {} as never,
+      )
+      const transport = controlledTransport(loaded.fetch)
+      if (!transport) throw new Error("Built-in transport was not recognized")
+      expect(controlledTransport(async () => new Response("opaque"))).toBeUndefined()
+      const prepared: string[] = []
+      const bun = await import("bun")
+      const request = async (model: string, effort: string, previous?: string) => {
+        const state: { ready?: Promise<void> } = {}
+        const validate = (value: unknown) => {
+          if (typeof value !== "string") throw new DispatchTransport.UnsupportedDispatch()
+          const body: unknown = JSON.parse(value)
+          if (!isRecord(body) || body.model !== model || !isRecord(body.reasoning) || body.reasoning.effort !== effort)
+            throw new DispatchTransport.UnsupportedDispatch()
+        }
+        const response = await transport.bind(
+          {
+            validateHttp: validate,
+            validateFrame: validate,
+            prepared: () =>
+              (state.ready ??= Promise.resolve().then(() => {
+                prepared.push(model)
+              })),
+          },
+          bun.fetch,
+        )(server.url.replace("/backend-api/codex/responses", "/v1/responses"), {
+          method: "POST",
+          headers: {
+            "session-id": "same-session",
+            "x-plugin-proof": "retained",
+            authorization: "Bearer synthetic-sdk-key",
+          },
+          body: JSON.stringify({
+            stream: true,
+            model,
+            reasoning: { effort },
+            ...(previous ? { previous_response_id: previous } : {}),
+          }),
+        })
+        expect(await response.text()).toContain("data: [DONE]")
+      }
+      await request("gpt-6.1-sol", "xhigh", "resp-parent")
+      await request("gpt-6.1-terra", "max", "resp_123")
+      expect(server.connections()).toBe(1)
+      await server.dropConnections()
+      await request("gpt-6.1-sol", "high")
+      expect(server.connections()).toBe(2)
+      expect(server.frames).toEqual([
+        {
+          type: "response.create",
+          model: "gpt-6.1-sol",
+          reasoning: { effort: "xhigh" },
+          previous_response_id: "resp-parent",
+        },
+        {
+          type: "response.create",
+          model: "gpt-6.1-terra",
+          reasoning: { effort: "max" },
+          previous_response_id: "resp_123",
+        },
+        { type: "response.create", model: "gpt-6.1-sol", reasoning: { effort: "high" } },
+      ])
+      expect(prepared).toEqual(["gpt-6.1-sol", "gpt-6.1-terra", "gpt-6.1-sol"])
+      expect(server.headers()?.authorization === `Bearer ${access}`).toBe(true)
+      expect(server.headers()?.["chatgpt-account-id"] === "synthetic-account").toBe(true)
+      expect(server.headers()?.["x-openai-internal-codex-residency"] === "eu").toBe(true)
+      expect(server.headers()?.["x-plugin-proof"]).toBe("retained")
+    } finally {
+      await hooks.dispose?.()
+    }
+  })
+
+  for (const websocket of [false, true]) {
+    test(`controlled HTTP final check follows prepared with websocket=${websocket}`, async () => {
+      let requests = 0
+      using server = Bun.serve({
+        port: 0,
+        fetch() {
+          requests++
+          return new Response("{}")
+        },
+      })
+      const hooks = await CodexAuthPlugin({} as never, {
+        issuer: server.url.origin,
+        codexApiEndpoint: new URL("/backend-api/codex/responses", server.url).toString(),
+        experimentalWebSockets: websocket,
+      })
+      try {
+        const loaded = await hooks.auth!.loader!(
+          async () => ({
+            type: "oauth",
+            access: "synthetic-final-check-access",
+            refresh: "synthetic-final-check-refresh",
+            expires: Date.now() + 60_000,
+          }),
+          {} as never,
+        )
+        const transport = controlledTransport(loaded.fetch)
+        if (!transport) throw new Error("Built-in transport was not recognized")
+        const state = { prepared: false }
+        const bun = await import("bun")
+        const request = transport.bind(
+          {
+            validateHttp() {
+              if (state.prepared) throw new DispatchTransport.UnsupportedDispatch()
+            },
+            validateFrame() {
+              throw new Error("Title request must use HTTP")
+            },
+            async prepared() {
+              state.prepared = true
+            },
+          },
+          bun.fetch,
+        )(new URL("/v1/responses", server.url), {
+          method: "POST",
+          headers: { "x-opencode-title": "true" },
+          body: JSON.stringify({ stream: true, model: "target", reasoning: { effort: "xhigh" } }),
+        })
+        await expect(request).rejects.toBeInstanceOf(DispatchTransport.UnsupportedDispatch)
+        expect(requests).toBe(0)
+      } finally {
+        await hooks.dispose?.()
+      }
+    })
+  }
+
+  test("controlled OAuth HTTP aborts during prepared without invoking its leaf", async () => {
+    let requests = 0
+    using server = Bun.serve({
+      port: 0,
+      fetch() {
+        requests++
+        return new Response("{}")
+      },
+    })
+    const hooks = await CodexAuthPlugin({} as never, {
+      codexApiEndpoint: new URL("/backend-api/codex/responses", server.url).toString(),
+    })
+    try {
+      const loaded = await hooks.auth!.loader!(
+        async () => ({
+          type: "oauth",
+          access: "synthetic-cancel-access",
+          refresh: "synthetic-cancel-refresh",
+          expires: Date.now() + 60_000,
+        }),
+        {} as never,
+      )
+      const transport = controlledTransport(loaded.fetch)
+      if (!transport) throw new Error("Built-in transport was not recognized")
+      const started = Promise.withResolvers<void>()
+      const ready = Promise.withResolvers<void>()
+      const abort = new AbortController()
+      const bun = await import("bun")
+      let leaves = 0
+      const request = transport.bind(
+        {
+          validateHttp() {},
+          validateFrame() {},
+          prepared() {
+            started.resolve()
+            return ready.promise
+          },
+        },
+        (input, init) => {
+          leaves++
+          return bun.fetch(input, init)
+        },
+      )(new URL("/v1/responses", server.url), {
+        method: "POST",
+        signal: abort.signal,
+        body: JSON.stringify({ stream: true, model: "target", reasoning: { effort: "max" } }),
+      })
+      await started.promise
+      abort.abort()
+      ready.resolve()
+      await expect(request).rejects.toHaveProperty("name", "AbortError")
+      expect(leaves).toBe(0)
+      expect(requests).toBe(0)
+    } finally {
+      await hooks.dispose?.()
+    }
+  })
+
   test("escapes provider errors in callback HTML", () => {
     const error = `</div><script>alert("xss" & 'more')</script>`
     const html = renderOAuthError(error)
@@ -450,11 +645,17 @@ describe("plugin.codex", () => {
 
 async function createCodexWebSocketServer() {
   let headers: IncomingMessage["headers"] | undefined
+  let connections = 0
+  const frames: Record<string, unknown>[] = []
   const server = createServer()
   const sockets = new WebSocketServer({ server })
   sockets.on("connection", (socket, request) => {
+    connections++
     headers = request.headers
-    socket.once("message", () => {
+    socket.on("message", (data) => {
+      const body: unknown = JSON.parse(data.toString())
+      if (!isRecord(body)) throw new Error("Unexpected synthetic request")
+      frames.push(body)
       socket.send(JSON.stringify({ type: "response.completed", response: { id: "resp_123" } }))
     })
   })
@@ -466,6 +667,19 @@ async function createCodexWebSocketServer() {
   return {
     url: `http://127.0.0.1:${address.port}/backend-api/codex/responses`,
     headers: () => headers,
+    frames,
+    connections: () => connections,
+    dropConnections: () =>
+      Promise.all(
+        Array.from(
+          sockets.clients,
+          (socket) =>
+            new Promise<void>((resolve) => {
+              socket.once("close", () => resolve())
+              socket.close(1000, "synthetic reconnect")
+            }),
+        ),
+      ),
     async [Symbol.asyncDispose]() {
       for (const socket of sockets.clients) socket.terminate()
       sockets.close()

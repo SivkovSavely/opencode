@@ -1,9 +1,9 @@
 {
   "version": "7",
   "dialect": "sqlite",
-  "id": "d9a7916c-d326-43a6-a6d9-c9dea0d7016c",
+  "id": "94e02199-1e84-4cae-929e-8ee1ccf8fdfa",
   "prevIds": [
-    "5041f680-12ea-41a1-89ec-93efa8404df7"
+    "dd629647-1803-4625-ba19-026198b4b561"
   ],
   "ddl": [
     {
@@ -48,6 +48,66 @@
     },
     {
       "name": "runtime_retirement",
+      "entityType": "tables"
+    },
+    {
+      "name": "session_handoff_attempt",
+      "entityType": "tables"
+    },
+    {
+      "name": "session_handoff_compaction",
+      "entityType": "tables"
+    },
+    {
+      "name": "session_handoff_context",
+      "entityType": "tables"
+    },
+    {
+      "name": "session_handoff_control",
+      "entityType": "tables"
+    },
+    {
+      "name": "session_handoff_notification",
+      "entityType": "tables"
+    },
+    {
+      "name": "session_handoff_recovery_queue_block",
+      "entityType": "tables"
+    },
+    {
+      "name": "session_handoff_recovery_child",
+      "entityType": "tables"
+    },
+    {
+      "name": "session_handoff_recovery_history",
+      "entityType": "tables"
+    },
+    {
+      "name": "session_handoff_recovery_hold",
+      "entityType": "tables"
+    },
+    {
+      "name": "session_handoff_root",
+      "entityType": "tables"
+    },
+    {
+      "name": "session_handoff_action",
+      "entityType": "tables"
+    },
+    {
+      "name": "session_handoff_assistant",
+      "entityType": "tables"
+    },
+    {
+      "name": "session_handoff_boundary",
+      "entityType": "tables"
+    },
+    {
+      "name": "session_handoff_receipt",
+      "entityType": "tables"
+    },
+    {
+      "name": "session_handoff_request",
       "entityType": "tables"
     },
     {
@@ -875,6 +935,956 @@
       "name": "time_created",
       "entityType": "columns",
       "table": "runtime_retirement"
+    },
+    {
+      "type": "integer",
+      "notNull": false,
+      "autoincrement": true,
+      "default": null,
+      "generated": null,
+      "name": "position",
+      "entityType": "columns",
+      "table": "session_handoff_attempt"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "message_id",
+      "entityType": "columns",
+      "table": "session_handoff_attempt"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "session_id",
+      "entityType": "columns",
+      "table": "session_handoff_attempt"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "queue_id",
+      "entityType": "columns",
+      "table": "session_handoff_attempt"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "user_message_id",
+      "entityType": "columns",
+      "table": "session_handoff_attempt"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "data",
+      "entityType": "columns",
+      "table": "session_handoff_attempt"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "message_id",
+      "entityType": "columns",
+      "table": "session_handoff_compaction"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "session_id",
+      "entityType": "columns",
+      "table": "session_handoff_compaction"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "reservation",
+      "entityType": "columns",
+      "table": "session_handoff_compaction"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "queue_id",
+      "entityType": "columns",
+      "table": "session_handoff_compaction"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "user_message_id",
+      "entityType": "columns",
+      "table": "session_handoff_compaction"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "parent_user_message_id",
+      "entityType": "columns",
+      "table": "session_handoff_compaction"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "kind",
+      "entityType": "columns",
+      "table": "session_handoff_compaction"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "epoch_sequence",
+      "entityType": "columns",
+      "table": "session_handoff_compaction"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "data",
+      "entityType": "columns",
+      "table": "session_handoff_compaction"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "identity",
+      "entityType": "columns",
+      "table": "session_handoff_context"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "session_id",
+      "entityType": "columns",
+      "table": "session_handoff_context"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "queue_id",
+      "entityType": "columns",
+      "table": "session_handoff_context"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "user_message_id",
+      "entityType": "columns",
+      "table": "session_handoff_context"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "retired_reason",
+      "entityType": "columns",
+      "table": "session_handoff_context"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "session_id",
+      "entityType": "columns",
+      "table": "session_handoff_control"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "queue_id",
+      "entityType": "columns",
+      "table": "session_handoff_control"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "user_message_id",
+      "entityType": "columns",
+      "table": "session_handoff_control"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "reservation",
+      "entityType": "columns",
+      "table": "session_handoff_control"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "state",
+      "entityType": "columns",
+      "table": "session_handoff_control"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "pending_request_id",
+      "entityType": "columns",
+      "table": "session_handoff_control"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "data",
+      "entityType": "columns",
+      "table": "session_handoff_control"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "message_id",
+      "entityType": "columns",
+      "table": "session_handoff_notification"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "session_id",
+      "entityType": "columns",
+      "table": "session_handoff_notification"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "reservation",
+      "entityType": "columns",
+      "table": "session_handoff_notification"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "classification",
+      "entityType": "columns",
+      "table": "session_handoff_notification"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "user_message_id",
+      "entityType": "columns",
+      "table": "session_handoff_notification"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "after_message_id",
+      "entityType": "columns",
+      "table": "session_handoff_notification"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "data",
+      "entityType": "columns",
+      "table": "session_handoff_notification"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "session_id",
+      "entityType": "columns",
+      "table": "session_handoff_recovery_queue_block"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "recovery_request_id",
+      "entityType": "columns",
+      "table": "session_handoff_recovery_queue_block"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "root_session_id",
+      "entityType": "columns",
+      "table": "session_handoff_recovery_queue_block"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "queue_id",
+      "entityType": "columns",
+      "table": "session_handoff_recovery_queue_block"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "user_message_id",
+      "entityType": "columns",
+      "table": "session_handoff_recovery_queue_block"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "reservation",
+      "entityType": "columns",
+      "table": "session_handoff_recovery_queue_block"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "recovery_revision",
+      "entityType": "columns",
+      "table": "session_handoff_recovery_queue_block"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "owner_lineage",
+      "entityType": "columns",
+      "table": "session_handoff_recovery_queue_block"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "owner_instance",
+      "entityType": "columns",
+      "table": "session_handoff_recovery_queue_block"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "recovery_fence",
+      "entityType": "columns",
+      "table": "session_handoff_recovery_queue_block"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "queue_revision",
+      "entityType": "columns",
+      "table": "session_handoff_recovery_queue_block"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "input_proof",
+      "entityType": "columns",
+      "table": "session_handoff_recovery_queue_block"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "state",
+      "entityType": "columns",
+      "table": "session_handoff_recovery_queue_block"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "reason",
+      "entityType": "columns",
+      "table": "session_handoff_recovery_queue_block"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "internal_user_id",
+      "entityType": "columns",
+      "table": "session_handoff_recovery_queue_block"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "session_id",
+      "entityType": "columns",
+      "table": "session_handoff_recovery_child"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "0",
+      "generated": null,
+      "name": "recovery_revision",
+      "entityType": "columns",
+      "table": "session_handoff_recovery_child"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "link",
+      "entityType": "columns",
+      "table": "session_handoff_recovery_child"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "input_digest",
+      "entityType": "columns",
+      "table": "session_handoff_recovery_child"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "prior_fence",
+      "entityType": "columns",
+      "table": "session_handoff_recovery_child"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "recovery_fence",
+      "entityType": "columns",
+      "table": "session_handoff_recovery_child"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "session_id",
+      "entityType": "columns",
+      "table": "session_handoff_recovery_history"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "queue_id",
+      "entityType": "columns",
+      "table": "session_handoff_recovery_history"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "user_message_id",
+      "entityType": "columns",
+      "table": "session_handoff_recovery_history"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "revision",
+      "entityType": "columns",
+      "table": "session_handoff_recovery_history"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "data",
+      "entityType": "columns",
+      "table": "session_handoff_recovery_history"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "root_session_id",
+      "entityType": "columns",
+      "table": "session_handoff_recovery_hold"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "reservation",
+      "entityType": "columns",
+      "table": "session_handoff_recovery_hold"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "session_id",
+      "entityType": "columns",
+      "table": "session_handoff_recovery_hold"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "session_id",
+      "entityType": "columns",
+      "table": "session_handoff_root"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "reservation",
+      "entityType": "columns",
+      "table": "session_handoff_root"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "state",
+      "entityType": "columns",
+      "table": "session_handoff_root"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "queue_id",
+      "entityType": "columns",
+      "table": "session_handoff_root"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "user_message_id",
+      "entityType": "columns",
+      "table": "session_handoff_root"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "source",
+      "entityType": "columns",
+      "table": "session_handoff_root"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "enrolled_request_id",
+      "entityType": "columns",
+      "table": "session_handoff_root"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "session_id",
+      "entityType": "columns",
+      "table": "session_handoff_action"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "queue_id",
+      "entityType": "columns",
+      "table": "session_handoff_action"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "user_message_id",
+      "entityType": "columns",
+      "table": "session_handoff_action"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "data",
+      "entityType": "columns",
+      "table": "session_handoff_action"
+    },
+    {
+      "type": "integer",
+      "notNull": false,
+      "autoincrement": true,
+      "default": null,
+      "generated": null,
+      "name": "position",
+      "entityType": "columns",
+      "table": "session_handoff_assistant"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "message_id",
+      "entityType": "columns",
+      "table": "session_handoff_assistant"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "session_id",
+      "entityType": "columns",
+      "table": "session_handoff_assistant"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "queue_id",
+      "entityType": "columns",
+      "table": "session_handoff_assistant"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "user_message_id",
+      "entityType": "columns",
+      "table": "session_handoff_assistant"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "data",
+      "entityType": "columns",
+      "table": "session_handoff_assistant"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "session_id",
+      "entityType": "columns",
+      "table": "session_handoff_boundary"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "queue_id",
+      "entityType": "columns",
+      "table": "session_handoff_boundary"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "user_message_id",
+      "entityType": "columns",
+      "table": "session_handoff_boundary"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "sequence",
+      "entityType": "columns",
+      "table": "session_handoff_boundary"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "request_id",
+      "entityType": "columns",
+      "table": "session_handoff_boundary"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "data",
+      "entityType": "columns",
+      "table": "session_handoff_boundary"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "request_id",
+      "entityType": "columns",
+      "table": "session_handoff_receipt"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "revision",
+      "entityType": "columns",
+      "table": "session_handoff_receipt"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "data",
+      "entityType": "columns",
+      "table": "session_handoff_receipt"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "request_id",
+      "entityType": "columns",
+      "table": "session_handoff_request"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "session_id",
+      "entityType": "columns",
+      "table": "session_handoff_request"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "queue_id",
+      "entityType": "columns",
+      "table": "session_handoff_request"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "user_message_id",
+      "entityType": "columns",
+      "table": "session_handoff_request"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "identity",
+      "entityType": "columns",
+      "table": "session_handoff_request"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "data",
+      "entityType": "columns",
+      "table": "session_handoff_request"
     },
     {
       "type": "text",
@@ -2617,6 +3627,206 @@
       "onUpdate": "NO ACTION",
       "onDelete": "CASCADE",
       "nameExplicit": false,
+      "name": "fk_session_handoff_recovery_queue_block_session_id_session_id_fk",
+      "entityType": "fks",
+      "table": "session_handoff_recovery_queue_block"
+    },
+    {
+      "columns": [
+        "recovery_request_id"
+      ],
+      "tableTo": "session_handoff_request",
+      "columnsTo": [
+        "request_id"
+      ],
+      "onUpdate": "NO ACTION",
+      "onDelete": "NO ACTION",
+      "nameExplicit": false,
+      "name": "fk_session_handoff_recovery_queue_block_recovery_request_id_session_handoff_request_request_id_fk",
+      "entityType": "fks",
+      "table": "session_handoff_recovery_queue_block"
+    },
+    {
+      "columns": [
+        "root_session_id",
+        "queue_id",
+        "user_message_id"
+      ],
+      "tableTo": "session_handoff_action",
+      "columnsTo": [
+        "session_id",
+        "queue_id",
+        "user_message_id"
+      ],
+      "onUpdate": "NO ACTION",
+      "onDelete": "NO ACTION",
+      "nameExplicit": false,
+      "name": "fk_session_handoff_recovery_queue_block_root_session_id_queue_id_user_message_id_session_handoff_action_session_id_queue_id_user_message_id_fk",
+      "entityType": "fks",
+      "table": "session_handoff_recovery_queue_block"
+    },
+    {
+      "columns": [
+        "session_id"
+      ],
+      "tableTo": "session",
+      "columnsTo": [
+        "id"
+      ],
+      "onUpdate": "NO ACTION",
+      "onDelete": "CASCADE",
+      "nameExplicit": false,
+      "name": "fk_session_handoff_recovery_child_session_id_session_id_fk",
+      "entityType": "fks",
+      "table": "session_handoff_recovery_child"
+    },
+    {
+      "columns": [
+        "session_id",
+        "queue_id",
+        "user_message_id"
+      ],
+      "tableTo": "session_handoff_action",
+      "columnsTo": [
+        "session_id",
+        "queue_id",
+        "user_message_id"
+      ],
+      "onUpdate": "NO ACTION",
+      "onDelete": "NO ACTION",
+      "nameExplicit": false,
+      "name": "fk_session_handoff_recovery_history_session_id_queue_id_user_message_id_session_handoff_action_session_id_queue_id_user_message_id_fk",
+      "entityType": "fks",
+      "table": "session_handoff_recovery_history"
+    },
+    {
+      "columns": [
+        "root_session_id"
+      ],
+      "tableTo": "session",
+      "columnsTo": [
+        "id"
+      ],
+      "onUpdate": "NO ACTION",
+      "onDelete": "CASCADE",
+      "nameExplicit": false,
+      "name": "fk_session_handoff_recovery_hold_root_session_id_session_id_fk",
+      "entityType": "fks",
+      "table": "session_handoff_recovery_hold"
+    },
+    {
+      "columns": [
+        "session_id"
+      ],
+      "tableTo": "session",
+      "columnsTo": [
+        "id"
+      ],
+      "onUpdate": "NO ACTION",
+      "onDelete": "CASCADE",
+      "nameExplicit": false,
+      "name": "fk_session_handoff_root_session_id_session_id_fk",
+      "entityType": "fks",
+      "table": "session_handoff_root"
+    },
+    {
+      "columns": [
+        "session_id",
+        "queue_id",
+        "user_message_id"
+      ],
+      "tableTo": "session_handoff_action",
+      "columnsTo": [
+        "session_id",
+        "queue_id",
+        "user_message_id"
+      ],
+      "onUpdate": "NO ACTION",
+      "onDelete": "NO ACTION",
+      "nameExplicit": false,
+      "name": "fk_session_handoff_assistant_session_id_queue_id_user_message_id_session_handoff_action_session_id_queue_id_user_message_id_fk",
+      "entityType": "fks",
+      "table": "session_handoff_assistant"
+    },
+    {
+      "columns": [
+        "request_id"
+      ],
+      "tableTo": "session_handoff_request",
+      "columnsTo": [
+        "request_id"
+      ],
+      "onUpdate": "NO ACTION",
+      "onDelete": "NO ACTION",
+      "nameExplicit": false,
+      "name": "fk_session_handoff_boundary_request_id_session_handoff_request_request_id_fk",
+      "entityType": "fks",
+      "table": "session_handoff_boundary"
+    },
+    {
+      "columns": [
+        "session_id",
+        "queue_id",
+        "user_message_id"
+      ],
+      "tableTo": "session_handoff_action",
+      "columnsTo": [
+        "session_id",
+        "queue_id",
+        "user_message_id"
+      ],
+      "onUpdate": "NO ACTION",
+      "onDelete": "NO ACTION",
+      "nameExplicit": false,
+      "name": "fk_session_handoff_boundary_session_id_queue_id_user_message_id_session_handoff_action_session_id_queue_id_user_message_id_fk",
+      "entityType": "fks",
+      "table": "session_handoff_boundary"
+    },
+    {
+      "columns": [
+        "request_id"
+      ],
+      "tableTo": "session_handoff_request",
+      "columnsTo": [
+        "request_id"
+      ],
+      "onUpdate": "NO ACTION",
+      "onDelete": "NO ACTION",
+      "nameExplicit": false,
+      "name": "fk_session_handoff_receipt_request_id_session_handoff_request_request_id_fk",
+      "entityType": "fks",
+      "table": "session_handoff_receipt"
+    },
+    {
+      "columns": [
+        "session_id",
+        "queue_id",
+        "user_message_id"
+      ],
+      "tableTo": "session_handoff_action",
+      "columnsTo": [
+        "session_id",
+        "queue_id",
+        "user_message_id"
+      ],
+      "onUpdate": "NO ACTION",
+      "onDelete": "NO ACTION",
+      "nameExplicit": false,
+      "name": "fk_session_handoff_request_session_id_queue_id_user_message_id_session_handoff_action_session_id_queue_id_user_message_id_fk",
+      "entityType": "fks",
+      "table": "session_handoff_request"
+    },
+    {
+      "columns": [
+        "session_id"
+      ],
+      "tableTo": "session",
+      "columnsTo": [
+        "id"
+      ],
+      "onUpdate": "NO ACTION",
+      "onDelete": "CASCADE",
+      "nameExplicit": false,
       "name": "fk_session_queue_import_session_id_session_id_fk",
       "entityType": "fks",
       "table": "session_queue_import"
@@ -2888,6 +4098,93 @@
     },
     {
       "columns": [
+        "session_id",
+        "queue_id",
+        "user_message_id"
+      ],
+      "nameExplicit": false,
+      "name": "session_handoff_control_pk",
+      "entityType": "pks",
+      "table": "session_handoff_control"
+    },
+    {
+      "columns": [
+        "session_id",
+        "recovery_request_id"
+      ],
+      "nameExplicit": false,
+      "name": "session_handoff_recovery_queue_block_pk",
+      "entityType": "pks",
+      "table": "session_handoff_recovery_queue_block"
+    },
+    {
+      "columns": [
+        "session_id",
+        "queue_id",
+        "user_message_id",
+        "revision"
+      ],
+      "nameExplicit": false,
+      "name": "session_handoff_recovery_history_pk",
+      "entityType": "pks",
+      "table": "session_handoff_recovery_history"
+    },
+    {
+      "columns": [
+        "root_session_id",
+        "reservation",
+        "session_id"
+      ],
+      "nameExplicit": false,
+      "name": "session_handoff_recovery_hold_pk",
+      "entityType": "pks",
+      "table": "session_handoff_recovery_hold"
+    },
+    {
+      "columns": [
+        "session_id",
+        "reservation"
+      ],
+      "nameExplicit": false,
+      "name": "session_handoff_root_pk",
+      "entityType": "pks",
+      "table": "session_handoff_root"
+    },
+    {
+      "columns": [
+        "session_id",
+        "queue_id",
+        "user_message_id"
+      ],
+      "nameExplicit": false,
+      "name": "session_handoff_action_pk",
+      "entityType": "pks",
+      "table": "session_handoff_action"
+    },
+    {
+      "columns": [
+        "session_id",
+        "queue_id",
+        "user_message_id",
+        "sequence"
+      ],
+      "nameExplicit": false,
+      "name": "session_handoff_boundary_pk",
+      "entityType": "pks",
+      "table": "session_handoff_boundary"
+    },
+    {
+      "columns": [
+        "request_id",
+        "revision"
+      ],
+      "nameExplicit": false,
+      "name": "session_handoff_receipt_pk",
+      "entityType": "pks",
+      "table": "session_handoff_receipt"
+    },
+    {
+      "columns": [
         "email",
         "url"
       ],
@@ -3004,6 +4301,69 @@
       "nameExplicit": false,
       "name": "runtime_retirement_pk",
       "table": "runtime_retirement",
+      "entityType": "pks"
+    },
+    {
+      "columns": [
+        "position"
+      ],
+      "nameExplicit": false,
+      "name": "session_handoff_attempt_pk",
+      "table": "session_handoff_attempt",
+      "entityType": "pks"
+    },
+    {
+      "columns": [
+        "message_id"
+      ],
+      "nameExplicit": false,
+      "name": "session_handoff_compaction_pk",
+      "table": "session_handoff_compaction",
+      "entityType": "pks"
+    },
+    {
+      "columns": [
+        "identity"
+      ],
+      "nameExplicit": false,
+      "name": "session_handoff_context_pk",
+      "table": "session_handoff_context",
+      "entityType": "pks"
+    },
+    {
+      "columns": [
+        "message_id"
+      ],
+      "nameExplicit": false,
+      "name": "session_handoff_notification_pk",
+      "table": "session_handoff_notification",
+      "entityType": "pks"
+    },
+    {
+      "columns": [
+        "session_id"
+      ],
+      "nameExplicit": false,
+      "name": "session_handoff_recovery_child_pk",
+      "table": "session_handoff_recovery_child",
+      "entityType": "pks"
+    },
+    {
+      "columns": [
+        "position"
+      ],
+      "nameExplicit": false,
+      "name": "session_handoff_assistant_pk",
+      "table": "session_handoff_assistant",
+      "entityType": "pks"
+    },
+    {
+      "columns": [
+        "request_id"
+      ],
+      "nameExplicit": false,
+      "name": "session_handoff_request_pk",
+      "table": "session_handoff_request",
       "entityType": "pks"
     },
     {
@@ -3300,6 +4660,108 @@
       "name": "runtime_retirement_root_idx",
       "entityType": "indexes",
       "table": "runtime_retirement"
+    },
+    {
+      "columns": [
+        {
+          "value": "message_id",
+          "isExpression": false
+        }
+      ],
+      "isUnique": true,
+      "where": null,
+      "origin": "manual",
+      "name": "session_handoff_attempt_message_idx",
+      "entityType": "indexes",
+      "table": "session_handoff_attempt"
+    },
+    {
+      "columns": [
+        {
+          "value": "session_id",
+          "isExpression": false
+        },
+        {
+          "value": "reservation",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "origin": "manual",
+      "name": "session_handoff_notification_action_idx",
+      "entityType": "indexes",
+      "table": "session_handoff_notification"
+    },
+    {
+      "columns": [
+        {
+          "value": "session_id",
+          "isExpression": false
+        }
+      ],
+      "isUnique": true,
+      "where": "\"session_handoff_recovery_queue_block\".\"state\"='owned'",
+      "origin": "manual",
+      "name": "session_handoff_recovery_queue_owned_idx",
+      "entityType": "indexes",
+      "table": "session_handoff_recovery_queue_block"
+    },
+    {
+      "columns": [
+        {
+          "value": "session_id",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "origin": "manual",
+      "name": "session_handoff_recovery_hold_session_idx",
+      "entityType": "indexes",
+      "table": "session_handoff_recovery_hold"
+    },
+    {
+      "columns": [
+        {
+          "value": "session_id",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "origin": "manual",
+      "name": "session_handoff_root_session_idx",
+      "entityType": "indexes",
+      "table": "session_handoff_root"
+    },
+    {
+      "columns": [
+        {
+          "value": "message_id",
+          "isExpression": false
+        }
+      ],
+      "isUnique": true,
+      "where": null,
+      "origin": "manual",
+      "name": "session_handoff_assistant_message_idx",
+      "entityType": "indexes",
+      "table": "session_handoff_assistant"
+    },
+    {
+      "columns": [
+        {
+          "value": "request_id",
+          "isExpression": false
+        }
+      ],
+      "isUnique": true,
+      "where": null,
+      "origin": "manual",
+      "name": "session_handoff_boundary_request_idx",
+      "entityType": "indexes",
+      "table": "session_handoff_boundary"
     },
     {
       "columns": [

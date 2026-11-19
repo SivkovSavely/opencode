@@ -12,7 +12,12 @@ import { Plugin } from "@/plugin"
 import { Config } from "@/config/config"
 import { NotFoundError } from "@/storage/storage"
 
-import { Effect, Layer, Context, Schema } from "effect"
+import { Effect, Layer, Context, Schema, Option } from "effect"
+import { Database } from "@opencode-ai/core/database/database"
+import { SessionHandoffControl } from "@opencode-ai/core/session/handoff-control"
+import { SessionHandoffRecoveryQueue } from "@opencode-ai/core/session/handoff-recovery-queue"
+import { SessionHandoffEnrollment } from "@opencode-ai/core/session/handoff-enrollment"
+import { SessionHandoffNotification } from "@opencode-ai/core/session/handoff-notification"
 import { InstanceState } from "@/effect/instance-state"
 import { isOverflow as overflow, usable } from "./overflow"
 import { serviceUse } from "@opencode-ai/core/effect/service-use"
@@ -182,6 +187,7 @@ export interface Interface {
     format?: SessionV1.User["format"]
     auto: boolean
     overflow?: boolean
+    sourceUserMessageID?: MessageID
   }) => Effect.Effect<void>
 }
 
@@ -200,6 +206,7 @@ const layer = Layer.effect(
     const provider = yield* Provider.Service
     const events = yield* EventV2Bridge.Service
     const flags = yield* RuntimeFlags.Service
+    const database = yield* Database.Service
 
     const isOverflow = Effect.fn("SessionCompaction.isOverflow")(function* (input: {
       tokens: SessionV1.Assistant["tokens"]
@@ -329,6 +336,10 @@ const layer = Layer.effect(
         throw new Error(`Compaction parent must be a user message: ${input.parentID}`)
       }
       const userMessage = parent.info
+      const ctx = yield* InstanceState.context
+      const action = input.auto
+        ? yield* SessionHandoffNotification.context(database, input.sessionID, input.parentID).pipe(Effect.orDie)
+        : undefined
       const compactionPart = parent.parts.find((part): part is SessionV1.CompactionPart => part.type === "compaction")
 
       let messages = input.messages
@@ -357,9 +368,19 @@ const layer = Layer.effect(
       }
 
       const agent = yield* agents.get("compaction")
+      const fallback = action?.selection ?? userMessage.model
       const model = agent.model
         ? yield* provider.getModel(agent.model.providerID, agent.model.modelID).pipe(Effect.orDie)
-        : yield* provider.getModel(userMessage.model.providerID, userMessage.model.modelID).pipe(Effect.orDie)
+        : yield* provider
+            .getModel(ProviderV2.ID.make(fallback.providerID), ModelV2.ID.make(fallback.modelID))
+            .pipe(Effect.orDie)
+      const variant = agent.model ? (agent.variant ?? "default") : (fallback.variant ?? "default")
+      if (action && variant !== "default" && !model.variants?.[variant])
+        throw new Error("unsupported_variant: compaction selection is unavailable")
+      const configuredSelection = agent.model
+        ? { providerID: agent.model.providerID, modelID: agent.model.modelID, variant: agent.variant ?? "default" }
+        : null
+      const dispatchSelection = { providerID: model.providerID, modelID: model.id, variant }
       const cfg = yield* config.get()
       const history = compactionPart && messages.at(-1)?.info.id === input.parentID ? messages.slice(0, -1) : messages
       const prior = completedCompactions(history)
@@ -390,7 +411,6 @@ const layer = Layer.effect(
         ]
           .filter(Boolean)
           .join("\n\n")
-      const ctx = yield* InstanceState.context
       const msg: SessionV1.Assistant = {
         id: MessageID.ascending(),
         role: "assistant",
@@ -398,7 +418,7 @@ const layer = Layer.effect(
         sessionID: input.sessionID,
         mode: "compaction",
         agent: "compaction",
-        variant: userMessage.model.variant,
+        variant: action ? (variant === "default" ? undefined : variant) : userMessage.model.variant,
         summary: true,
         path: {
           cwd: ctx.directory,
@@ -418,13 +438,61 @@ const layer = Layer.effect(
         },
       }
       yield* session.updateMessage(msg)
+      if (action)
+        yield* database.db
+          .transaction(
+            () =>
+              SessionHandoffControl.summary(
+                database,
+                input.sessionID,
+                msg.id,
+                input.parentID,
+                configuredSelection,
+                dispatchSelection,
+                false,
+              ),
+            { behavior: "immediate" },
+          )
+          .pipe(Effect.orDie)
       const processor = yield* processors.create({
         assistantMessage: msg,
         sessionID: input.sessionID,
         model,
       })
       const result = yield* processor.process({
-        user: userMessage,
+        user: action
+          ? {
+              ...userMessage,
+              model: {
+                providerID: model.providerID,
+                modelID: model.id,
+                variant: variant === "default" ? undefined : variant,
+              },
+            }
+          : userMessage,
+        ...(action?.enrolled
+          ? {
+              expectedSelection: dispatchSelection,
+              onDispatch: () =>
+                database.db
+                  .transaction(
+                    () =>
+                      SessionHandoffControl.summary(
+                        database,
+                        input.sessionID,
+                        msg.id,
+                        input.parentID,
+                        configuredSelection,
+                        dispatchSelection,
+                        true,
+                      ),
+                    { behavior: "immediate" },
+                  )
+                  .pipe(Effect.orDie),
+              onUnsupportedDispatch: () =>
+                SessionHandoffControl.unsupportedDispatch(database, action).pipe(Effect.orDie),
+            }
+          : {}),
         agent,
         sessionID: input.sessionID,
         tools: {},
@@ -468,40 +536,58 @@ const layer = Layer.effect(
 
       if (result === "continue" && input.auto) {
         if (replay) {
-          const original = replay.info
-          const replayMsg = yield* session.updateMessage({
-            id: MessageID.ascending(),
-            role: "user",
-            sessionID: input.sessionID,
-            time: { created: Date.now() },
-            agent: original.agent,
-            model: original.model,
-            format: original.format ? Schema.decodeUnknownSync(SessionV1.Format)(original.format) : undefined,
-            tools: original.tools,
-            system: original.system,
-          })
-          for (const part of replay.parts) {
-            if (part.type === "compaction") continue
-            const replayPart =
-              part.type === "file" && MessageV2.isMedia(part.mime)
-                ? { type: "text" as const, text: `[Attached ${part.mime}: ${part.filename ?? "file"}]` }
-                : part
-            yield* session.updatePart({
-              ...replayPart,
-              id: PartID.ascending(),
-              messageID: replayMsg.id,
-              sessionID: input.sessionID,
-            })
-          }
-          yield* session.updatePart({
-            id: PartID.ascending(),
-            messageID: replayMsg.id,
-            sessionID: input.sessionID,
-            type: "text",
-            synthetic: true,
-            metadata: { compaction_continue: true },
-            text: "Continue the same request after context compaction.",
-          })
+          yield* database.db
+            .transaction(
+              () =>
+                Effect.gen(function* () {
+                  const original = replay.info
+                  const replayID = MessageID.ascending()
+                  yield* SessionHandoffRecoveryQueue.preauthorizeCompaction(database, input.sessionID, replayID)
+                  const replayMsg = yield* session.updateMessage({
+                    id: replayID,
+                    role: "user",
+                    sessionID: input.sessionID,
+                    time: { created: Date.now() },
+                    agent: original.agent,
+                    model: original.model,
+                    format: original.format ? Schema.decodeUnknownSync(SessionV1.Format)(original.format) : undefined,
+                    tools: original.tools,
+                    system: original.system,
+                  })
+                  for (const part of replay.parts) {
+                    if (part.type === "compaction") continue
+                    const replayPart =
+                      part.type === "file" && MessageV2.isMedia(part.mime)
+                        ? { type: "text" as const, text: `[Attached ${part.mime}: ${part.filename ?? "file"}]` }
+                        : part
+                    yield* session.updatePart({
+                      ...replayPart,
+                      id: PartID.ascending(),
+                      messageID: replayMsg.id,
+                      sessionID: input.sessionID,
+                    })
+                  }
+                  yield* session.updatePart({
+                    id: PartID.ascending(),
+                    messageID: replayMsg.id,
+                    sessionID: input.sessionID,
+                    type: "text",
+                    synthetic: true,
+                    metadata: { compaction_continue: true },
+                    text: "Continue the same request after context compaction.",
+                  })
+                  if (action)
+                    yield* SessionHandoffControl.compaction(
+                      database,
+                      input.sessionID,
+                      input.parentID,
+                      replayMsg.id,
+                      "continuation",
+                    )
+                }),
+              { behavior: "immediate" },
+            )
+            .pipe(Effect.orDie)
         }
 
         if (!replay) {
@@ -526,36 +612,56 @@ const layer = Layer.effect(
               { enabled: true },
             )).enabled
           ) {
-            const continueMsg = yield* session.updateMessage({
-              id: MessageID.ascending(),
-              role: "user",
-              sessionID: input.sessionID,
-              time: { created: Date.now() },
-              agent: userMessage.agent,
-              model: userMessage.model,
-              format: userMessage.format ? Schema.decodeUnknownSync(SessionV1.Format)(userMessage.format) : undefined,
-            })
-            const text =
-              (input.overflow
-                ? "The previous request exceeded the provider's size limit due to large media attachments. The conversation was compacted and media files were removed from context. If the user was asking about attached images or files, explain that the attachments were too large to process and suggest they try again with smaller or fewer files.\n\n"
-                : "") +
-              "Continue if you have next steps, or stop and ask for clarification if you are unsure how to proceed."
-            yield* session.updatePart({
-              id: PartID.ascending(),
-              messageID: continueMsg.id,
-              sessionID: input.sessionID,
-              type: "text",
-              // Internal marker for auto-compaction followups so provider plugins
-              // can distinguish them from manual post-compaction user prompts.
-              // This is not a stable plugin contract and may change or disappear.
-              metadata: { compaction_continue: true },
-              synthetic: true,
-              text,
-              time: {
-                start: Date.now(),
-                end: Date.now(),
-              },
-            })
+            yield* database.db
+              .transaction(
+                () =>
+                  Effect.gen(function* () {
+                    const continuationID = MessageID.ascending()
+                    yield* SessionHandoffRecoveryQueue.preauthorizeCompaction(database, input.sessionID, continuationID)
+                    const continueMsg = yield* session.updateMessage({
+                      id: continuationID,
+                      role: "user",
+                      sessionID: input.sessionID,
+                      time: { created: Date.now() },
+                      agent: userMessage.agent,
+                      model: userMessage.model,
+                      format: userMessage.format
+                        ? Schema.decodeUnknownSync(SessionV1.Format)(userMessage.format)
+                        : undefined,
+                    })
+                    const text =
+                      (input.overflow
+                        ? "The previous request exceeded the provider's size limit due to large media attachments. The conversation was compacted and media files were removed from context. If the user was asking about attached images or files, explain that the attachments were too large to process and suggest they try again with smaller or fewer files.\n\n"
+                        : "") +
+                      "Continue if you have next steps, or stop and ask for clarification if you are unsure how to proceed."
+                    yield* session.updatePart({
+                      id: PartID.ascending(),
+                      messageID: continueMsg.id,
+                      sessionID: input.sessionID,
+                      type: "text",
+                      // Internal marker for auto-compaction followups so provider plugins
+                      // can distinguish them from manual post-compaction user prompts.
+                      // This is not a stable plugin contract and may change or disappear.
+                      metadata: { compaction_continue: true },
+                      synthetic: true,
+                      text,
+                      time: {
+                        start: Date.now(),
+                        end: Date.now(),
+                      },
+                    })
+                    if (action)
+                      yield* SessionHandoffControl.compaction(
+                        database,
+                        input.sessionID,
+                        input.parentID,
+                        continueMsg.id,
+                        "continuation",
+                      )
+                  }),
+                { behavior: "immediate" },
+              )
+              .pipe(Effect.orDie)
           }
         }
       }
@@ -574,24 +680,57 @@ const layer = Layer.effect(
       format?: SessionV1.User["format"]
       auto: boolean
       overflow?: boolean
+      sourceUserMessageID?: MessageID
     }) {
-      const msg = yield* session.updateMessage({
-        id: MessageID.ascending(),
-        role: "user",
-        model: input.model,
-        format: input.format ? Schema.decodeUnknownSync(SessionV1.Format)(input.format) : undefined,
-        sessionID: input.sessionID,
-        agent: input.agent,
-        time: { created: Date.now() },
-      })
-      yield* session.updatePart({
-        id: PartID.ascending(),
-        messageID: msg.id,
-        sessionID: msg.sessionID,
-        type: "compaction",
-        auto: input.auto,
-        overflow: input.overflow,
-      })
+      yield* database.db
+        .transaction(
+          () =>
+            Effect.gen(function* () {
+              const persisted = input.sourceUserMessageID
+                ? yield* session.findMessage(
+                    input.sessionID,
+                    (message) => message.info.id === input.sourceUserMessageID,
+                  )
+                : undefined
+              const source =
+                persisted && Option.isSome(persisted) && persisted.value.info.role === "user"
+                  ? persisted.value.info
+                  : undefined
+              if (!input.auto) yield* SessionHandoffEnrollment.close(database, input.sessionID, "competing")
+              const messageID = MessageID.ascending()
+              if (input.auto)
+                yield* SessionHandoffRecoveryQueue.preauthorizeCompaction(database, input.sessionID, messageID)
+              const msg = yield* session.updateMessage({
+                id: messageID,
+                role: "user",
+                model: source?.model ?? input.model,
+                format:
+                  source?.format ??
+                  (input.format ? Schema.decodeUnknownSync(SessionV1.Format)(input.format) : undefined),
+                sessionID: input.sessionID,
+                agent: source?.agent ?? input.agent,
+                time: { created: Date.now() },
+              })
+              yield* session.updatePart({
+                id: PartID.ascending(),
+                messageID: msg.id,
+                sessionID: msg.sessionID,
+                type: "compaction",
+                auto: input.auto,
+                overflow: input.overflow,
+              })
+              if (input.auto && input.sourceUserMessageID)
+                yield* SessionHandoffControl.compaction(
+                  database,
+                  input.sessionID,
+                  input.sourceUserMessageID,
+                  msg.id,
+                  "request",
+                )
+            }),
+          { behavior: "immediate" },
+        )
+        .pipe(Effect.orDie)
     })
 
     return Service.of({
@@ -615,6 +754,7 @@ export const node = LayerNode.make({
     Provider.node,
     EventV2Bridge.node,
     RuntimeFlags.node,
+    Database.node,
   ],
 })
 

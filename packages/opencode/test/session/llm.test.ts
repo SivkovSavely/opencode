@@ -28,6 +28,16 @@ import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { LayerNodePlatform } from "@opencode-ai/core/effect/app-node-platform"
 import { ProviderError } from "@/provider/error"
+import { Plugin } from "@/plugin"
+import { isRecord } from "@/util/record"
+import { Auth } from "@/auth"
+import { Env } from "@/env"
+import { CodexAuthPlugin } from "@/plugin/openai/codex"
+import { createCodexServer } from "../lib/codex-server"
+import { SessionProcessor } from "@/session/processor"
+import { DispatchTransport } from "@/provider/dispatch-transport"
+import { LLMDispatchGuard } from "@/session/llm/dispatch-guard"
+import WebSocket from "ws"
 
 type ConfigModel = NonNullable<NonNullable<ConfigV1.Info["provider"]>[string]["models"]>[string]
 
@@ -753,6 +763,920 @@ function createEventResponse(chunks: unknown[], includeDone = false) {
 }
 
 describe("session.llm.stream", () => {
+  for (const scenario of [
+    "responses-sol-xhigh",
+    "responses-leaf-rejection",
+    "responses-sol-max",
+    "responses-terra-xhigh",
+    "responses-terra-max",
+    "responses-default",
+    "responses-default-medium",
+    "responses-max-alias",
+    "responses-plugin-auth",
+    "responses-plugin-effort",
+    "responses-plugin-wire-model",
+    "responses-plugin-nested-reasoning",
+    "responses-plugin-reasoning-mode",
+    "responses-plugin-unknown",
+    "responses-plugin-effort-getter",
+    "responses-plugin-mapping",
+    "responses-cached-fetch",
+    "responses-oauth",
+    "responses-oauth-refresh",
+    "responses-oauth-default",
+    "responses-oauth-max-alias",
+    "responses-oauth-plugin-effort",
+    "responses-oauth-callback-failure",
+    "responses-oauth-processor-rejection",
+    "responses-oauth-leaf-rejection",
+    "responses-websocket",
+    "responses-websocket-refresh",
+    "responses-websocket-reconnect-continuation",
+    "responses-websocket-terra-max",
+    "responses-websocket-default",
+    "responses-websocket-plugin-effort",
+    "responses-websocket-callback-failure",
+    "responses-websocket-processor-rejection",
+    "responses-websocket-leaf-rejection",
+    "responses-api-websocket",
+    "responses-native",
+    "responses-callback-failure",
+    "responses-callback-mutation",
+    "chat-xhigh",
+    "chat-max",
+    "chat-default",
+  ] as const) {
+    testEffect(
+      AppNodeBuilder.build(
+        LayerNode.group([
+          LLM.node,
+          Provider.node,
+          Plugin.node,
+          Auth.node,
+          Env.node,
+          ...(scenario.endsWith("processor-rejection") ? [SessionProcessor.node, SessionNs.node] : []),
+        ]),
+        [
+          [
+            RuntimeFlags.node,
+            RuntimeFlags.layer({
+              experimentalNativeLlm: scenario === "responses-native",
+              experimentalWebSockets: scenario.includes("websocket"),
+            }),
+          ],
+        ],
+      ),
+    ).instance(
+      `native OpenAI dispatch ${scenario}`,
+      () =>
+        Effect.gen(function* () {
+          const chat = scenario.startsWith("chat-")
+          const oauth =
+            scenario.includes("oauth") || (scenario.includes("websocket") && scenario !== "responses-api-websocket")
+          const websocket = scenario.includes("websocket")
+          const providerID = ProviderV2.ID.make(chat ? "github-copilot" : "openai")
+          const modelID = ModelV2.ID.make(
+            chat ? "gpt-5-mini" : scenario.includes("-terra-") ? "gpt-6.1-terra" : "gpt-6.1-sol",
+          )
+          const variant = scenario.includes("default")
+            ? "default"
+            : scenario.endsWith("-max") || scenario.endsWith("-max-alias")
+              ? "max"
+              : "xhigh"
+          const auth = yield* Auth.Service
+          const env = yield* Env.Service
+          yield* env.set("DISPATCH_R2_TOKEN", "synthetic-key-r2")
+          const previous = yield* auth.get(providerID)
+          yield* Effect.addFinalizer(() =>
+            (previous ? auth.set(providerID, previous) : auth.remove(providerID)).pipe(Effect.orDie),
+          )
+          const codex =
+            oauth || websocket
+              ? yield* Effect.promise(() => createCodexServer(`http://127.0.0.1:${state.server!.port}`))
+              : undefined
+          if (codex) {
+            yield* Effect.addFinalizer(() => Effect.promise(() => codex.close()))
+            const plugin = yield* Plugin.Service
+            const hooks = yield* plugin.list()
+            const builtin = yield* Effect.promise(() =>
+              CodexAuthPlugin({} as never, {
+                issuer: codex.issuer,
+                codexApiEndpoint: codex.endpoint,
+                experimentalWebSockets: websocket,
+              }),
+            )
+            const index = hooks.findIndex((hook) => hook.auth?.provider === "openai")
+            expect(index).toBeGreaterThanOrEqual(0)
+            hooks.splice(index, 1, builtin)
+            yield* Effect.addFinalizer(() =>
+              Effect.promise(async () => {
+                await builtin.dispose?.()
+              }),
+            )
+          }
+          if (oauth)
+            yield* auth.set(providerID, {
+              type: "oauth",
+              access: "synthetic-access",
+              refresh: "synthetic-refresh",
+              expires: scenario.includes("refresh") ? 0 : Date.now() + 3_600_000,
+            })
+          if (scenario === "responses-api-websocket")
+            yield* auth.set(providerID, { type: "api", key: "synthetic-stored-key" })
+          const model = yield* Provider.use.getModel(providerID, modelID)
+          if (scenario.endsWith("default-medium")) model.options.reasoningEffort = "medium"
+          if (scenario.endsWith("-max-alias") && model.variants?.max) model.variants.max.reasoningEffort = "xhigh"
+          const provider = yield* Provider.use.getProvider(providerID)
+          if (oauth || websocket) expect(typeof provider.options.fetch).toBe("function")
+          if (scenario === "responses-api-websocket" && codex)
+            provider.options.baseURL = `${codex.issuer}/backend-api/codex`
+          if (scenario === "responses-cached-fetch") {
+            provider.options.fetch = (url: RequestInfo | URL, init?: RequestInit) =>
+              fetch(url, {
+                ...init,
+                body: JSON.stringify({
+                  ...JSON.parse(String(init?.body)),
+                  model: "other-model",
+                  reasoning: { effort: "low" },
+                }),
+              })
+            yield* Provider.use.getLanguage(model)
+            delete provider.options.fetch
+          }
+          const plugin = yield* Plugin.Service
+          const hooks = yield* plugin.list()
+          const options: { value?: Record<string, unknown> } = {}
+          hooks.push({
+            "chat.params": async (_input, output) => {
+              options.value = output.options
+              if (scenario.endsWith("-plugin-effort")) output.options.reasoningEffort = "low"
+              if (scenario === "responses-plugin-wire-model") output.options.model = "other-model"
+              if (scenario === "responses-plugin-nested-reasoning") output.options.reasoning = { effort: "low" }
+              if (scenario === "responses-plugin-reasoning-mode") output.options.reasoningMode = "pro"
+              if (scenario === "responses-plugin-unknown") output.options.unproved = "never-disclose-r2-secret"
+              if (scenario === "responses-plugin-mapping" && model.variants?.xhigh) {
+                model.variants.xhigh.reasoningEffort = "low"
+                output.options.reasoningEffort = "low"
+              }
+              if (scenario === "responses-plugin-effort-getter") {
+                let reads = 0
+                Object.defineProperty(output.options, "reasoningEffort", {
+                  enumerable: true,
+                  get: () => (++reads === 1 ? "xhigh" : "low"),
+                })
+              }
+            },
+            "chat.headers": async (_input, output) => {
+              output.headers["x-dispatch-r2"] = "retained"
+              if (scenario === "responses-plugin-auth") output.headers.Authorization = "Bearer synthetic-plugin-key"
+            },
+          })
+          const request = waitRequest(
+            chat ? "/chat/completions" : "/responses",
+            chat
+              ? createEventResponse(
+                  [
+                    {
+                      id: "chat-r2",
+                      object: "chat.completion.chunk",
+                      choices: [{ index: 0, delta: { role: "assistant", content: "ok" }, finish_reason: null }],
+                    },
+                    {
+                      id: "chat-r2",
+                      object: "chat.completion.chunk",
+                      choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+                    },
+                  ],
+                  true,
+                )
+              : createEventResponse(
+                  [
+                    {
+                      type: "response.created",
+                      response: { id: "resp-guard-r2", created_at: 1, model: modelID, service_tier: null },
+                    },
+                    {
+                      type: "response.completed",
+                      response: {
+                        incomplete_details: null,
+                        usage: {
+                          input_tokens: 1,
+                          input_tokens_details: null,
+                          output_tokens: 1,
+                          output_tokens_details: null,
+                        },
+                        service_tier: null,
+                      },
+                    },
+                  ],
+                  true,
+                ),
+          )
+          const dispatched: LLM.DispatchSelection[] = []
+          const failure = new ProviderError.ResponseStreamError("synthetic persistence failure")
+          const sessionID = scenario.endsWith("processor-rejection")
+            ? (yield* SessionNs.use.create({})).id
+            : SessionID.make("session-dispatch-r2")
+          const agent = { name: "test", mode: "primary", options: {}, permission: [] } satisfies Agent.Info
+          const input: LLM.StreamInput = {
+            sessionID,
+            model,
+            agent,
+            system: [],
+            messages: [{ role: "user", content: "hello" }],
+            tools: {},
+            user: {
+              id: MessageID.make("msg-dispatch-r2"),
+              sessionID,
+              role: "user",
+              time: { created: 1 },
+              agent: agent.name,
+              model: { providerID, modelID, ...(variant === "default" ? {} : { variant }) },
+            },
+            expectedSelection: { providerID, modelID, variant },
+            onDispatch: (selection) =>
+              Effect.gen(function* () {
+                expect(state.queue).toHaveLength(1)
+                expect(Object.isFrozen(selection)).toBe(true)
+                dispatched.push(selection)
+                yield* Effect.yieldNow
+                expect(state.queue).toHaveLength(1)
+                if (scenario.endsWith("-callback-failure")) return yield* Effect.fail(failure)
+                if (scenario.endsWith("processor-rejection")) return yield* new DispatchTransport.UnsupportedDispatch()
+                if (scenario === "responses-callback-mutation") {
+                  if (!options.value) throw new Error("Missing plugin options")
+                  options.value.reasoningEffort = "low"
+                  model.api.id = "other-model"
+                }
+              }),
+          }
+          if (scenario.endsWith("leaf-rejection")) {
+            const language = yield* Provider.use.getLanguage(model)
+            const guard = yield* Effect.promise(() =>
+              LLMDispatchGuard.prepare(model, language, { providerID, modelID, variant }, provider),
+            )
+            const unsupported: unknown[] = []
+            const attempt = guard.attempt(
+              { openai: { reasoningEffort: "xhigh", forceReasoning: true } },
+              async () => {
+                dispatched.push(guard.selection)
+              },
+              (error) => {
+                unsupported.push(error)
+              },
+            )
+            const fetch: unknown = Reflect.get(Reflect.get(attempt.model, "config"), "fetch")
+            if (typeof fetch !== "function") throw new Error("Private adapter fetch was not found")
+            const rejected = yield* Effect.exit(
+              Effect.tryPromise({
+                try: () =>
+                  fetch(`${state.server!.url.origin}/v1/responses`, {
+                    method: "POST",
+                    headers: { "session-id": sessionID, authorization: "never-disclose-final-header" },
+                    body: JSON.stringify({
+                      stream: true,
+                      model: "wrong-model",
+                      reasoning: { effort: "low" },
+                      sentinel: "never-disclose-final-body",
+                    }),
+                  }),
+                catch: (error) => error,
+              }),
+            )
+            expect(Exit.isFailure(rejected)).toBe(true)
+            if (Exit.isFailure(rejected)) {
+              expect(Cause.squash(rejected.cause)).toMatchObject({ _tag: "UnsupportedDispatch" })
+              expect(Cause.pretty(rejected.cause)).not.toContain("never-disclose-final")
+            }
+            expect(unsupported.length).toBeGreaterThan(0)
+            expect(dispatched).toHaveLength(0)
+            expect(state.queue).toHaveLength(1)
+            if (codex) expect(codex.frames).toHaveLength(0)
+            return
+          }
+          if (scenario.endsWith("processor-rejection")) {
+            const session = yield* SessionNs.Service
+            const context = yield* InstanceRef
+            if (!context) throw new Error("Instance was not provided")
+            yield* session.updateMessage(input.user)
+            const assistant = yield* session.updateMessage({
+              id: MessageID.ascending(),
+              role: "assistant",
+              sessionID,
+              parentID: input.user.id,
+              providerID,
+              modelID,
+              agent: "build",
+              mode: "build",
+              path: { cwd: context.directory, root: context.directory },
+              cost: 0,
+              tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+              time: { created: Date.now() },
+            } satisfies SessionV1.Assistant)
+            const processor = yield* SessionProcessor.Service
+            const handle = yield* processor.create({ assistantMessage: assistant, sessionID, model })
+            const unsupported: boolean[] = []
+            const result = yield* handle.process({
+              ...input,
+              onUnsupportedDispatch: () =>
+                Effect.sync(() => {
+                  unsupported.push(true)
+                }),
+            })
+            expect(result).toBe("stop")
+            expect(unsupported).toHaveLength(1)
+            expect(dispatched).toHaveLength(1)
+            expect(state.queue).toHaveLength(1)
+            expect(codex?.frames).toHaveLength(0)
+            return
+          }
+          const exit = yield* Effect.exit(drain(input))
+          const valid =
+            scenario.startsWith("chat-") ||
+            ((oauth || websocket) && !scenario.endsWith("-plugin-effort") && !scenario.endsWith("-callback-failure")) ||
+            [
+              "responses-sol-xhigh",
+              "responses-sol-max",
+              "responses-terra-xhigh",
+              "responses-terra-max",
+              "responses-default",
+              "responses-default-medium",
+              "responses-max-alias",
+              "responses-plugin-auth",
+              "responses-plugin-effort-getter",
+              "responses-callback-mutation",
+              "responses-oauth",
+            ].includes(scenario)
+          if (!valid) {
+            expect(Exit.isFailure(exit)).toBe(true)
+            expect(state.queue).toHaveLength(1)
+            expect(dispatched).toHaveLength(scenario.endsWith("-callback-failure") ? 1 : 0)
+            if (codex) expect(codex.frames).toHaveLength(0)
+            if (Exit.isFailure(exit)) {
+              if (scenario.endsWith("-callback-failure")) expect(Cause.squash(exit.cause)).toBe(failure)
+              if (!scenario.endsWith("-callback-failure"))
+                expect(Cause.squash(exit.cause)).toMatchObject({ _tag: "UnsupportedDispatch" })
+              expect(Cause.pretty(exit.cause)).not.toContain("never-disclose-r2-secret")
+            }
+            return
+          }
+          if (Exit.isFailure(exit)) return yield* Effect.failCause(exit.cause)
+          const capture = yield* Effect.promise(() => request)
+          const effort =
+            variant === "default"
+              ? scenario === "responses-default-medium" || chat
+                ? "medium"
+                : undefined
+              : scenario.endsWith("-max-alias")
+                ? "xhigh"
+                : variant
+          expect(capture.body.model).toBe(modelID)
+          if (chat) expect(capture.body.reasoning_effort).toBe(effort)
+          if (!chat && effort === undefined) expect(capture.body.reasoning).toBeUndefined()
+          if (!chat && effort !== undefined) expect(capture.body.reasoning).toMatchObject({ effort })
+          if (codex) {
+            expect(codex.frames).toHaveLength(1)
+            expect(codex.frames[0].model).toBe(modelID)
+            expect(codex.frames[0].type).toBe(websocket ? "response.create" : undefined)
+            if (websocket) expect(codex.frames[0].stream).toBeUndefined()
+            expect(codex.refreshes()).toBe(scenario.includes("refresh") ? 1 : 0)
+            if (scenario.includes("refresh")) {
+              const refreshed = yield* auth.get(providerID)
+              expect(refreshed?.type === "oauth" && refreshed.access === "fixture-refreshed-access").toBe(true)
+            }
+          }
+          if (!codex) {
+            expect(
+              capture.headers.get("authorization") ===
+                (scenario === "responses-plugin-auth" ? "Bearer synthetic-plugin-key" : "Bearer synthetic-key-r2"),
+            ).toBe(true)
+            expect(capture.headers.get("x-dispatch-r2")).toBe("retained")
+          }
+          if (!chat) {
+            if (!codex) {
+              expect(capture.headers.get("originator")).toBe("opencode")
+              expect(capture.headers.get("session-id")).toBe(sessionID)
+            }
+            expect(capture.body.max_output_tokens).toBeUndefined()
+          }
+          expect(dispatched).toEqual([
+            {
+              providerID,
+              modelID,
+              variant,
+              apiModelID: modelID,
+              reasoningEffort: effort ?? null,
+              adapter: chat ? "openai-chat" : "openai-responses",
+              phase: "prepared",
+            },
+          ])
+          expect(JSON.stringify(dispatched)).not.toContain("synthetic-key")
+          if (variant !== "default")
+            expect(model.variants?.[variant]?.reasoningEffort).toBe(scenario.endsWith("-max-alias") ? "xhigh" : variant)
+          if (scenario === "responses-websocket-reconnect-continuation") {
+            if (!codex) throw new Error("Codex fixture was not provided")
+            const closed = Promise.withResolvers<void>()
+            const descriptor = Object.getOwnPropertyDescriptor(WebSocket.prototype, "emit")
+            const emit = WebSocket.prototype.emit
+            // Observe the real owned client close; dropConnections does not await its peer.
+            yield* Effect.acquireRelease(
+              Effect.sync(() =>
+                Object.defineProperty(WebSocket.prototype, "emit", {
+                  configurable: true,
+                  value(this: WebSocket, event: string | symbol, ...args: unknown[]) {
+                    const result = Reflect.apply(emit, this, [event, ...args])
+                    if (event === "close" && this.url === codex.endpoint.replace(/^http/, "ws")) closed.resolve()
+                    return result
+                  },
+                }),
+              ),
+              () =>
+                Effect.sync(() => {
+                  if (descriptor) Object.defineProperty(WebSocket.prototype, "emit", descriptor)
+                  if (!descriptor) Reflect.deleteProperty(WebSocket.prototype, "emit")
+                }),
+            )
+            codex.dropConnections()
+            yield* Effect.promise(() => closed.promise)
+            const nextID = ModelV2.ID.make("gpt-6.1-terra")
+            const next = yield* Provider.use.getModel(providerID, nextID)
+            const continuation = "resp-explicit-after-reconnect"
+            const reconnected = waitRequest(
+              "/responses",
+              createEventResponse(
+                [
+                  {
+                    type: "response.created",
+                    response: { id: "resp-reconnected", created_at: 1, model: nextID, service_tier: null },
+                  },
+                  {
+                    type: "response.completed",
+                    response: {
+                      incomplete_details: null,
+                      usage: {
+                        input_tokens: 1,
+                        input_tokens_details: null,
+                        output_tokens: 1,
+                        output_tokens_details: null,
+                      },
+                      service_tier: null,
+                    },
+                  },
+                ],
+                true,
+              ),
+            )
+            yield* drain({
+              ...input,
+              model: next,
+              agent: { ...agent, options: { previousResponseId: continuation } },
+              user: {
+                ...input.user,
+                id: MessageID.make("msg-dispatch-reconnected"),
+                model: { providerID, modelID: nextID, variant: "max" },
+              },
+              expectedSelection: { providerID, modelID: nextID, variant: "max" },
+            })
+            const second = yield* Effect.promise(() => reconnected)
+            expect(second.body).toMatchObject({
+              model: nextID,
+              reasoning: { effort: "high" },
+              previous_response_id: continuation,
+            })
+            expect(codex.frames).toHaveLength(2)
+            expect(codex.frames[0]).toMatchObject({
+              type: "response.create",
+              model: modelID,
+              reasoning: { effort: "xhigh" },
+            })
+            expect(codex.frames[0].previous_response_id).toBeUndefined()
+            expect(codex.frames[1]).toMatchObject({
+              type: "response.create",
+              model: nextID,
+              reasoning: { effort: "high" },
+              previous_response_id: continuation,
+            })
+            expect(codex.frames[1].stream).toBeUndefined()
+            expect(codex.observations.map((observation) => observation.transport)).toEqual(["ws", "ws"])
+            expect(dispatched).toHaveLength(2)
+            expect(dispatched[1]).toEqual({
+              providerID,
+              modelID: nextID,
+              variant: "max",
+              apiModelID: nextID,
+              reasoningEffort: "high",
+              adapter: "openai-responses",
+              phase: "prepared",
+            })
+            expect(next.variants?.max.reasoningEffort).toBe("high")
+          }
+        }),
+      {
+        config: () => {
+          const providerID = scenario.startsWith("chat-") ? "github-copilot" : "openai"
+          const modelID = scenario.startsWith("chat-")
+            ? "gpt-5-mini"
+            : scenario.includes("-terra-")
+              ? "gpt-6.1-terra"
+              : "gpt-6.1-sol"
+          return {
+            enabled_providers: [providerID],
+            provider: {
+              [providerID]: {
+                npm: "@ai-sdk/openai",
+                env: ["DISPATCH_R2_TOKEN"],
+                models: {
+                  ...(scenario === "responses-websocket-reconnect-continuation"
+                    ? {
+                        "gpt-6.1-terra": {
+                          id: "gpt-6.1-terra",
+                          reasoning: true,
+                          limit: { context: 8192, output: 1024 },
+                          variants: {
+                            max: {
+                              reasoningEffort: "high",
+                              reasoningSummary: "auto",
+                              include: ["reasoning.encrypted_content"],
+                            },
+                          },
+                        },
+                      }
+                    : {}),
+                  [modelID]: {
+                    id: modelID,
+                    reasoning: true,
+                    limit: { context: 8192, output: 1024 },
+                    variants: {
+                      xhigh: {
+                        reasoningEffort: "xhigh",
+                        reasoningSummary: "auto",
+                        include: ["reasoning.encrypted_content"],
+                      },
+                      max: {
+                        reasoningEffort: "max",
+                        reasoningSummary: "auto",
+                        include: ["reasoning.encrypted_content"],
+                      },
+                    },
+                  },
+                },
+                options: { apiKey: "synthetic-key-r2", baseURL: `${state.server!.url.origin}/v1` },
+              },
+            },
+          }
+        },
+      },
+    )
+  }
+
+  for (const scenario of [
+    "exact",
+    "default",
+    "default-then-xhigh",
+    "default-no-variants",
+    "default-empty-mapping",
+    "default-known",
+    "default-contradictory",
+    "default-rewrite",
+    "default-unsupported-mapping",
+    "xhigh",
+    "callback-success",
+    "callback-failure",
+    "callback-defect",
+    "callback-interrupt",
+    "callback-mismatch",
+    "callback-mutation",
+    "callback-uncontrolled",
+    "plugin-effort",
+    "effort-getter",
+    "effort-proxy",
+    "mapping-getter",
+    "model-id-getter",
+    "language-model-getter",
+    "language-config-getter",
+    "global-fetch-before",
+    "global-fetch-after",
+    "global-fetch-before-uncontrolled",
+    "global-fetch-after-uncontrolled",
+    "nested-reasoning",
+    "enable-thinking",
+    "unknown-option",
+    "wire-model",
+    "wire-json",
+    "plugin-mapping",
+    "wrong-provider",
+    "wrong-model",
+    "unknown-variant",
+    "unsupported-mapping",
+    "unsupported-adapter",
+    "custom-fetch",
+    "cached-model-fetch",
+    "cached-sdk-fetch",
+    "cached-model-uncontrolled",
+    "cached-sdk-uncontrolled",
+    "body-transform",
+    "native",
+    "uncontrolled",
+  ] as const) {
+    testEffect(
+      AppNodeBuilder.build(LayerNode.group([LLM.node, Provider.node, Plugin.node]), [
+        [RuntimeFlags.node, RuntimeFlags.layer({ experimentalNativeLlm: scenario === "native" })],
+      ]),
+    ).instance(
+      `controlled dispatch ${scenario}`,
+      () =>
+        Effect.gen(function* () {
+          const original = yield* Effect.acquireRelease(
+            Effect.sync(() => globalThis.fetch),
+            (value) =>
+              Effect.sync(() => {
+                globalThis.fetch = value
+              }),
+          )
+          const changedFetch: typeof fetch = Object.assign(
+            (url: RequestInfo | URL, init?: RequestInit) =>
+              original(url, {
+                ...init,
+                body: JSON.stringify({
+                  ...JSON.parse(String(init?.body)),
+                  model: "global-other-model",
+                  reasoning_effort: "low",
+                }),
+              }),
+            { preconnect: original.preconnect },
+          )
+          if (scenario.startsWith("global-fetch-before")) globalThis.fetch = changedFetch
+          const model = yield* Provider.use.getModel(ProviderV2.ID.make("dispatch-test"), ModelV2.ID.make("target"))
+          const variant = scenario.startsWith("default") ? "default" : scenario === "xhigh" ? "xhigh" : "high"
+          if (scenario === "default-no-variants") delete model.variants
+          if (scenario === "default-empty-mapping") model.variants = { default: {} }
+          if (scenario === "default-known") model.options.reasoningEffort = "medium"
+          if (scenario === "default-unsupported-mapping")
+            model.variants = { default: { thinking: { budgetTokens: 1024 } } }
+          if (scenario === "mapping-getter") {
+            const variant = model.variants?.high
+            if (!variant) throw new Error("Missing test variant")
+            Object.defineProperty(variant, "reasoningEffort", { enumerable: true, get: () => "high" })
+          }
+          if (scenario === "unsupported-mapping") model.variants = { high: { thinking: { budgetTokens: 1024 } } }
+          const provider = yield* Provider.use.getProvider(model.providerID)
+          const language = scenario.startsWith("language-") ? yield* Provider.use.getLanguage(model) : undefined
+          if (scenario === "custom-fetch")
+            provider.options.fetch = (url: RequestInfo | URL, init?: RequestInit) => fetch(url, init)
+          if (scenario.startsWith("cached-")) {
+            provider.options.fetch = (url: RequestInfo | URL, init?: RequestInit) =>
+              fetch(url, {
+                ...init,
+                body: JSON.stringify({
+                  ...JSON.parse(String(init?.body)),
+                  model: "transport-other-model",
+                  reasoning_effort: "low",
+                }),
+              })
+            const cached = scenario.startsWith("cached-model-")
+              ? model
+              : yield* Provider.use.getModel(model.providerID, ModelV2.ID.make("sibling"))
+            yield* Provider.use.getLanguage(cached)
+            delete provider.options.fetch
+          }
+          if (scenario === "body-transform")
+            provider.options.transformRequestBody = (body: Record<string, unknown>) => ({ ...body, model: "changed" })
+          const plugin = yield* Plugin.Service
+          const hooks = yield* plugin.list()
+          const pluginOptions: { value?: Record<string, unknown> } = {}
+          const dispatched: unknown[] = []
+          const failure = new ProviderError.ResponseStreamError("dispatch evidence unavailable")
+          hooks.push({
+            "chat.params": async (_input, output) => {
+              pluginOptions.value = output.options
+              if (scenario === "callback-mismatch") output.options.reasoningEffort = "low"
+              if (scenario === "default-contradictory") output.options.enable_thinking = false
+              if (scenario === "default-rewrite") output.options.reasoningEffort = "high"
+              if (scenario === "effort-proxy") output.options = new Proxy(output.options, {})
+              if (scenario === "model-id-getter")
+                Object.defineProperty(model, "id", { enumerable: true, get: () => "target" })
+              if (scenario === "language-model-getter") {
+                let reads = 0
+                Object.defineProperty(language, "modelId", {
+                  get: () => (++reads === 1 ? "wire-target" : "wrong-wire-model"),
+                })
+              }
+              if (scenario === "language-config-getter" && language) {
+                const config: unknown = Reflect.get(language, "config")
+                if (!isRecord(config)) throw new Error("Missing test adapter config")
+                const transport = config.fetch
+                let reads = 0
+                Object.defineProperty(config, "fetch", { get: () => (++reads === 1 ? transport : changedFetch) })
+              }
+              if (scenario.startsWith("global-fetch-after")) globalThis.fetch = changedFetch
+              if (scenario === "effort-getter") {
+                let reads = 0
+                Object.defineProperty(output.options, "reasoningEffort", {
+                  enumerable: true,
+                  get: () => (++reads === 1 ? "high" : "low"),
+                })
+              }
+              if (scenario === "plugin-effort" || scenario === "uncontrolled") {
+                output.options.reasoningEffort = "low"
+                output.options.secret = "never-include-this-secret"
+              }
+              if (scenario === "wire-model") output.options.model = "wrong-wire-model"
+              if (scenario === "nested-reasoning") output.options.reasoning = { effort: "low" }
+              if (scenario === "enable-thinking") output.options.enable_thinking = false
+              if (scenario === "unknown-option") output.options.unqualified_option = "never-include-this-secret"
+              if (scenario === "wire-json") output.options.toJSON = () => ({ model: "wrong-wire-model" })
+              if (scenario === "plugin-mapping") {
+                model.variants = { high: { reasoningEffort: "low" } }
+                output.options.reasoningEffort = "low"
+              }
+            },
+          })
+          const request = waitRequest(
+            "/chat/completions",
+            new Response(createChatStream("ok"), {
+              headers: { "Content-Type": "text/event-stream" },
+            }),
+          )
+          const sessionID = SessionID.make("session-dispatch")
+          const agent = { name: "test", mode: "primary", options: {}, permission: [] } satisfies Agent.Info
+          const input = {
+            sessionID,
+            user: {
+              id: MessageID.make("msg-dispatch"),
+              sessionID,
+              role: "user",
+              time: { created: 1 },
+              agent: agent.name,
+              model: { providerID: model.providerID, modelID: model.id, ...(variant === "default" ? {} : { variant }) },
+            },
+            model,
+            agent,
+            system: [],
+            messages: [{ role: "user", content: "hello" }],
+            tools: {},
+            ...(scenario === "uncontrolled" || scenario.endsWith("-uncontrolled")
+              ? {}
+              : {
+                  expectedSelection: {
+                    providerID: scenario === "wrong-provider" ? "other" : "dispatch-test",
+                    modelID: scenario === "wrong-model" ? "other" : "target",
+                    variant: scenario === "unknown-variant" ? "missing" : variant,
+                  },
+                }),
+            ...(!scenario.startsWith("default") && scenario !== "xhigh" && !scenario.startsWith("callback-")
+              ? {}
+              : {
+                  onDispatch: (selection: unknown) =>
+                    Effect.gen(function* () {
+                      expect(state.queue).toHaveLength(1)
+                      expect(Object.isFrozen(selection)).toBe(true)
+                      dispatched.push(selection)
+                      yield* Effect.yieldNow
+                      expect(state.queue).toHaveLength(1)
+                      if (scenario === "callback-mutation") {
+                        if (!pluginOptions.value) throw new Error("Missing plugin options")
+                        pluginOptions.value.reasoningEffort = "low"
+                        model.api.id = "wrong-wire-model"
+                      }
+                      if (scenario === "callback-failure") return yield* Effect.fail(failure)
+                      if (scenario === "callback-defect") return yield* Effect.die(failure)
+                      if (scenario === "callback-interrupt") return yield* Effect.interrupt
+                    }),
+                }),
+          } satisfies LLM.StreamInput
+          const exit = yield* Effect.exit(drain(input))
+          if (scenario === "callback-failure" || scenario === "callback-defect" || scenario === "callback-interrupt") {
+            expect(Exit.isFailure(exit)).toBe(true)
+            expect(state.queue).toHaveLength(1)
+            expect(dispatched).toHaveLength(1)
+            if (Exit.isFailure(exit)) {
+              if (scenario === "callback-interrupt") {
+                expect(Cause.hasInterruptsOnly(exit.cause)).toBe(true)
+                return
+              }
+              expect(Cause.squash(exit.cause)).toBe(failure)
+              expect(Cause.hasDies(exit.cause)).toBe(scenario === "callback-defect")
+              expect(Cause.hasFails(exit.cause)).toBe(scenario === "callback-failure")
+            }
+            return
+          }
+          if (scenario === "effort-getter" && Exit.isSuccess(exit)) {
+            const capture = yield* Effect.promise(() => request)
+            expect(capture.body.reasoning_effort).toBe("high")
+          }
+          if (
+            scenario === "exact" ||
+            [
+              "default",
+              "default-then-xhigh",
+              "default-no-variants",
+              "default-empty-mapping",
+              "default-known",
+              "xhigh",
+              "callback-success",
+              "callback-mutation",
+            ].includes(scenario) ||
+            scenario.startsWith("global-fetch-") ||
+            scenario === "uncontrolled" ||
+            (scenario.endsWith("-uncontrolled") && scenario !== "callback-uncontrolled")
+          ) {
+            expect(Exit.isSuccess(exit)).toBe(true)
+            const capture = yield* Effect.promise(() => request)
+            expect(capture.body.model).toBe(
+              scenario.startsWith("cached-")
+                ? "transport-other-model"
+                : scenario.startsWith("global-fetch-") && scenario.endsWith("-uncontrolled")
+                  ? "global-other-model"
+                  : "wire-target",
+            )
+            expect(capture.body.reasoning_effort).toBe(
+              variant === "default"
+                ? scenario === "default-known"
+                  ? "medium"
+                  : undefined
+                : scenario === "xhigh"
+                  ? "xhigh"
+                  : scenario === "exact" ||
+                      scenario.startsWith("callback-") ||
+                      (scenario.startsWith("global-fetch-") && !scenario.endsWith("-uncontrolled"))
+                    ? "high"
+                    : "low",
+            )
+            if (scenario.startsWith("default") || scenario === "xhigh" || scenario.startsWith("callback-")) {
+              expect(dispatched).toEqual([
+                {
+                  providerID: "dispatch-test",
+                  modelID: "target",
+                  variant,
+                  apiModelID: "wire-target",
+                  reasoningEffort: capture.body.reasoning_effort ?? null,
+                  adapter: "openai-compatible-chat",
+                  phase: "prepared",
+                },
+              ])
+              if (variant === "default" && scenario !== "default-known")
+                expect(Object.hasOwn(capture.body, "reasoning_effort")).toBe(false)
+            }
+            if (scenario === "default-then-xhigh") {
+              const targetRequest = waitRequest(
+                "/chat/completions",
+                new Response(createChatStream("target"), {
+                  headers: { "Content-Type": "text/event-stream" },
+                }),
+              )
+              yield* drain({
+                ...input,
+                user: { ...input.user, model: { ...input.user.model, variant: "xhigh" } },
+                expectedSelection: { providerID: "dispatch-test", modelID: "target", variant: "xhigh" },
+              })
+              const target = yield* Effect.promise(() => targetRequest)
+              expect(target.body.model).toBe("wire-target")
+              expect(target.body.reasoning_effort).toBe("xhigh")
+              expect(dispatched).toHaveLength(2)
+              expect(dispatched[1]).toEqual({
+                providerID: "dispatch-test",
+                modelID: "target",
+                variant: "xhigh",
+                apiModelID: "wire-target",
+                reasoningEffort: "xhigh",
+                adapter: "openai-compatible-chat",
+                phase: "prepared",
+              })
+            }
+            return
+          }
+          expect(Exit.isFailure(exit)).toBe(true)
+          expect(state.queue).toHaveLength(1)
+          expect(dispatched).toEqual([])
+          if (Exit.isFailure(exit)) {
+            const error = Cause.pretty(exit.cause)
+            expect(error).toContain("unsupported_dispatch")
+            expect(error).not.toContain("never-include-this-secret")
+          }
+        }),
+      {
+        config: () => ({
+          enabled_providers: ["dispatch-test"],
+          provider: {
+            "dispatch-test": {
+              npm: scenario === "unsupported-adapter" ? "@ai-sdk/anthropic" : "@ai-sdk/openai-compatible",
+              models: {
+                target: {
+                  id: "wire-target",
+                  reasoning: true,
+                  limit: { context: 8192, output: 1024 },
+                  variants: { high: { reasoningEffort: "high" }, xhigh: { reasoningEffort: "xhigh" } },
+                },
+                sibling: { id: "wire-sibling", limit: { context: 8192, output: 1024 } },
+              },
+              options: { apiKey: "synthetic-key", baseURL: `${state.server!.url.origin}/v1` },
+            },
+          },
+        }),
+      },
+    )
+  }
+
   const vivgridFixture = { providerID: "vivgrid", modelID: "gemini-3.1-pro-preview" }
   const opencodeFixture = { providerID: "opencode-test", modelID: vivgridFixture.modelID }
 

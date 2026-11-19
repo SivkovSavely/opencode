@@ -46,6 +46,7 @@ const InvalidWorkspaceID = Symbol("InvalidWorkspaceID")
 export class WorkspaceRouteContext extends Context.Service<
   WorkspaceRouteContext,
   {
+    // Request inputs are decoded here; stored session and workspace paths are already filesystem paths.
     readonly directory: string
     readonly workspaceID?: WorkspaceV2.ID
   }
@@ -85,12 +86,21 @@ function selectedV2WorkspaceID(
 }
 
 function defaultDirectory(request: HttpServerRequest.HttpServerRequest, url: URL): string {
+  const header = request.headers["x-opencode-directory"]
   return (
     url.searchParams.get("directory") ||
-    request.headers["x-opencode-directory"] ||
+    (header ? decodeDirectoryHeader(header) : undefined) ||
     ManagedWorkspace.directory ||
     process.cwd()
   )
+}
+
+function decodeDirectoryHeader(input: string): string {
+  try {
+    return decodeURIComponent(input)
+  } catch {
+    return input
+  }
 }
 
 function shouldStayOnControlPlane(request: HttpServerRequest.HttpServerRequest, url: URL): boolean {
@@ -227,19 +237,12 @@ function routeHttpApiWorkspace<E>(
     const request = yield* HttpServerRequest.HttpServerRequest
     const url = requestURL(request)
     if (ManagedWorkspace.directory) {
-      const hints = [...url.searchParams.getAll("directory"), request.headers["x-opencode-directory"]].filter(
-        (value): value is string => value !== undefined,
-      )
+      const header = request.headers["x-opencode-directory"]
+      const hints = [...url.searchParams.getAll("directory"), ...(header ? [decodeDirectoryHeader(header)] : [])]
       if (
         url.searchParams.has("workspace") ||
         configuredWorkspaceID() ||
-        hints.some((hint) => {
-          try {
-            return !ManagedWorkspace.allows(decodeURIComponent(hint))
-          } catch {
-            return !ManagedWorkspace.allows(hint)
-          }
-        })
+        hints.some((hint) => !ManagedWorkspace.allows(hint))
       )
         return HttpServerResponse.text("Forbidden", { status: 403 })
     }

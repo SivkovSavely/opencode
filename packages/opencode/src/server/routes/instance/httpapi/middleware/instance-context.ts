@@ -13,24 +13,16 @@ export class InstanceContextMiddleware extends HttpApiMiddleware.Service<
   }
 >()("@opencode/ExperimentalHttpApiInstanceContext") {}
 
-function decode(input: string): string {
-  try {
-    return decodeURIComponent(input)
-  } catch {
-    return input
-  }
-}
-
 function provideInstanceContext<E>(
   effect: Effect.Effect<HttpServerResponse.HttpServerResponse, E>,
   store: InstanceStore.Interface,
 ): Effect.Effect<HttpServerResponse.HttpServerResponse, E, WorkspaceRouteContext> {
   return Effect.gen(function* () {
     const route = yield* WorkspaceRouteContext
-    if (route.workspaceID || !ManagedWorkspace.allows(decode(route.directory))) {
+    if (route.workspaceID || !ManagedWorkspace.allows(route.directory)) {
       if (ManagedWorkspace.directory) return HttpServerResponse.text("Forbidden", { status: 403 })
     }
-    const ctx = yield* store.load({ directory: ManagedWorkspace.directory ?? decode(route.directory) })
+    const ctx = yield* store.load({ directory: ManagedWorkspace.directory ?? route.directory })
     return yield* effect.pipe(
       Effect.provideService(InstanceRef, ctx),
       Effect.provideService(WorkspaceRef, route.workspaceID),

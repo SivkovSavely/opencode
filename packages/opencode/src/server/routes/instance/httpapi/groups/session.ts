@@ -6,6 +6,8 @@ import { Session } from "@/session/session"
 import { MessageV2 } from "@/session/message-v2"
 import { SessionPrompt } from "@/session/prompt"
 import { SessionQueueV1 } from "@opencode-ai/schema/v1/session-queue"
+import { SessionHandoffV1 } from "@opencode-ai/schema/v1/session-handoff"
+import { HandoffErrors } from "../handoff-errors"
 import { SessionRevert } from "@/session/revert"
 import { SessionStatus } from "@/session/status"
 import { SessionSummary } from "@/session/summary"
@@ -36,6 +38,11 @@ import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
 
 const root = "/session"
+export const ExecutionQuery = Schema.Struct({
+  ...WorkspaceRoutingQueryFields,
+  queueID: Schema.optional(Schema.String.check(Schema.isNonEmpty())),
+  userMessageID: Schema.optional(Schema.String.check(Schema.isNonEmpty())),
+})
 export const ListQuery = Schema.Struct({
   ...WorkspaceRoutingQueryFields,
   scope: Schema.optional(Schema.Literals(["project"])),
@@ -108,6 +115,11 @@ export const SessionPaths = {
   promptAsync: `${root}/:sessionID/prompt_async`,
   queue: `${root}/:sessionID/queue`,
   queueFlush: `${root}/:sessionID/queue/flush`,
+  execution: `${root}/:sessionID/execution`,
+  enrollment: `${root}/:sessionID/enrollment`,
+  modelControl: `${root}/:sessionID/model-control`,
+  recovery: `${root}/:sessionID/recovery`,
+  handoffReceipt: `${root}/:sessionID/handoff/:requestID`,
   command: `${root}/:sessionID/command`,
   shell: `${root}/:sessionID/shell`,
   revert: `${root}/:sessionID/revert`,
@@ -122,6 +134,52 @@ export const SessionApi = HttpApi.make("session")
   .add(
     HttpApiGroup.make("session")
       .add(
+        HttpApiEndpoint.get("execution", SessionPaths.execution, {
+          params: { sessionID: SessionID },
+          query: ExecutionQuery,
+          success: SessionHandoffV1.ExecutionView,
+          error: HandoffErrors,
+        }).annotateMerge(
+          OpenApi.annotations({ identifier: "session.execution", summary: "Get queue action execution" }),
+        ),
+        HttpApiEndpoint.post("enrollQueueAction", SessionPaths.enrollment, {
+          params: { sessionID: SessionID },
+          query: WorkspaceRoutingQuery,
+          payload: SessionHandoffV1.EnrollRequest,
+          success: SessionHandoffV1.EnrollmentReceipt,
+          error: HandoffErrors,
+        }).annotateMerge(
+          OpenApi.annotations({ identifier: "session.enrollQueueAction", summary: "Enroll a queue action" }),
+        ),
+        HttpApiEndpoint.post("modelControl", SessionPaths.modelControl, {
+          params: { sessionID: SessionID },
+          query: WorkspaceRoutingQuery,
+          payload: SessionHandoffV1.ControlRequest,
+          success: SessionHandoffV1.ControlReceipt,
+          error: HandoffErrors,
+        }).annotateMerge(
+          OpenApi.annotations({ identifier: "session.modelControl", summary: "Control the queue action model" }),
+        ),
+        HttpApiEndpoint.post("recoverQueueAction", SessionPaths.recovery, {
+          params: { sessionID: SessionID },
+          query: WorkspaceRoutingQuery,
+          payload: SessionHandoffV1.RecoveryRequest,
+          success: SessionHandoffV1.ControlReceipt,
+          error: HandoffErrors,
+        }).annotateMerge(
+          OpenApi.annotations({
+            identifier: "session.recoverQueueAction",
+            summary: "Recover an enrolled queue action",
+          }),
+        ),
+        HttpApiEndpoint.get("handoffReceipt", SessionPaths.handoffReceipt, {
+          params: { sessionID: SessionID, requestID: Schema.String.check(Schema.isNonEmpty()) },
+          query: WorkspaceRoutingQuery,
+          success: SessionHandoffV1.Receipt,
+          error: HandoffErrors,
+        }).annotateMerge(
+          OpenApi.annotations({ identifier: "session.handoffReceipt", summary: "Get a durable handoff receipt" }),
+        ),
         HttpApiEndpoint.get("list", SessionPaths.list, {
           query: ListQuery,
           success: described(Schema.Array(Session.Info), "List of sessions"),

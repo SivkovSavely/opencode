@@ -7,6 +7,7 @@ import { ProviderError } from "@/provider/error"
 import { errorMessage } from "@/util/error"
 import { ProxyEnv } from "@/util/proxy-env"
 import { isRecord } from "@/util/record"
+import { DispatchTransport } from "../../provider/dispatch-transport"
 
 export const PROTOCOL_HEADER = "responses_websockets=2026-02-06"
 export const MESSAGE_TOO_BIG_CLOSE_CODE = 1009
@@ -21,6 +22,9 @@ export interface ConnectResponsesWebSocketOptions {
 export interface StreamResponsesWebSocketOptions {
   socket: WebSocket
   body: Record<string, unknown>
+  frame?: string
+  boundary?: DispatchTransport.Boundary
+  onDispatchFailure?: (error: Error) => void
   idleTimeout?: number
   signal?: AbortSignal
   onFirstEvent?: (error?: WrappedError) => void
@@ -206,7 +210,7 @@ export function streamResponsesWebSocket(options: StreamResponsesWebSocketOption
           return
         }
         if (next) {
-          attach(next)
+          await attach(next)
           return
         }
       } catch (error) {
@@ -308,13 +312,41 @@ export function streamResponsesWebSocket(options: StreamResponsesWebSocketOption
       socket.off("error", onError)
       socket.off("close", onClose)
     }
-    const { stream: _stream, background: _background, ...payload } = options.body
-    resetIdleTimeout("idle timeout sending websocket request")
-    socket.send(JSON.stringify({ type: "response.create", ...payload }), (error) => {
-      if (completed) return
-      resetIdleTimeout("idle timeout waiting for websocket")
-      if (error) invalidate(new ProviderError.ResponseStreamError(error.message, { cause: error }))
-    })
+    const frame = options.frame ?? serializeRequest(options.body)
+    const send = () => {
+      resetIdleTimeout("idle timeout sending websocket request")
+      socket.send(frame, (error) => {
+        if (completed) return
+        resetIdleTimeout("idle timeout waiting for websocket")
+        if (error) invalidate(new ProviderError.ResponseStreamError(error.message, { cause: error }))
+      })
+    }
+    const boundary = options.boundary
+    if (!boundary) return send()
+    return (async () => {
+      try {
+        await boundary.prepared()
+        if (completed) return
+        if (options.signal?.aborted) {
+          onAbort()
+          return
+        }
+        if (socket.readyState !== WebSocket.OPEN) {
+          invalidate(new ProviderError.ResponseStreamError("WebSocket closed before request"))
+          return
+        }
+        boundary.validateFrame(frame)
+        send()
+      } catch (error) {
+        if (completed) return
+        completed = true
+        cleanup()
+        const failure = error instanceof Error ? error : new DispatchTransport.UnsupportedDispatch()
+        options.onDispatchFailure?.(failure)
+        controller?.error(failure)
+        return
+      }
+    })()
   }
 
   return new Response(
@@ -328,7 +360,7 @@ export function streamResponsesWebSocket(options: StreamResponsesWebSocketOption
           return
         }
 
-        attach(socket)
+        return attach(socket)
       },
       cancel(reason) {
         onCancel(reason)
@@ -339,6 +371,11 @@ export function streamResponsesWebSocket(options: StreamResponsesWebSocketOption
       headers: { "content-type": "text/event-stream" },
     },
   )
+}
+
+export function serializeRequest(body: Record<string, unknown>) {
+  const { stream: _stream, background: _background, ...payload } = body
+  return JSON.stringify({ type: "response.create", ...payload })
 }
 
 function parseWrappedError(event: Record<string, unknown> | undefined, body: string) {

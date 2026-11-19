@@ -11,6 +11,13 @@ import managedAncestry from "./migration/20261028174200_managed_command_ancestry
 import managedExecution from "./migration/20261031090000_managed_execution_accounting"
 import historicalFence from "./migration/20261101090000_historical_admission_fence"
 import managedCapabilities from "./migration/20261101091000_managed_capabilities"
+import handoffRetention from "./migration/20261115200739_session_handoff_retention"
+import handoffReceiptRetention from "./migration/20261115203647_session_handoff_receipt_retention"
+import handoffRootGuards from "./migration/20261115210000_session_handoff_root_guards"
+import handoffNotificationGuards from "./migration/20261115221828_session_handoff_notification_guards"
+import handoffControl from "./migration/20261116001000_session_handoff_control"
+import handoffRecoveryHistory from "./migration/20261116002000_session_handoff_recovery_history"
+import handoffRecoveryQueueBlock from "./migration/20261116003000_session_handoff_recovery_queue_block"
 
 type Database = EffectDrizzleSqlite.EffectSQLiteDatabase
 type Transaction = Parameters<Parameters<Database["transaction"]>[0]>[0]
@@ -39,6 +46,13 @@ export function apply(db: Database) {
           yield* managedExecution.up(tx)
           yield* historicalFence.up(tx)
           yield* managedCapabilities.up(tx)
+          yield* handoffRetention.up(tx)
+          yield* handoffReceiptRetention.up(tx)
+          yield* handoffRootGuards.up(tx)
+          yield* handoffNotificationGuards.up(tx)
+          yield* handoffControl.up(tx)
+          yield* handoffRecoveryHistory.up(tx)
+          yield* handoffRecoveryQueueBlock.up(tx)
           yield* tx.run(
             sql`CREATE TABLE ${sql.identifier("migration")} (id TEXT PRIMARY KEY, time_completed INTEGER NOT NULL)`,
           )

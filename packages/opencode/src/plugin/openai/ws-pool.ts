@@ -2,6 +2,7 @@ import WebSocket from "ws"
 import { ProviderError } from "@/provider/error"
 import { isRecord } from "@/util/record"
 import { OpenAIWebSocket } from "./ws"
+import { DispatchTransport } from "../../provider/dispatch-transport"
 
 export const TITLE_HEADER = "x-opencode-title"
 
@@ -40,13 +41,28 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
     pruneTimer.unref()
   }
 
-  async function websocketFetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
+  async function websocketFetch(
+    input: RequestInfo | URL,
+    init?: RequestInit,
+    boundary?: DispatchTransport.Boundary,
+    leaf: DispatchTransport.Fetch = httpFetch,
+  ): Promise<Response> {
     const url = input instanceof URL ? input.toString() : typeof input === "string" ? input : input.url
     const internalHeaders = OpenAIWebSocket.normalizeHeaders(init?.headers)
     const httpInit = withoutInternalHeaders(init)
+    const immutableBody = init?.body
+    const sendHttp = async () => {
+      if (boundary) {
+        boundary.validateHttp(immutableBody)
+        await boundary.prepared()
+        httpInit?.signal?.throwIfAborted()
+        boundary.validateHttp(immutableBody)
+      }
+      return leaf(input, boundary ? { ...httpInit, body: immutableBody } : httpInit)
+    }
 
     if (init?.method !== "POST" || !new URL(url).pathname.endsWith("/responses")) {
-      return httpFetch(input, httpInit)
+      return sendHttp()
     }
 
     const body = (() => {
@@ -58,14 +74,20 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
         return undefined
       }
     })()
-    if (!body?.stream) return httpFetch(input, httpInit)
+    if (!body?.stream) return sendHttp()
     if (internalHeaders[TITLE_HEADER] === "true") {
-      return httpFetch(input, httpInit)
+      return sendHttp()
     }
 
     const sessionID = internalHeaders["x-session-affinity"] ?? internalHeaders["session-id"]
     if (!sessionID) {
-      return httpFetch(input, httpInit)
+      return sendHttp()
+    }
+    const frame = boundary ? OpenAIWebSocket.serializeRequest(body) : undefined
+    if (boundary && frame !== undefined) {
+      boundary.validateFrame(frame)
+      await boundary.prepared()
+      init?.signal?.throwIfAborted()
     }
     const key = `${sessionID}:conversation`
 
@@ -73,10 +95,10 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
     pool.set(key, entry)
 
     if (entry.fallback) {
-      return httpFetch(input, httpInit)
+      return sendHttp()
     }
     if (entry.busy) {
-      return httpFetch(input, httpInit)
+      return sendHttp()
     }
 
     entry.busy = true
@@ -99,6 +121,9 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
       const response = OpenAIWebSocket.streamResponsesWebSocket({
         socket: entry.socket,
         body,
+        frame,
+        boundary,
+        onDispatchFailure: rejectFirstEvent,
         idleTimeout,
         signal: init?.signal ?? undefined,
         onFirstEvent: (error) => resolveFirstEvent(error ?? true),
@@ -140,10 +165,14 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
         })
       }
       if (!entry.fallback) return response
-      return httpFetch(input, httpInit)
+      return sendHttp()
     } catch (error) {
       entry.busy = false
       entry.lastUsedAt = Date.now()
+      if (DispatchTransport.isFailure(error)) {
+        invalidate(entry)
+        throw error
+      }
       if (OpenAIWebSocket.isAbortError(error)) {
         entry.streamFailures = 0
         invalidate(entry)
@@ -152,7 +181,7 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
 
       recordStreamFailure(entry)
       invalidate(entry)
-      if (entry.fallback) return httpFetch(input, httpInit)
+      if (entry.fallback) return sendHttp()
       return failedResponse(
         new ProviderError.ResponseStreamError(error instanceof Error ? error.message : String(error), {
           cause: error,
@@ -192,7 +221,14 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
     pool.delete(key)
   }
 
-  return Object.assign(websocketFetch, { close, remove })
+  return Object.assign(websocketFetch, {
+    close,
+    remove,
+    controlled:
+      (boundary: DispatchTransport.Boundary, leaf: DispatchTransport.Fetch): DispatchTransport.Fetch =>
+      (input, init) =>
+        websocketFetch(input, init, boundary, leaf),
+  })
 }
 
 function connectionLimitError(event: Record<string, unknown>) {

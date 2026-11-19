@@ -4,7 +4,7 @@ import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { Provider } from "@/provider/provider"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { serviceUse } from "@opencode-ai/core/effect/service-use"
-import { Context, Effect, Layer } from "effect"
+import { Cause, Context, Effect, Exit, Layer } from "effect"
 import * as Stream from "effect/Stream"
 import { streamText, wrapLanguageModel, type ModelMessage, type Tool } from "ai"
 import type { LLMEvent } from "@opencode-ai/llm"
@@ -29,14 +29,21 @@ import * as OtelTracer from "@effect/opentelemetry/Tracer"
 import { LLMAISDK } from "./llm/ai-sdk"
 import { LLMNativeRuntime } from "./llm/native-runtime"
 import { LLMRequestPrep } from "./llm/request"
+import { LLMDispatchGuard } from "./llm/dispatch-guard"
+import { DispatchTransport } from "@/provider/dispatch-transport"
 
 export const OUTPUT_TOKEN_MAX = ProviderTransform.OUTPUT_TOKEN_MAX
+
+export type DispatchSelection = LLMDispatchGuard.DispatchSelection
 
 export type StreamInput = {
   user: SessionV1.User
   sessionID: string
   parentSessionID?: string
   model: Provider.Model
+  expectedSelection?: LLMDispatchGuard.Selection
+  // Per-attempt prepared witness, not proof of network start. Requires expectedSelection.
+  onDispatch?: (selection: DispatchSelection) => Effect.Effect<void, unknown>
   agent: Agent.Info
   permission?: PermissionV1.Ruleset
   system: string[]
@@ -103,6 +110,25 @@ const live: Layer.Layer<
       )
 
       const isWorkflow = language instanceof GitLabWorkflowLanguageModel
+      const expected = input.expectedSelection
+      if (input.onDispatch && !expected) return yield* new LLMDispatchGuard.UnsupportedDispatch()
+      const dispatchGuard = expected
+        ? yield* Effect.tryPromise({
+            try: () =>
+              LLMDispatchGuard.prepare(input.model, language, expected, item, [
+                input.small
+                  ? ProviderTransform.smallOptions(input.model)
+                  : ProviderTransform.options({
+                      model: input.model,
+                      sessionID: input.sessionID,
+                      providerOptions: item.options,
+                    }),
+                input.model.options,
+                input.agent.options,
+              ]),
+            catch: () => new LLMDispatchGuard.UnsupportedDispatch(),
+          })
+        : undefined
       const prepared = yield* LLMRequestPrep.prepare({
         ...input,
         provider: item,
@@ -224,6 +250,7 @@ const live: Layer.Layer<
       // Runtime seam: native is an opt-in adapter over @opencode-ai/llm. It
       // either returns a ready LLMEvent stream or a concrete fallback reason.
       if (flags.experimentalNativeLlm) {
+        if (dispatchGuard) return yield* new LLMDispatchGuard.UnsupportedDispatch()
         const native = LLMNativeRuntime.stream({
           model: input.model,
           provider: item,
@@ -275,8 +302,11 @@ const live: Layer.Layer<
       })
       // Default runtime path: AI SDK owns provider execution and tool dispatch;
       // LLMAISDK.toLLMEvents below normalizes fullStream parts for the processor.
+      // Preserve the callback's typed cause across the SDK's Promise/error-event boundary.
+      const dispatchFailure: { cause?: Cause.Cause<unknown> } = {}
       return {
         type: "ai-sdk" as const,
+        dispatchFailure,
         result: streamText({
           onError(error) {
             bridge.fork(
@@ -323,7 +353,7 @@ const live: Layer.Layer<
           maxRetries: input.retries ?? 0,
           messages: prepared.messages,
           model: wrapLanguageModel({
-            model: language,
+            model: dispatchGuard?.model ?? language,
             middleware: [
               {
                 specificationVersion: "v3" as const,
@@ -337,6 +367,27 @@ const live: Layer.Layer<
                     )
                   }
                   return args.params
+                },
+                async wrapStream({ params, doStream }) {
+                  if (!dispatchGuard) return doStream()
+                  const attempt = dispatchGuard.attempt(
+                    params.providerOptions,
+                    async () => {
+                      const onDispatch = input.onDispatch
+                      if (!onDispatch) return
+                      const exit = await bridge.promise(
+                        Effect.exit(Effect.suspend(() => onDispatch(dispatchGuard.selection))),
+                      )
+                      if (Exit.isFailure(exit)) {
+                        dispatchFailure.cause = exit.cause
+                        throw new DispatchTransport.CallbackFailure()
+                      }
+                    },
+                    (error) => {
+                      dispatchFailure.cause = Cause.fail(error)
+                    },
+                  )
+                  return attempt.model.doStream({ ...params, providerOptions: attempt.providerOptions })
                 },
               },
             ],
@@ -373,8 +424,13 @@ const live: Layer.Layer<
             return Stream.fromAsyncIterable(result.result.fullStream, (e) =>
               e instanceof Error ? e : new Error(String(e)),
             ).pipe(
-              Stream.mapEffect((event) => LLMAISDK.toLLMEvents(state, event)),
+              Stream.mapEffect((event) =>
+                result.dispatchFailure.cause
+                  ? Effect.failCause(result.dispatchFailure.cause)
+                  : LLMAISDK.toLLMEvents(state, event),
+              ),
               Stream.flatMap((events) => Stream.fromIterable(events)),
+              Stream.catchCause((cause) => Stream.failCause(result.dispatchFailure.cause ?? cause)),
             )
           }),
         ),

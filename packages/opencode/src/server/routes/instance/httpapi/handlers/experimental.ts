@@ -40,7 +40,22 @@ export const experimentalHandlers = HttpApiBuilder.group(InstanceHttpApi, "exper
     const flags = yield* RuntimeFlags.Service
 
     const capabilities = Effect.fn("ExperimentalHttpApi.capabilities")(function* () {
-      return { backgroundSubagents: flags.experimentalBackgroundSubagents }
+      return {
+        backgroundSubagents: flags.experimentalBackgroundSubagents,
+        legacyQueuePromptHandoffRecovery: {
+          version: "legacy-queue-prompt-handoff-recovery/4",
+          enrollment: true,
+          modelControl: true,
+          guardedRecovery: true,
+          applicationMarker: true,
+          assistantProvenance: true,
+          interruptedResources: true,
+          startupHold: "enrolled_only",
+          ownerDeathRequired: true,
+          taskDescendantRecovery: true,
+          historicalExecution: true,
+        },
+      } as const
     })
 
     const getConsole = Effect.fn("ExperimentalHttpApi.console")(function* () {

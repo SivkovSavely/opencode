@@ -60,5 +60,17 @@ export const migrations = (
     import("./migration/20261101091000_managed_capabilities"),
     import("./migration/20261103090000_session_schedule"),
     import("./migration/20261112165157_session_schedule_definition_order"),
+    import("./migration/20261115200737_session_handoff_store"),
+    import("./migration/20261115200739_session_handoff_retention"),
+    import("./migration/20261115203645_session_handoff_receipt"),
+    import("./migration/20261115203647_session_handoff_receipt_retention"),
+    import("./migration/20261115205619_session_handoff_root"),
+    import("./migration/20261115210000_session_handoff_root_guards"),
+    import("./migration/20261115221824_session_handoff_notification"),
+    import("./migration/20261115221828_session_handoff_notification_guards"),
+    import("./migration/20261116000000_session_handoff_recovery"),
+    import("./migration/20261116001000_session_handoff_control"),
+    import("./migration/20261116002000_session_handoff_recovery_history"),
+    import("./migration/20261116003000_session_handoff_recovery_queue_block"),
   ])
 ).map((module) => module.default) satisfies DatabaseMigration.Migration[]

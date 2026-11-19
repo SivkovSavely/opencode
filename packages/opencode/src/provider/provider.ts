@@ -31,8 +31,21 @@ import { ModelV2 } from "@opencode-ai/core/model"
 import { ModelStatus } from "./model-status"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { ProviderError } from "./error"
+import { DispatchTransport } from "./dispatch-transport"
 
 const OPENAI_HEADER_TIMEOUT_DEFAULT = 300_000
+const dispatchTransports = new WeakMap<
+  object,
+  {
+    source: unknown
+    builtin: "default" | "codex-oauth" | "codex-websocket"
+    bind: (boundary: DispatchTransport.Boundary) => typeof globalThis.fetch
+  }
+>()
+
+export function dispatchTransport(value: unknown) {
+  return typeof value === "function" ? dispatchTransports.get(value) : undefined
+}
 
 function wrapSSE(res: Response, ms: number, ctl: AbortController) {
   if (typeof ms !== "number" || ms <= 0) return res
@@ -1802,37 +1815,73 @@ const layer = Layer.effect(
         if (existing) return existing
 
         const customFetch = options["fetch"]
+        const bun = await import("bun")
+        const builtin = Object.getOwnPropertyDescriptor(bun, "fetch")
         const chunkTimeout = options["chunkTimeout"] ?? 300_000
         const headerTimeout = options["headerTimeout"] ?? 300_000
         delete options["chunkTimeout"]
         delete options["headerTimeout"]
 
-        options["fetch"] = async (input: any, init?: BunFetchRequestInit) => {
-          const fetchFn = customFetch ?? fetch
-          const opts = init ?? {}
-          const chunkAbortCtl = typeof chunkTimeout === "number" && chunkTimeout > 0 ? new AbortController() : undefined
-          const headerTimeoutMs = headerTimeout === false ? undefined : headerTimeout
-          const headerTimeoutCtl = typeof headerTimeoutMs === "number" ? timeoutController(headerTimeoutMs) : undefined
-          const signals: AbortSignal[] = []
+        const wrap =
+          (transport?: DispatchTransport.Fetch) =>
+          async (input: Parameters<typeof fetch>[0], init?: BunFetchRequestInit) => {
+            const fetchFn = transport ?? customFetch ?? globalThis.fetch
+            const opts = init ?? {}
+            const chunkAbortCtl =
+              typeof chunkTimeout === "number" && chunkTimeout > 0 ? new AbortController() : undefined
+            const headerTimeoutMs = headerTimeout === false ? undefined : headerTimeout
+            const headerTimeoutCtl =
+              typeof headerTimeoutMs === "number" ? timeoutController(headerTimeoutMs) : undefined
+            const signals: AbortSignal[] = []
 
-          if (opts.signal) signals.push(opts.signal)
-          if (chunkAbortCtl) signals.push(chunkAbortCtl.signal)
-          if (headerTimeoutCtl) signals.push(headerTimeoutCtl.signal)
-          if (options["timeout"] !== undefined && options["timeout"] !== null && options["timeout"] !== false)
-            signals.push(AbortSignal.timeout(options["timeout"]))
+            if (opts.signal) signals.push(opts.signal)
+            if (chunkAbortCtl) signals.push(chunkAbortCtl.signal)
+            if (headerTimeoutCtl) signals.push(headerTimeoutCtl.signal)
+            if (options["timeout"] !== undefined && options["timeout"] !== null && options["timeout"] !== false)
+              signals.push(AbortSignal.timeout(options["timeout"]))
 
-          const combined = signals.length === 0 ? null : signals.length === 1 ? signals[0] : AbortSignal.any(signals)
-          if (combined) opts.signal = combined
+            const combined = signals.length === 0 ? null : signals.length === 1 ? signals[0] : AbortSignal.any(signals)
+            if (combined) opts.signal = combined
 
-          const res = await fetchFn(input, {
-            ...opts,
-            // @ts-ignore see here: https://github.com/oven-sh/bun/issues/16682
-            timeout: false,
-          }).finally(() => headerTimeoutCtl?.clear())
+            const res = await fetchFn(input, {
+              ...opts,
+              // @ts-ignore see here: https://github.com/oven-sh/bun/issues/16682
+              timeout: false,
+            }).finally(() => headerTimeoutCtl?.clear())
 
-          if (!chunkAbortCtl) return res
-          return wrapSSE(res, chunkTimeout, chunkAbortCtl)
-        }
+            if (!chunkAbortCtl) return res
+            return wrapSSE(res, chunkTimeout, chunkAbortCtl)
+          }
+        options["fetch"] = wrap()
+        const { controlledTransport } = await import("../plugin/openai/codex")
+        const controlled = controlledTransport(customFetch)
+        // Retain the actual cached transport's provenance, not mutable provider options.
+        if (
+          (customFetch === undefined || controlled) &&
+          builtin?.writable === false &&
+          builtin.configurable === false &&
+          typeof bun.fetch === "function"
+        )
+          dispatchTransports.set(options["fetch"], {
+            source: customFetch,
+            builtin: controlled?.builtin ?? "default",
+            bind: (boundary) =>
+              Object.assign(
+                wrap(
+                  controlled
+                    ? controlled.bind(boundary, bun.fetch)
+                    : async (input, init) => {
+                        const body = init?.body
+                        boundary.validateHttp(body)
+                        await boundary.prepared()
+                        init?.signal?.throwIfAborted()
+                        boundary.validateHttp(body)
+                        return bun.fetch(input, { ...init, body })
+                      },
+                ),
+                { preconnect: bun.fetch.preconnect },
+              ),
+          })
 
         const bundledLoader = BUNDLED_PROVIDERS[model.api.npm]
         if (bundledLoader) {

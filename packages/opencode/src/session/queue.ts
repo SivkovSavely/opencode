@@ -2,6 +2,8 @@ import { randomUUID } from "node:crypto"
 import { and, asc, eq, inArray, isNull, ne, or, sql } from "drizzle-orm"
 import { Context, Effect, Layer, Option, Schema } from "effect"
 import { Database } from "@opencode-ai/core/database/database"
+import { SessionHandoffEnrollment } from "@opencode-ai/core/session/handoff-enrollment"
+import { SessionHandoffRecoveryQueue } from "@opencode-ai/core/session/handoff-recovery-queue"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { MessageTable, SessionTable } from "@opencode-ai/core/session/sql"
 import { SessionQueueStateTable, SessionQueueTable } from "@opencode-ai/core/session/queue.sql"
@@ -49,6 +51,7 @@ export interface Interface {
   readonly delivered: (sessionID: SessionID, id: string, messageID?: MessageID) => Result<SessionQueueV1.Entry>
   readonly releaseClaim: (sessionID: SessionID, id: string) => Result<void>
   readonly block: (sessionID: SessionID) => Result<SessionQueueV1.Snapshot>
+  readonly blockForRecovery: (sessionID: SessionID) => Result<SessionQueueV1.Snapshot>
   readonly abandon: (sessionID: SessionID) => Result<SessionQueueV1.Snapshot>
   readonly unblock: (sessionID: SessionID) => Result<SessionQueueV1.Snapshot>
   readonly get: (sessionID: SessionID, id: string) => Result<SessionQueueV1.Entry>
@@ -561,6 +564,7 @@ export const layer = Layer.effect(
             (row) => row.state === "pending" && row.delivery === "queue" && (!ids || ids.has(row.id)),
           )
           if (!row) return { value: undefined, changed: false }
+          yield* SessionHandoffEnrollment.close({ db }, sessionID, "competing").pipe(Effect.orDie)
           yield* db
             .update(SessionQueueTable)
             .set({ state: "claimed", owner })
@@ -661,6 +665,24 @@ export const layer = Layer.effect(
       )).value
     })
 
+    const blockForRecovery = Effect.fn("SessionQueue.blockForRecovery")(function* (sessionID: SessionID) {
+      const frame = yield* SessionHandoffRecoveryQueue.CurrentFrame
+      if (!frame || frame.sessionID !== sessionID) return yield* setBlocked(sessionID, true)
+      return (yield* transaction(sessionID, (state) =>
+        Effect.gen(function* () {
+          if ((yield* SessionHandoffRecoveryQueue.block({ db }, frame).pipe(Effect.orDie)) === "owned")
+            return { value: undefined, changed: false }
+          yield* db
+            .update(SessionQueueStateTable)
+            .set({ blocked: true })
+            .where(eq(SessionQueueStateTable.session_id, sessionID))
+            .run()
+            .pipe(Effect.orDie)
+          return { value: undefined, changed: !state.blocked }
+        }),
+      )).snapshot
+    })
+
     return Service.of({
       list,
       enqueue,
@@ -674,6 +696,7 @@ export const layer = Layer.effect(
       releaseClaim,
       delivered,
       get,
+      blockForRecovery,
       block: (sessionID) => setBlocked(sessionID, true),
       abandon: (sessionID) => setBlocked(sessionID, true, true),
       unblock: (sessionID) => setBlocked(sessionID, false),

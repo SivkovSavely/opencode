@@ -18,6 +18,7 @@ import { described } from "./metadata"
 import { QueryBoolean } from "./query"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
+import { SessionHandoffV1 } from "@opencode-ai/schema/v1/session-handoff"
 
 const ConsoleStateResponse = Schema.Struct({
   consoleManagedProviders: Schema.mutable(Schema.Array(Schema.String)),
@@ -27,6 +28,7 @@ const ConsoleStateResponse = Schema.Struct({
 
 const CapabilitiesResponse = Schema.Struct({
   backgroundSubagents: Schema.Boolean,
+  legacyQueuePromptHandoffRecovery: Schema.optionalKey(SessionHandoffV1.Capability),
 }).annotate({ identifier: "ExperimentalCapabilities" })
 
 const ConsoleOrgOption = Schema.Struct({

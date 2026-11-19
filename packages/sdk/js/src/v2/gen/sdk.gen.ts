@@ -207,10 +207,19 @@ import type {
   SessionDeleteResponses,
   SessionDiffErrors,
   SessionDiffResponses,
+  SessionEnrollQueueActionErrors,
+  SessionEnrollQueueActionResponses,
+  SessionExecutionErrors,
+  SessionExecutionResponses,
   SessionForkErrors,
   SessionForkResponses,
   SessionGetErrors,
   SessionGetResponses,
+  SessionHandoffReceiptErrors,
+  SessionHandoffReceiptResponses,
+  SessionHandoffV1ControlRequest,
+  SessionHandoffV1EnrollRequest,
+  SessionHandoffV1RecoveryRequest,
   SessionInitErrors,
   SessionInitResponses,
   SessionListErrors,
@@ -219,6 +228,8 @@ import type {
   SessionMessageResponses,
   SessionMessagesErrors,
   SessionMessagesResponses,
+  SessionModelControlErrors,
+  SessionModelControlResponses,
   SessionPromptAsyncErrors,
   SessionPromptAsyncResponses,
   SessionPromptErrors,
@@ -233,6 +244,8 @@ import type {
   SessionQueueUpdateResponses,
   SessionQueueV1Mutation,
   SessionQueueV1Payload,
+  SessionRecoverQueueActionErrors,
+  SessionRecoverQueueActionResponses,
   SessionRetireErrors,
   SessionRetireResponses,
   SessionRetryErrors,
@@ -3739,6 +3752,197 @@ export class Provider extends HeyApiClient {
 }
 
 export class Session2 extends HeyApiClient {
+  /**
+   * Get queue action execution
+   */
+  public execution<ThrowOnError extends boolean = false>(
+    parameters: {
+      sessionID: string
+      directory?: string
+      workspace?: string
+      queueID?: string
+      userMessageID?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "sessionID" },
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+            { in: "query", key: "queueID" },
+            { in: "query", key: "userMessageID" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).get<SessionExecutionResponses, SessionExecutionErrors, ThrowOnError>({
+      url: "/session/{sessionID}/execution",
+      ...options,
+      ...params,
+    })
+  }
+
+  /**
+   * Enroll a queue action
+   */
+  public enrollQueueAction<ThrowOnError extends boolean = false>(
+    parameters: {
+      sessionID: string
+      directory?: string
+      workspace?: string
+      sessionHandoffV1EnrollRequest?: SessionHandoffV1EnrollRequest
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "sessionID" },
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+            { key: "sessionHandoffV1EnrollRequest", map: "body" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).post<
+      SessionEnrollQueueActionResponses,
+      SessionEnrollQueueActionErrors,
+      ThrowOnError
+    >({
+      url: "/session/{sessionID}/enrollment",
+      ...options,
+      ...params,
+      headers: {
+        "Content-Type": "application/json",
+        ...options?.headers,
+        ...params.headers,
+      },
+    })
+  }
+
+  /**
+   * Control the queue action model
+   */
+  public modelControl<ThrowOnError extends boolean = false>(
+    parameters: {
+      sessionID: string
+      directory?: string
+      workspace?: string
+      sessionHandoffV1ControlRequest?: SessionHandoffV1ControlRequest
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "sessionID" },
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+            { key: "sessionHandoffV1ControlRequest", map: "body" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).post<SessionModelControlResponses, SessionModelControlErrors, ThrowOnError>(
+      {
+        url: "/session/{sessionID}/model-control",
+        ...options,
+        ...params,
+        headers: {
+          "Content-Type": "application/json",
+          ...options?.headers,
+          ...params.headers,
+        },
+      },
+    )
+  }
+
+  /**
+   * Recover an enrolled queue action
+   */
+  public recoverQueueAction<ThrowOnError extends boolean = false>(
+    parameters: {
+      sessionID: string
+      directory?: string
+      workspace?: string
+      sessionHandoffV1RecoveryRequest?: SessionHandoffV1RecoveryRequest
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "sessionID" },
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+            { key: "sessionHandoffV1RecoveryRequest", map: "body" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).post<
+      SessionRecoverQueueActionResponses,
+      SessionRecoverQueueActionErrors,
+      ThrowOnError
+    >({
+      url: "/session/{sessionID}/recovery",
+      ...options,
+      ...params,
+      headers: {
+        "Content-Type": "application/json",
+        ...options?.headers,
+        ...params.headers,
+      },
+    })
+  }
+
+  /**
+   * Get a durable handoff receipt
+   */
+  public handoffReceipt<ThrowOnError extends boolean = false>(
+    parameters: {
+      sessionID: string
+      requestID: string
+      directory?: string
+      workspace?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "sessionID" },
+            { in: "path", key: "requestID" },
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).get<
+      SessionHandoffReceiptResponses,
+      SessionHandoffReceiptErrors,
+      ThrowOnError
+    >({
+      url: "/session/{sessionID}/handoff/{requestID}",
+      ...options,
+      ...params,
+    })
+  }
+
   /**
    * List sessions
    *

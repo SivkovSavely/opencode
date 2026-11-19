@@ -126,6 +126,181 @@ export default {
         );
       `)
       yield* tx.run(`
+        CREATE TABLE \`session_handoff_attempt\` (
+          \`position\` integer PRIMARY KEY AUTOINCREMENT,
+          \`message_id\` text NOT NULL,
+          \`session_id\` text NOT NULL,
+          \`queue_id\` text NOT NULL,
+          \`user_message_id\` text NOT NULL,
+          \`data\` text NOT NULL
+        );
+      `)
+      yield* tx.run(`
+        CREATE TABLE \`session_handoff_compaction\` (
+          \`message_id\` text PRIMARY KEY,
+          \`session_id\` text NOT NULL,
+          \`reservation\` text NOT NULL,
+          \`queue_id\` text NOT NULL,
+          \`user_message_id\` text NOT NULL,
+          \`parent_user_message_id\` text NOT NULL,
+          \`kind\` text NOT NULL,
+          \`epoch_sequence\` integer NOT NULL,
+          \`data\` text NOT NULL
+        );
+      `)
+      yield* tx.run(`
+        CREATE TABLE \`session_handoff_context\` (
+          \`identity\` text PRIMARY KEY,
+          \`session_id\` text NOT NULL,
+          \`queue_id\` text NOT NULL,
+          \`user_message_id\` text NOT NULL,
+          \`retired_reason\` text
+        );
+      `)
+      yield* tx.run(`
+        CREATE TABLE \`session_handoff_control\` (
+          \`session_id\` text NOT NULL,
+          \`queue_id\` text NOT NULL,
+          \`user_message_id\` text NOT NULL,
+          \`reservation\` text NOT NULL,
+          \`state\` text NOT NULL,
+          \`pending_request_id\` text,
+          \`data\` text NOT NULL,
+          CONSTRAINT \`session_handoff_control_pk\` PRIMARY KEY(\`session_id\`, \`queue_id\`, \`user_message_id\`)
+        );
+      `)
+      yield* tx.run(`
+        CREATE TABLE \`session_handoff_notification\` (
+          \`message_id\` text PRIMARY KEY,
+          \`session_id\` text NOT NULL,
+          \`reservation\` text,
+          \`classification\` text NOT NULL,
+          \`user_message_id\` text,
+          \`after_message_id\` text,
+          \`data\` text NOT NULL
+        );
+      `)
+      yield* tx.run(`
+        CREATE TABLE \`session_handoff_recovery_queue_block\` (
+          \`session_id\` text NOT NULL,
+          \`recovery_request_id\` text NOT NULL,
+          \`root_session_id\` text NOT NULL,
+          \`queue_id\` text NOT NULL,
+          \`user_message_id\` text NOT NULL,
+          \`reservation\` text NOT NULL,
+          \`recovery_revision\` integer NOT NULL,
+          \`owner_lineage\` text NOT NULL,
+          \`owner_instance\` text NOT NULL,
+          \`recovery_fence\` integer NOT NULL,
+          \`queue_revision\` integer NOT NULL,
+          \`input_proof\` text NOT NULL,
+          \`state\` text NOT NULL,
+          \`reason\` text,
+          \`internal_user_id\` text,
+          CONSTRAINT \`session_handoff_recovery_queue_block_pk\` PRIMARY KEY(\`session_id\`, \`recovery_request_id\`),
+          CONSTRAINT \`fk_session_handoff_recovery_queue_block_session_id_session_id_fk\` FOREIGN KEY (\`session_id\`) REFERENCES \`session\`(\`id\`) ON DELETE CASCADE,
+          CONSTRAINT \`fk_session_handoff_recovery_queue_block_recovery_request_id_session_handoff_request_request_id_fk\` FOREIGN KEY (\`recovery_request_id\`) REFERENCES \`session_handoff_request\`(\`request_id\`),
+          CONSTRAINT \`fk_session_handoff_recovery_queue_block_root_session_id_queue_id_user_message_id_session_handoff_action_session_id_queue_id_user_message_id_fk\` FOREIGN KEY (\`root_session_id\`,\`queue_id\`,\`user_message_id\`) REFERENCES \`session_handoff_action\`(\`session_id\`,\`queue_id\`,\`user_message_id\`)
+        );
+      `)
+      yield* tx.run(`
+        CREATE TABLE \`session_handoff_recovery_child\` (
+          \`session_id\` text PRIMARY KEY,
+          \`recovery_revision\` integer DEFAULT 0 NOT NULL,
+          \`link\` text NOT NULL,
+          \`input_digest\` text NOT NULL,
+          \`prior_fence\` integer NOT NULL,
+          \`recovery_fence\` integer NOT NULL,
+          CONSTRAINT \`fk_session_handoff_recovery_child_session_id_session_id_fk\` FOREIGN KEY (\`session_id\`) REFERENCES \`session\`(\`id\`) ON DELETE CASCADE
+        );
+      `)
+      yield* tx.run(`
+        CREATE TABLE \`session_handoff_recovery_history\` (
+          \`session_id\` text NOT NULL,
+          \`queue_id\` text NOT NULL,
+          \`user_message_id\` text NOT NULL,
+          \`revision\` integer NOT NULL,
+          \`data\` text NOT NULL,
+          CONSTRAINT \`session_handoff_recovery_history_pk\` PRIMARY KEY(\`session_id\`, \`queue_id\`, \`user_message_id\`, \`revision\`),
+          CONSTRAINT \`fk_session_handoff_recovery_history_session_id_queue_id_user_message_id_session_handoff_action_session_id_queue_id_user_message_id_fk\` FOREIGN KEY (\`session_id\`,\`queue_id\`,\`user_message_id\`) REFERENCES \`session_handoff_action\`(\`session_id\`,\`queue_id\`,\`user_message_id\`)
+        );
+      `)
+      yield* tx.run(`
+        CREATE TABLE \`session_handoff_recovery_hold\` (
+          \`root_session_id\` text NOT NULL,
+          \`reservation\` text NOT NULL,
+          \`session_id\` text NOT NULL,
+          CONSTRAINT \`session_handoff_recovery_hold_pk\` PRIMARY KEY(\`root_session_id\`, \`reservation\`, \`session_id\`),
+          CONSTRAINT \`fk_session_handoff_recovery_hold_root_session_id_session_id_fk\` FOREIGN KEY (\`root_session_id\`) REFERENCES \`session\`(\`id\`) ON DELETE CASCADE
+        );
+      `)
+      yield* tx.run(`
+        CREATE TABLE \`session_handoff_root\` (
+          \`session_id\` text NOT NULL,
+          \`reservation\` text NOT NULL,
+          \`state\` text NOT NULL,
+          \`queue_id\` text,
+          \`user_message_id\` text,
+          \`source\` text,
+          \`enrolled_request_id\` text,
+          CONSTRAINT \`session_handoff_root_pk\` PRIMARY KEY(\`session_id\`, \`reservation\`),
+          CONSTRAINT \`fk_session_handoff_root_session_id_session_id_fk\` FOREIGN KEY (\`session_id\`) REFERENCES \`session\`(\`id\`) ON DELETE CASCADE
+        );
+      `)
+      yield* tx.run(`
+        CREATE TABLE \`session_handoff_action\` (
+          \`session_id\` text NOT NULL,
+          \`queue_id\` text NOT NULL,
+          \`user_message_id\` text NOT NULL,
+          \`data\` text NOT NULL,
+          CONSTRAINT \`session_handoff_action_pk\` PRIMARY KEY(\`session_id\`, \`queue_id\`, \`user_message_id\`)
+        );
+      `)
+      yield* tx.run(`
+        CREATE TABLE \`session_handoff_assistant\` (
+          \`position\` integer PRIMARY KEY AUTOINCREMENT,
+          \`message_id\` text NOT NULL,
+          \`session_id\` text NOT NULL,
+          \`queue_id\` text NOT NULL,
+          \`user_message_id\` text NOT NULL,
+          \`data\` text NOT NULL,
+          CONSTRAINT \`fk_session_handoff_assistant_session_id_queue_id_user_message_id_session_handoff_action_session_id_queue_id_user_message_id_fk\` FOREIGN KEY (\`session_id\`,\`queue_id\`,\`user_message_id\`) REFERENCES \`session_handoff_action\`(\`session_id\`,\`queue_id\`,\`user_message_id\`)
+        );
+      `)
+      yield* tx.run(`
+        CREATE TABLE \`session_handoff_boundary\` (
+          \`session_id\` text NOT NULL,
+          \`queue_id\` text NOT NULL,
+          \`user_message_id\` text NOT NULL,
+          \`sequence\` integer NOT NULL,
+          \`request_id\` text NOT NULL,
+          \`data\` text NOT NULL,
+          CONSTRAINT \`session_handoff_boundary_pk\` PRIMARY KEY(\`session_id\`, \`queue_id\`, \`user_message_id\`, \`sequence\`),
+          CONSTRAINT \`fk_session_handoff_boundary_request_id_session_handoff_request_request_id_fk\` FOREIGN KEY (\`request_id\`) REFERENCES \`session_handoff_request\`(\`request_id\`),
+          CONSTRAINT \`fk_session_handoff_boundary_session_id_queue_id_user_message_id_session_handoff_action_session_id_queue_id_user_message_id_fk\` FOREIGN KEY (\`session_id\`,\`queue_id\`,\`user_message_id\`) REFERENCES \`session_handoff_action\`(\`session_id\`,\`queue_id\`,\`user_message_id\`)
+        );
+      `)
+      yield* tx.run(`
+        CREATE TABLE \`session_handoff_receipt\` (
+          \`request_id\` text NOT NULL,
+          \`revision\` integer NOT NULL,
+          \`data\` text NOT NULL,
+          CONSTRAINT \`session_handoff_receipt_pk\` PRIMARY KEY(\`request_id\`, \`revision\`),
+          CONSTRAINT \`fk_session_handoff_receipt_request_id_session_handoff_request_request_id_fk\` FOREIGN KEY (\`request_id\`) REFERENCES \`session_handoff_request\`(\`request_id\`)
+        );
+      `)
+      yield* tx.run(`
+        CREATE TABLE \`session_handoff_request\` (
+          \`request_id\` text PRIMARY KEY,
+          \`session_id\` text NOT NULL,
+          \`queue_id\` text NOT NULL,
+          \`user_message_id\` text NOT NULL,
+          \`identity\` text NOT NULL,
+          \`data\` text NOT NULL,
+          CONSTRAINT \`fk_session_handoff_request_session_id_queue_id_user_message_id_session_handoff_action_session_id_queue_id_user_message_id_fk\` FOREIGN KEY (\`session_id\`,\`queue_id\`,\`user_message_id\`) REFERENCES \`session_handoff_action\`(\`session_id\`,\`queue_id\`,\`user_message_id\`)
+        );
+      `)
+      yield* tx.run(`
         CREATE TABLE \`session_queue_import\` (
           \`session_id\` text PRIMARY KEY,
           \`hidden\` text NOT NULL,
@@ -425,6 +600,25 @@ export default {
       )
       yield* tx.run(`CREATE INDEX \`runtime_execution_parent_idx\` ON \`runtime_execution\` (\`parent_session_id\`);`)
       yield* tx.run(`CREATE INDEX \`runtime_retirement_root_idx\` ON \`runtime_retirement\` (\`root_session_id\`);`)
+      yield* tx.run(
+        `CREATE UNIQUE INDEX \`session_handoff_attempt_message_idx\` ON \`session_handoff_attempt\` (\`message_id\`);`,
+      )
+      yield* tx.run(
+        `CREATE INDEX \`session_handoff_notification_action_idx\` ON \`session_handoff_notification\` (\`session_id\`,\`reservation\`);`,
+      )
+      yield* tx.run(
+        `CREATE UNIQUE INDEX \`session_handoff_recovery_queue_owned_idx\` ON \`session_handoff_recovery_queue_block\` (\`session_id\`) WHERE "session_handoff_recovery_queue_block"."state"='owned';`,
+      )
+      yield* tx.run(
+        `CREATE INDEX \`session_handoff_recovery_hold_session_idx\` ON \`session_handoff_recovery_hold\` (\`session_id\`);`,
+      )
+      yield* tx.run(`CREATE INDEX \`session_handoff_root_session_idx\` ON \`session_handoff_root\` (\`session_id\`);`)
+      yield* tx.run(
+        `CREATE UNIQUE INDEX \`session_handoff_assistant_message_idx\` ON \`session_handoff_assistant\` (\`message_id\`);`,
+      )
+      yield* tx.run(
+        `CREATE UNIQUE INDEX \`session_handoff_boundary_request_idx\` ON \`session_handoff_boundary\` (\`request_id\`);`,
+      )
       yield* tx.run(
         `CREATE INDEX \`session_queue_session_state_delivery_position_idx\` ON \`session_queue\` (\`session_id\`,\`state\`,\`delivery\`,\`position\`);`,
       )

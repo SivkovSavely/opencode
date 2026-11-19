@@ -7,8 +7,232 @@ import { APICallError } from "ai"
 import { ProviderError } from "../../src/provider/error"
 import { OpenAIWebSocket } from "../../src/plugin/openai/ws"
 import { OpenAIWebSocketPool, TITLE_HEADER } from "../../src/plugin/openai/ws-pool"
+import { DispatchTransport } from "../../src/provider/dispatch-transport"
 
 describe("plugin.openai.ws", () => {
+  test("controlled busy-lane fallback keeps concurrent request intents separate", async () => {
+    const received = Promise.withResolvers<void>()
+    const release = Promise.withResolvers<void>()
+    const frames: unknown[] = []
+    await using server = await createWebSocketServer((socket) => {
+      socket.on("message", async (data) => {
+        frames.push(JSON.parse(data.toString()))
+        socket.send(JSON.stringify({ type: "response.output_text.delta", delta: "started" }))
+        received.resolve()
+        await release.promise
+        socket.send(JSON.stringify({ type: "response.completed", response: { id: "resp-concurrent" } }))
+      })
+    })
+    const pool = OpenAIWebSocketPool.createWebSocketFetch()
+    const bun = await import("bun")
+    const prepared: string[] = []
+    const request = (model: string, effort: string) => {
+      const state: { ready?: Promise<void> } = {}
+      const validate = (serialized: unknown) => {
+        const body: unknown = JSON.parse(String(serialized))
+        expect(body).toMatchObject({ model, reasoning: { effort } })
+      }
+      return pool.controlled(
+        {
+          validateHttp: validate,
+          validateFrame: validate,
+          prepared: () =>
+            (state.ready ??= Promise.resolve().then(() => {
+              prepared.push(model)
+            })),
+        },
+        bun.fetch,
+      )(server.url, {
+        method: "POST",
+        headers: { "session-id": "same-lane" },
+        body: JSON.stringify({ stream: true, model, reasoning: { effort } }),
+      })
+    }
+    try {
+      const first = await request("gpt-6.1-sol", "xhigh")
+      await received.promise
+      const second = await request("gpt-6.1-terra", "max")
+      expect(await second.text()).toBe("http")
+      expect(server.httpRequests).toHaveLength(1)
+      expect(JSON.parse(await server.httpBodies[0])).toMatchObject({
+        model: "gpt-6.1-terra",
+        reasoning: { effort: "max" },
+      })
+      release.resolve()
+      expect(await first.text()).toContain("data: [DONE]")
+      expect(frames).toEqual([{ type: "response.create", model: "gpt-6.1-sol", reasoning: { effort: "xhigh" } }])
+      expect(prepared).toEqual(["gpt-6.1-sol", "gpt-6.1-terra"])
+    } finally {
+      release.resolve()
+      pool.close()
+    }
+  })
+
+  test("controlled send is cancelled while its prepared callback is pending", async () => {
+    const frames: unknown[] = []
+    await using server = await createWebSocketServer((socket) => {
+      socket.on("message", (data) => frames.push(JSON.parse(data.toString())))
+    })
+    const socket = await OpenAIWebSocket.connectResponsesWebSocket({ url: server.wsUrl, headers: {} })
+    const started = Promise.withResolvers<void>()
+    const ready = Promise.withResolvers<void>()
+    const abort = new AbortController()
+    const sends: unknown[] = []
+    const send = socket.send
+    Object.defineProperty(socket, "send", {
+      value(...args: Parameters<typeof send>) {
+        sends.push(args[0])
+        return Reflect.apply(send, socket, args)
+      },
+    })
+    const response = OpenAIWebSocket.streamResponsesWebSocket({
+      socket,
+      body: { stream: true, model: "target", reasoning: { effort: "xhigh" } },
+      signal: abort.signal,
+      boundary: {
+        validateHttp() {},
+        validateFrame() {},
+        prepared() {
+          started.resolve()
+          return ready.promise
+        },
+      },
+    })
+    const text = readTextError(response.text())
+    await started.promise
+    abort.abort()
+    ready.resolve()
+    await ready.promise
+    expect((await text).name).toBe("AbortError")
+    expect(sends).toHaveLength(0)
+    expect(frames).toHaveLength(0)
+  })
+
+  test("controlled HTTP fallback is cancelled after awaiting prepared", async () => {
+    await using server = await createHttpServer()
+    const pool = OpenAIWebSocketPool.createWebSocketFetch()
+    const started = Promise.withResolvers<void>()
+    const ready = Promise.withResolvers<void>()
+    const abort = new AbortController()
+    const bun = await import("bun")
+    const calls: unknown[] = []
+    const request = pool.controlled(
+      {
+        validateHttp() {},
+        validateFrame() {},
+        prepared() {
+          started.resolve()
+          return ready.promise
+        },
+      },
+      (input, init) => {
+        calls.push(input)
+        return bun.fetch(input, init)
+      },
+    )(server.url, {
+      method: "POST",
+      signal: abort.signal,
+      body: JSON.stringify({ stream: true, model: "target", reasoning: { effort: "max" } }),
+    })
+    await started.promise
+    abort.abort()
+    ready.resolve()
+    await expect(request).rejects.toHaveProperty("name", "AbortError")
+    expect(calls).toHaveLength(0)
+    expect(server.httpRequests).toHaveLength(0)
+    pool.close()
+  })
+
+  test("controlled frame rejection is fatal before handshake and never uses HTTP fallback", async () => {
+    const connections: unknown[] = []
+    await using server = await createWebSocketServer((socket) => connections.push(socket))
+    const pool = OpenAIWebSocketPool.createWebSocketFetch({ streamRetries: 0 })
+    const calls: unknown[] = []
+    const prepared: unknown[] = []
+    const boundary: DispatchTransport.Boundary = {
+      validateHttp() {},
+      validateFrame() {
+        throw new DispatchTransport.UnsupportedDispatch()
+      },
+      prepared: async () => {
+        prepared.push(true)
+      },
+    }
+    await expect(
+      pool.controlled(boundary, async (input) => {
+        calls.push(input)
+        return new Response("unexpected")
+      })(server.url, streamRequest()),
+    ).rejects.toBeInstanceOf(DispatchTransport.UnsupportedDispatch)
+    expect(connections).toHaveLength(0)
+    expect(calls).toHaveLength(0)
+    expect(prepared).toHaveLength(0)
+    pool.close()
+  })
+
+  test("controlled final frame rejection suppresses enabled retries and releases its lane", async () => {
+    const connections: WebSocket[] = []
+    const frames: unknown[] = []
+    const closed = Promise.withResolvers<void>()
+    await using server = await createWebSocketServer((socket) => {
+      connections.push(socket)
+      if (connections.length === 1) socket.once("close", () => closed.resolve())
+      socket.on("message", (data) => {
+        frames.push(JSON.parse(data.toString()))
+        socket.send(JSON.stringify({ type: "response.completed", response: { id: "resp-recovered-lane" } }))
+      })
+    })
+    const pool = OpenAIWebSocketPool.createWebSocketFetch({ streamRetries: 3 })
+    const bun = await import("bun")
+    const failure = new DispatchTransport.UnsupportedDispatch()
+    const state: { checks: number; prepared: number; ready?: Promise<void> } = { checks: 0, prepared: 0 }
+    try {
+      const boundary: DispatchTransport.Boundary = {
+        validateHttp() {},
+        validateFrame() {
+          state.checks++
+          if (state.checks !== 2) return
+          expect(connections).toHaveLength(1)
+          throw failure
+        },
+        prepared: () =>
+          (state.ready ??= Promise.resolve().then(() => {
+            state.prepared++
+          })),
+      }
+      await expect(pool.controlled(boundary, bun.fetch)(server.url, streamRequest())).rejects.toBe(failure)
+      await closed.promise
+      expect(failure).toMatchObject({ _tag: "UnsupportedDispatch" })
+      expect(failure.message).toBe("unsupported_dispatch: controlled model/effort could not be verified")
+      expect(state.checks).toBe(2)
+      expect(state.prepared).toBe(1)
+      expect(connections).toHaveLength(1)
+      expect(frames).toHaveLength(0)
+      expect(server.httpRequests).toHaveLength(0)
+
+      const recovered = { prepared: 0, ready: undefined as Promise<void> | undefined }
+      const response = await pool.controlled(
+        {
+          validateHttp() {},
+          validateFrame() {},
+          prepared: () =>
+            (recovered.ready ??= Promise.resolve().then(() => {
+              recovered.prepared++
+            })),
+        },
+        bun.fetch,
+      )(server.url, streamRequest())
+      expect(await response.text()).toContain("data: [DONE]")
+      expect(recovered.prepared).toBe(1)
+      expect(state.prepared).toBe(1)
+      expect(connections).toHaveLength(2)
+      expect(frames).toHaveLength(1)
+      expect(server.httpRequests).toHaveLength(0)
+    } finally {
+      pool.close()
+    }
+  })
+
   test("derives websocket URLs and sends auth plus protocol headers", async () => {
     let headers: IncomingMessage["headers"] | undefined
     await using server = await createWebSocketServer((_socket, request) => {
@@ -47,13 +271,21 @@ describe("plugin.openai.ws", () => {
 
   test("surfaces websocket upgrade rejection messages", async () => {
     await using server = await createRejectingWebSocketServer(() => {})
+    // Bun versions differ in upgrade error wording; preserve the native diagnostic.
+    const error = await new Promise<Error>((resolve, reject) => {
+      const socket = new WebSocket(server.wsUrl)
+      socket.once("error", resolve)
+      socket.once("open", () => reject(new Error("Expected websocket upgrade rejection")))
+    })
+    expect(error).toBeInstanceOf(Error)
+    expect(error.message.length).toBeGreaterThan(0)
 
     await expect(
       OpenAIWebSocket.connectResponsesWebSocket({
         url: server.wsUrl,
         headers: {},
       }),
-    ).rejects.toThrow("Expected 101 status code")
+    ).rejects.toMatchObject({ name: error.name, message: error.message })
   })
 
   test("enforces websocket send idle timeout", async () => {
@@ -866,8 +1098,16 @@ async function createRejectingWebSocketServer(onAttempt: () => void) {
 
 async function createHttpServer() {
   const httpRequests: IncomingMessage[] = []
+  const httpBodies: Promise<string>[] = []
   const server = createServer((request, response) => {
     httpRequests.push(request)
+    httpBodies.push(
+      new Promise((resolve) => {
+        const chunks: Buffer[] = []
+        request.on("data", (chunk) => chunks.push(Buffer.from(chunk)))
+        request.on("end", () => resolve(Buffer.concat(chunks).toString()))
+      }),
+    )
     response.writeHead(200, { "content-type": "text/plain" })
     response.end("http")
   })
@@ -876,6 +1116,7 @@ async function createHttpServer() {
   return {
     server,
     httpRequests,
+    httpBodies,
     url: `http://127.0.0.1:${address.port}/v1/responses`,
     async [Symbol.asyncDispose]() {
       await closeHttpServer(server)
@@ -888,6 +1129,7 @@ function websocketServerHandle(server: WebSocketServer, http: Awaited<ReturnType
     url: http.url,
     wsUrl: http.url.replace(/^http/, "ws"),
     httpRequests: http.httpRequests,
+    httpBodies: http.httpBodies,
     async [Symbol.asyncDispose]() {
       for (const socket of server.clients) socket.terminate()
       server.close()

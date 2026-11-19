@@ -63,6 +63,11 @@ import { SessionQueueV1 } from "@opencode-ai/schema/v1/session-queue"
 import { SessionQueueTable } from "@opencode-ai/core/session/queue.sql"
 import { requireUnmanagedShell } from "@/util/managed-shell"
 import { ManagedCommand } from "@opencode-ai/core/managed-command"
+import { SessionHandoffEnrollment } from "@opencode-ai/core/session/handoff-enrollment"
+import { SessionHandoffNotification } from "@opencode-ai/core/session/handoff-notification"
+import { SessionHandoffStore } from "@opencode-ai/core/session/handoff-store"
+import { SessionHandoffControl } from "@opencode-ai/core/session/handoff-control"
+import { SessionHandoffRecovery } from "@opencode-ai/core/session/handoff-recovery"
 import { ManagedWorkspace } from "@/server/managed-workspace"
 import { SkillTool } from "@/tool/skill"
 import { Skill } from "@/skill"
@@ -199,6 +204,7 @@ type TaskAdmission = {
   parentCallID?: string
   parentMode?: "foreground" | "background"
   notification?: boolean
+  notificationLink?: SessionHandoffNotification.Link
   recoveryFence?: number
   admission?: Deferred.Deferred<void, RuntimeLifecycle.RuntimeDrainingError | InputError>
 }
@@ -865,6 +871,12 @@ const layer = Layer.effect(
       delivery?: SessionQueueV1.Entry,
     ) {
       requireUnmanagedShell()
+      const reservation = ulid()
+      yield* SessionHandoffEnrollment.reserve(database, input.sessionID, reservation).pipe(Effect.orDie)
+      yield* Effect.addFinalizer(() =>
+        SessionHandoffEnrollment.abort(database, input.sessionID, reservation).pipe(Effect.orDie),
+      )
+      yield* SessionHandoffEnrollment.preparing(database, input.sessionID, reservation).pipe(Effect.orDie)
       return yield* Effect.uninterruptibleMask((restore) =>
         Effect.gen(function* () {
           const markReady = ready ? ready.open.pipe(Effect.asVoid) : Effect.void
@@ -1030,7 +1042,7 @@ const layer = Layer.effect(
           return { info: msg, parts: [part], aborted }
         }),
       )
-    })
+    }, Effect.scoped)
 
     const getModel = Effect.fn("SessionPrompt.getModel")(function* (
       providerID: ProviderV2.ID,
@@ -1073,12 +1085,31 @@ const layer = Layer.effect(
       return yield* provider.defaultModel().pipe(Effect.orDie)
     })
 
+    const notificationOwner = Effect.fnUntraced(function* (link: SessionHandoffNotification.Link) {
+      const fence = yield* runtime.ownershipFence(link.childSessionID)
+      return fence === undefined
+        ? undefined
+        : { ownerLineage: runtime.identity.lineage, ownerInstance: runtime.identity.instance, fence }
+    })
+
     const prepareUserMessage = Effect.fn("SessionPrompt.prepareUserMessage")(function* (
       input: PromptInput,
       delivery?: SessionQueueV1.Entry,
       resolved = false,
+      suppliedReservation?: string,
+      beforeEffects: Effect.Effect<void> = Effect.void,
+      notificationLink?: SessionHandoffNotification.Link,
     ) {
       rejectManagedInputParts(input.parts)
+      if (notificationLink && (yield* SessionHandoffRecovery.held(database, input.sessionID).pipe(Effect.orDie)))
+        return yield* new InputError({ message: "Background Task notification is held for guarded recovery" })
+      const reservation = suppliedReservation ?? ulid()
+      if (suppliedReservation === undefined && !notificationLink)
+        yield* SessionHandoffEnrollment.reserve(database, input.sessionID, reservation).pipe(Effect.orDie)
+      const release = notificationLink
+        ? Effect.void
+        : SessionHandoffEnrollment.abort(database, input.sessionID, reservation).pipe(Effect.orDie)
+      yield* Effect.addFinalizer((exit) => (Exit.isFailure(exit) ? release : Effect.void))
       const agentName = input.agent
       const ag = agentName ? yield* agents.get(agentName) : yield* agents.defaultInfo()
       if (!ag) {
@@ -1101,6 +1132,11 @@ const layer = Layer.effect(
         input.variant ??
         (input.selection && "variant" in model && typeof model.variant === "string" ? model.variant : undefined) ??
         (!resolved && ag.variant && full?.variants?.[ag.variant] ? ag.variant : undefined)
+
+      if (!notificationLink) {
+        yield* SessionHandoffEnrollment.preparing(database, input.sessionID, reservation).pipe(Effect.orDie)
+        yield* beforeEffects
+      }
 
       const info: SessionV1.User = {
         id: input.messageID ?? MessageID.ascending(),
@@ -1538,7 +1574,7 @@ const layer = Layer.effect(
         })
       }
 
-      const save = (active?: SessionV1.User["model"]) =>
+      const save = (active?: SessionV1.User["model"], cancelledFence?: number) =>
         Effect.gen(function* () {
           if (input.selection && !resolved) {
             const inherited = input.selection.inheritActive ? active : undefined
@@ -1567,6 +1603,15 @@ const layer = Layer.effect(
             .transaction(
               () =>
                 Effect.gen(function* () {
+                  if (cancelledFence !== undefined) {
+                    const cancelled =
+                      yield* db.get(sql`SELECT 1 FROM runtime_execution WHERE session_id = ${input.sessionID}
+                      AND owner_lineage = ${runtime.identity.lineage} AND owner_instance = ${runtime.identity.instance}
+                      AND fence = ${cancelledFence} AND state = 'cancelled' AND desired_active = 0`)
+                    if (!cancelled) return yield* Effect.interrupt
+                  }
+                  if (!notificationLink)
+                    yield* SessionHandoffEnrollment.preparing(database, input.sessionID, reservation).pipe(Effect.orDie)
                   const retired = yield* db
                     .get<{
                       session_id: string
@@ -1591,8 +1636,40 @@ const layer = Layer.effect(
                         parts.push({ ...part, text: "", synthetic: true, ignored: true })
                     }
                   } else if (delivery) yield* requireUnusedMessageID(info.id)
+                  const activeOwner = notificationLink ? yield* notificationOwner(notificationLink) : undefined
+                  const notification = notificationLink
+                    ? yield* SessionHandoffNotification.admit(
+                        database,
+                        input.sessionID,
+                        info.id,
+                        notificationLink,
+                        activeOwner,
+                      ).pipe(
+                        Effect.catchIf(
+                          (error): error is SessionHandoffNotification.NotificationError =>
+                            Schema.is(SessionHandoffNotification.NotificationError)(error) &&
+                            error.code === "ambiguous_lineage",
+                          (error) =>
+                            Effect.gen(function* () {
+                              if (
+                                yield* SessionHandoffNotification.required(
+                                  database,
+                                  input.sessionID,
+                                  info.id,
+                                  notificationLink.parentMessageID,
+                                )
+                              )
+                                return yield* Effect.fail(error)
+                              yield* SessionHandoffEnrollment.reserve(database, input.sessionID, reservation)
+                              yield* SessionHandoffEnrollment.preparing(database, input.sessionID, reservation)
+                              return undefined
+                            }),
+                        ),
+                      )
+                    : undefined
                   const current = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
                   if (
+                    notification?.classification !== "in_action" &&
                     !input.selection &&
                     (current.agent !== info.agent ||
                       current.model?.providerID !== info.model.providerID ||
@@ -1615,10 +1692,19 @@ const layer = Layer.effect(
                   for (const part of parts) yield* sessions.updatePart(part)
                   if (delivery && (delivery.delivery === "queue" || delivery.state === "claimed")) {
                     yield* queue.delivered(input.sessionID, delivery.id, info.id)
+                    if (reservation && delivery.payload.kind === "prompt")
+                      yield* SessionHandoffEnrollment.delivered(
+                        database,
+                        input.sessionID,
+                        reservation,
+                        delivery.id,
+                        info.id,
+                      )
                     return
                   }
                   if (delivery) {
                     yield* queue.attachSteer(input.sessionID, delivery.id, info.id)
+                    yield* SessionHandoffEnrollment.committed(database, input.sessionID, reservation)
                     return
                   }
                   yield* queue.registerSteer(
@@ -1645,13 +1731,14 @@ const layer = Layer.effect(
                     },
                     info.id,
                   )
+                  if (!notification) yield* SessionHandoffEnrollment.committed(database, input.sessionID, reservation)
                 }),
               { behavior: "immediate" },
             )
             .pipe(Effect.orDie)
-        }).pipe(Effect.asVoid)
+        }).pipe(Effect.asVoid, Effect.ensuring(release))
 
-      return { message: { info, parts }, save }
+      return { message: { info, parts }, save, release }
     }, Effect.scoped)
 
     const createUserMessage = Effect.fn("SessionPrompt.createUserMessage")(function* (
@@ -1679,6 +1766,64 @@ const layer = Layer.effect(
       ) {
         rejectManagedInputParts(input.parts)
         const session = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
+        const reservation = ulid()
+        const notification = task?.notification
+          ? yield* db
+              .transaction(
+                () =>
+                  Effect.gen(function* () {
+                    const strict = yield* SessionHandoffNotification.required(
+                      database,
+                      input.sessionID,
+                      input.messageID,
+                      task.notificationLink?.parentMessageID ?? task.parentMessageID,
+                    )
+                    const link = task.notificationLink
+                    const messageID = input.messageID
+                    const activeOwner = link ? yield* notificationOwner(link) : undefined
+                    const eligible =
+                      !delivery &&
+                      !input.tools &&
+                      !input.system &&
+                      !input.format &&
+                      !input.selection &&
+                      input.parts.every((part) => part.type === "text" && part.synthetic)
+                    const proof =
+                      eligible && link && messageID
+                        ? yield* SessionHandoffNotification.verify(
+                            database,
+                            input.sessionID,
+                            messageID,
+                            link,
+                            activeOwner,
+                          ).pipe(
+                            Effect.catchIf(
+                              (error) =>
+                                Schema.is(SessionHandoffNotification.NotificationError)(error) &&
+                                error.code === "ambiguous_lineage",
+                              () => Effect.succeed(undefined),
+                            ),
+                          )
+                        : undefined
+                    if (proof) return { link: proof.link, rejected: false }
+                    if (strict) return { link: undefined, rejected: true }
+                    // Reserve and invalidate the unprovable candidate before plugins, atomically with the proof decision.
+                    yield* SessionHandoffEnrollment.reserve(database, input.sessionID, reservation)
+                    yield* SessionHandoffEnrollment.preparing(database, input.sessionID, reservation)
+                    return { link: undefined, rejected: false }
+                  }),
+                { behavior: "immediate" },
+              )
+              .pipe(Effect.orDie)
+          : undefined
+        if (notification?.rejected)
+          return yield* new InputError({ message: "Background Task notification lineage is unprovable or conflicting" })
+        const notificationLink = notification?.link
+        if (!task?.notification)
+          yield* SessionHandoffEnrollment.reserve(database, input.sessionID, reservation).pipe(Effect.orDie)
+        yield* Effect.addFinalizer(() =>
+          SessionHandoffEnrollment.abort(database, input.sessionID, reservation).pipe(Effect.orDie),
+        )
         const work = Effect.gen(function* () {
           const existing =
             input.idempotent && input.messageID
@@ -1689,12 +1834,43 @@ const layer = Layer.effect(
           const complete =
             Option.isSome(existing) &&
             input.parts.every((part) => part.id && existing.value.parts.some((saved) => saved.id === part.id))
+          if (notificationLink && Option.isSome(existing)) {
+            const proof = yield* SessionHandoffNotification.verify(
+              database,
+              input.sessionID,
+              existing.value.info.id,
+              notificationLink,
+            ).pipe(Effect.orDie)
+            if (
+              !proof.prior ||
+              !complete ||
+              input.parts.some(
+                (part) =>
+                  part.type === "text" &&
+                  !existing.value.parts.some(
+                    (saved) =>
+                      saved.id === part.id &&
+                      saved.type === "text" &&
+                      saved.text === part.text &&
+                      saved.synthetic === part.synthetic,
+                  ),
+              )
+            )
+              return yield* new InputError({ message: "Background Task notification message collision" })
+          }
           const prepared = complete
             ? { message: existing.value, save: () => Effect.void }
             : yield* Effect.gen(function* () {
-                yield* revert.cleanup(session)
-                return yield* prepareUserMessage(input, delivery, resolved)
+                return yield* prepareUserMessage(
+                  input,
+                  delivery,
+                  resolved,
+                  reservation,
+                  revert.cleanup(session),
+                  notificationLink,
+                )
               })
+          if (complete) yield* SessionHandoffEnrollment.abort(database, input.sessionID, reservation).pipe(Effect.orDie)
           yield* sessions.touch(input.sessionID)
 
           const permissions: PermissionV1.Rule[] = []
@@ -1768,13 +1944,26 @@ const layer = Layer.effect(
                   message: "Session execution is no longer active",
                 })
               const prepared = yield* work
-              if (!(yield* runtime.beforeTurn(input.sessionID)))
+              const continuing = yield* runtime.beforeTurn(input.sessionID)
+              // A no-reply input already admitted before local cancellation may finish its save, never start a turn.
+              // Cancellation advances exactly one fence; replacement ownership or a later execution cannot qualify.
+              const cancelledAdmission =
+                !continuing && input.noReply && !task?.notification
+                  ? yield* db
+                      .get(
+                        sql`SELECT 1 FROM runtime_execution WHERE session_id = ${input.sessionID}
+                    AND owner_lineage = ${runtime.identity.lineage} AND owner_instance = ${runtime.identity.instance}
+                    AND fence = ${admission.fence + 1} AND state = 'cancelled' AND desired_active = 0`,
+                      )
+                      .pipe(Effect.orDie)
+                  : undefined
+              if (!continuing && !cancelledAdmission)
                 return yield* new RuntimeLifecycle.RuntimeDrainingError({
                   message: "Session execution is no longer active",
                 })
               if (input.noReply) {
                 yield* state.admit(input.sessionID, (active) =>
-                  prepared.save(active).pipe(
+                  prepared.save(active, cancelledAdmission ? admission.fence + 1 : undefined).pipe(
                     Effect.map(() => {
                       if (prepared.message.info.role !== "user") throw new Error("Expected admitted user message")
                       return prepared.message.info
@@ -1814,7 +2003,7 @@ const layer = Layer.effect(
                 })
               : runtime.release(input.sessionID, admission.fence),
         )
-      })
+      }, Effect.scoped)
 
     const lastAssistant = Effect.fnUntraced(function* (sessionID: SessionID) {
       const match = yield* sessions.findMessage(sessionID, (m) => m.info.role !== "user").pipe(Effect.orDie)
@@ -1960,6 +2149,7 @@ const layer = Layer.effect(
           () =>
             Effect.gen(function* () {
               if (!(yield* ownsQueue(sessionID))) return
+              if (yield* SessionHandoffRecovery.held(database, sessionID)) return
               if (flushing?.size) {
                 const entry = yield* queue.claimNext(sessionID, true, flushing)
                 if (entry) return entry
@@ -2256,8 +2446,11 @@ const layer = Layer.effect(
       const parent =
         prepared?.message.info ??
         (Option.isSome(existing) && existing.value.info.role === "user" ? existing.value.info : undefined)
-      if (parent) yield* state.admit(sessionID, () => mutation.pipe(Effect.as(parent)))
-      else yield* mutation
+      if (parent)
+        yield* state
+          .admit(sessionID, () => mutation.pipe(Effect.as(parent)))
+          .pipe(Effect.ensuring(prepared?.release ?? Effect.void))
+      else yield* mutation.pipe(Effect.ensuring(prepared?.release ?? Effect.void))
       yield* notifyQueue(sessionID)
       if (
         (input.mutation.action === "convert" && input.mutation.delivery === "steer") ||
@@ -2311,6 +2504,8 @@ const layer = Layer.effect(
             Effect.gen(function* () {
               if (!(yield* ownsQueue(sessionID))) return
               const entries = yield* queue.list(sessionID)
+              const notificationRecords = yield* SessionHandoffNotification.records(database, sessionID)
+              const boundary = yield* SessionHandoffNotification.boundary(database, sessionID)
               // A restart may continue a provider turn, but must not start a shell that
               // was only converted to steering before the previous process stopped.
               const deferred = new Set(
@@ -2325,14 +2520,30 @@ const layer = Layer.effect(
               const msgs = (yield* MessageV2.filterCompactedEffect(sessionID).pipe(
                 Effect.provideService(Database.Service, database),
               )).filter((msg) => !deferred.has(msg.info.id))
+              const newTask = yield* SessionHandoffRecovery.CurrentNewTask
+              const initialTask =
+                newTask?.sessionID === sessionID &&
+                (yield* SessionHandoffEnrollment.newTaskAllowed(database, sessionID, {
+                  ownerLineage: runtime.identity.lineage,
+                  ownerInstance: runtime.identity.instance,
+                }))
+                  ? yield* db.get<{ messageID: MessageID }>(
+                      sql`SELECT json_extract(metadata,'$.task.messageID') AS messageID FROM session WHERE id=${sessionID}`,
+                    )
+                  : undefined
               const claimed = yield* queue.claimSteers(
                 sessionID,
-                msgs.map((msg) => msg.info.id),
+                (yield* SessionHandoffRecovery.held(database, sessionID))
+                  ? initialTask
+                    ? [initialTask.messageID]
+                    : []
+                  : msgs.map((msg) => msg.info.id),
               )
               const ids = claimed.flatMap((entry) => (entry.messageID ? [entry.messageID] : []))
               for (const messageID of ids) {
                 const first = msgs.find((msg) => msg.info.id === messageID)
                 if (!first) continue
+                if (notificationRecords.some((record) => record.message_id === messageID)) continue
                 const text = first.parts.find((part) => part.type === "text")
                 // Persist the boundary and batch order without changing bubble timestamps.
                 // Metadata survives runner rebuilds; a hidden marker also covers file-only inputs.
@@ -2362,6 +2573,14 @@ const layer = Layer.effect(
                   ),
                 )
                 .filter((order, index, all) => all.findIndex((item) => item.ids[0] === order.ids[0]) === index)
+              orders.push(
+                ...notificationRecords
+                  .filter((row) => msgs.some((msg) => msg.info.id === row.message_id))
+                  .map((row) => ({
+                    after: row.after_message_id ? MessageID.make(row.after_message_id) : undefined,
+                    ids: [MessageID.make(row.message_id)],
+                  })),
+              )
               const selected = new Map<MessageID, SessionV1.User>()
               for (const order of orders) {
                 const group = order.ids.flatMap((id) => msgs.filter((msg) => msg.info.id === id))
@@ -2376,7 +2595,35 @@ const layer = Layer.effect(
               }
               const latest = MessageV2.latest(msgs)
               if (latest.user) latest.user = selected.get(latest.user.id) ?? latest.user
-              return { msgs, latest, claimed }
+              const action = latest.user
+                ? yield* SessionHandoffNotification.context(database, sessionID, latest.user.id)
+                : undefined
+              const retired =
+                latest.user && !action
+                  ? yield* db.get(sql`SELECT 1 FROM session_handoff_control c
+                WHERE c.session_id = ${sessionID} AND c.state != 'active' AND (c.user_message_id = ${latest.user.id}
+                  OR EXISTS (SELECT 1 FROM session_handoff_notification n WHERE n.session_id = c.session_id AND n.reservation = c.reservation AND n.classification = 'in_action' AND n.message_id = ${latest.user.id})
+                  OR EXISTS (SELECT 1 FROM session_handoff_compaction p WHERE p.session_id = c.session_id AND p.reservation = c.reservation AND p.kind IN ('request','continuation') AND p.message_id = ${latest.user.id})) LIMIT 1`)
+                  : undefined
+              if (latest.user && action) {
+                const persisted = yield* sessions.findMessage(
+                  sessionID,
+                  (message) => message.info.id === action.userMessageID,
+                )
+                const original = Option.isSome(persisted) ? persisted.value.info : undefined
+                if (original?.role !== "user") throw new Error("Missing original Task notification authorization user")
+                latest.user = {
+                  ...original,
+                  id: latest.user.id,
+                  time: latest.user.time,
+                  model: {
+                    providerID: ProviderV2.ID.make(action.selection.providerID),
+                    modelID: ModelV2.ID.make(action.selection.modelID),
+                    variant: action.selection.variant,
+                  },
+                }
+              }
+              return { msgs, latest, claimed, boundary, action, retired: retired !== undefined }
             }),
           { behavior: "immediate" },
         )
@@ -2496,7 +2743,7 @@ const layer = Layer.effect(
         let structured: unknown
         let step = 0
         const session = yield* sessions.get(sessionID).pipe(Effect.orDie)
-        if (recovery || reconcile || manualRecovery) yield* queue.block(sessionID).pipe(Effect.orDie)
+        if (recovery || reconcile || manualRecovery) yield* queue.blockForRecovery(sessionID).pipe(Effect.orDie)
         if (reconcile) yield* reconcileCrashTools(sessionID, manualRecovery)
         let userID: MessageID | undefined
 
@@ -2517,7 +2764,8 @@ const layer = Layer.effect(
           const snapshot = yield* history(sessionID, recovery || reconcile || manualRecovery)
           if (!snapshot) break
           let msgs = snapshot.msgs
-          const { user: lastUser, assistant: lastAssistant, finished: lastFinished, tasks } = snapshot.latest
+          const { user: historyUser, assistant: lastAssistant, finished: lastFinished, tasks } = snapshot.latest
+          let lastUser = historyUser
 
           for (const entry of snapshot.claimed) {
             if (entry.payload.kind === "command") {
@@ -2546,7 +2794,7 @@ const layer = Layer.effect(
             const internalCompaction =
               process.env.OPENCODE_MANAGED_PROFILE === "1" &&
               msgs
-                .find((message) => message.info.id === lastUser.id)
+                .find((message) => message.info.id === historyUser?.id)
                 ?.parts.some(
                   (part) =>
                     part.type === "compaction" || (part.type === "text" && part.metadata?.compaction_continue === true),
@@ -2593,11 +2841,36 @@ const layer = Layer.effect(
               })
             }
             yield* Effect.logInfo("exiting loop", { "session.id": sessionID })
+            if (
+              !(yield* SessionHandoffNotification.terminalize(database, sessionID, snapshot.boundary).pipe(
+                Effect.orDie,
+              ))
+            )
+              continue
             if (!recovery && !reconcile && !manualRecovery && !lastAssistant.error && (yield* advanceQueue(sessionID)))
               continue
             break
           }
 
+          if (snapshot.retired) break
+          const action = yield* SessionHandoffControl.beforeTurn(
+            database,
+            sessionID,
+            ctx.directory,
+            lastUser.id,
+            snapshot.boundary,
+          ).pipe(Effect.orDie)
+          if (action === null) continue
+          if (snapshot.action?.enrolled && !action) continue
+          if (action)
+            lastUser = {
+              ...lastUser,
+              model: {
+                providerID: ProviderV2.ID.make(action.selection.providerID),
+                modelID: ModelV2.ID.make(action.selection.modelID),
+                variant: action.selection.variant,
+              },
+            }
           step++
           if (step === 1 && process.env.OPENCODE_MANAGED_PROFILE !== "1")
             yield* title({
@@ -2624,6 +2897,12 @@ const layer = Layer.effect(
               overflow: task.overflow,
             })
             if (result === "stop") {
+              if (
+                !(yield* SessionHandoffNotification.terminalize(database, sessionID, snapshot.boundary).pipe(
+                  Effect.orDie,
+                ))
+              )
+                continue
               const completed = yield* sessions
                 .findMessage(sessionID, (message) => message.info.role === "assistant")
                 .pipe(Effect.orDie)
@@ -2653,6 +2932,7 @@ const layer = Layer.effect(
               model: lastUser.model,
               format: lastUser.format,
               auto: true,
+              sourceUserMessageID: lastUser.id,
             })
             continue
           }
@@ -2688,7 +2968,31 @@ const layer = Layer.effect(
             time: { created: Date.now() },
             sessionID,
           }
-          yield* sessions.updateMessage(msg)
+          yield* db
+            .transaction(
+              () =>
+                Effect.gen(function* () {
+                  yield* sessions.updateMessage(msg)
+                  const membership = yield* SessionHandoffNotification.context(database, sessionID, lastUser.id)
+                  if (membership?.enrolled && membership.epochSequence === 0) {
+                    yield* SessionHandoffStore.appendAssistant(database, membership, {
+                      kind: "ordinary",
+                      messageID: msg.id,
+                      parentUserMessageID: lastUser.id,
+                      authorizationUserMessageID: membership.userMessageID,
+                      epochSequence: 0,
+                      controlRequestID: null,
+                      selection: membership.selection,
+                      selectionEvidence: "persisted_message",
+                      dispatch: "unknown",
+                    })
+                  }
+                  if (membership?.enrolled && membership.epochSequence > 0)
+                    yield* SessionHandoffControl.preparedAssistant(database, membership, msg.id, lastUser.id)
+                }),
+              { behavior: "immediate" },
+            )
+            .pipe(Effect.orDie)
 
           const finalizeFailedAssistant = (cause: Cause.Cause<unknown>) =>
             Effect.gen(function* () {
@@ -2758,6 +3062,7 @@ const layer = Layer.effect(
                   model: lastUser.model,
                   format: lastUser.format,
                   auto: true,
+                  sourceUserMessageID: lastUser.id,
                 }),
               executionFence,
               managedRuntime: runtime,
@@ -2822,6 +3127,17 @@ const layer = Layer.effect(
                 ],
                 tools,
                 model,
+                ...(action?.enrolled && action.epochSequence > 0
+                  ? {
+                      expectedSelection: action.selection,
+                      onDispatch: () =>
+                        SessionHandoffControl.normalizedDispatch(database, action, msg.id, lastUser.id).pipe(
+                          Effect.orDie,
+                        ),
+                      onUnsupportedDispatch: () =>
+                        SessionHandoffControl.unsupportedDispatch(database, action).pipe(Effect.orDie),
+                    }
+                  : {}),
                 toolChoice: format.type === "json_schema" ? "required" : undefined,
               })
               .pipe(RuntimeLifecycle.withRecoveryPhase("provider-turn"))
@@ -2858,7 +3174,7 @@ const layer = Layer.effect(
               }
             }
 
-            if (result === "stop") return "break" as const
+            if (result === "stop") return "stop" as const
             if (result === "compact") {
               yield* compaction.create({
                 sessionID,
@@ -2867,6 +3183,7 @@ const layer = Layer.effect(
                 auto: true,
                 format: lastUser.format,
                 overflow: !handle.message.finish,
+                sourceUserMessageID: lastUser.id,
               })
             }
             return "continue" as const
@@ -2888,7 +3205,19 @@ const layer = Layer.effect(
           ) {
             const flush = yield* InstanceState.get(queueState)
             flush.delete(sessionID)
-            yield* queue.block(sessionID).pipe(Effect.orDie)
+            const closed = yield* db
+              .transaction(
+                () =>
+                  Effect.gen(function* () {
+                    if (!(yield* SessionHandoffNotification.terminalize(database, sessionID, snapshot.boundary)))
+                      return false
+                    yield* queue.block(sessionID)
+                    return true
+                  }),
+                { behavior: "immediate" },
+              )
+              .pipe(Effect.orDie)
+            if (!closed) continue
             break
           }
           const checkpoint = yield* runtime.checkpoint(sessionID)
@@ -2938,7 +3267,7 @@ const layer = Layer.effect(
                 flush.delete(sessionID)
               if (Exit.isFailure(exit)) yield* queue.abandon(sessionID).pipe(Effect.orDie)
               if (Exit.isSuccess(exit) && (recovery || reconcile || manualRecovery))
-                yield* queue.block(sessionID).pipe(Effect.orDie)
+                yield* queue.blockForRecovery(sessionID).pipe(Effect.orDie)
             }),
           ),
         ),
@@ -2993,7 +3322,9 @@ const layer = Layer.effect(
           sessionID,
           Effect.die(new Runner.Cancelled()),
           Effect.gen(function* () {
-            yield* queue.block(sessionID).pipe(Effect.orDie, RuntimeLifecycle.withRecoveryPhase("queue-block"))
+            yield* queue
+              .blockForRecovery(sessionID)
+              .pipe(Effect.orDie, RuntimeLifecycle.withRecoveryPhase("queue-block"))
             if (input)
               yield* prompt({ ...input, sessionID, noReply: true }, { recoveryFence: executionFence }).pipe(
                 Effect.orDie,
@@ -3099,6 +3430,11 @@ const layer = Layer.effect(
       delivery?: SessionQueueV1.Entry,
       handoff?: Effect.Effect<void>,
     ) {
+      const reservation = ulid()
+      yield* SessionHandoffEnrollment.reserve(database, input.sessionID, reservation).pipe(Effect.orDie)
+      yield* Effect.addFinalizer(() =>
+        SessionHandoffEnrollment.abort(database, input.sessionID, reservation).pipe(Effect.orDie),
+      )
       yield* Effect.logInfo("command", {
         "session.id": input.sessionID,
         command: input.command,
@@ -3114,6 +3450,7 @@ const layer = Layer.effect(
         throw error
       }
       const agentName = cmd.agent ?? input.agent
+      yield* SessionHandoffEnrollment.preparing(database, input.sessionID, reservation).pipe(Effect.orDie)
 
       const raw = input.arguments.match(argsRegex) ?? []
       const args = raw.map((arg) => arg.replace(quoteTrimRegex, ""))
@@ -3254,7 +3591,7 @@ const layer = Layer.effect(
         messageID: result.info.id,
       })
       return result
-    })
+    }, Effect.scoped)
 
     return Service.of({
       cancel,

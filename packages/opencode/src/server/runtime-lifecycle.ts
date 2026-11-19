@@ -3,6 +3,9 @@ import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { RuntimeRetirement } from "@opencode-ai/core/runtime-retirement"
 import { HistoricalFence } from "@opencode-ai/core/historical-fence"
 import { ManagedCommand } from "@opencode-ai/core/managed-command"
+import { SessionHandoffRecovery } from "@opencode-ai/core/session/handoff-recovery"
+import { SessionHandoffRecoveryQueue } from "@opencode-ai/core/session/handoff-recovery-queue"
+import { SessionHandoffEnrollment } from "@opencode-ai/core/session/handoff-enrollment"
 import { sql } from "drizzle-orm"
 import {
   Cause,
@@ -65,6 +68,10 @@ export type ExecutionRecord = {
   parentNotificationState?: "pending" | "delivering" | "delivered"
   recoveryAttempts: number
   recoveryPreparationAttempts: number
+  /** Exact enrolled generation whose durable startup hold this guarded claim may release. */
+  handoffReservation?: string
+  handoffRootSessionID?: string
+  recoveryQueueFrame?: SessionHandoffRecoveryQueue.Frame
 }
 
 export type AdmissionResult = { manualRecovery: boolean; fence: number }
@@ -128,7 +135,10 @@ export type Interface = {
   readonly waitForIdle: (sessionID: string) => Effect.Effect<void>
   /** Acknowledge this cancellation owner only; does not release leases or imply work has stopped. */
   readonly finishCancel: (sessionID: string) => Effect.Effect<void>
-  readonly verifyOwner: (sessionID: string) => Effect.Effect<"live" | "dead" | "unknown">
+  readonly verifyOwner: (
+    sessionID: string,
+    connection?: SessionHandoffRecovery.Connection,
+  ) => Effect.Effect<"live" | "dead" | "unknown">
   readonly reconstructChild: (input: ReconstructedChildInput) => Effect.Effect<boolean>
   readonly setParentMode: (sessionID: string, mode: "foreground" | "background") => Effect.Effect<void>
   readonly claimParentNotification: (sessionID: string, parentCallID?: string) => Effect.Effect<boolean>
@@ -158,6 +168,12 @@ export type Interface = {
   readonly status: () => Effect.Effect<Status>
   readonly isParked: (sessionID: string) => Effect.Effect<boolean>
   readonly recover: (run: (record: ExecutionRecord) => Effect.Effect<unknown, unknown>) => Effect.Effect<void>
+  readonly runHandoffRecovery: (
+    records: ExecutionRecord[],
+    run: (record: ExecutionRecord) => Effect.Effect<unknown, unknown>,
+    onFailure?: (cause: Cause.Cause<unknown>) => Effect.Effect<void>,
+    onSuccess?: (connection: SessionHandoffRecovery.Connection) => Effect.Effect<void>,
+  ) => Effect.Effect<void, RuntimeDrainingError>
 }
 
 export type Status = {
@@ -572,8 +588,8 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
     return yield* ManagedCommand.status(database, rootSessionID, new Set(managed.keys()))
   })
 
-  const read = Effect.fnUntraced(function* (sessionID: string) {
-    const database = databaseRef.current ?? (yield* Database.Service)
+  const read = Effect.fnUntraced(function* (sessionID: string, connection?: SessionHandoffRecovery.Connection) {
+    const database = connection ?? databaseRef.current ?? (yield* Database.Service)
     return decodeRow(yield* database.db.get(sql`SELECT * FROM runtime_execution WHERE session_id = ${sessionID}`))
   })
 
@@ -646,8 +662,10 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
     if (pending) yield* Deferred.succeed(pending, prepared).pipe(Effect.ignore)
   })
 
-  const update = Effect.fnUntraced(function* (input: FencedTransitionInput) {
-    const database = databaseRef.current ?? (yield* Database.Service)
+  const transition = Effect.fnUntraced(function* (
+    input: FencedTransitionInput,
+    database: SessionHandoffRecovery.Connection,
+  ) {
     const updated = decodeRow(
       yield* database.db.get<Row>(sql`
       UPDATE runtime_execution
@@ -668,7 +686,7 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
     )
     if (updated) return updated
 
-    const current = yield* read(input.sessionID)
+    const current = yield* read(input.sessionID, database)
     if (
       input.ignoreRevoked &&
       (current?.desired_active !== 1 ||
@@ -696,6 +714,38 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
         sessionID: input.sessionID,
         operation: input.operation,
       }),
+    )
+  })
+
+  const handoffCompletions = new Map<
+    string,
+    {
+      fence: number
+      finish: (connection: SessionHandoffRecovery.Connection) => Effect.Effect<unknown>
+    }
+  >()
+  const update = Effect.fnUntraced(function* (input: FencedTransitionInput) {
+    const database = databaseRef.current ?? (yield* Database.Service)
+    if (input.nextState !== "completed") return yield* transition(input, database)
+    // A completed tree must never become admissible before its action-owned evidence commits.
+    return yield* database.db.transaction(
+      (tx) =>
+        Effect.gen(function* () {
+          const connection = { db: tx }
+          const updated = yield* transition(input, connection)
+          if (updated) {
+            const completion = handoffCompletions.get(input.sessionID)
+            if (completion?.fence === input.fence) yield* completion.finish(connection)
+            yield* SessionHandoffRecovery.captureCurrent(
+              connection,
+              input.sessionID,
+              (id) => verifyOwner(id, connection).pipe(Effect.provideService(Database.Service, database), Effect.orDie),
+              processLiveness,
+            ).pipe(Effect.orDie)
+          }
+          return updated
+        }),
+      { behavior: "immediate" },
     )
   })
 
@@ -879,20 +929,58 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
       return yield* new RuntimeDrainingError({ message: reason })
     })
 
-  const admitDurably = Effect.fnUntraced(function* (input: AdmissionInput, row: Row | undefined) {
-    const database = databaseRef.current ?? (yield* Database.Service)
-    yield* rejectRetired(input)
-    yield* Effect.logInfo("restart diagnostic admission durable claim beginning", {
-      sessionID: input.sessionID,
-      observed: row ? rowFields(row) : undefined,
-      currentRuntimeLineage: identity.lineage,
-      currentRuntimeInstance: identity.instance,
-      processIdentityAvailable: owner !== undefined,
-    })
+  const admitDurably = Effect.fnUntraced(
+    function* (input: AdmissionInput, row: Row | undefined) {
+      const database = databaseRef.current ?? (yield* Database.Service)
+      const rootAdmission = yield* SessionHandoffRecovery.CurrentRootAdmission
+      const taskAdmission = yield* SessionHandoffRecovery.CurrentNewTask
+      const newTask =
+        rootAdmission &&
+        taskAdmission &&
+        input.parentSessionID === rootAdmission.sessionID &&
+        input.parentMessageID === taskAdmission.parentMessageID &&
+        input.parentCallID === taskAdmission.parentCallID &&
+        input.parentMode === "foreground" &&
+        (yield* SessionHandoffEnrollment.newTaskAllowed(database, input.sessionID, {
+          ownerLineage: identity.lineage,
+          ownerInstance: identity.instance,
+        }))
+      if (
+        input.recoveryFence === undefined &&
+        !newTask &&
+        ((yield* SessionHandoffRecovery.held(database, input.sessionID)) ||
+          (input.parentSessionID !== undefined &&
+            (yield* SessionHandoffRecovery.held(database, input.parentSessionID))))
+      )
+        return yield* new RuntimeDrainingError({
+          message: "Enrolled execution is held for guarded same-input recovery",
+        })
+      if (input.recoveryFence === undefined && (!row || row.owner_instance !== identity.instance)) {
+        const protectedIDs = yield* SessionHandoffRecovery.installStartupHolds(
+          database,
+          identity.instance,
+          (sessionID) => verifyOwner(sessionID).pipe(Effect.provideService(Database.Service, database), Effect.orDie),
+        )
+        if (
+          protectedIDs.includes(input.sessionID) &&
+          !(!row && input.parentSessionID && SynchronizedRef.getUnsafe(ref).active.has(input.parentSessionID))
+        )
+          return yield* new RuntimeDrainingError({
+            message: "Enrolled ownership changes require guarded same-input recovery",
+          })
+      }
+      yield* rejectRetired(input)
+      yield* Effect.logInfo("restart diagnostic admission durable claim beginning", {
+        sessionID: input.sessionID,
+        observed: row ? rowFields(row) : undefined,
+        currentRuntimeLineage: identity.lineage,
+        currentRuntimeInstance: identity.instance,
+        processIdentityAvailable: owner !== undefined,
+      })
 
-    if (!row) {
-      const inserted = decodeRow(
-        yield* database.db.get<Row>(sql`
+      if (!row) {
+        const inserted = decodeRow(
+          yield* database.db.get<Row>(sql`
           INSERT INTO runtime_execution
             (id, session_id, directory, owner_lineage, owner_instance, owner_host, owner_machine_id, owner_boot_id,
              owner_pid_namespace, owner_pid, owner_start_time, fence, state, desired_active, retry_at,
@@ -912,75 +1000,77 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
           ON CONFLICT (session_id) DO NOTHING
           RETURNING *
         `),
-      )
-      if (!inserted) {
-        yield* rejectRetired(input)
-        const current = yield* read(input.sessionID)
-        yield* Effect.logWarning("restart diagnostic admission durable claim failed", {
-          sessionID: input.sessionID,
-          reason: current ? "insert compare-and-set conflict" : "insert returned no row",
-          current: current ? rowFields(current) : undefined,
-          currentRuntimeLineage: identity.lineage,
+        )
+        if (!inserted) {
+          yield* rejectRetired(input)
+          const current = yield* read(input.sessionID)
+          yield* Effect.logWarning("restart diagnostic admission durable claim failed", {
+            sessionID: input.sessionID,
+            reason: current ? "insert compare-and-set conflict" : "insert returned no row",
+            current: current ? rowFields(current) : undefined,
+            currentRuntimeLineage: identity.lineage,
+            currentRuntimeInstance: identity.instance,
+          })
+          if (current) return yield* rejectAdmission(input, "Session was admitted by another runtime", current)
+          return yield* Effect.die(
+            new RuntimeFencedTransitionError({
+              message: `Durable admission failed for session ${input.sessionID}`,
+              sessionID: input.sessionID,
+              operation: "admit",
+            }),
+          )
+        }
+        yield* Effect.logInfo("restart diagnostic admission durable claim succeeded", {
+          ...rowFields(inserted),
+          takeover: false,
           currentRuntimeInstance: identity.instance,
         })
-        if (current) return yield* rejectAdmission(input, "Session was admitted by another runtime", current)
-        return yield* Effect.die(
-          new RuntimeFencedTransitionError({
-            message: `Durable admission failed for session ${input.sessionID}`,
-            sessionID: input.sessionID,
-            operation: "admit",
-          }),
-        )
+        return { row: inserted, manualRecovery: false }
       }
-      yield* Effect.logInfo("restart diagnostic admission durable claim succeeded", {
-        ...rowFields(inserted),
-        takeover: false,
-        currentRuntimeInstance: identity.instance,
-      })
-      return { row: inserted, manualRecovery: false }
-    }
 
-    const unverifiedTakeover =
-      row.state === "active" &&
-      row.owner_instance !== identity.instance &&
-      input.manualRecovery === true &&
-      ownerLiveness(row, owner) !== "live"
-    const manualRecovery = unverifiedTakeover || (input.manualRecovery === true && row.state === "recovery_needed")
-    if (
-      row.state === "active" &&
-      (row.owner_lineage !== identity.lineage || row.owner_instance !== identity.instance)
-    ) {
-      if (row.owner_lineage !== identity.lineage || !unverifiedTakeover)
-        return yield* rejectAdmission(input, "Session is owned by another runtime", row)
-    }
-    if (input.rejectCancelled && row.state === "cancelled")
-      return yield* rejectAdmission(input, "Session was cancelled before background notification delivery", row)
-    if (input.rejectRecoveryNeeded && row.state === "recovery_needed")
-      return yield* rejectAdmission(
-        input,
-        "Session requires manual continuation before background notification delivery",
-        row,
-      )
-    if (row.state === "parked") return yield* rejectAdmission(input, "Session is parked for recovery", row)
-    if (row.state === "retry_wait") return yield* rejectAdmission(input, "Session is waiting for retry", row)
-    if (row.state === "recovery_needed" && row.owner_lineage !== identity.lineage) {
-      return yield* rejectAdmission(input, "Session requires recovery by its owning server identity", row)
-    }
-    if (!(["active", "completed", "cancelled", "recovery_needed"] as ExecutionState[]).includes(row.state)) {
-      return yield* rejectAdmission(input, `Session cannot be admitted from state ${row.state}`, row)
-    }
+      const unverifiedTakeover =
+        row.state === "active" &&
+        row.owner_instance !== identity.instance &&
+        input.manualRecovery === true &&
+        ownerLiveness(row, owner) !== "live"
+      const manualRecovery = unverifiedTakeover || (input.manualRecovery === true && row.state === "recovery_needed")
+      if (
+        row.state === "active" &&
+        (row.owner_lineage !== identity.lineage || row.owner_instance !== identity.instance)
+      ) {
+        if (row.owner_lineage !== identity.lineage || !unverifiedTakeover)
+          return yield* rejectAdmission(input, "Session is owned by another runtime", row)
+      }
+      if (input.rejectCancelled && row.state === "cancelled")
+        return yield* rejectAdmission(input, "Session was cancelled before background notification delivery", row)
+      if (input.rejectRecoveryNeeded && row.state === "recovery_needed")
+        return yield* rejectAdmission(
+          input,
+          "Session requires manual continuation before background notification delivery",
+          row,
+        )
+      if (row.state === "parked") return yield* rejectAdmission(input, "Session is parked for recovery", row)
+      if (row.state === "retry_wait") return yield* rejectAdmission(input, "Session is waiting for retry", row)
+      if (row.state === "recovery_needed" && row.owner_lineage !== identity.lineage) {
+        return yield* rejectAdmission(input, "Session requires recovery by its owning server identity", row)
+      }
+      if (!(["active", "completed", "cancelled", "recovery_needed"] as ExecutionState[]).includes(row.state)) {
+        return yield* rejectAdmission(input, `Session cannot be admitted from state ${row.state}`, row)
+      }
 
-    const takeover = row.state !== "active" || unverifiedTakeover
-    const nextFence = takeover ? row.fence + 1 : row.fence
-    const parentSessionID =
-      row.state === "active" ? row.parent_session_id : (input.parentSessionID ?? row.parent_session_id)
-    const parentMessageID =
-      row.state === "active" ? row.parent_message_id : (input.parentMessageID ?? row.parent_message_id)
-    const parentCallID = row.state === "active" ? row.parent_call_id : (input.parentCallID ?? row.parent_call_id)
-    const parentMode =
-      row.state === "active" && row.parent_mode === "background" ? "background" : (input.parentMode ?? row.parent_mode)
-    const claimed = decodeRow(
-      yield* database.db.get<Row>(sql`
+      const takeover = row.state !== "active" || unverifiedTakeover
+      const nextFence = takeover ? row.fence + 1 : row.fence
+      const parentSessionID =
+        row.state === "active" ? row.parent_session_id : (input.parentSessionID ?? row.parent_session_id)
+      const parentMessageID =
+        row.state === "active" ? row.parent_message_id : (input.parentMessageID ?? row.parent_message_id)
+      const parentCallID = row.state === "active" ? row.parent_call_id : (input.parentCallID ?? row.parent_call_id)
+      const parentMode =
+        row.state === "active" && row.parent_mode === "background"
+          ? "background"
+          : (input.parentMode ?? row.parent_mode)
+      const claimed = decodeRow(
+        yield* database.db.get<Row>(sql`
         UPDATE runtime_execution
         SET directory = ${input.directory}, owner_lineage = ${identity.lineage}, owner_instance = ${identity.instance},
             owner_host = ${owner?.host ?? null}, owner_machine_id = ${owner?.machineID ?? null},
@@ -1015,43 +1105,49 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
            )
         RETURNING *
       `),
-    )
-    if (!claimed) {
-      yield* rejectRetired(input)
-      const current = yield* read(input.sessionID)
-      yield* Effect.logWarning("restart diagnostic admission durable claim failed", {
-        sessionID: input.sessionID,
-        reason: "compare-and-set conflict",
-        observed: rowFields(row),
-        current: current ? rowFields(current) : undefined,
-        currentRuntimeLineage: identity.lineage,
-        currentRuntimeInstance: identity.instance,
-      })
-      return yield* Effect.die(
-        new RuntimeFencedTransitionError({
-          message: `Durable admission compare-and-set failed for session ${input.sessionID}`,
-          sessionID: input.sessionID,
-          operation: "admit",
-        }),
       )
-    }
-    if (manualRecovery)
-      yield* Effect.logWarning("session explicitly continued despite unverifiable prior owner", {
-        sessionID: input.sessionID,
+      if (!claimed) {
+        yield* rejectRetired(input)
+        const current = yield* read(input.sessionID)
+        yield* Effect.logWarning("restart diagnostic admission durable claim failed", {
+          sessionID: input.sessionID,
+          reason: "compare-and-set conflict",
+          observed: rowFields(row),
+          current: current ? rowFields(current) : undefined,
+          currentRuntimeLineage: identity.lineage,
+          currentRuntimeInstance: identity.instance,
+        })
+        return yield* Effect.die(
+          new RuntimeFencedTransitionError({
+            message: `Durable admission compare-and-set failed for session ${input.sessionID}`,
+            sessionID: input.sessionID,
+            operation: "admit",
+          }),
+        )
+      }
+      if (manualRecovery)
+        yield* Effect.logWarning("session explicitly continued despite unverifiable prior owner", {
+          sessionID: input.sessionID,
+          previousOwnerInstance: row.owner_instance,
+          previousOwnerPID: row.owner_pid,
+          newFence: claimed.fence,
+          note: "Uncertain tools are reconciled before the new model turn; verify state because the prior process may still be running.",
+        })
+      yield* Effect.logInfo("restart diagnostic admission durable claim succeeded", {
+        ...rowFields(claimed),
+        takeover,
         previousOwnerInstance: row.owner_instance,
-        previousOwnerPID: row.owner_pid,
-        newFence: claimed.fence,
-        note: "Uncertain tools are reconciled before the new model turn; verify state because the prior process may still be running.",
+        currentRuntimeInstance: identity.instance,
+        manualRecovery,
       })
-    yield* Effect.logInfo("restart diagnostic admission durable claim succeeded", {
-      ...rowFields(claimed),
-      takeover,
-      previousOwnerInstance: row.owner_instance,
-      currentRuntimeInstance: identity.instance,
-      manualRecovery,
-    })
-    return { row: claimed, manualRecovery }
-  })
+      return { row: claimed, manualRecovery }
+    },
+    (effect) =>
+      Effect.gen(function* () {
+        const database = databaseRef.current ?? (yield* Database.Service)
+        return yield* database.db.transaction(() => effect, { behavior: "immediate" })
+      }),
+  )
 
   const finishStartupRecovery = Effect.fn("RuntimeLifecycle.finishStartupRecovery")(function* () {
     if (startupReady) yield* Deferred.succeed(startupReady, undefined).pipe(Effect.ignore)
@@ -1521,28 +1617,37 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
     )
   })
 
-  const verifyOwner = Effect.fn("RuntimeLifecycle.verifyOwner")(function* (sessionID: string) {
-    const row = yield* read(sessionID)
+  const verifyOwner = Effect.fn("RuntimeLifecycle.verifyOwner")(function* (
+    sessionID: string,
+    connection?: SessionHandoffRecovery.Connection,
+  ) {
+    const row = yield* read(sessionID, connection)
     if (!row || row.owner_lineage !== identity.lineage) return "unknown" as const
     return ownerLiveness(row, owner)
   })
 
-  const reconstructChild = Effect.fn("RuntimeLifecycle.reconstructChild")(function* (input: ReconstructedChildInput) {
-    if (process.env.OPENCODE_MANAGED_PROFILE === "1") return false
-    const parent = yield* read(input.parentSessionID)
-    if (
-      !parent ||
-      parent.owner_lineage !== identity.lineage ||
-      !["active", "waiting_child", "completed"].includes(parent.state) ||
-      parent.desired_active !== 1 ||
-      ownerLiveness(parent, owner) !== "dead"
-    )
-      return false
+  const reconstructChild = Effect.fn("RuntimeLifecycle.reconstructChild")(
+    function* (input: ReconstructedChildInput) {
+      if (process.env.OPENCODE_MANAGED_PROFILE === "1") return false
+      const database = databaseRef.current ?? (yield* Database.Service)
+      if (
+        (yield* SessionHandoffRecovery.held(database, input.sessionID)) ||
+        (yield* SessionHandoffRecovery.held(database, input.parentSessionID))
+      )
+        return false
+      const parent = yield* read(input.parentSessionID)
+      if (
+        !parent ||
+        parent.owner_lineage !== identity.lineage ||
+        !["active", "waiting_child", "completed"].includes(parent.state) ||
+        parent.desired_active !== 1 ||
+        ownerLiveness(parent, owner) !== "dead"
+      )
+        return false
 
-    const database = databaseRef.current ?? (yield* Database.Service)
-    const now = Date.now()
-    const inserted = decodeRow(
-      yield* database.db.get<Row>(sql`
+      const now = Date.now()
+      const inserted = decodeRow(
+        yield* database.db.get<Row>(sql`
         INSERT INTO runtime_execution
           (id, session_id, directory, owner_lineage, owner_instance, owner_host, owner_machine_id, owner_boot_id,
            owner_pid_namespace, owner_pid, owner_start_time, fence, state, desired_active, retry_at,
@@ -1566,20 +1671,26 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
           )
         RETURNING *
       `),
-    )
-    if (inserted) {
-      yield* Effect.logWarning("runtime recovery reconstructed a missing Task child execution", {
-        sessionID: input.sessionID,
-        parentSessionID: input.parentSessionID,
-        parentMessageID: input.parentMessageID,
-        parentCallID: input.parentCallID,
-        parentMode: input.parentMode,
-        ownerInstance: inserted.owner_instance,
-      })
-      return true
-    }
-    return false
-  })
+      )
+      if (inserted) {
+        yield* Effect.logWarning("runtime recovery reconstructed a missing Task child execution", {
+          sessionID: input.sessionID,
+          parentSessionID: input.parentSessionID,
+          parentMessageID: input.parentMessageID,
+          parentCallID: input.parentCallID,
+          parentMode: input.parentMode,
+          ownerInstance: inserted.owner_instance,
+        })
+        return true
+      }
+      return false
+    },
+    (effect) =>
+      Effect.gen(function* () {
+        const database = databaseRef.current ?? (yield* Database.Service)
+        return yield* database.db.transaction(() => effect, { behavior: "immediate" })
+      }),
+  )
 
   const progress = Effect.fn("RuntimeLifecycle.progress")(function* (sessionID: string) {
     const current = SynchronizedRef.getUnsafe(ref).active.get(sessionID)
@@ -1672,44 +1783,43 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
     if (acknowledged) notificationClaims.delete(`${sessionID}:${parentCallID ?? row.parent_call_id ?? ""}`)
   })
 
-  const claimParentNotification = Effect.fn("RuntimeLifecycle.claimParentNotification")(function* (
-    sessionID: string,
-    parentCallID?: string,
-  ) {
-    const database = databaseRef.current ?? (yield* Database.Service)
-    const current = SynchronizedRef.getUnsafe(ref).active.get(sessionID)
-    const row = yield* read(sessionID)
-    if (
-      !row ||
-      row.parent_mode !== "background" ||
-      row.parent_notification_state === "delivered" ||
-      (parentCallID && row.parent_call_id !== parentCallID)
-    )
-      return false
-    const claimID = `${sessionID}:${parentCallID ?? row.parent_call_id ?? ""}`
-    if (notificationClaims.has(claimID)) return false
-    notificationClaims.add(claimID)
-    const completed = row.state === "completed"
-    const recovering =
-      row.state === "active" && current?.fence === row.fence && row.owner_instance === identity.instance
-    const staleDelivery =
-      row.parent_notification_state === "delivering" &&
-      (row.owner_instance === identity.instance || ownerLiveness(row, owner) === "dead")
-    const completedOwnerAvailable = row.owner_instance === identity.instance || ownerLiveness(row, owner) === "dead"
-    if (!completed && !recovering) {
-      notificationClaims.delete(claimID)
-      return false
-    }
-    if (completed && !completedOwnerAvailable) {
-      notificationClaims.delete(claimID)
-      return false
-    }
-    if (row.parent_notification_state === "delivering" && !staleDelivery && !recovering) {
-      notificationClaims.delete(claimID)
-      return false
-    }
-    const claimed = decodeRow(
-      yield* database.db.get<Row>(sql`
+  const claimParentNotification = Effect.fn("RuntimeLifecycle.claimParentNotification")(
+    function* (sessionID: string, parentCallID?: string) {
+      const database = databaseRef.current ?? (yield* Database.Service)
+      if (yield* SessionHandoffRecovery.held(database, sessionID)) return false
+      const current = SynchronizedRef.getUnsafe(ref).active.get(sessionID)
+      const row = yield* read(sessionID)
+      if (
+        !row ||
+        row.parent_mode !== "background" ||
+        row.parent_notification_state === "delivered" ||
+        (parentCallID && row.parent_call_id !== parentCallID)
+      )
+        return false
+      const claimID = `${sessionID}:${parentCallID ?? row.parent_call_id ?? ""}`
+      if (notificationClaims.has(claimID)) return false
+      notificationClaims.add(claimID)
+      const completed = row.state === "completed"
+      const recovering =
+        row.state === "active" && current?.fence === row.fence && row.owner_instance === identity.instance
+      const staleDelivery =
+        row.parent_notification_state === "delivering" &&
+        (row.owner_instance === identity.instance || ownerLiveness(row, owner) === "dead")
+      const completedOwnerAvailable = row.owner_instance === identity.instance || ownerLiveness(row, owner) === "dead"
+      if (!completed && !recovering) {
+        notificationClaims.delete(claimID)
+        return false
+      }
+      if (completed && !completedOwnerAvailable) {
+        notificationClaims.delete(claimID)
+        return false
+      }
+      if (row.parent_notification_state === "delivering" && !staleDelivery && !recovering) {
+        notificationClaims.delete(claimID)
+        return false
+      }
+      const claimed = decodeRow(
+        yield* database.db.get<Row>(sql`
         UPDATE runtime_execution
         SET parent_notification_state = ${"delivering"},
             owner_instance = ${completed ? identity.instance : row.owner_instance},
@@ -1735,11 +1845,17 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
           )
         RETURNING session_id
       `),
-    )
-    if (claimed) return true
-    notificationClaims.delete(claimID)
-    return false
-  })
+      )
+      if (claimed) return true
+      notificationClaims.delete(claimID)
+      return false
+    },
+    (effect) =>
+      Effect.gen(function* () {
+        const database = databaseRef.current ?? (yield* Database.Service)
+        return yield* database.db.transaction(() => effect, { behavior: "immediate" })
+      }),
+  )
 
   const releaseParentNotificationClaim = Effect.fn("RuntimeLifecycle.releaseParentNotificationClaim")(function* (
     sessionID: string,
@@ -1776,9 +1892,12 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
   ) {
     if (process.env.OPENCODE_MANAGED_PROFILE === "1") return
     yield* Effect.gen(function* () {
+      const database = databaseRef.current ?? (yield* Database.Service)
+      if (yield* SessionHandoffRecovery.held(database, parentSessionID)) return
       const pending = SynchronizedRef.getUnsafe(ref).startupPending.get(parentSessionID)
       if (pending) yield* Deferred.await(pending)
       if (!(yield* waitForParentIdle(parentSessionID))) return
+      if (yield* SessionHandoffRecovery.held(database, parentSessionID)) return
       yield* recoveryPermits.withPermit(effect)
     }).pipe(Effect.forkIn(scope, { startImmediately: true }), Effect.asVoid)
   })
@@ -2244,12 +2363,21 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
   })
 
   const claimForRecovery = Effect.fnUntraced(function* (row: Row) {
+    const database = databaseRef.current ?? (yield* Database.Service)
+    if (yield* SessionHandoffRecovery.held(database, row.session_id)) return undefined
     return yield* SynchronizedRef.modifyEffect(
       ref,
       Effect.fnUntraced(function* (state) {
         if (state.phase !== "running") return [undefined, state] as const
         if (state.leases.has(row.session_id)) return [undefined, state] as const
-        const record = yield* claim(row)
+        const record = yield* database.db.transaction(
+          () =>
+            Effect.gen(function* () {
+              if (yield* SessionHandoffRecovery.held(database, row.session_id)) return undefined
+              return yield* claim(row)
+            }),
+          { behavior: "immediate" },
+        )
         if (!record) return [undefined, state] as const
         const active = new Map(state.active)
         active.set(record.sessionID, {
@@ -2386,6 +2514,9 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
     run: (record: ExecutionRecord) => Effect.Effect<unknown, unknown>,
   ) {
     const database = databaseRef.current ?? (yield* Database.Service)
+    const protectedIDs = yield* SessionHandoffRecovery.installStartupHolds(database, identity.instance, (sessionID) =>
+      verifyOwner(sessionID).pipe(Effect.provideService(Database.Service, database), Effect.orDie),
+    )
     const candidates = yield* database.db.all<Row>(sql`
       WITH RECURSIVE cancelled(session_id) AS (
         SELECT session_id FROM runtime_execution WHERE state = ${"cancelled"}
@@ -2397,6 +2528,8 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
       SELECT * FROM runtime_execution
       WHERE desired_active = 1 AND state NOT IN ('completed', 'cancelled')
         AND session_id NOT IN (SELECT session_id FROM cancelled)
+        AND session_id NOT IN (SELECT session_id FROM session_handoff_recovery_hold)
+        AND session_id NOT IN (SELECT value FROM json_each(${JSON.stringify(protectedIDs)}))
       ORDER BY time_updated ASC
     `)
     const activeOwnedElsewhere = candidates.filter(
@@ -2802,6 +2935,8 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
         AND parent_mode = ${"background"}
         AND parent_notification_state IN ('pending', 'delivering')
         AND session_id NOT IN (SELECT session_id FROM cancelled)
+        AND session_id NOT IN (SELECT value FROM json_each(${JSON.stringify(protectedIDs)}))
+        AND session_id NOT IN (SELECT session_id FROM session_handoff_recovery_hold)
     `)
     const notifications = notificationCandidates.filter(
       (row) => row.owner_instance === identity.instance || ownerLiveness(row, owner) === "dead",
@@ -2860,6 +2995,136 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
     return row?.state === "parked" || row?.state === "retry_wait"
   })
 
+  const runHandoffRecovery: Interface["runHandoffRecovery"] = (records, run, onFailure, onSuccess) =>
+    Effect.suspend(() => {
+      const database = databaseRef.current
+      if (!database)
+        return Effect.fail(new RuntimeDrainingError({ message: "Guarded recovery requires a bound database" }))
+      return Effect.gen(function* () {
+        yield* SynchronizedRef.modifyEffect(ref, (state) =>
+          Effect.gen(function* () {
+            if (state.phase !== "running") return yield* new RuntimeDrainingError({ message: "Runtime is draining" })
+            for (const record of records) {
+              const row = yield* read(record.sessionID)
+              if (
+                state.active.has(record.sessionID) ||
+                state.leases.has(record.sessionID) ||
+                row?.owner_instance !== identity.instance ||
+                row.owner_lineage !== identity.lineage ||
+                row.fence !== record.fence ||
+                row.state !== "active"
+              )
+                return yield* new RuntimeDrainingError({
+                  message: "Guarded recovery ownership changed before scheduling",
+                })
+            }
+            const active = new Map(state.active)
+            for (const record of records)
+              active.set(record.sessionID, { fence: record.fence, leases: 0, recoveryOwner: true, mode: "active" })
+            return [undefined, { ...state, active }] as const
+          }),
+        )
+        // The durable transaction has claimed the whole tree. Execute one dependency at a time, leaves first.
+        const pending = new Map(records.map((record) => [record.sessionID, record]))
+        const rootRecord = records.find((record) => record.sessionID === record.handoffRootSessionID)
+        const control = rootRecord
+          ? yield* database.db.get<{ data: string }>(sql`SELECT data FROM session_handoff_control
+              WHERE session_id=${rootRecord.sessionID} AND reservation=${rootRecord.handoffReservation} AND state='active'`)
+          : undefined
+        const rootAdmission =
+          rootRecord && control && rootRecord.handoffReservation
+            ? {
+                sessionID: rootRecord.sessionID,
+                reservation: rootRecord.handoffReservation,
+                ownerLineage: identity.lineage,
+                ownerInstance: identity.instance,
+                fence: rootRecord.fence,
+                controlData: control.data,
+              }
+            : undefined
+        const worker = Effect.gen(function* () {
+          while (pending.size > 0) {
+            const leaf = [...pending.values()].find(
+              (record) => ![...pending.values()].some((child) => child.parentSessionID === record.sessionID),
+            )
+            if (!leaf) return yield* Effect.die(new Error("Guarded Task recovery dependency cycle"))
+            if (!(yield* beforeTurn(leaf.sessionID)))
+              return yield* Effect.die(new Error("Guarded recovery continuation lost its fence"))
+            yield* run(leaf).pipe(
+              Effect.provideService(SessionHandoffRecoveryQueue.CurrentFrame, leaf.recoveryQueueFrame),
+              Effect.provideService(
+                SessionHandoffRecovery.CurrentRootAdmission,
+                leaf.sessionID === rootAdmission?.sessionID ? rootAdmission : undefined,
+              ),
+            )
+            const rootSessionID =
+              leaf.handoffRootSessionID ??
+              records.find((record) => !records.some((parent) => parent.sessionID === record.parentSessionID))
+                ?.sessionID
+            if (rootSessionID && leaf.sessionID !== rootSessionID) {
+              const snapshot = yield* SessionHandoffRecovery.inspect(
+                database,
+                rootSessionID,
+                (sessionID) =>
+                  verifyOwner(sessionID).pipe(Effect.provideService(Database.Service, database), Effect.orDie),
+                processLiveness,
+              )
+              const child = snapshot.descendants.find((child) => child.childSessionID === leaf.sessionID)
+              if (
+                !child ||
+                child.proof !== "verified" ||
+                child.resultState === "none" ||
+                child.resultState === "uncertain"
+              )
+                return yield* Effect.die(
+                  new Error("Guarded Task continuation did not persist a safe actual child result"),
+                )
+            }
+            yield* complete(leaf.sessionID)
+            pending.delete(leaf.sessionID)
+          }
+        }).pipe(
+          Effect.catchCause((cause) =>
+            Effect.gen(function* () {
+              for (const record of pending.values()) yield* markRecoveryNeeded(record.sessionID)
+              if (onFailure) yield* onFailure(cause)
+              yield* Effect.logError("guarded same-input continuation failed; remaining dependencies stay held", {
+                ...recoveryFailureFields(cause, "handoff-continuation"),
+              })
+            }),
+          ),
+        )
+        const frames = records.flatMap((record) => (record.recoveryQueueFrame ? [record.recoveryQueueFrame] : []))
+        if (frames.length === records.length && frames.length > 0) {
+          const finish = (connection: SessionHandoffRecovery.Connection) =>
+            SessionHandoffRecoveryQueue.finish(
+              connection,
+              frames,
+              onSuccess ?? (() => Effect.void),
+              (id) => verifyOwner(id, connection).pipe(Effect.provideService(Database.Service, database), Effect.orDie),
+              processLiveness,
+            ).pipe(
+              Effect.tap((decision) =>
+                decision.state === "held" && decision.reason !== "not_ready"
+                  ? Effect.gen(function* () {
+                      yield* connection.db
+                        .run(sql`UPDATE session_handoff_recovery_queue_block SET reason=${decision.reason}
+                    WHERE recovery_request_id=${frames[0]?.recoveryRequestID ?? null} AND state='owned'`)
+                      yield* Effect.logWarning("guarded recovery queue restoration remains held", {
+                        rootSessionID: frames[0]?.root.sessionID,
+                        reason: decision.reason,
+                      })
+                    })
+                  : Effect.void,
+              ),
+              Effect.orDie,
+            )
+          for (const record of records) handoffCompletions.set(record.sessionID, { fence: record.fence, finish })
+        }
+        yield* worker.pipe(Effect.forkIn(scope))
+      }).pipe(Effect.provideService(Database.Service, database), Effect.catchTag("EffectDrizzleQueryError", Effect.die))
+    })
+
   return {
     identity,
     withDurableAdmission,
@@ -2903,6 +3168,7 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
     status,
     isParked,
     recover,
+    runHandoffRecovery,
   } as Interface
 }
 
@@ -2957,6 +3223,8 @@ export function unavailable(): Interface {
     status: () => Effect.succeed(status),
     isParked: () => Effect.succeed(false),
     recover: () => Effect.void,
+    runHandoffRecovery: () =>
+      Effect.fail(new RuntimeDrainingError({ message: "Guarded recovery requires a tracked runtime" })),
   }
 }
 
