@@ -44,6 +44,7 @@ import { Image } from "@/image/image"
 import { decodeDataUrl } from "@/util/data-url"
 import { Cause, Deferred, Effect, Exit, Latch, Layer, Option, Scope, Context, Schema, Types } from "effect"
 import { InstanceState } from "@/effect/instance-state"
+import { withInstanceActivity } from "@/effect/instance-registry"
 import { TaskTool, type TaskPromptOps } from "@/tool/task"
 import { SessionRunState } from "./run-state"
 import { Runner } from "@/effect/runner"
@@ -2878,7 +2879,7 @@ const layer = Layer.effect(
               modelID: lastUser.model.modelID,
               providerID: lastUser.model.providerID,
               history: msgs,
-            }).pipe(Effect.ignore, Effect.forkIn(scope))
+            }).pipe(Effect.ignore, withInstanceActivity, Effect.forkIn(scope))
 
           const model = yield* getModel(lastUser.model.providerID, lastUser.model.modelID, sessionID)
           const task = tasks.pop()
@@ -3087,7 +3088,9 @@ const layer = Layer.effect(
             }
 
             if (step === 1 && process.env.OPENCODE_MANAGED_PROFILE !== "1")
-              yield* summary.summarize({ sessionID, messageID: lastUser.id }).pipe(Effect.ignore, Effect.forkIn(scope))
+              yield* summary
+                .summarize({ sessionID, messageID: lastUser.id })
+                .pipe(Effect.ignore, withInstanceActivity, Effect.forkIn(scope))
 
             yield* plugin
               .trigger("experimental.chat.messages.transform", {}, { messages: msgs })
@@ -3232,7 +3235,7 @@ const layer = Layer.effect(
         }
 
         if (process.env.OPENCODE_MANAGED_PROFILE !== "1")
-          yield* compaction.prune({ sessionID }).pipe(Effect.ignore, Effect.forkIn(scope))
+          yield* compaction.prune({ sessionID }).pipe(Effect.ignore, withInstanceActivity, Effect.forkIn(scope))
         return yield* lastAssistant(sessionID)
       },
       (

@@ -257,13 +257,20 @@ const layer = Layer.effect(
 
         // Notify plugins of current config
         for (const hook of hooks) {
-          yield* Effect.tryPromise({
-            try: () => Promise.resolve((hook as any).config?.(cfg)),
-            catch: errorMessage,
-          }).pipe(
-            Effect.tapError((error) => Effect.logError("plugin config hook failed", { error })),
-            Effect.ignore,
-          )
+          if (!hook.config) continue
+          yield* config
+            .runPluginConfigHook(
+              cfg,
+              Effect.tryPromise({
+                try: () =>
+                  Promise.resolve(hook.config?.(cfg as unknown as Parameters<NonNullable<Hooks["config"]>>[0])),
+                catch: errorMessage,
+              }),
+            )
+            .pipe(
+              Effect.tapError((error) => Effect.logError("plugin config hook failed", { error })),
+              Effect.ignore,
+            )
         }
 
         const unsubscribe = yield* events.listen((event) => {

@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test"
 import { Database } from "@opencode-ai/core/database/database"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
+import { ManagedCommand } from "@opencode-ai/core/managed-command"
 import { Cause, Clock, Deferred, Duration, Effect, Exit, Fiber, Logger, Ref, References, Scope } from "effect"
 import * as TestClock from "effect/testing/TestClock"
 import { randomUUID } from "node:crypto"
@@ -8,7 +9,7 @@ import { sql } from "drizzle-orm"
 import { EffectDrizzleQueryError } from "drizzle-orm/effect-core/errors"
 import { Server } from "../../src/server/server"
 import { RuntimeLifecycle } from "../../src/server/runtime-lifecycle"
-import { testEffect } from "../lib/effect"
+import { awaitWithTimeout, pollWithTimeout, testEffect } from "../lib/effect"
 
 const it = testEffect(LayerNode.compile(LayerNode.group([Database.node])))
 
@@ -168,6 +169,390 @@ test("recovery diagnostics do not render query parameters or invoke error access
 })
 
 describe("runtime lifecycle", () => {
+  for (const state of ["active", "retry_wait", "parked"] as const) {
+    it.live(`config reload rejects ${state} owners until every admission releases without mutating sessions`, () =>
+      Effect.gen(function* () {
+        const database = yield* Database.Service
+        const runtime = RuntimeLifecycle.make({ lineage: randomUUID() }, yield* Effect.scope, database)
+        const sessionID = yield* seedSession(database)
+        const admission = yield* runtime.admit({ sessionID, directory: "/tmp" })
+        yield* runtime.admit({ sessionID, directory: "/tmp" })
+        if (state === "retry_wait") yield* runtime.retry(sessionID, Date.now() + 60_000)
+        if (state === "parked") yield* runtime.park(sessionID)
+        const invalidated = yield* Deferred.make<void>()
+        const session = yield* database.db.get(sql`SELECT * FROM session WHERE id = ${sessionID}`)
+
+        for (const release of [false, true]) {
+          if (release) yield* runtime.release(sessionID, admission.fence)
+          const row = yield* database.db.get(sql`SELECT * FROM runtime_execution WHERE session_id = ${sessionID}`)
+          const status = yield* runtime.status()
+          const error = yield* runtime.withConfigReload(Deferred.succeed(invalidated, undefined)).pipe(Effect.flip)
+          expect(error).toBeInstanceOf(RuntimeLifecycle.ConfigReloadBusyError)
+          expect(error.message).toBe("Configuration reload requires an idle runtime")
+          expect(yield* Deferred.isDone(invalidated)).toBe(false)
+          expect(yield* runtime.status()).toEqual(status)
+          expect(yield* database.db.get(sql`SELECT * FROM session WHERE id = ${sessionID}`)).toEqual(session)
+          expect(yield* database.db.get(sql`SELECT * FROM runtime_execution WHERE session_id = ${sessionID}`)).toEqual(
+            row,
+          )
+        }
+
+        yield* runtime.release(sessionID, admission.fence)
+        const row = yield* database.db.get(sql`SELECT * FROM runtime_execution WHERE session_id = ${sessionID}`)
+        const status = yield* runtime.status()
+        expect(yield* runtime.withConfigReload(Effect.succeed("reloaded"))).toBe("reloaded")
+        expect(yield* runtime.status()).toEqual(status)
+        expect(yield* database.db.get(sql`SELECT * FROM session WHERE id = ${sessionID}`)).toEqual(session)
+        expect(yield* database.db.get(sql`SELECT * FROM runtime_execution WHERE session_id = ${sessionID}`)).toEqual(
+          row,
+        )
+      }),
+    )
+  }
+
+  it.live("config reload rejects an outstanding cancellation owner after its execution releases", () =>
+    Effect.gen(function* () {
+      const database = yield* Database.Service
+      const runtime = RuntimeLifecycle.make({ lineage: randomUUID() }, yield* Effect.scope, database)
+      const sessionID = yield* seedSession(database)
+      const admission = yield* runtime.admit({ sessionID, directory: "/tmp" })
+      expect(yield* runtime.cancel(sessionID)).toBe(true)
+      yield* runtime.release(sessionID, admission.fence)
+      expect((yield* runtime.status()).active).toBe(0)
+      const row = yield* executionDetails(database, sessionID)
+      expect(yield* runtime.withConfigReload(Effect.void).pipe(Effect.flip)).toBeInstanceOf(
+        RuntimeLifecycle.ConfigReloadBusyError,
+      )
+      expect(yield* executionDetails(database, sessionID)).toEqual(row)
+      yield* runtime.finishCancel(sessionID)
+      expect(yield* runtime.withConfigReload(Effect.succeed("reloaded"))).toBe("reloaded")
+    }),
+  )
+
+  it.live("config reload rejects unfinished startup recovery even with no execution slots", () =>
+    Effect.gen(function* () {
+      const runtime = RuntimeLifecycle.make({ lineage: randomUUID(), startupRecovery: true }, yield* Effect.scope)
+      expect(yield* runtime.withConfigReload(Effect.void).pipe(Effect.flip)).toBeInstanceOf(
+        RuntimeLifecycle.ConfigReloadBusyError,
+      )
+      yield* runtime.finishStartupRecovery()
+      expect(yield* runtime.withConfigReload(Effect.succeed("reloaded"))).toBe("reloaded")
+    }),
+  )
+
+  it.live("config reload rejects a cancelled recovery continuation until it returns", () =>
+    Effect.gen(function* () {
+      const database = yield* Database.Service
+      const scope = yield* Effect.scope
+      const lineage = randomUUID()
+      const sessionID = yield* seedSession(database)
+      yield* seedExecution(database, sessionID, { lineage, instance: randomUUID(), state: "parked" })
+      const runtime = RuntimeLifecycle.make({ lineage, startupRecovery: true }, scope, database)
+      const started = yield* Deferred.make<void>()
+      const finish = yield* Deferred.make<void>()
+      yield* runtime.recover(() => Deferred.succeed(started, undefined).pipe(Effect.andThen(Deferred.await(finish))))
+      yield* runtime.finishStartupRecovery()
+      yield* awaitWithTimeout(Deferred.await(started), "recovery did not start")
+      expect(yield* runtime.withConfigReload(Effect.void).pipe(Effect.flip)).toBeInstanceOf(
+        RuntimeLifecycle.ConfigReloadBusyError,
+      )
+      expect(yield* runtime.cancel(sessionID)).toBe(true)
+      yield* runtime.finishCancel(sessionID)
+      expect(yield* runtime.withConfigReload(Effect.void).pipe(Effect.flip)).toBeInstanceOf(
+        RuntimeLifecycle.ConfigReloadBusyError,
+      )
+      yield* Deferred.succeed(finish, undefined)
+      yield* awaitWithTimeout(runtime.waitForIdle(sessionID), "recovery owner did not release")
+      expect(yield* runtime.withConfigReload(Effect.succeed("reloaded"))).toBe("reloaded")
+      expect((yield* executionDetails(database, sessionID))?.state).toBe("cancelled")
+    }),
+  )
+
+  it.live("config reload ignores completed guarded recovery preparation markers", () =>
+    Effect.gen(function* () {
+      const database = yield* Database.Service
+      const runtime = RuntimeLifecycle.make({ lineage: randomUUID() }, yield* Effect.scope, database)
+      const sessionID = yield* seedSession(database)
+      yield* seedExecution(database, sessionID, {
+        lineage: runtime.identity.lineage,
+        instance: runtime.identity.instance,
+        state: "active",
+      })
+      yield* runtime.runHandoffRecovery(
+        [
+          {
+            sessionID,
+            directory: "/tmp",
+            ownerLineage: runtime.identity.lineage,
+            ownerInstance: runtime.identity.instance,
+            fence: 0,
+            state: "active",
+            recoveryAttempts: 0,
+            recoveryPreparationAttempts: 0,
+          },
+        ],
+        () => runtime.recoveryPrepared(sessionID),
+      )
+      yield* awaitWithTimeout(runtime.waitForIdle(sessionID), "guarded recovery did not finish")
+      expect((yield* executionDetails(database, sessionID))?.state).toBe("completed")
+      expect(yield* runtime.withConfigReload(Effect.succeed("reloaded"))).toBe("reloaded")
+    }),
+  )
+
+  for (const operation of [
+    "admission",
+    "recovery",
+    "durable mutation",
+    "restart",
+    "notification",
+    "notification claim",
+  ] as const) {
+    it.live(`config reload holds the barrier until invalidation finishes before ${operation}`, () =>
+      Effect.gen(function* () {
+        const database = yield* Database.Service
+        const runtime = RuntimeLifecycle.make({ lineage: randomUUID() }, yield* Effect.scope, database)
+        const sessionID = yield* seedSession(database)
+        if (operation === "recovery")
+          yield* seedExecution(database, sessionID, {
+            lineage: runtime.identity.lineage,
+            instance: randomUUID(),
+            state: "parked",
+          })
+        if (operation === "notification claim") {
+          yield* runtime.admit({
+            sessionID,
+            directory: "/tmp",
+            parentSessionID: yield* seedSession(database),
+            parentCallID: "task-call",
+            parentMode: "background",
+          })
+          yield* runtime.release(sessionID)
+        }
+        const entered = yield* Deferred.make<void>()
+        const finish = yield* Deferred.make<void>()
+        const attempted = yield* Deferred.make<void>()
+        const proceeded = yield* Deferred.make<void>()
+        yield* Effect.addFinalizer(() => Deferred.succeed(finish, undefined))
+        const order: string[] = []
+        const reload = yield* runtime
+          .withConfigReload(
+            Effect.gen(function* () {
+              yield* Deferred.succeed(entered, undefined)
+              yield* Deferred.await(finish)
+              order.push("reloaded")
+              return "result"
+            }),
+          )
+          .pipe(Effect.forkChild)
+        yield* Deferred.await(entered)
+        const proceed = Effect.sync(() => order.push(operation)).pipe(
+          Effect.andThen(Deferred.succeed(proceeded, undefined)),
+          Effect.asVoid,
+        )
+        const contender = yield* Effect.gen(function* () {
+          yield* Deferred.succeed(attempted, undefined)
+          if (operation === "admission") {
+            const admission = yield* runtime.admit({ sessionID, directory: "/tmp" })
+            yield* proceed
+            yield* runtime.release(sessionID, admission.fence)
+            return
+          }
+          if (operation === "recovery") return yield* runtime.recover(() => proceed)
+          if (operation === "notification") return yield* runtime.scheduleNotification(sessionID, proceed)
+          if (operation === "notification claim") {
+            expect(yield* runtime.claimParentNotification(sessionID, "task-call")).toBe(true)
+            yield* proceed
+            yield* runtime.acknowledgeParentNotification(sessionID, "task-call")
+            return
+          }
+          if (operation === "durable mutation") return yield* runtime.withDurableAdmission(proceed)
+          yield* runtime.request("restart")
+          yield* proceed
+        }).pipe(Effect.forkChild({ startImmediately: true }))
+        yield* Deferred.await(attempted)
+        yield* Effect.yieldNow
+        expect(yield* Deferred.isDone(proceeded)).toBe(false)
+        expect((yield* runtime.status()).state).toBe("running")
+        yield* Deferred.succeed(finish, undefined)
+        expect(yield* awaitWithTimeout(Fiber.join(reload), "reload did not finish")).toBe("result")
+        yield* awaitWithTimeout(Fiber.join(contender), "runtime operation did not finish")
+        yield* awaitWithTimeout(Deferred.await(proceeded), "runtime operation did not proceed")
+        expect(order).toEqual(["reloaded", operation])
+      }),
+    )
+  }
+
+  it.live("config reload waits for the durable admission owner before invalidating", () =>
+    Effect.gen(function* () {
+      const runtime = RuntimeLifecycle.make({ lineage: randomUUID() }, yield* Effect.scope)
+      const entered = yield* Deferred.make<void>()
+      const finish = yield* Deferred.make<void>()
+      const invalidated = yield* Deferred.make<void>()
+      yield* Effect.addFinalizer(() => Deferred.succeed(finish, undefined))
+      const mutation = yield* runtime
+        .withDurableAdmission(Deferred.succeed(entered, undefined).pipe(Effect.andThen(Deferred.await(finish))))
+        .pipe(Effect.forkChild)
+      yield* Deferred.await(entered)
+      const reload = yield* runtime
+        .withConfigReload(Deferred.succeed(invalidated, undefined))
+        .pipe(Effect.forkChild({ startImmediately: true }))
+      expect(yield* Deferred.isDone(invalidated)).toBe(false)
+      yield* Deferred.succeed(finish, undefined)
+      yield* Fiber.join(mutation)
+      yield* awaitWithTimeout(Fiber.join(reload), "reload did not acquire durable admission")
+      expect(yield* Deferred.isDone(invalidated)).toBe(true)
+    }),
+  )
+
+  it.live("config reload releases both locks after failure or interruption and rejects draining", () =>
+    Effect.gen(function* () {
+      const runtime = RuntimeLifecycle.make({ lineage: randomUUID() }, yield* Effect.scope)
+      expect(yield* runtime.withConfigReload(Effect.fail("expected")).pipe(Effect.flip)).toBe("expected")
+      expect(yield* runtime.withConfigReload(Effect.succeed(42))).toBe(42)
+      const entered = yield* Deferred.make<void>()
+      const reload = yield* runtime
+        .withConfigReload(Deferred.succeed(entered, undefined).pipe(Effect.andThen(Effect.never)))
+        .pipe(Effect.forkChild)
+      yield* Deferred.await(entered)
+      yield* Fiber.interrupt(reload)
+      expect(yield* awaitWithTimeout(runtime.withConfigReload(Effect.succeed(42)), "reload locks leaked")).toBe(42)
+      yield* runtime.request("shutdown")
+      expect(yield* runtime.withConfigReload(Effect.void).pipe(Effect.flip)).toBeInstanceOf(
+        RuntimeLifecycle.ConfigReloadBusyError,
+      )
+    }),
+  )
+
+  it.live("config reload does not leak either lock at automatic yield boundaries", () =>
+    Effect.gen(function* () {
+      for (const budget of [32, 2048]) {
+        const scope = yield* Scope.make()
+        const runtime = RuntimeLifecycle.make({ lineage: randomUUID() }, scope)
+        const leaks: number[] = []
+        for (let padding = Math.max(0, budget - 68); padding < budget + 52; padding++) {
+          const reload = yield* Effect.gen(function* () {
+            for (let i = 0; i < padding; i++) yield* Effect.sync(() => {})
+            yield* runtime.withConfigReload(Effect.never)
+          }).pipe(
+            Effect.provideService(References.MaxOpsBeforeYield, budget),
+            Effect.forkChild({ startImmediately: true }),
+          )
+          yield* Fiber.interrupt(reload)
+          const reused = yield* runtime
+            .withConfigReload(Effect.service(References.PreventSchedulerYield))
+            .pipe(Effect.timeoutOption("50 millis"))
+          if (reused._tag === "None") {
+            expect(
+              (yield* runtime.withDurableAdmission(Effect.void).pipe(Effect.timeoutOption("50 millis")))._tag,
+            ).toBe("Some")
+            leaks.push(padding)
+            break
+          }
+          expect(reused.value).toBe(false)
+        }
+        expect(leaks).toEqual([])
+        expect((yield* runtime.request("shutdown").pipe(Effect.timeoutOption("200 millis")))._tag).toBe("Some")
+        yield* Scope.close(scope, Exit.void)
+      }
+    }),
+  )
+
+  it.live("config reload rejects managed preparation without an execution slot", () =>
+    Effect.gen(function* () {
+      const database = yield* Database.Service
+      const runtime = RuntimeLifecycle.make({ lineage: randomUUID() }, yield* Effect.scope, database)
+      const sessionID = yield* seedSession(database)
+      yield* ManagedCommand.coverRoot(database, sessionID)
+      const entered = yield* Deferred.make<void>()
+      const finish = yield* Deferred.make<void>()
+      const command = yield* runtime
+        .runManagedCommand(
+          sessionID,
+          async () => {
+            await Effect.runPromise(Deferred.succeed(entered, undefined).pipe(Effect.andThen(Deferred.await(finish))))
+            return {
+              start: async () => ({ cleanup: "confirmed" as const }),
+              cancel: async () => ({ cleanup: "confirmed" as const }),
+            }
+          },
+          undefined,
+          { preparation: "process-free" },
+        )
+        .pipe(Effect.forkChild)
+      yield* Effect.addFinalizer(() =>
+        Deferred.succeed(finish, undefined).pipe(Effect.andThen(runtime.waitForIdle(sessionID))),
+      )
+      yield* Deferred.await(entered)
+      expect(yield* runtime.ownershipFence(sessionID)).toBeUndefined()
+      expect(yield* runtime.withConfigReload(Effect.void).pipe(Effect.flip)).toBeInstanceOf(
+        RuntimeLifecycle.ConfigReloadBusyError,
+      )
+      yield* Deferred.succeed(finish, undefined)
+      yield* awaitWithTimeout(Fiber.join(command), "managed preparation did not settle")
+      expect(yield* runtime.withConfigReload(Effect.succeed("reloaded"))).toBe("reloaded")
+    }),
+  )
+
+  it.live("config reload rejects notification work after execution slots are empty", () =>
+    Effect.gen(function* () {
+      const database = yield* Database.Service
+      const runtime = RuntimeLifecycle.make({ lineage: randomUUID() }, yield* Effect.scope, database)
+      const sessionID = yield* seedSession(database)
+      const started = yield* Deferred.make<void>()
+      const finish = yield* Deferred.make<void>()
+      yield* runtime.scheduleNotification(
+        sessionID,
+        Deferred.succeed(started, undefined).pipe(Effect.andThen(Deferred.await(finish))),
+      )
+      yield* awaitWithTimeout(Deferred.await(started), "notification did not start")
+      expect((yield* runtime.status()).active).toBe(0)
+      expect(yield* runtime.withConfigReload(Effect.void).pipe(Effect.flip)).toBeInstanceOf(
+        RuntimeLifecycle.ConfigReloadBusyError,
+      )
+      yield* Deferred.succeed(finish, undefined)
+      expect(
+        yield* pollWithTimeout(
+          runtime
+            .withConfigReload(Effect.succeed("reloaded"))
+            .pipe(Effect.catchTag("ConfigReloadBusyError", () => Effect.succeed(undefined))),
+          "notification ownership did not release",
+        ),
+      ).toBe("reloaded")
+    }),
+  )
+
+  it.live("config reload rejects a claimed notification until acknowledgement", () =>
+    Effect.gen(function* () {
+      const database = yield* Database.Service
+      const runtime = RuntimeLifecycle.make({ lineage: randomUUID() }, yield* Effect.scope, database)
+      const parentID = yield* seedSession(database)
+      const childID = yield* seedSession(database)
+      yield* runtime.admit({
+        sessionID: childID,
+        directory: "/tmp",
+        parentSessionID: parentID,
+        parentCallID: "task-call",
+        parentMode: "background",
+      })
+      yield* runtime.release(childID)
+      expect(yield* runtime.claimParentNotification(childID, "task-call")).toBe(true)
+      expect((yield* runtime.status()).active).toBe(0)
+      expect(yield* runtime.withConfigReload(Effect.void).pipe(Effect.flip)).toBeInstanceOf(
+        RuntimeLifecycle.ConfigReloadBusyError,
+      )
+      yield* runtime.acknowledgeParentNotification(childID, "task-call")
+      expect(yield* runtime.withConfigReload(Effect.succeed("reloaded"))).toBe("reloaded")
+    }),
+  )
+
+  it.live("config reload permits the ownerless embedded runtime", () =>
+    Effect.gen(function* () {
+      const runtime = RuntimeLifecycle.unavailable()
+      expect(yield* runtime.withConfigReload(Effect.succeed("reloaded"))).toBe("reloaded")
+      expect(yield* runtime.withConfigReload(Effect.fail("expected")).pipe(Effect.flip)).toBe("expected")
+    }),
+  )
+
   it.live("finishes an admitted durable commit before closing admission for draining", () =>
     Effect.gen(function* () {
       const database = yield* Database.Service

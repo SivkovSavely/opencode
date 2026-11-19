@@ -5,11 +5,13 @@ import { Effect, Layer } from "effect"
 export function make(overrides: Partial<Config.Interface> = {}) {
   return Config.Service.of({
     get: () => Effect.succeed({}),
+    runPluginConfigHook: (_config, hook) => hook,
     getGlobal: () => Effect.succeed({}),
     getConsoleState: () => Effect.succeed(emptyConsoleState),
     update: () => Effect.void,
     updateGlobal: (config) => Effect.succeed({ info: config, changed: false }),
     invalidate: () => Effect.void,
+    reload: (effect) => effect,
     directories: () => Effect.succeed([]),
     waitForDependencies: () => Effect.void,
     ...overrides,

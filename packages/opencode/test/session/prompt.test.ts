@@ -129,6 +129,7 @@ function makeMcp(instructions: MCP.ServerInstructions[] = []) {
   return Layer.succeed(
     MCP.Service,
     MCP.Service.of({
+      assertReloadable: () => Effect.void,
       status: () => Effect.succeed({}),
       clients: () => Effect.succeed({}),
       lazyServers: () => Effect.succeed([]),

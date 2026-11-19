@@ -1,23 +1,58 @@
 import { Config } from "@/config/config"
 import { GlobalBus, type GlobalEvent as GlobalBusEvent } from "@/bus/global"
-import { EffectBridge } from "@/effect/bridge"
+import { InstanceReloadBusyError } from "@/effect/instance-registry"
+import { MCP } from "@/mcp"
+import { InstanceStore } from "@/project/instance-store"
 import { EventV2 } from "@opencode-ai/core/event"
 import { EventDiagnostics, type SubscriberHandle } from "@opencode-ai/core/event-diagnostics"
 import { ServerEvent } from "@opencode-ai/schema/server-event"
 import { Installation } from "@/installation"
 import { GlobalProjectList } from "@/server/global-project-list"
-import { disposeAllInstancesAndEmitGlobalDisposed } from "@/server/global-lifecycle"
+import { disposeAllInstancesAndEmitGlobalDisposed, reloadConfig } from "@/server/global-lifecycle"
 import { InstallationVersion } from "@opencode-ai/core/installation/version"
-import { Effect, Option, Queue } from "effect"
+import { Cause, Effect, Option, Queue } from "effect"
 import * as Stream from "effect/Stream"
 import { HttpServerResponse } from "effect/unstable/http"
 import { HttpApiBuilder } from "effect/unstable/httpapi"
 import * as Sse from "effect/unstable/encoding/Sse"
 import { RootHttpApi } from "../api"
-import { GlobalUpgradeInput } from "../groups/global"
+import {
+  ConfigReloadInvalidError,
+  ConfigReloadBusyError,
+  ConfigReloadInternalError,
+  GlobalUpgradeInput,
+} from "../groups/global"
 import { RuntimeLifecycle } from "@/server/runtime-lifecycle"
+import { ConfigErrorV1 } from "@opencode-ai/core/v1/config/error"
 import { HttpApiError } from "effect/unstable/httpapi"
 import { ManagedWorkspace } from "@/server/managed-workspace"
+
+function configReloadError(cause: Cause.Cause<unknown>) {
+  const error = Cause.squash(cause)
+  if (error instanceof InstanceReloadBusyError || error instanceof RuntimeLifecycle.ConfigReloadBusyError)
+    return new ConfigReloadBusyError({
+      message: "Configuration reload requires an idle runtime. Try again when work has finished.",
+    })
+  if (
+    error instanceof ConfigErrorV1.JsonError ||
+    error instanceof ConfigErrorV1.InvalidError ||
+    error instanceof ConfigErrorV1.FrontmatterError
+  ) {
+    const source = /^https?:\/\//i.test(error.data.path) ? "remote configuration" : error.data.path
+    const fields =
+      error instanceof ConfigErrorV1.InvalidError
+        ? error.data.issues?.flatMap((issue: { path: readonly string[] }) =>
+            issue.path.length ? [issue.path.join(".")] : [],
+          )
+        : undefined
+    return new ConfigReloadInvalidError({
+      message: `Invalid configuration in ${source}${fields?.length ? ` (${fields.join(", ")})` : ""}`,
+    })
+  }
+  return new ConfigReloadInternalError({
+    message: "Configuration reload failed. Previous configuration remains active.",
+  })
+}
 
 function globalEventType(data: unknown) {
   if (!data || typeof data !== "object" || !("payload" in data)) return "unknown"
@@ -94,7 +129,8 @@ export const globalHandlers = HttpApiBuilder.group(RootHttpApi, "global", (handl
     const config = yield* Config.Service
     const installation = yield* Installation.Service
     const projectList = yield* GlobalProjectList.Service
-    const bridge = yield* EffectBridge.make()
+    const store = yield* Effect.serviceOption(InstanceStore.Service)
+    const mcp = yield* Effect.serviceOption(MCP.Service)
     const runtime = Option.getOrElse(
       yield* Effect.serviceOption(RuntimeLifecycle.Service),
       () => RuntimeLifecycle.current() ?? RuntimeLifecycle.unavailable(),
@@ -112,10 +148,28 @@ export const globalHandlers = HttpApiBuilder.group(RootHttpApi, "global", (handl
       return yield* config.getGlobal()
     })
 
+    const reload = Effect.fn("GlobalHttpApi.reload")(function* (
+      update?: Parameters<Config.Interface["updateGlobal"]>[0],
+    ) {
+      if (Option.isNone(store) || Option.isNone(mcp))
+        return yield* new ConfigReloadInternalError({ message: "Configuration reload is unavailable." })
+      return yield* reloadConfig(runtime, update).pipe(
+        Effect.provideService(Config.Service, config),
+        Effect.provideService(InstanceStore.Service, store.value),
+        Effect.provideService(MCP.Service, mcp.value),
+        Effect.catchCause((cause) =>
+          Cause.hasInterruptsOnly(cause) ? Effect.interrupt : Effect.fail(configReloadError(cause)),
+        ),
+      )
+    })
+
     const configUpdate = Effect.fn("GlobalHttpApi.configUpdate")(function* (ctx) {
-      const result = yield* config.updateGlobal(ctx.payload)
-      if (result.changed) bridge.fork(disposeAllInstancesAndEmitGlobalDisposed({ swallowErrors: true }))
-      return result.info
+      return (yield* reload(ctx.payload)) ?? ctx.payload
+    })
+
+    const configReload = Effect.fn("GlobalHttpApi.configReload")(function* () {
+      yield* reload()
+      return true as const
     })
 
     const projectsList = Effect.fn("GlobalHttpApi.projectsList")(function* () {
@@ -189,6 +243,7 @@ export const globalHandlers = HttpApiBuilder.group(RootHttpApi, "global", (handl
       .handleRaw("event", event)
       .handle("configGet", configGet)
       .handle("configUpdate", configUpdate)
+      .handle("configReload", configReload)
       .handle("projectsList", projectsList)
       .handle("projectsUpdate", projectsUpdate)
       .handle("dispose", dispose)

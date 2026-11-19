@@ -165,6 +165,7 @@ const layer = Layer.effect(
           formatFile,
         }
       }),
+      { reloadable: true },
     )
 
     const init = Effect.fn("Format.init")(function* () {

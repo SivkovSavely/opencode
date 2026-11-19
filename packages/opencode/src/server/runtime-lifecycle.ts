@@ -44,6 +44,15 @@ export class RuntimeDrainingError extends Schema.TaggedErrorClass<RuntimeDrainin
   rootSessionID: Schema.optional(Schema.String),
 }) {}
 
+export class ConfigReloadBusyError extends Schema.TaggedErrorClass<ConfigReloadBusyError>()(
+  "ConfigReloadBusyError",
+  {},
+) {
+  override get message() {
+    return "Configuration reload requires an idle runtime"
+  }
+}
+
 export class RuntimeFencedTransitionError extends Schema.TaggedErrorClass<RuntimeFencedTransitionError>()(
   "RuntimeFencedTransitionError",
   {
@@ -101,6 +110,8 @@ export type Interface = {
   readonly withDurableAdmission: <A, E, R>(
     effect: Effect.Effect<A, E, R>,
   ) => Effect.Effect<A, E | RuntimeDrainingError, R>
+  /** Cache invalidation only, while idle; the effect must not invoke runtime methods or durable mutations. */
+  readonly withConfigReload: <A, E, R>(effect: Effect.Effect<A, E, R>) => Effect.Effect<A, E | ConfigReloadBusyError, R>
   readonly finishStartupRecovery: () => Effect.Effect<void>
   readonly recoveryPrepared: (sessionID: string) => Effect.Effect<void>
   /** Each successful admission requires exactly one owner release, even after cancellation. */
@@ -442,6 +453,7 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
       }),
     )
   const notificationClaims = new Set<string>()
+  const notifications = new Set<object>()
   const idleWaiters = new Map<string, Deferred.Deferred<boolean>>()
   const retryWakes = new Map<string, { attempt: number; retryAt: number; deferred: Deferred.Deferred<void> }>()
   const recoveryPreparedSessions = new Set<string>()
@@ -451,6 +463,35 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
   // Identity-only, single-use capabilities never cross the public HTTP schema.
   const childAuthorizations = new WeakMap<object, { sessionID: string; parentSessionID: string; parentFence: number }>()
   const childTaskOwners = new Map<string, object>()
+  const withConfigReload: Interface["withConfigReload"] = (effect) =>
+    withDurablePermit(
+      Effect.flatMap(Effect.service(References.PreventSchedulerYield), (prevent) =>
+        SynchronizedRef.modifyEffect(ref, (state) =>
+          Effect.gen(function* () {
+            if (
+              state.phase !== "running" ||
+              (startupReady && !Deferred.isDoneUnsafe(startupReady)) ||
+              state.active.size > 0 ||
+              state.leases.size > 0 ||
+              state.startupPending.size > 0 ||
+              state.cancelling.size > 0 ||
+              managed.size > 0 ||
+              executionPermits.size > 0 ||
+              childTaskOwners.size > 0 ||
+              notificationClaims.size > 0 ||
+              notifications.size > 0
+            )
+              return yield* new ConfigReloadBusyError()
+            return [
+              yield* effect.pipe(Effect.provideService(References.PreventSchedulerYield, prevent)),
+              state,
+            ] as const
+          }),
+        )
+          // The ref's nested semaphore has the same beta.83 acquisition gap as durableAdmission.
+          .pipe(Effect.provideService(References.PreventSchedulerYield, true)),
+      ),
+    )
   // Preserve column order: this is compared with Core's persisted admission-generation snapshot.
   const managedAncestors = (database: Database.Interface, sessionID: string) =>
     database.db.all<{ id: string }>(sql`
@@ -1187,12 +1228,14 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
     const prompt = {}
     const runner = {}
     yield* Effect.acquireRelease(
-      Effect.suspend(() => {
-        if (childTaskOwners.has(sessionID))
-          return Effect.fail(new RuntimeDrainingError({ message: "Managed child already has a foreground Task owner" }))
-        childTaskOwners.set(sessionID, prompt)
-        return Effect.void
-      }),
+      SynchronizedRef.modifyEffect(ref, (state) =>
+        Effect.gen(function* () {
+          if (childTaskOwners.has(sessionID))
+            return yield* new RuntimeDrainingError({ message: "Managed child already has a foreground Task owner" })
+          childTaskOwners.set(sessionID, prompt)
+          return [undefined, state] as const
+        }),
+      ),
       () =>
         Effect.sync(() => {
           if (childTaskOwners.get(sessionID) === prompt) childTaskOwners.delete(sessionID)
@@ -1853,7 +1896,11 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
     (effect) =>
       Effect.gen(function* () {
         const database = databaseRef.current ?? (yield* Database.Service)
-        return yield* database.db.transaction(() => effect, { behavior: "immediate" })
+        return yield* SynchronizedRef.modifyEffect(ref, (state) =>
+          database.db.transaction(() => effect.pipe(Effect.map((result) => [result, state] as const)), {
+            behavior: "immediate",
+          }),
+        )
       }),
   )
 
@@ -1892,6 +1939,14 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
   ) {
     if (process.env.OPENCODE_MANAGED_PROFILE === "1") return
     yield* Effect.gen(function* () {
+      yield* Effect.acquireRelease(
+        SynchronizedRef.modify(ref, (state) => {
+          const token = {}
+          notifications.add(token)
+          return [token, state] as const
+        }),
+        (token) => Effect.sync(() => notifications.delete(token)),
+      )
       const database = databaseRef.current ?? (yield* Database.Service)
       if (yield* SessionHandoffRecovery.held(database, parentSessionID)) return
       const pending = SynchronizedRef.getUnsafe(ref).startupPending.get(parentSessionID)
@@ -1899,7 +1954,7 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
       if (!(yield* waitForParentIdle(parentSessionID))) return
       if (yield* SessionHandoffRecovery.held(database, parentSessionID)) return
       yield* recoveryPermits.withPermit(effect)
-    }).pipe(Effect.forkIn(scope, { startImmediately: true }), Effect.asVoid)
+    }).pipe(Effect.scoped, Effect.forkIn(scope, { startImmediately: true }), Effect.asVoid)
   })
 
   const release = Effect.fn("RuntimeLifecycle.release")(function* (sessionID: string, fence?: number) {
@@ -3128,6 +3183,7 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
   return {
     identity,
     withDurableAdmission,
+    withConfigReload,
     bindDatabase(database: Database.Interface) {
       databaseRef.current = database
     },
@@ -3178,6 +3234,8 @@ export function unavailable(): Interface {
   return {
     identity,
     withDurableAdmission: (effect) => effect,
+    // Embedded runtimes have no lifecycle-owned work to exclude.
+    withConfigReload: (effect) => effect,
     bindDatabase() {},
     finishStartupRecovery: () => Effect.void,
     recoveryPrepared: () => Effect.void,

@@ -316,6 +316,7 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
 
   let bootedAt = 0
   let bootingRoot = false
+  let configGeneration = 0
   let eventFrame: number | undefined
   let eventTimer: ReturnType<typeof setTimeout> | undefined
 
@@ -385,8 +386,11 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
       queue.push(directory, { priority })
     },
     onMcp: (directory, setStore) => {
+      const generation = configGeneration
       void loadCommands(directory, serverSDK.api.command, sdkFor(directory), serverSDK.getProtocol)
-        .then((commands) => setStore("command", commands))
+        .then((commands) => {
+          if (generation === configGeneration && !disposed) setStore("command", commands)
+        })
         .catch((err) => {
           showToast({
             variant: "error",
@@ -521,6 +525,7 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
     const pending = booting.get(key)
     if (pending) return pending
 
+    const generation = configGeneration
     children.pin(key)
     const promise = Promise.resolve().then(async () => {
       const child = children.ensureChild(directory)
@@ -541,7 +546,10 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
         sdk,
         api: serverSDK.api,
         store: child[0],
-        setStore: child[1],
+        setStore: ((...input: unknown[]) => {
+          if (["config", "command", "agent"].includes(String(input[0])) && generation !== configGeneration) return
+          return (child[1] as (...args: unknown[]) => unknown)(...input)
+        }) as (typeof child)[1],
         vcsCache: cache,
         loadSessions,
         translate: language.t,
@@ -576,12 +584,59 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
     })
   }
 
+  const refreshConfig = async (generation: number) => {
+    const predicate = (query: { queryKey: readonly unknown[] }) =>
+      query.queryKey[0] === serverSDK.scope &&
+      ["config", "providers", "agents", "mcp", "mcpResources"].includes(String(query.queryKey[2] ?? query.queryKey[1]))
+    await queryClient.cancelQueries({ predicate })
+    if (generation !== configGeneration || disposed) return
+    await queryClient.invalidateQueries({ predicate, refetchType: "none" })
+    if (generation !== configGeneration || disposed) return
+    await Promise.all([
+      queryClient.fetchQuery(queryOptionsApi.globalConfig()),
+      queryClient.fetchQuery(queryOptionsApi.providers(null)),
+      ...Object.entries(children.children).flatMap(([directory, child]) => {
+        const key = directoryKey(directory)
+        return [
+          retry(async () => {
+            if ((await serverSDK.getProtocol()) !== "v1") return
+            const result = await sdkFor(key).config.get()
+            if (generation !== configGeneration || disposed) return
+            child[1]("config", reconcile(result.data ?? {}, { merge: false }))
+          }),
+          queryClient.fetchQuery(queryOptionsApi.providers(key)),
+          queryClient.fetchQuery(queryOptionsApi.agents(key)).then((agents) => {
+            if (generation === configGeneration && !disposed) child[1]("agent", agents)
+          }),
+          loadCommands(key, serverSDK.api.command, sdkFor(key), serverSDK.getProtocol).then((commands) => {
+            if (generation === configGeneration && !disposed) child[1]("command", commands)
+          }),
+          queryClient.fetchQuery(queryOptionsApi.mcp(key)),
+          queryClient.fetchQuery(queryOptionsApi.mcpResources(key)),
+        ]
+      }),
+    ])
+  }
+
   const unsub = serverSDK.event.listen((e) => {
     const directory = e.name
     const key = directoryKey(directory)
     const event = e.details
     const eventType: string = event.type
     const recent = bootingRoot || Date.now() - bootedAt < 1500
+
+    if (directory === "global" && eventType === "config.reloaded") {
+      const generation = ++configGeneration
+      void refreshConfig(generation).catch(() => {
+        if (generation !== configGeneration || disposed) return
+        showToast({
+          variant: "error",
+          title: language.t("toast.config.reloadFailed.title"),
+          description: language.t("toast.config.reloadFailed.description"),
+        })
+      })
+      return
+    }
 
     if (event.current) session.applyV2(event.current)
     session.apply(event)

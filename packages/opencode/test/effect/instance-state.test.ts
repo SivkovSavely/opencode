@@ -2,8 +2,10 @@ import { expect } from "bun:test"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { $ } from "bun"
-import { Cause, Context, Deferred, Duration, Effect, Exit, Fiber, Layer } from "effect"
+import { Cause, Context, Deferred, Duration, Effect, Exit, Fiber, Layer, Logger, ScopedCache } from "effect"
 import { InstanceState } from "@/effect/instance-state"
+import { InstanceRef } from "@/effect/instance-ref"
+import { disposeInstance } from "@/effect/instance-registry"
 import {
   disposeAllInstancesEffect,
   provideInstanceEffect,
@@ -243,6 +245,454 @@ it.live("InstanceState invalidates on disposeAll", () =>
     yield* disposeAllInstancesEffect
 
     expect(seen.sort()).toEqual([one, two].sort())
+  }),
+)
+
+it.live("InstanceState reload commit hooks run after preparation and before releasing old scopes", () =>
+  Effect.gen(function* () {
+    const one = yield* InstanceState.context.pipe(provideInstanceEffect(yield* tmpdirScoped()))
+    const two = yield* InstanceState.context.pipe(provideInstanceEffect(yield* tmpdirScoped()))
+    const prepared: string[] = []
+    const committed: string[] = []
+    let revision = 1
+    let broken = true
+    const state = yield* InstanceState.make(
+      (ctx) =>
+        Effect.gen(function* () {
+          const value = yield* Effect.acquireRelease(Effect.succeed({ revision }), (value) =>
+            Effect.sync(() => {
+              if (value.revision === 1) expect(committed).toEqual([one.directory, two.directory])
+            }),
+          )
+          if (revision === 1) return value
+          prepared.push(ctx.directory)
+          yield* InstanceState.onReloadCommit(() => {
+            expect(prepared).toEqual([one.directory, two.directory])
+            committed.push(ctx.directory)
+          })
+          if (broken && ctx.directory === two.directory) return yield* Effect.fail("later preparation failed")
+          return value
+        }),
+      { reloadable: true },
+    )
+    const beforeOne = yield* access(state, one.directory)
+    const beforeTwo = yield* access(state, two.directory)
+    revision = 2
+    expect(Exit.isFailure(yield* InstanceState.reload([one, two]).pipe(Effect.exit))).toBe(true)
+    expect(committed).toEqual([])
+    expect(yield* access(state, one.directory)).toBe(beforeOne)
+    expect(yield* access(state, two.directory)).toBe(beforeTwo)
+
+    prepared.length = 0
+    broken = false
+    yield* InstanceState.reload([one, two])
+    expect(committed).toEqual([one.directory, two.directory])
+    expect((yield* access(state, one.directory)).revision).toBe(2)
+    expect((yield* access(state, two.directory)).revision).toBe(2)
+  }),
+)
+
+it.live("InstanceState commit hook defects discard staged states without publishing a generation", () =>
+  Effect.gen(function* () {
+    const ctx = yield* InstanceState.context.pipe(provideInstanceEffect(yield* tmpdirScoped()))
+    const released: number[] = []
+    let revision = 1
+    const state = yield* InstanceState.make(
+      () =>
+        Effect.gen(function* () {
+          const value = yield* Effect.acquireRelease(Effect.succeed({ revision }), (value) =>
+            Effect.sync(() => {
+              released.push(value.revision)
+            }),
+          )
+          if (revision === 2)
+            yield* InstanceState.onReloadCommit(() => {
+              throw new Error("commit failed")
+            })
+          return value
+        }),
+      { reloadable: true },
+    )
+    const before = yield* access(state, ctx.directory)
+    revision = 2
+    expect(Exit.isFailure(yield* InstanceState.reload([ctx]).pipe(Effect.exit))).toBe(true)
+    expect(yield* access(state, ctx.directory)).toBe(before)
+    expect(released).toEqual([2])
+    expect(yield* ScopedCache.size(state.cache)).toBe(1)
+    revision = 3
+    yield* InstanceState.reload([ctx])
+    expect((yield* access(state, ctx.directory)).revision).toBe(3)
+  }),
+)
+
+it.live("InstanceState staged reload publishes both directories before releasing old scopes", () =>
+  Effect.gen(function* () {
+    const one = yield* InstanceState.context.pipe(provideInstanceEffect(yield* tmpdirScoped()))
+    const two = yield* InstanceState.context.pipe(provideInstanceEffect(yield* tmpdirScoped()))
+    const other = yield* InstanceState.context.pipe(provideInstanceEffect(yield* tmpdirScoped()))
+    const released: object[] = []
+    const observed: object[] = []
+    let revision = 1
+    const state: InstanceState.InstanceState<{ directory: string; revision: number }> = yield* InstanceState.make(
+      (ctx) =>
+        Effect.acquireRelease(
+          Effect.sync(() => {
+            expect(released).toEqual([])
+            return { directory: ctx.directory, revision }
+          }),
+          (value) =>
+            Effect.gen(function* () {
+              released.push(value)
+              if (value.revision !== 1 || value.directory === other.directory) return
+              observed.push(yield* access(state, one.directory), yield* access(state, two.directory))
+            }),
+        ),
+      { reloadable: true },
+    )
+    let ordinaryBuilds = 0
+    const ordinary = yield* InstanceState.make(() => Effect.succeed({ n: ++ordinaryBuilds }))
+    let unusedBuilds = 0
+    yield* InstanceState.make(() => Effect.succeed(++unusedBuilds), { reloadable: true })
+    const first = yield* access(state, one.directory)
+    const second = yield* access(state, two.directory)
+    const untouched = yield* access(state, other.directory)
+    const session = yield* access(ordinary, one.directory)
+    session.n = 42
+    revision = 2
+
+    yield* InstanceState.reload([one, two, one])
+
+    const nextOne = yield* access(state, one.directory)
+    const nextTwo = yield* access(state, two.directory)
+    expect(nextOne).toEqual({ directory: one.directory, revision: 2 })
+    expect(nextTwo).toEqual({ directory: two.directory, revision: 2 })
+    expect(nextOne).not.toBe(first)
+    expect(nextTwo).not.toBe(second)
+    expect(observed).toEqual([nextOne, nextTwo, nextOne, nextTwo])
+    expect(released).toEqual([first, second])
+    expect(yield* access(state, other.directory)).toBe(untouched)
+    expect(yield* access(ordinary, one.directory)).toBe(session)
+    expect(session.n).toBe(42)
+    expect(ordinaryBuilds).toBe(1)
+    expect(unusedBuilds).toBe(0)
+    expect(yield* ScopedCache.size(state.cache)).toBe(3)
+  }),
+)
+
+it.live("InstanceState staged reload rolls back a later directory failure and retries corrected dependencies", () =>
+  Effect.gen(function* () {
+    const one = yield* InstanceState.context.pipe(provideInstanceEffect(yield* tmpdirScoped()))
+    const two = yield* InstanceState.context.pipe(provideInstanceEffect(yield* tmpdirScoped()))
+    const released: string[] = []
+    let revision = 1
+    let broken = true
+    const dependency = yield* InstanceState.make(
+      (ctx) =>
+        Effect.gen(function* () {
+          const value = yield* Effect.acquireRelease(Effect.succeed({ directory: ctx.directory, revision }), (value) =>
+            Effect.sync(() => {
+              released.push(`dependency:${value.directory}:${value.revision}`)
+            }),
+          )
+          if (broken && ctx.directory === two.directory) return yield* Effect.fail("bad dependency")
+          return value
+        }),
+      { reloadable: true },
+    )
+    const state = yield* InstanceState.make(
+      (ctx) =>
+        Effect.gen(function* () {
+          const value = yield* Effect.acquireRelease(Effect.succeed({ directory: ctx.directory, revision }), (value) =>
+            Effect.sync(() => {
+              released.push(`state:${value.directory}:${value.revision}`)
+            }),
+          )
+          const dep = revision === 1 ? undefined : yield* InstanceState.get(dependency)
+          return { ...value, dependency: dep }
+        }),
+      { reloadable: true },
+    )
+    const first = yield* access(state, one.directory)
+    const second = yield* access(state, two.directory)
+    revision = 2
+
+    const failed = yield* InstanceState.reload([one, two]).pipe(Effect.exit)
+
+    expect(Exit.isFailure(failed)).toBe(true)
+    expect(yield* access(state, one.directory)).toBe(first)
+    expect(yield* access(state, two.directory)).toBe(second)
+    expect(released.sort()).toEqual(
+      [
+        `dependency:${one.directory}:2`,
+        `dependency:${two.directory}:2`,
+        `state:${one.directory}:2`,
+        `state:${two.directory}:2`,
+      ].sort(),
+    )
+    expect(yield* ScopedCache.size(state.cache)).toBe(2)
+    expect(yield* ScopedCache.size(dependency.cache)).toBe(0)
+
+    broken = false
+    revision = 3
+    yield* InstanceState.reload([one, two])
+    const nextOne = yield* access(state, one.directory)
+    const nextTwo = yield* access(state, two.directory)
+    expect(nextOne.revision).toBe(3)
+    expect(nextTwo.revision).toBe(3)
+    expect(nextOne.dependency).toBe(yield* access(dependency, one.directory))
+    expect(nextTwo.dependency).toBe(yield* access(dependency, two.directory))
+    expect(nextOne.dependency?.revision).toBe(3)
+    expect(nextTwo.dependency?.revision).toBe(3)
+    expect(released).toContain(`state:${one.directory}:1`)
+    expect(released).toContain(`state:${two.directory}:1`)
+    expect(yield* ScopedCache.size(state.cache)).toBe(2)
+    expect(yield* ScopedCache.size(dependency.cache)).toBe(2)
+  }),
+)
+
+it.live("InstanceState staged dependencies replace cached values without rebuilding the service graph", () =>
+  Effect.gen(function* () {
+    const one = yield* InstanceState.context.pipe(provideInstanceEffect(yield* tmpdirScoped()))
+    const two = yield* InstanceState.context.pipe(provideInstanceEffect(yield* tmpdirScoped()))
+    class Settings extends Context.Service<Settings, { revision: number }>()("@test/InstanceStateReloadSettings") {}
+    const settings = { revision: 1 }
+    const dependency = yield* InstanceState.make(
+      () =>
+        Effect.gen(function* () {
+          const service = yield* Settings
+          return { service, revision: service.revision, reloading: yield* InstanceState.reloading }
+        }),
+      { reloadable: true },
+    ).pipe(
+      Effect.provideService(Settings, settings),
+      Effect.provideService(InstanceRef, one),
+      Effect.provideService(InstanceState.reloading, true),
+    )
+    const state = yield* InstanceState.make(
+      (ctx) => Effect.map(InstanceState.get(dependency), (dependency) => ({ directory: ctx.directory, dependency })),
+      { reloadable: true },
+    ).pipe(Effect.provideService(Settings, settings), Effect.provideService(InstanceRef, one))
+    const first = yield* access(state, one.directory)
+    const second = yield* access(state, two.directory)
+    expect(first.dependency.reloading).toBe(false)
+    expect(second.directory).toBe(two.directory)
+    settings.revision = 2
+
+    yield* InstanceState.reload([one, two])
+
+    const nextOne = yield* access(state, one.directory)
+    const nextTwo = yield* access(state, two.directory)
+    expect(nextOne.dependency).not.toBe(first.dependency)
+    expect(nextTwo.dependency).not.toBe(second.dependency)
+    expect(nextOne.dependency).toBe(yield* access(dependency, one.directory))
+    expect(nextTwo.dependency).toBe(yield* access(dependency, two.directory))
+    expect(nextOne.dependency).toEqual({ service: settings, revision: 2, reloading: true })
+    expect(nextOne.dependency.service).toBe(settings)
+    expect(nextTwo.dependency.service).toBe(settings)
+    expect(nextTwo.directory).toBe(two.directory)
+    expect(yield* InstanceState.reloading).toBe(false)
+    const missing = yield* InstanceState.get(state).pipe(Effect.exit)
+    expect(Exit.isFailure(missing)).toBe(true)
+  }),
+)
+
+it.live("InstanceState staged reload rebuilds cached failures", () =>
+  Effect.gen(function* () {
+    const ctx = yield* InstanceState.context.pipe(provideInstanceEffect(yield* tmpdirScoped()))
+    let broken = true
+    const state = yield* InstanceState.make(
+      () => (broken ? Effect.fail("invalid settings") : Effect.succeed({ corrected: true })),
+      { reloadable: true },
+    )
+    expect(Exit.isFailure(yield* access(state, ctx.directory).pipe(Effect.exit))).toBe(true)
+    broken = false
+
+    yield* InstanceState.reload([ctx])
+
+    expect(yield* access(state, ctx.directory)).toEqual({ corrected: true })
+    expect(yield* ScopedCache.size(state.cache)).toBe(1)
+  }),
+)
+
+it.live("InstanceState rollback releases every staged entry even when a finalizer defects", () =>
+  Effect.gen(function* () {
+    const one = yield* InstanceState.context.pipe(provideInstanceEffect(yield* tmpdirScoped()))
+    const two = yield* InstanceState.context.pipe(provideInstanceEffect(yield* tmpdirScoped()))
+    const released: string[] = []
+    let revision = 1
+    const state = yield* InstanceState.make(
+      (ctx) =>
+        Effect.gen(function* () {
+          const value = yield* Effect.acquireRelease(Effect.succeed({ directory: ctx.directory, revision }), (value) =>
+            Effect.gen(function* () {
+              released.push(`${value.directory}:${value.revision}`)
+              if (value.directory === one.directory && value.revision === 2) {
+                yield* Effect.die(new Error("resource close failed"))
+              }
+            }),
+          )
+          if (ctx.directory === two.directory && revision === 2) return yield* Effect.fail("bad settings")
+          return value
+        }),
+      { reloadable: true },
+    )
+    const first = yield* access(state, one.directory)
+    const second = yield* access(state, two.directory)
+    revision = 2
+
+    const failed = yield* InstanceState.reload([one, two]).pipe(Effect.exit)
+
+    expect(Exit.isFailure(failed)).toBe(true)
+    expect(released).toEqual([`${one.directory}:2`, `${two.directory}:2`])
+    expect(yield* ScopedCache.size(state.cache)).toBe(2)
+    expect(yield* access(state, one.directory)).toBe(first)
+    expect(yield* access(state, two.directory)).toBe(second)
+  }),
+)
+
+it.live("InstanceState staged reload remains committed when an old scope finalizer defects", () =>
+  Effect.gen(function* () {
+    const one = yield* InstanceState.context.pipe(provideInstanceEffect(yield* tmpdirScoped()))
+    const two = yield* InstanceState.context.pipe(provideInstanceEffect(yield* tmpdirScoped()))
+    const released: object[] = []
+    const logs: unknown[] = []
+    let revision = 1
+    const state = yield* InstanceState.make(
+      (ctx) =>
+        Effect.acquireRelease(Effect.succeed({ directory: ctx.directory, revision }), (value) =>
+          Effect.gen(function* () {
+            released.push(value)
+            if (value.directory === one.directory && value.revision === 1) {
+              yield* Effect.die(new Error("reload-private-secret"))
+            }
+          }),
+        ),
+      { reloadable: true },
+    )
+    const first = yield* access(state, one.directory)
+    const second = yield* access(state, two.directory)
+    revision = 2
+
+    const exit = yield* InstanceState.reload([one, two]).pipe(
+      Effect.exit,
+      Effect.provide(Logger.layer([Logger.make((entry) => logs.push({ message: entry.message, cause: entry.cause }))])),
+    )
+
+    expect(Exit.isSuccess(exit)).toBe(true)
+    expect(released).toEqual([first, second])
+    expect((yield* access(state, one.directory)).revision).toBe(2)
+    expect((yield* access(state, two.directory)).revision).toBe(2)
+    expect(yield* ScopedCache.size(state.cache)).toBe(2)
+    expect(logs).toHaveLength(1)
+    expect(Bun.inspect(logs, { depth: 10 })).not.toContain("reload-private-secret")
+  }),
+)
+
+it.live("InstanceState staged reload cancellation releases staged scopes and retains both active values", () =>
+  Effect.gen(function* () {
+    const one = yield* InstanceState.context.pipe(provideInstanceEffect(yield* tmpdirScoped()))
+    const two = yield* InstanceState.context.pipe(provideInstanceEffect(yield* tmpdirScoped()))
+    const started = yield* Deferred.make<void>()
+    const released: object[] = []
+    const staged: object[] = []
+    const committed: object[] = []
+    let revision = 1
+    let block = true
+    const state = yield* InstanceState.make(
+      (ctx) =>
+        Effect.gen(function* () {
+          const value = yield* Effect.acquireRelease(Effect.succeed({ directory: ctx.directory, revision }), (value) =>
+            Effect.sync(() => {
+              released.push(value)
+            }),
+          )
+          if (revision === 2) {
+            staged.push(value)
+            yield* InstanceState.onReloadCommit(() => committed.push(value))
+            if (block && ctx.directory === two.directory) {
+              yield* Deferred.succeed(started, undefined)
+              yield* Effect.never
+            }
+          }
+          return value
+        }),
+      { reloadable: true },
+    )
+    const first = yield* access(state, one.directory)
+    const second = yield* access(state, two.directory)
+    revision = 2
+    const fiber = yield* InstanceState.reload([one, two]).pipe(Effect.forkScoped)
+    yield* awaitWithTimeout(Deferred.await(started), "second staged directory did not start")
+    expect(staged).toHaveLength(2)
+    expect(released).toEqual([])
+    expect(yield* access(state, one.directory)).toBe(first)
+    expect(yield* access(state, two.directory)).toBe(second)
+
+    yield* Fiber.interrupt(fiber)
+
+    const exit = yield* Fiber.await(fiber)
+    expect(Exit.isFailure(exit) && Cause.hasInterruptsOnly(exit.cause)).toBe(true)
+    expect(released).toEqual(staged)
+    expect(committed).toEqual([])
+    expect(yield* access(state, one.directory)).toBe(first)
+    expect(yield* access(state, two.directory)).toBe(second)
+    expect(yield* ScopedCache.size(state.cache)).toBe(2)
+    block = false
+    revision = 3
+    yield* InstanceState.reload([one, two])
+    expect((yield* access(state, one.directory)).revision).toBe(3)
+    expect((yield* access(state, two.directory)).revision).toBe(3)
+  }),
+)
+
+it.live("InstanceState disposal removes active and in-flight staged generations", () =>
+  Effect.gen(function* () {
+    const ctx = yield* InstanceState.context.pipe(provideInstanceEffect(yield* tmpdirScoped()))
+    const started = yield* Deferred.make<void>()
+    const released: number[] = []
+    let revision = 1
+    const state = yield* InstanceState.make(
+      () =>
+        Effect.gen(function* () {
+          const value = yield* Effect.acquireRelease(Effect.succeed({ revision }), (value) =>
+            Effect.gen(function* () {
+              released.push(value.revision)
+              if (value.revision === 2) yield* Effect.die(new Error("resource close failed"))
+            }),
+          )
+          if (revision === 3) {
+            yield* Deferred.succeed(started, undefined)
+            yield* Effect.never
+          }
+          return value
+        }),
+      { reloadable: true },
+    )
+    yield* access(state, ctx.directory)
+    const initialKeys = yield* ScopedCache.keys(state.cache)
+    revision = 2
+    yield* InstanceState.reload([ctx])
+    revision = 3
+    const fiber = yield* InstanceState.reload([ctx]).pipe(Effect.forkScoped)
+    yield* awaitWithTimeout(Deferred.await(started), "staged initializer did not start")
+    expect(yield* ScopedCache.size(state.cache)).toBe(2)
+
+    yield* Effect.promise(() => disposeInstance(ctx.directory))
+    expect(yield* ScopedCache.size(state.cache)).toBe(0)
+    yield* Fiber.interrupt(fiber)
+
+    expect(released).toEqual([1, 2, 3])
+    expect(yield* ScopedCache.size(state.cache)).toBe(0)
+    expect(yield* InstanceState.has(state).pipe(provideInstanceEffect(ctx.directory))).toBe(false)
+    revision = 4
+    expect((yield* access(state, ctx.directory)).revision).toBe(4)
+    expect(yield* ScopedCache.keys(state.cache)).toEqual(initialKeys)
+    revision = 5
+    yield* InstanceState.reload([ctx])
+    expect((yield* access(state, ctx.directory)).revision).toBe(5)
+    yield* disposeAllInstancesEffect
+    expect(released).toEqual([1, 2, 3, 4, 5])
+    expect(yield* ScopedCache.size(state.cache)).toBe(0)
   }),
 )
 

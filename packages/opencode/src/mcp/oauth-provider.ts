@@ -163,29 +163,38 @@ export class McpOAuthProvider implements OAuthClientProvider {
   }
 
   async invalidateCredentials(type: "all" | "client" | "tokens"): Promise<void> {
-    const entry = await Effect.runPromise(this.auth.get(this.mcpName))
-    if (!entry) return
-    switch (type) {
-      case "all":
-        await Effect.runPromise(this.auth.remove(this.mcpName))
-        break
-      case "client":
-        delete entry.clientInfo
-        await Effect.runPromise(this.auth.set(this.mcpName, entry))
-        break
-      case "tokens":
-        delete entry.tokens
-        await Effect.runPromise(this.auth.set(this.mcpName, entry))
-        break
-    }
+    await Effect.runPromise(this.auth.invalidate(this.mcpName, this.serverUrl, type))
   }
 }
 
 export class McpOAuthPendingProvider extends McpOAuthProvider {
   private pendingClientInfo?: OAuthClientInformationFull
   private pendingTokens?: OAuthTokens
+  private preparation?: { state: string; codeVerifier?: string }
+  private published = false
+
+  async prepare(): Promise<void> {
+    const client = await super.clientInformation()
+    const tokens = await super.tokens()
+    this.pendingClientInfo = client ? { ...this.clientMetadata, ...client } : undefined
+    // Refresh can rotate a remote token irreversibly, so preparation may only reuse the access token.
+    this.pendingTokens = tokens ? { ...tokens, refresh_token: undefined } : undefined
+    this.preparation = {
+      state: Array.from(crypto.getRandomValues(new Uint8Array(32)))
+        .map((b) => b.toString(16).padStart(2, "0"))
+        .join(""),
+    }
+  }
+
+  publish(): void {
+    this.published = true
+    this.preparation = undefined
+    this.pendingClientInfo = undefined
+    this.pendingTokens = undefined
+  }
 
   override async clientInformation(): Promise<OAuthClientInformation | undefined> {
+    if (this.published) return super.clientInformation()
     if (!this.config.clientId) return this.pendingClientInfo
     return {
       client_id: this.config.clientId,
@@ -194,20 +203,44 @@ export class McpOAuthPendingProvider extends McpOAuthProvider {
   }
 
   override async saveClientInformation(info: OAuthClientInformationFull): Promise<void> {
+    if (this.published) return super.saveClientInformation(info)
     this.pendingClientInfo = info
   }
 
   override async tokens(): Promise<OAuthTokens | undefined> {
+    if (this.published) return super.tokens()
     return this.pendingTokens
   }
 
   override async saveTokens(tokens: OAuthTokens): Promise<void> {
+    if (this.published) return super.saveTokens(tokens)
     this.pendingTokens = tokens
   }
 
   override async invalidateCredentials(type: "all" | "client" | "tokens"): Promise<void> {
+    if (this.published) return super.invalidateCredentials(type)
     if (type === "all" || type === "client") this.pendingClientInfo = undefined
     if (type === "all" || type === "tokens") this.pendingTokens = undefined
+  }
+
+  override async state(): Promise<string> {
+    return this.preparation?.state ?? super.state()
+  }
+
+  override async saveState(state: string): Promise<void> {
+    if (!this.preparation) return super.saveState(state)
+    this.preparation.state = state
+  }
+
+  override async saveCodeVerifier(codeVerifier: string): Promise<void> {
+    if (!this.preparation) return super.saveCodeVerifier(codeVerifier)
+    this.preparation.codeVerifier = codeVerifier
+  }
+
+  override async codeVerifier(): Promise<string> {
+    if (!this.preparation) return super.codeVerifier()
+    if (!this.preparation.codeVerifier) throw new Error(`No code verifier saved for MCP server: ${this.mcpName}`)
+    return this.preparation.codeVerifier
   }
 
   async commit(): Promise<void> {

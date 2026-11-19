@@ -3,11 +3,12 @@ import os from "os"
 import { ConfigV1 } from "@opencode-ai/core/v1/config/config"
 import fuzzysort from "fuzzysort"
 import { Config } from "@/config/config"
-import { mapValues, mergeDeep, omit, pickBy, sortBy } from "remeda"
+import { clone, mapValues, mergeDeep, omit, pickBy, sortBy } from "remeda"
 import { NoSuchModelError, type Provider as SDK } from "ai"
 import { Npm } from "@opencode-ai/core/npm"
 import { Hash } from "@opencode-ai/core/util/hash"
 import { Plugin } from "../plugin"
+import type { Hooks } from "@opencode-ai/plugin"
 import { serviceUse } from "@opencode-ai/core/effect/service-use"
 import { type LanguageModelV3 } from "@ai-sdk/provider"
 import { ModelsDev } from "@opencode-ai/core/models-dev"
@@ -1406,9 +1407,20 @@ const layer = Layer.effect(
     const modelsDevSvc = yield* ModelsDev.Service
     const runtimeFlags = yield* RuntimeFlags.Service
 
+    // Hook resources share the plugin/instance lifetime, not the config generation.
+    const retained = yield* InstanceState.make(() =>
+      Effect.gen(function* () {
+        return {
+          bridge: yield* EffectBridge.make(),
+          models: new Map<Hooks, Effect.Effect<Record<string, Model>>>(),
+          options: new Map<Hooks, Effect.Effect<Record<string, unknown>>>(),
+        }
+      }),
+    )
+
     const state = yield* InstanceState.make<State>(() =>
       Effect.gen(function* () {
-        const bridge = yield* EffectBridge.make()
+        const hooks = yield* InstanceState.get(retained)
         const cfg = yield* config.get()
         const modelsDev = yield* modelsDevSvc.get()
         const catalog = mapValues(modelsDev, fromModelsDevProvider)
@@ -1472,19 +1484,28 @@ const layer = Layer.effect(
           if (!provider) continue
           const pluginAuth = yield* auth.get(providerID).pipe(Effect.orDie)
 
-          provider.models = yield* Effect.promise(async () => {
-            const next = await models(toPublicInfo(provider), { auth: pluginAuth })
-            return Object.fromEntries(
-              Object.entries(next).map(([id, model]) => [
-                id,
-                {
-                  ...model,
-                  id: ModelV2.ID.make(id),
-                  providerID,
-                },
-              ]),
-            )
-          })
+          const load =
+            hooks.models.get(hook) ??
+            (yield* Effect.cached(
+              Effect.promise(async () => {
+                const next = await models(toPublicInfo(provider), { auth: pluginAuth })
+                return clone(
+                  Object.fromEntries(
+                    Object.entries(next).map(([id, model]) => [
+                      id,
+                      {
+                        ...model,
+                        id: ModelV2.ID.make(id),
+                        providerID,
+                      },
+                    ]),
+                  ),
+                )
+              }),
+            ))
+          hooks.models.set(hook, load)
+          // Config overlays and filtering mutate models; keep the retained snapshot isolated.
+          provider.models = clone(yield* load)
         }
 
         // extend database from config
@@ -1625,12 +1646,18 @@ const layer = Layer.effect(
           if (!stored) continue
           if (!plugin.auth.loader) continue
 
-          const options = yield* Effect.promise(() =>
-            plugin.auth!.loader!(
-              () => bridge.promise(auth.get(providerID).pipe(Effect.orDie)) as any,
-              toPublicInfo(database[plugin.auth!.provider]),
-            ),
-          )
+          const load =
+            hooks.options.get(plugin) ??
+            (yield* Effect.cached(
+              Effect.promise(() =>
+                plugin.auth!.loader!(
+                  () => hooks.bridge.promise(auth.get(providerID).pipe(Effect.orDie)) as any,
+                  toPublicInfo(database[plugin.auth!.provider]),
+                ),
+              ),
+            ))
+          hooks.options.set(plugin, load)
+          const options = yield* load
           const opts = options ?? {}
           const patch: Partial<Info> = providers[providerID] ? { options: opts } : { source: "custom", options: opts }
           mergeProvider(providerID, patch)
@@ -1739,6 +1766,7 @@ const layer = Layer.effect(
           varsLoaders,
         }
       }),
+      { reloadable: true },
     )
 
     const list = Effect.fn("Provider.list")(() => InstanceState.use(state, (s) => s.providers))

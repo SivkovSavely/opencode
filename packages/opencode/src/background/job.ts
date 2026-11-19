@@ -1,6 +1,7 @@
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { BackgroundJob as CoreBackgroundJob } from "@opencode-ai/core/background-job"
 import { InstanceState } from "@/effect/instance-state"
+import { withInstanceActivity } from "@/effect/instance-registry"
 import { Effect, Layer } from "effect"
 
 export {
@@ -22,8 +23,16 @@ const layer = Layer.effect(
     return CoreBackgroundJob.Service.of({
       list: () => InstanceState.useEffect(state, (jobs) => jobs.list()),
       get: (id) => InstanceState.useEffect(state, (jobs) => jobs.get(id)),
-      start: (input) => InstanceState.useEffect(state, (jobs) => jobs.start(input)),
-      extend: (input) => InstanceState.useEffect(state, (jobs) => jobs.extend(input)),
+      start: (input) =>
+        InstanceState.useEffect(state, (jobs) =>
+          jobs.start({
+            ...input,
+            run: input.run.pipe(withInstanceActivity),
+            onPromote: input.onPromote?.pipe(withInstanceActivity),
+          }),
+        ),
+      extend: (input) =>
+        InstanceState.useEffect(state, (jobs) => jobs.extend({ ...input, run: input.run.pipe(withInstanceActivity) })),
       wait: (input) => InstanceState.useEffect(state, (jobs) => jobs.wait(input)),
       waitForPromotion: (id) => InstanceState.useEffect(state, (jobs) => jobs.waitForPromotion(id)),
       promote: (id) => InstanceState.useEffect(state, (jobs) => jobs.promote(id)),

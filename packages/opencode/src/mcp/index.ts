@@ -30,6 +30,7 @@ import { Cause, Effect, Exit, Layer, Context, Schema, Stream, Semaphore } from "
 import { EffectBridge } from "@/effect/bridge"
 import { InstanceState } from "@/effect/instance-state"
 import { InstanceRef } from "@/effect/instance-ref"
+import { InstanceReloadBusyError, withInstanceActivity } from "@/effect/instance-registry"
 import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { McpCatalog } from "./catalog"
@@ -186,6 +187,7 @@ export interface McpTool {
 }
 
 export interface Interface {
+  readonly assertReloadable: () => Effect.Effect<void, InstanceReloadBusyError>
   readonly status: () => Effect.Effect<Record<string, Status>>
   readonly clients: (activated?: readonly string[]) => Effect.Effect<Record<string, MCPClient>>
   readonly lazyServers: () => Effect.Effect<{ name: string; description?: string }[]>
@@ -245,6 +247,7 @@ const layer = Layer.effect(
     const auth = yield* McpAuth.Service
     const events = yield* EventV2Bridge.Service
     const browser = yield* McpBrowser.Service
+    const liveBridge = yield* EffectBridge.make()
 
     type Transport = StdioClientTransport | StreamableHTTPClientTransport | SSEClientTransport
 
@@ -290,7 +293,8 @@ const layer = Layer.effect(
       let authProvider: McpOAuthProvider | undefined
 
       if (!oauthDisabled) {
-        authProvider = new McpOAuthProvider(
+        const Provider = (yield* InstanceState.reloading) ? McpOAuthPendingProvider : McpOAuthProvider
+        authProvider = new Provider(
           key,
           mcp.url,
           {
@@ -305,6 +309,13 @@ const layer = Layer.effect(
           },
           auth,
         )
+        if (authProvider instanceof McpOAuthPendingProvider) {
+          const provider = authProvider
+          yield* Effect.promise(() => provider.prepare())
+          yield* InstanceState.onReloadCommit(() => {
+            if (s.clients[key]) provider.publish()
+          })
+        }
       }
 
       const transports: Array<{ name: string; transport: TransportWithAuth }> = [
@@ -498,20 +509,50 @@ const layer = Layer.effect(
       }
 
       client.setNotificationHandler(LoggingMessageNotificationSchema, (notification) =>
-        bridge.promise(serverLog(name, notification.params)),
+        bridge.promise(
+          Effect.gen(function* () {
+            if (s.clients[name] !== client) return
+            const instance = yield* InstanceState.context
+            // The service bridge predates staging; unpublished clients must not log arbitrary payloads.
+            const published = yield* liveBridge.run(
+              Effect.gen(function* () {
+                if (!(yield* InstanceState.has(state))) return false
+                return (yield* InstanceState.get(state)) === s
+              }).pipe(Effect.provideService(InstanceRef, instance)),
+            )
+            if (!published || s.clients[name] !== client) return
+            yield* serverLog(name, notification.params)
+          }),
+        ),
       )
 
       if (!client.getServerCapabilities()?.tools) return
-      client.setNotificationHandler(ToolListChangedNotificationSchema, async () => {
-        if (s.clients[name] !== client || s.status[name]?.status !== "connected") return
-
-        const listed = await bridge.promise(McpCatalog.defs(client, timeout))
-        if (!listed) return
-        if (s.clients[name] !== client || s.status[name]?.status !== "connected") return
-
-        s.defs[name] = listed
-        await bridge.promise(events.publish(ToolsChanged, { server: name }).pipe(Effect.ignore))
-      })
+      client.setNotificationHandler(ToolListChangedNotificationSchema, () =>
+        bridge.promise(
+          Effect.gen(function* () {
+            const instance = yield* InstanceState.context
+            const published = liveBridge.run(
+              Effect.gen(function* () {
+                if (!(yield* InstanceState.has(state))) return false
+                return (yield* InstanceState.get(state)) === s
+              }).pipe(Effect.provideService(InstanceRef, instance)),
+            )
+            const refresh = Effect.gen(function* () {
+              if (s.clients[name] !== client || s.status[name]?.status !== "connected") return
+              const listed = yield* McpCatalog.defs(client, timeout)
+              if (!listed || s.clients[name] !== client || s.status[name]?.status !== "connected") return
+              s.defs[name] = listed
+              if (yield* published) yield* events.publish(ToolsChanged, { server: name }).pipe(Effect.ignore)
+            })
+            // Published callbacks must not refresh OAuth credentials across the exclusive reload barrier.
+            if (yield* published)
+              return yield* liveBridge.run(
+                withInstanceActivity(refresh).pipe(Effect.provideService(InstanceRef, instance)),
+              )
+            yield* refresh
+          }),
+        ),
+      )
     }
 
     function serverLog(name: string, params: LoggingMessageNotification["params"]) {
@@ -550,32 +591,6 @@ const layer = Layer.effect(
         if (process.env.OPENCODE_MANAGED_PROFILE === "1") return s
         const bridge = yield* EffectBridge.make()
 
-        yield* Effect.forEach(
-          Object.entries(config),
-          ([key, mcp]) =>
-            Effect.gen(function* () {
-              if (!isMcpConfigured(mcp)) {
-                yield* Effect.logError("Ignoring MCP config entry without type", { key })
-                return
-              }
-
-              if (mcp.enabled === false) {
-                s.status[key] = { status: "disabled" }
-                return
-              }
-
-              const result = yield* create(s, key, mcp)
-              s.status[key] = result.status
-              if (result.mcpClient) {
-                s.clients[key] = result.mcpClient
-                s.defs[key] = result.defs!
-                if (result.instructions) s.instructions[key] = result.instructions
-                watch(s, key, result.mcpClient, bridge, mcp.timeout)
-              }
-            }),
-          { concurrency: "unbounded" },
-        )
-
         yield* Effect.addFinalizer(() =>
           Effect.gen(function* () {
             for (const attempt of s.activeOAuth.values()) {
@@ -612,8 +627,35 @@ const layer = Layer.effect(
           }),
         )
 
+        yield* Effect.forEach(
+          Object.entries(config),
+          ([key, mcp]) =>
+            Effect.gen(function* () {
+              if (!isMcpConfigured(mcp)) {
+                yield* Effect.logError("Ignoring MCP config entry without type", { key })
+                return
+              }
+
+              if (mcp.enabled === false) {
+                s.status[key] = { status: "disabled" }
+                return
+              }
+
+              const result = yield* create(s, key, mcp)
+              s.status[key] = result.status
+              if (result.mcpClient) {
+                s.clients[key] = result.mcpClient
+                s.defs[key] = result.defs!
+                if (result.instructions) s.instructions[key] = result.instructions
+                watch(s, key, result.mcpClient, bridge, mcp.timeout)
+              }
+            }),
+          { concurrency: "unbounded" },
+        )
+
         return s
       }),
+      { reloadable: true },
     )
 
     function connectLock(s: State, name: string) {
@@ -705,6 +747,12 @@ const layer = Layer.effect(
       watch(s, name, client, bridge, timeout)
       if (previous) yield* Effect.tryPromise(() => previous.close()).pipe(Effect.ignore)
       return s.status[name]
+    })
+
+    const assertReloadable = Effect.fn("MCP.assertReloadable")(function* () {
+      if (!(yield* InstanceState.has(state))) return
+      const s = yield* InstanceState.get(state)
+      if (s.activeOAuth.size || s.pendingOAuthTransports.size) return yield* Effect.fail(new InstanceReloadBusyError())
     })
 
     const status = Effect.fn("MCP.status")(function* () {
@@ -1248,7 +1296,7 @@ const layer = Layer.effect(
           return yield* Effect.gen(function* () {
             if (connectRevision(s, mcpName) !== pending.revision) {
               if (pending.attempt) yield* releaseOAuth(s, mcpName, pending.attempt)
-               else yield* closePendingOAuth(s, mcpName, pending)
+              else yield* closePendingOAuth(s, mcpName, pending)
               return s.status[mcpName] ?? { status: "disabled" as const }
             }
 
@@ -1264,7 +1312,7 @@ const layer = Layer.effect(
 
             if (error) {
               if (pending.attempt) yield* releaseOAuth(s, mcpName, pending.attempt)
-               else yield* closePendingOAuth(s, mcpName, pending)
+              else yield* closePendingOAuth(s, mcpName, pending)
               return { status: "failed", error: `OAuth completion failed: ${error}` } satisfies Status
             }
 
@@ -1275,7 +1323,7 @@ const layer = Layer.effect(
             const mcpConfig = yield* requireMcpConfig(mcpName)
             const status = yield* createAndStore(mcpName, { ...mcpConfig, enabled: true })
             if (pending.attempt) yield* releaseOAuth(s, mcpName, pending.attempt)
-               else yield* closePendingOAuth(s, mcpName, pending)
+            else yield* closePendingOAuth(s, mcpName, pending)
             return status
           }).pipe(
             Effect.onExit((exit) => {
@@ -1321,29 +1369,34 @@ const layer = Layer.effect(
       return "authenticated"
     })
 
+    function activity<Args extends unknown[], A, E>(fn: (...args: Args) => Effect.Effect<A, E>) {
+      return (...args: Args) => withInstanceActivity(fn(...args))
+    }
+
     return Service.of({
-      status,
-      clients,
-      lazyServers,
-      instructions,
-      tools,
-      prompts,
-      resources,
-      resourceTemplates,
-      add,
-      connect,
-      ensureConnected,
-      configuredServer,
-      disconnect,
-      getPrompt,
-      readResource,
-      startAuth,
-      authenticate,
-      finishAuth,
-      removeAuth,
-      supportsOAuth,
-      hasStoredTokens,
-      getAuthStatus,
+      assertReloadable,
+      status: activity(status),
+      clients: activity(clients),
+      lazyServers: activity(lazyServers),
+      instructions: activity(instructions),
+      tools: activity(tools),
+      prompts: activity(prompts),
+      resources: activity(resources),
+      resourceTemplates: activity(resourceTemplates),
+      add: activity(add),
+      connect: activity(connect),
+      ensureConnected: activity(ensureConnected),
+      configuredServer: activity(configuredServer),
+      disconnect: activity(disconnect),
+      getPrompt: activity(getPrompt),
+      readResource: activity(readResource),
+      startAuth: activity(startAuth),
+      authenticate: activity(authenticate),
+      finishAuth: activity(finishAuth),
+      removeAuth: activity(removeAuth),
+      supportsOAuth: activity(supportsOAuth),
+      hasStoredTokens: activity(hasStoredTokens),
+      getAuthStatus: activity(getAuthStatus),
     })
   }),
 )

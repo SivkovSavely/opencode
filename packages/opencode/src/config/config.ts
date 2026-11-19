@@ -4,7 +4,8 @@ import { serviceUse } from "@opencode-ai/core/effect/service-use"
 import path from "path"
 import { pathToFileURL } from "url"
 import os from "os"
-import { mergeDeep } from "remeda"
+import { isDeepStrictEqual } from "node:util"
+import { isPlainObject, mergeDeep } from "remeda"
 import { Global } from "@opencode-ai/core/global"
 import fsNode from "fs/promises"
 import { Flag } from "@opencode-ai/core/flag/flag"
@@ -23,7 +24,7 @@ import { FetchHttpClient, HttpClient, HttpClientRequest } from "effect/unstable/
 import { EffectFlock } from "@opencode-ai/core/util/effect-flock"
 import { containsPath, type InstanceContext } from "../project/instance-context"
 import { ConfigV1 } from "@opencode-ai/core/v1/config/config"
-import { RemoteAuthError } from "@opencode-ai/core/v1/config/error"
+import { InvalidError, RemoteAuthError } from "@opencode-ai/core/v1/config/error"
 import { ConfigPermissionV1 } from "@opencode-ai/core/v1/config/permission"
 import { ConfigPluginV1 } from "@opencode-ai/core/v1/config/plugin"
 import { ConfigAgent } from "./agent"
@@ -122,13 +123,89 @@ type State = {
   consoleState: ConsoleState
 }
 
+type PluginConfigEdit = { path: string[]; value?: unknown; append?: unknown[]; remove: boolean }
+
+function copyPluginConfig<T>(value: T, seen = new WeakMap<object, unknown>()): T {
+  // Copy data containers, retaining functions and opaque resources owned by the plugin.
+  if (!Array.isArray(value) && !isPlainObject(value)) return value
+  if (seen.has(value)) return seen.get(value) as T
+  const result: unknown[] | Record<string, unknown> = Array.isArray(value)
+    ? new Array<unknown>(value.length)
+    : Object.create(Object.getPrototypeOf(value))
+  seen.set(value, result)
+  for (const [key, item] of Object.entries(value)) {
+    Object.defineProperty(result, key, {
+      value: copyPluginConfig(item, seen),
+      writable: true,
+      enumerable: true,
+      configurable: true,
+    })
+  }
+  return result as T
+}
+
+function pluginConfigEdits(
+  before: Record<string, unknown>,
+  after: Record<string, unknown>,
+  path: string[] = [],
+): PluginConfigEdit[] {
+  return Array.from(new Set([...Object.keys(before), ...Object.keys(after)])).flatMap((key) => {
+    if (isDeepStrictEqual(before[key], after[key]) && Object.hasOwn(before, key) === Object.hasOwn(after, key))
+      return []
+    if (isPlainObject(before[key]) && isPlainObject(after[key]))
+      return pluginConfigEdits(before[key], after[key], [...path, key])
+    if (
+      Array.isArray(before[key]) &&
+      Array.isArray(after[key]) &&
+      after[key].length > before[key].length &&
+      isDeepStrictEqual(after[key].slice(0, before[key].length), before[key])
+    )
+      return [{ path: [...path, key], append: copyPluginConfig(after[key].slice(before[key].length)), remove: false }]
+    // Non-append array edits replace the value rather than replaying potentially stale indexes.
+    return [{ path: [...path, key], value: copyPluginConfig(after[key]), remove: !Object.hasOwn(after, key) }]
+  })
+}
+
+function applyPluginConfigEdits(config: Info, edits: PluginConfigEdit[]) {
+  edits: for (const edit of edits) {
+    let target: Record<string, unknown> = config
+    for (const key of edit.path.slice(0, -1)) {
+      if (!Object.hasOwn(target, key) || !isRecord(target[key])) {
+        if (edit.remove) continue edits
+        Object.defineProperty(target, key, { value: {}, writable: true, enumerable: true, configurable: true })
+      }
+      target = target[key] as Record<string, unknown>
+    }
+    const key = edit.path[edit.path.length - 1]
+    if (edit.remove) delete target[key]
+    else
+      Object.defineProperty(target, key, {
+        value: edit.append
+          ? [...(Array.isArray(target[key]) ? target[key] : []), ...copyPluginConfig(edit.append)]
+          : copyPluginConfig(edit.value),
+        writable: true,
+        enumerable: true,
+        configurable: true,
+      })
+  }
+}
+
+const stagedGlobal = Context.Reference<Info | undefined>("@opencode/Config/stagedGlobal", {
+  defaultValue: () => undefined,
+})
+
 export interface Interface {
   readonly get: () => Effect.Effect<Info>
+  readonly runPluginConfigHook: <A, E, R>(config: Info, hook: Effect.Effect<A, E, R>) => Effect.Effect<A, E, R>
   readonly getGlobal: () => Effect.Effect<Info>
   readonly getConsoleState: () => Effect.Effect<ConsoleState>
   readonly update: (config: Info) => Effect.Effect<void>
-  readonly updateGlobal: (config: Info) => Effect.Effect<{ info: Info; changed: boolean }>
+  readonly updateGlobal: (
+    config: Info,
+    options?: { deferInvalidate: boolean },
+  ) => Effect.Effect<{ info: Info; changed: boolean }>
   readonly invalidate: () => Effect.Effect<void>
+  readonly reload: <A, E, R>(effect: Effect.Effect<A, E, R>) => Effect.Effect<A, E, R>
   readonly directories: () => Effect.Effect<string[]>
   readonly waitForDependencies: () => Effect.Effect<void>
 }
@@ -183,10 +260,25 @@ const layer = Layer.effect(
     const npmSvc = yield* Npm.Service
     const http = yield* HttpClient.HttpClient
 
-    const readConfigFile = (filepath: string) => fs.readFileStringSafe(filepath).pipe(Effect.orDie)
+    const readConfigFile = Effect.fnUntraced(function* (filepath: string) {
+      if (!(yield* InstanceState.reloading)) return yield* fs.readFileStringSafe(filepath).pipe(Effect.orDie)
+      return yield* fs.readFileString(filepath).pipe(
+        Effect.catchReason("PlatformError", "NotFound", () => Effect.succeed(undefined)),
+        Effect.orDie,
+      )
+    })
 
     const decodeConfig = Effect.fnUntraced(function* (input: unknown, source: string) {
       const result = ConfigV2Compat.lower(normalizeLoadedConfig(input), source)
+      if (yield* InstanceState.reloading) {
+        const invalid = result.diagnostics.filter((diagnostic) => diagnostic.kind === "invalid")
+        if (invalid.length)
+          throw new InvalidError({
+            path: source,
+            issues: invalid.map((diagnostic) => ({ path: [...diagnostic.path], message: diagnostic.message })),
+          })
+        return ConfigParse.schema(ConfigV1.Info, result.value, source)
+      }
       yield* Effect.forEach(result.diagnostics, (diagnostic) =>
         Effect.logWarning("configuration compatibility diagnostic", {
           source,
@@ -229,6 +321,7 @@ const layer = Layer.effect(
       options: { path: string } | { dir: string; source: string },
       env?: Record<string, string>,
     ) {
+      const strict = yield* InstanceState.reloading
       const source = "path" in options ? options.path : options.source
       const expanded = yield* Effect.promise(() =>
         ConfigVariable.substitute(
@@ -244,8 +337,10 @@ const layer = Layer.effect(
       yield* Effect.promise(() => resolveLoadedPlugins(data, options.path))
       if (!data.$schema) {
         data.$schema = "https://opencode.ai/config.json"
-        const updated = text.replace(/^\s*\{/, '{\n  "$schema": "https://opencode.ai/config.json",')
-        yield* fs.writeFileString(options.path, updated).pipe(Effect.catch(() => Effect.void))
+        if (!strict) {
+          const updated = text.replace(/^\s*\{/, '{\n  "$schema": "https://opencode.ai/config.json",')
+          yield* fs.writeFileString(options.path, updated).pipe(Effect.catch(() => Effect.void))
+        }
       }
       return data
     })
@@ -253,15 +348,16 @@ const layer = Layer.effect(
     const loadFile = Effect.fnUntraced(function* (filepath: string, env?: Record<string, string>) {
       yield* Effect.logInfo("loading", { path: filepath })
       const text = yield* readConfigFile(filepath)
-      if (!text) return {} as Info
+      if (text === undefined || (!text && !(yield* InstanceState.reloading))) return {} as Info
       return yield* loadConfig(text, { path: filepath }, env)
     })
 
     const loadGlobal = Effect.fnUntraced(function* (env?: Record<string, string>) {
+      const strict = yield* InstanceState.reloading
       let result: Info = {}
       // Seed the default global config with the schema for editor completion, but avoid writing when the user
       // explicitly routes config through env-provided paths or content.
-      if (!Flag.OPENCODE_CONFIG && !Flag.OPENCODE_CONFIG_DIR && !Flag.OPENCODE_CONFIG_CONTENT) {
+      if (!strict && !Flag.OPENCODE_CONFIG && !Flag.OPENCODE_CONFIG_DIR && !Flag.OPENCODE_CONFIG_CONTENT) {
         const file = globalConfigFile()
         if (!existsSync(file)) {
           yield* fs
@@ -274,7 +370,26 @@ const layer = Layer.effect(
       result = mergeConfig(result, yield* loadFile(path.join(Global.Path.config, "opencode.jsonc"), env))
 
       const legacy = path.join(Global.Path.config, "config")
-      if (existsSync(legacy)) {
+      if (strict) {
+        const text = yield* readConfigFile(legacy)
+        if (text !== undefined) {
+          const parsed = yield* Effect.try({
+            try: () => Bun.TOML.parse(text),
+            catch: (cause) => new InvalidError({ path: legacy, message: "Invalid TOML configuration" }, { cause }),
+          }).pipe(Effect.orDie)
+          if (!isRecord(parsed)) throw new InvalidError({ path: legacy, message: "Expected a TOML object" })
+          const { provider, model, ...rest } = parsed
+          if (
+            (provider !== undefined && typeof provider !== "string") ||
+            (model !== undefined && typeof model !== "string")
+          )
+            throw new InvalidError({ path: legacy, message: "Legacy provider and model must be strings" })
+          result = mergeConfig(result, yield* decodeConfig(rest, legacy))
+          if (provider && model) result.model = `${provider}/${model}`
+          result.$schema = "https://opencode.ai/config.json"
+        }
+      }
+      if (!strict && existsSync(legacy)) {
         yield* Effect.promise(() =>
           import(pathToFileURL(legacy).href, { with: { type: "toml" } })
             .then(async (mod) => {
@@ -289,10 +404,10 @@ const layer = Layer.effect(
         )
       }
 
-      return result
+      return strict ? ConfigParse.schema(ConfigV1.Info, result, Global.Path.config) : result
     })
 
-    const [cachedGlobal, invalidateGlobal] = yield* Effect.cachedInvalidateWithTTL(
+    const [initialGlobal, invalidateGlobal] = yield* Effect.cachedInvalidateWithTTL(
       loadGlobal().pipe(
         Effect.tapError((error) =>
           Effect.logError("failed to load global config, using defaults", { error: String(error) }),
@@ -301,9 +416,21 @@ const layer = Layer.effect(
       ),
       Duration.infinity,
     )
+    let cachedGlobal = initialGlobal
 
     const getGlobal = Effect.fn("Config.getGlobal")(function* () {
-      return yield* cachedGlobal
+      return (yield* stagedGlobal) ?? (yield* cachedGlobal)
+    })
+
+    const reload: Interface["reload"] = Effect.fn("Config.reload")(function* <A, E, R>(effect: Effect.Effect<A, E, R>) {
+      return yield* Effect.uninterruptibleMask((restore) =>
+        Effect.gen(function* () {
+          const global = yield* restore(loadGlobal())
+          const result = yield* restore(effect.pipe(Effect.provideService(stagedGlobal, global)))
+          cachedGlobal = Effect.succeed(global)
+          return result
+        }).pipe(Effect.provideService(InstanceState.reloading, true)),
+      )
     })
 
     const ensureGitignore = Effect.fn("Config.ensureGitignore")(function* (dir: string) {
@@ -327,6 +454,7 @@ const layer = Layer.effect(
 
     const loadInstanceState = Effect.fn("Config.loadInstanceState")(
       function* (ctx: InstanceContext) {
+        const strict = yield* InstanceState.reloading
         const auth = yield* authSvc.all().pipe(Effect.orDie)
 
         let result: Info = {}
@@ -372,7 +500,7 @@ const layer = Layer.effect(
             const url = key.replace(/\/+$/, "")
             authEnv[value.key] = value.token
             const wellknownURL = `${url}/.well-known/opencode`
-            yield* Effect.logDebug("fetching remote config", { url: wellknownURL })
+            if (!strict) yield* Effect.logDebug("fetching remote config", { url: wellknownURL })
             const wellknown = yield* fetchRemoteJson(wellknownURL, undefined, ConfigV1.WellKnown, url)
             const remote = yield* Effect.promise(() =>
               substituteWellKnownRemoteConfig({
@@ -384,7 +512,7 @@ const layer = Layer.effect(
             )
             const fetchedConfig = remote
               ? yield* Effect.gen(function* () {
-                  yield* Effect.logDebug("fetching remote config", { url: remote.url })
+                  if (!strict) yield* Effect.logDebug("fetching remote config", { url: remote.url })
                   const data = yield* fetchRemoteJson(remote.url, remote.headers, Schema.Json, url)
                   if (isRecord(data) && isRecord(data.config)) return data.config
                   if (isRecord(data)) return data
@@ -405,7 +533,7 @@ const layer = Layer.effect(
               authEnv,
             )
             yield* merge(source, next, "global")
-            yield* Effect.logDebug("loaded remote config from well-known", { url })
+            if (!strict) yield* Effect.logDebug("loaded remote config from well-known", { url })
           }
         }
 
@@ -447,9 +575,10 @@ const layer = Layer.effect(
             }
           }
 
-          yield* ensureGitignore(dir).pipe(Effect.orDie)
+          if (!strict) yield* ensureGitignore(dir).pipe(Effect.orDie)
 
-          if (process.env.OPENCODE_MANAGED_PROFILE !== "1") {
+          // Reload preserves loaded plugin modules and must not start detached installers or rewrite their dependencies.
+          if (!strict && process.env.OPENCODE_MANAGED_PROFILE !== "1") {
             const dep = yield* npmSvc
               .install(dir, {
                 add: [
@@ -472,9 +601,15 @@ const layer = Layer.effect(
             deps.push(dep)
           }
 
-          result.command = mergeDeep(result.command ?? {}, yield* Effect.promise(() => ConfigCommand.load(dir)))
-          result.agent = mergeDeep(result.agent ?? {}, yield* Effect.promise(() => ConfigAgent.load(dir)))
-          result.agent = mergeDeep(result.agent ?? {}, yield* Effect.promise(() => ConfigAgent.loadMode(dir)))
+          result.command = mergeDeep(
+            result.command ?? {},
+            yield* Effect.promise(() => ConfigCommand.load(dir, { strict })),
+          )
+          result.agent = mergeDeep(result.agent ?? {}, yield* Effect.promise(() => ConfigAgent.load(dir, { strict })))
+          result.agent = mergeDeep(
+            result.agent ?? {},
+            yield* Effect.promise(() => ConfigAgent.loadMode(dir, { strict })),
+          )
           // Auto-discovered plugins under `.opencode/plugin(s)` are already local files, so ConfigPlugin.load
           // returns normalized Specs and we only need to attach origin metadata here.
           const list = yield* Effect.promise(() => ConfigPlugin.load(dir))
@@ -492,7 +627,7 @@ const layer = Layer.effect(
         }
 
         const activeAccount = Option.getOrUndefined(
-          yield* accountSvc.active().pipe(Effect.catch(() => Effect.succeed(Option.none()))),
+          yield* accountSvc.active().pipe(strict ? Effect.orDie : Effect.catch(() => Effect.succeed(Option.none()))),
         )
         if (activeAccount?.active_org_id) {
           const accountID = activeAccount.id
@@ -503,17 +638,21 @@ const layer = Layer.effect(
               [accountSvc.config(accountID, orgID), accountSvc.token(accountID)],
               { concurrency: 2 },
             )
-            if (Option.isSome(tokenOpt)) {
+            if (!strict && Option.isSome(tokenOpt)) {
               process.env["OPENCODE_CONSOLE_TOKEN"] = tokenOpt.value
               yield* env.set("OPENCODE_CONSOLE_TOKEN", tokenOpt.value)
             }
 
             if (Option.isSome(configOpt)) {
               const source = `${url}/api/config`
-              const next = yield* loadConfig(JSON.stringify(configOpt.value), {
-                dir: path.dirname(source),
-                source,
-              })
+              const next = yield* loadConfig(
+                JSON.stringify(configOpt.value),
+                {
+                  dir: path.dirname(source),
+                  source,
+                },
+                strict && Option.isSome(tokenOpt) ? { OPENCODE_CONSOLE_TOKEN: tokenOpt.value } : undefined,
+              )
               for (const providerID of Object.keys(next.provider ?? {})) {
                 consoleManagedProviders.add(providerID)
               }
@@ -521,11 +660,13 @@ const layer = Layer.effect(
             }
           }).pipe(
             Effect.withSpan("Config.loadActiveOrgConfig"),
-            Effect.catch((err) =>
-              Effect.logDebug("failed to fetch remote account config", {
-                error: err instanceof Error ? err.message : String(err),
-              }),
-            ),
+            strict
+              ? Effect.orDie
+              : Effect.catch((err) =>
+                  Effect.logDebug("failed to fetch remote account config", {
+                    error: err instanceof Error ? err.message : String(err),
+                  }),
+                ),
           )
         }
 
@@ -560,8 +701,18 @@ const layer = Layer.effect(
 
         if (Flag.OPENCODE_PERMISSION) {
           try {
-            result.permission = mergeDeep(result.permission ?? {}, JSON.parse(Flag.OPENCODE_PERMISSION))
+            result.permission = mergeDeep(
+              result.permission ?? {},
+              strict
+                ? ConfigParse.schema(
+                    ConfigPermissionV1.Info,
+                    ConfigParse.jsonc(Flag.OPENCODE_PERMISSION, "OPENCODE_PERMISSION"),
+                    "OPENCODE_PERMISSION",
+                  )
+                : JSON.parse(Flag.OPENCODE_PERMISSION),
+            )
           } catch (err) {
+            if (strict) throw err
             yield* Effect.logWarning("OPENCODE_PERMISSION contains invalid JSON, skipping", { err })
           }
         }
@@ -599,6 +750,8 @@ const layer = Layer.effect(
           result.compaction = { ...result.compaction, prune: false }
         }
 
+        if (strict) ConfigParse.schema(ConfigV1.Info, result, ctx.directory)
+
         return {
           config: result,
           directories,
@@ -613,11 +766,32 @@ const layer = Layer.effect(
       Effect.provideService(FSUtil.Service, fs),
     )
 
+    // Plugins retain their original lifetime; replay data, never arbitrary hook code, during reload.
+    const pluginEdits = yield* InstanceState.make(() => Effect.sync(() => [] as PluginConfigEdit[]))
     const state = yield* InstanceState.make<State>(
       Effect.fn("Config.state")(function* (ctx) {
-        return yield* loadInstanceState(ctx).pipe(Effect.orDie)
+        const loaded = yield* loadInstanceState(ctx).pipe(Effect.orDie)
+        applyPluginConfigEdits(loaded.config, yield* InstanceState.get(pluginEdits))
+        if (yield* InstanceState.reloading) ConfigParse.schema(ConfigV1.Info, loaded.config, ctx.directory)
+        return loaded
       }),
+      { reloadable: true },
     )
+
+    const runPluginConfigHook = Effect.fn("Config.runPluginConfigHook")(function* <A, E, R>(
+      config: Info,
+      hook: Effect.Effect<A, E, R>,
+    ) {
+      const edits = yield* InstanceState.get(pluginEdits)
+      const before = copyPluginConfig(config)
+      return yield* hook.pipe(
+        Effect.ensuring(
+          Effect.sync(() => {
+            edits.push(...pluginConfigEdits(before, config))
+          }),
+        ),
+      )
+    })
 
     const get = Effect.fn("Config.get")(function* () {
       const config = yield* InstanceState.use(state, (s) => s.config)
@@ -659,9 +833,13 @@ const layer = Layer.effect(
 
     const invalidate = Effect.fn("Config.invalidate")(function* () {
       yield* invalidateGlobal
+      cachedGlobal = initialGlobal
     })
 
-    const updateGlobal = Effect.fn("Config.updateGlobal")(function* (config: Info) {
+    const updateGlobal = Effect.fn("Config.updateGlobal")(function* (
+      config: Info,
+      options?: { deferInvalidate: boolean },
+    ) {
       const file = globalConfigFile()
       const before = (yield* readConfigFile(file)) ?? "{}"
       const patch = writableGlobal(config)
@@ -683,17 +861,19 @@ const layer = Layer.effect(
         if (changed) yield* fs.writeFileString(file, updated).pipe(Effect.orDie)
       }
 
-      if (changed) yield* invalidate()
+      if (changed && !options?.deferInvalidate) yield* invalidate()
       return { info: next, changed }
     })
 
     return Service.of({
       get,
+      runPluginConfigHook,
       getGlobal,
       getConsoleState,
       update,
       updateGlobal,
       invalidate,
+      reload,
       directories,
       waitForDependencies,
     })

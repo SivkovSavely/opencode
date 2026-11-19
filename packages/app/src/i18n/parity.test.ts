@@ -66,6 +66,10 @@ const appLocales = [
 ] as const
 const desktopLocales = appLocales
 const appFallbackKeys = new Set([
+  "command.config.reload",
+  "toast.config.reloaded.title",
+  "toast.config.reloadFailed.title",
+  "toast.config.reloadFailed.description",
   "settings.appearance.tabPosition.title",
   "settings.appearance.tabPosition.description",
   "settings.appearance.tabPosition.option.top",

@@ -10,7 +10,8 @@ import { SkillPlugin } from "@opencode-ai/core/plugin/skill"
 import { Permission } from "@/permission"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import { Config } from "@/config/config"
-import { FrontmatterError } from "@opencode-ai/core/v1/config/error"
+import { ConfigErrorV1, FrontmatterError } from "@opencode-ai/core/v1/config/error"
+import { ConfigAgent } from "@/config/agent"
 import { ConfigMarkdown } from "@/config/markdown"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { Glob } from "@opencode-ai/core/util/glob"
@@ -104,24 +105,30 @@ export interface Interface {
 }
 
 const add = Effect.fnUntraced(function* (state: State, match: string, events: EventV2Bridge.Service["Service"]) {
+  const strict = yield* InstanceState.reloading
   const md = yield* Effect.tryPromise({
-    try: () => ConfigMarkdown.parse(match),
+    try: () => (strict ? ConfigAgent.parseMarkdown(match, { strict: true }) : ConfigMarkdown.parse(match)),
     catch: (err) => err,
   }).pipe(
-    Effect.catch(
-      Effect.fnUntraced(function* (err) {
-        const message = FrontmatterError.isInstance(err) ? err.data.message : `Failed to parse skill ${match}`
-        const { Session } = yield* Effect.promise(() => import("@/session/session"))
-        yield* events.publish(Session.Event.Error, { error: new NamedError.Unknown({ message }).toObject() })
-        yield* Effect.logError("failed to load skill", { skill: match, error: err })
-        return undefined
-      }),
-    ),
+    strict
+      ? Effect.orDie
+      : Effect.catch(
+          Effect.fnUntraced(function* (err) {
+            const message = FrontmatterError.isInstance(err) ? err.data.message : `Failed to parse skill ${match}`
+            const { Session } = yield* Effect.promise(() => import("@/session/session"))
+            yield* events.publish(Session.Event.Error, { error: new NamedError.Unknown({ message }).toObject() })
+            yield* Effect.logError("failed to load skill", { skill: match, error: err })
+            return undefined
+          }),
+        ),
   )
 
   if (!md) return
 
-  if (!isSkillFrontmatter(md.data)) return
+  if (!isSkillFrontmatter(md.data)) {
+    if (strict) throw new ConfigErrorV1.InvalidError({ path: match, message: "Invalid skill frontmatter" })
+    return
+  }
 
   if (state.skills[md.data.name]) {
     yield* Effect.logWarning("duplicate skill name", {
@@ -271,6 +278,7 @@ const layer = Layer.effect(
           ctx.worktree,
         )
       }),
+      { reloadable: true },
     )
     const state = yield* InstanceState.make(
       Effect.fn("Skill.state")(function* (ctx) {
@@ -291,6 +299,7 @@ const layer = Layer.effect(
         yield* loadSkills(s, yield* InstanceState.get(discovered), events)
         return s
       }),
+      { reloadable: true },
     )
 
     const get = Effect.fn("Skill.get")(function* (name: string) {

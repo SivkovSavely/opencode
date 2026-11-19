@@ -1,10 +1,12 @@
 import { useDialog } from "@opencode-ai/ui/context/dialog"
 import { createResource } from "solid-js"
+import { createStore } from "solid-js/store"
 import { useCommand } from "@/context/command"
 import { useLanguage } from "@/context/language"
 import { usePlatform } from "@/context/platform"
 import { serverName } from "@/context/server"
 import { useServerSDK } from "@/context/server-sdk"
+import { showToast } from "@/utils/toast"
 import { DialogRuntimeLifecycle } from "./dialog-runtime-lifecycle"
 
 export function ServerLifecycleCommands() {
@@ -13,6 +15,7 @@ export function ServerLifecycleCommands() {
   const language = useLanguage()
   const platform = usePlatform()
   const serverSDK = useServerSDK()
+  const [state, setState] = createStore({ reloading: false })
   const [status] = createResource(
     () => serverSDK().server,
     async () => (await serverSDK().client.global.runtime()).data,
@@ -39,7 +42,46 @@ export function ServerLifecycleCommands() {
     ))
   }
 
+  const reload = async () => {
+    if (state.reloading) return
+    const sdk = serverSDK()
+    setState("reloading", true)
+    await sdk.client["client"]
+      .post<true, unknown, true>({ url: "/global/config/reload", throwOnError: true })
+      .then((result) => {
+        if (result.data !== true) throw new Error()
+        showToast({ variant: "success", title: language.t("toast.config.reloaded.title") })
+      })
+      .catch((error: unknown) => {
+        const body =
+          error instanceof Error && error.cause && typeof error.cause === "object" && "body" in error.cause
+            ? error.cause.body
+            : error
+        const message =
+          body !== null &&
+          typeof body === "object" &&
+          "_tag" in body &&
+          body._tag === "ConfigReloadError" &&
+          "kind" in body &&
+          (body.kind === "invalid" || body.kind === "busy" || body.kind === "internal") &&
+          "message" in body &&
+          typeof body.message === "string"
+            ? body.message
+            : language.t("toast.config.reloadFailed.description")
+        showToast({ variant: "error", title: language.t("toast.config.reloadFailed.title"), description: message })
+      })
+      .finally(() => setState("reloading", false))
+  }
+
   command.register("runtime-lifecycle", () => [
+    {
+      id: "config.reload",
+      title: language.t("command.config.reload"),
+      category: language.t("command.category.system"),
+      slash: "reload-config",
+      disabled: state.reloading,
+      onSelect: reload,
+    },
     {
       id: "runtime.restart",
       title: language.t("command.runtime.restart"),

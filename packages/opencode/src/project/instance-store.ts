@@ -4,9 +4,9 @@ import { GlobalBus } from "@/bus/global"
 import { serviceUse } from "@opencode-ai/core/effect/service-use"
 import { WorkspaceContext } from "@/control-plane/workspace-context"
 import { InstanceRef } from "@/effect/instance-ref"
-import { disposeInstance as runDisposers } from "@/effect/instance-registry"
+import { disposeInstance as runDisposers, withInstanceActivity } from "@/effect/instance-registry"
 import { FSUtil } from "@opencode-ai/core/fs-util"
-import { Context, Deferred, Duration, Effect, Exit, Layer, Scope } from "effect"
+import { Context, Deferred, Duration, Effect, Exit, Fiber, Layer, Scope } from "effect"
 import { type InstanceContext } from "./instance-context"
 import { InstanceBootstrap } from "./bootstrap-service"
 import * as Project from "./project"
@@ -18,6 +18,7 @@ export interface LoadInput {
 }
 
 export interface Interface {
+  readonly list: () => Effect.Effect<InstanceContext[]>
   readonly load: (input: LoadInput) => Effect.Effect<InstanceContext>
   readonly reload: (input: LoadInput) => Effect.Effect<InstanceContext>
   readonly dispose: (ctx: InstanceContext) => Effect.Effect<void>
@@ -95,7 +96,7 @@ const layer: Layer.Layer<Service, never, Project.Service | InstanceBootstrap.Ser
       yield* Effect.logInfo("disposing instance", { directory: ctx.directory })
       yield* Effect.promise(() => runDisposers(ctx.directory))
       yield* emitDisposed({ directory: ctx.directory, project: ctx.project.id })
-    })
+    }, Effect.uninterruptible)
 
     const disposeEntry = Effect.fnUntraced(function* (directory: string, entry: Entry, ctx: InstanceContext) {
       if (cache.get(directory) !== entry) return false
@@ -114,13 +115,14 @@ const layer: Layer.Layer<Service, never, Project.Service | InstanceBootstrap.Ser
 
           const entry: Entry = { deferred: Deferred.makeUnsafe<InstanceContext>() }
           cache.set(directory, entry)
-          yield* Effect.gen(function* () {
+          const fiber = yield* Effect.gen(function* () {
             yield* Effect.logInfo("creating instance", { directory: directory })
             yield* completeLoad(directory, input, entry)
           }).pipe(Effect.forkIn(scope, { startImmediately: true }))
-          return yield* restore(Deferred.await(entry.deferred))
+          // Keep the activity lease until detached boot exits, even if this caller is cancelled.
+          return yield* restore(Deferred.await(entry.deferred)).pipe(Effect.ensuring(Fiber.await(fiber)))
         }),
-      ).pipe(Effect.withSpan("InstanceStore.load"))
+      ).pipe(Effect.withSpan("InstanceStore.load"), withInstanceActivity)
     }
 
     const reload = (input: LoadInput): Effect.Effect<InstanceContext> => {
@@ -130,18 +132,18 @@ const layer: Layer.Layer<Service, never, Project.Service | InstanceBootstrap.Ser
           const previous = cache.get(directory)
           const entry: Entry = { deferred: Deferred.makeUnsafe<InstanceContext>() }
           cache.set(directory, entry)
-          yield* Effect.gen(function* () {
+          const fiber = yield* Effect.gen(function* () {
             yield* Effect.logInfo("reloading instance", { directory: directory })
             if (previous) {
               yield* Deferred.await(previous.deferred).pipe(Effect.ignore)
-              yield* Effect.promise(() => runDisposers(directory))
+              yield* Effect.promise(() => runDisposers(directory)).pipe(Effect.uninterruptible)
               yield* emitDisposed({ directory, project: input.project?.id })
             }
             yield* completeLoad(directory, input, entry)
           }).pipe(Effect.forkIn(scope, { startImmediately: true }))
-          return yield* restore(Deferred.await(entry.deferred))
+          return yield* restore(Deferred.await(entry.deferred)).pipe(Effect.ensuring(Fiber.await(fiber)))
         }),
-      ).pipe(Effect.withSpan("InstanceStore.reload"))
+      ).pipe(Effect.withSpan("InstanceStore.reload"), withInstanceActivity)
     }
 
     const dispose = Effect.fn("InstanceStore.dispose")(function* (ctx: InstanceContext) {
@@ -152,7 +154,7 @@ const layer: Layer.Layer<Service, never, Project.Service | InstanceBootstrap.Ser
       if (Exit.isFailure(exit)) return yield* removeEntry(ctx.directory, entry).pipe(Effect.asVoid)
       if (exit.value !== ctx) return
       yield* disposeEntry(ctx.directory, entry, ctx).pipe(Effect.asVoid)
-    })
+    }, withInstanceActivity)
 
     const disposeDirectory = Effect.fn("InstanceStore.disposeDirectory")(function* (input: string) {
       const directory = FSUtil.resolve(input)
@@ -161,7 +163,7 @@ const layer: Layer.Layer<Service, never, Project.Service | InstanceBootstrap.Ser
       const exit = yield* Deferred.await(entry.deferred).pipe(Effect.exit)
       if (Exit.isFailure(exit)) return yield* removeEntry(directory, entry).pipe(Effect.asVoid)
       yield* disposeEntry(directory, entry, exit.value).pipe(Effect.asVoid)
-    })
+    }, withInstanceActivity)
 
     const disposeAllOnce = Effect.fnUntraced(function* () {
       yield* Effect.logInfo("disposing all instances")
@@ -184,14 +186,23 @@ const layer: Layer.Layer<Service, never, Project.Service | InstanceBootstrap.Ser
     const cachedDisposeAll = yield* Effect.cachedWithTTL(disposeAllOnce(), Duration.zero)
     const disposeAll = Effect.fn("InstanceStore.disposeAll")(function* () {
       return yield* cachedDisposeAll
-    })
+    }, withInstanceActivity)
 
     const provide = <A, E, R>(input: LoadInput, effect: Effect.Effect<A, E, R>): Effect.Effect<A, E, R> =>
-      load(input).pipe(Effect.flatMap((ctx) => effect.pipe(Effect.provideService(InstanceRef, ctx))))
+      load(input).pipe(
+        Effect.flatMap((ctx) => effect.pipe(Effect.provideService(InstanceRef, ctx))),
+        withInstanceActivity,
+      )
+
+    // The reload caller holds the exclusive gate while consuming this snapshot.
+    const list = Effect.fn("InstanceStore.list")(function* () {
+      return yield* Effect.forEach([...cache.values()], (entry) => Deferred.await(entry.deferred))
+    })
 
     yield* Effect.addFinalizer(() => disposeAll().pipe(Effect.ignore))
 
     return Service.of({
+      list,
       load,
       reload,
       dispose,

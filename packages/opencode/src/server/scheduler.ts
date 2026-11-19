@@ -11,6 +11,7 @@ import { SessionV1 } from "@opencode-ai/schema/v1/session"
 import { InstanceStore } from "@/project/instance-store"
 import type { InstanceContext } from "@/project/instance-context"
 import { InstanceRef, WorkspaceRef } from "@/effect/instance-ref"
+import { withInstanceActivity } from "@/effect/instance-registry"
 import { SessionPrompt } from "@/session/prompt"
 import { SessionQueue } from "@/session/queue"
 import { SessionStatus } from "@/session/status"
@@ -485,6 +486,8 @@ export function engine(input: {
     }).pipe(
       Effect.scoped,
       Effect.tap(() => notify),
+      // Acquire activity before preparation and durable admission, matching reload's lock order.
+      withInstanceActivity,
     )
   const reconcilePage = db
     .transaction(() => reconcile, { behavior: "immediate" })

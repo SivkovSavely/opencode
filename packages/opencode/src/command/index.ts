@@ -167,7 +167,7 @@ const layer = Layer.effect(
       }
     })
 
-    const state = yield* InstanceState.make<State>((ctx) => init(ctx))
+    const state = yield* InstanceState.make<State>((ctx) => init(ctx), { reloadable: true })
 
     const get = Effect.fn("Command.get")(function* (name: string, activated?: readonly string[]) {
       const s = yield* InstanceState.get(state)

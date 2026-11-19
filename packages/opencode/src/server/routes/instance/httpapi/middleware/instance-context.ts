@@ -1,4 +1,4 @@
-import { InstanceRef, WorkspaceRef } from "@/effect/instance-ref"
+import { WorkspaceRef } from "@/effect/instance-ref"
 import { InstanceStore } from "@/project/instance-store"
 import { Effect, Layer } from "effect"
 import { HttpServerResponse } from "effect/unstable/http"
@@ -22,10 +22,9 @@ function provideInstanceContext<E>(
     if (route.workspaceID || !ManagedWorkspace.allows(route.directory)) {
       if (ManagedWorkspace.directory) return HttpServerResponse.text("Forbidden", { status: 403 })
     }
-    const ctx = yield* store.load({ directory: ManagedWorkspace.directory ?? route.directory })
-    return yield* effect.pipe(
-      Effect.provideService(InstanceRef, ctx),
-      Effect.provideService(WorkspaceRef, route.workspaceID),
+    return yield* store.provide(
+      { directory: ManagedWorkspace.directory ?? route.directory },
+      effect.pipe(Effect.provideService(WorkspaceRef, route.workspaceID)),
     )
   })
 }

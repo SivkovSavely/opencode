@@ -1,14 +1,32 @@
 export * as ConfigAgent from "./agent"
 
 import path from "path"
-import { Exit, Schema } from "effect"
+import matter from "gray-matter"
+import { Option, Schema } from "effect"
 import { Glob } from "@opencode-ai/core/util/glob"
 import { ConfigAgentV1 } from "@opencode-ai/core/v1/config/agent"
+import { FrontmatterError } from "@opencode-ai/core/v1/config/error"
 import { configEntryNameFromPath } from "./entry-name"
-import * as ConfigMarkdown from "./markdown"
+import { ConfigMarkdown } from "./markdown"
 import { ConfigParse } from "./parse"
+import { Filesystem } from "@/util/filesystem"
 
-export async function load(dir: string) {
+export async function parseMarkdown(file: string, options?: { strict?: boolean }) {
+  if (!options?.strict) return ConfigMarkdown.parse(file).catch(() => undefined)
+  const text = await Filesystem.readText(file)
+  try {
+    // gray-matter caches failed parses too; strict loads must bypass that cache.
+    try {
+      return matter(text, {})
+    } catch {
+      return matter(ConfigMarkdown.fallbackSanitization(text), {})
+    }
+  } catch (cause) {
+    throw new FrontmatterError({ path: file, message: "Failed to parse YAML frontmatter" }, { cause })
+  }
+}
+
+export async function load(dir: string, options?: { strict?: boolean }) {
   const result: Record<string, ConfigAgentV1.Info> = {}
   for (const item of await Glob.scan("{agent,agents}/**/*.md", {
     cwd: dir,
@@ -16,7 +34,7 @@ export async function load(dir: string) {
     dot: true,
     symlink: true,
   })) {
-    const md = await ConfigMarkdown.parse(item).catch(() => undefined)
+    const md = await parseMarkdown(item, options)
     if (!md) continue
 
     const name = configEntryNameFromPath(path.relative(dir, item), ["agent/", "agents/"])
@@ -31,7 +49,7 @@ export async function load(dir: string) {
   return result
 }
 
-export async function loadMode(dir: string) {
+export async function loadMode(dir: string, options?: { strict?: boolean }) {
   const result: Record<string, ConfigAgentV1.Info> = {}
   for (const item of await Glob.scan("{mode,modes}/*.md", {
     cwd: dir,
@@ -39,7 +57,7 @@ export async function loadMode(dir: string) {
     dot: true,
     symlink: true,
   })) {
-    const md = await ConfigMarkdown.parse(item).catch(() => undefined)
+    const md = await parseMarkdown(item, options)
     if (!md) continue
 
     const config = {
@@ -47,10 +65,14 @@ export async function loadMode(dir: string) {
       ...md.data,
       prompt: md.content.trim(),
     }
-    const parsed = Schema.decodeUnknownExit(ConfigAgentV1.Info)(config, { errors: "all", propertyOrder: "original" })
-    if (Exit.isSuccess(parsed)) {
+    const parsed = options?.strict
+      ? ConfigParse.schema(ConfigAgentV1.Info, config, item)
+      : Option.getOrUndefined(
+          Schema.decodeUnknownOption(ConfigAgentV1.Info)(config, { errors: "all", propertyOrder: "original" }),
+        )
+    if (parsed) {
       result[config.name] = {
-        ...parsed.value,
+        ...parsed,
         mode: "primary" as const,
       }
     }

@@ -55,6 +55,11 @@ const GlobalEventSchema = Schema.Struct({
       )
       .toArray(),
     InstanceDisposed,
+    Schema.Struct({
+      id: EventV2.ID,
+      type: Schema.Literal("config.reloaded"),
+      properties: Schema.Struct({}),
+    }).annotate({ identifier: "Event.config.reloaded" }),
     ...SyncEventSchemas,
   ]),
 }).annotate({ identifier: "GlobalEvent" })
@@ -78,10 +83,30 @@ const GlobalUpgradeResult = Schema.Union([
 
 const GlobalProjects = Schema.Struct({ projects: Schema.Array(Schema.String) })
 
+export class ConfigReloadInvalidError extends Schema.ErrorClass<ConfigReloadInvalidError>("ConfigReloadInvalidError")(
+  { _tag: Schema.tag("ConfigReloadError"), kind: Schema.tag("invalid"), message: Schema.String },
+  { httpApiStatus: 400 },
+) {}
+
+export class ConfigReloadBusyError extends Schema.ErrorClass<ConfigReloadBusyError>("ConfigReloadBusyError")(
+  { _tag: Schema.tag("ConfigReloadError"), kind: Schema.tag("busy"), message: Schema.String },
+  { httpApiStatus: 409 },
+) {}
+
+export class ConfigReloadInternalError extends Schema.ErrorClass<ConfigReloadInternalError>(
+  "ConfigReloadInternalError",
+)(
+  { _tag: Schema.tag("ConfigReloadError"), kind: Schema.tag("internal"), message: Schema.String },
+  { httpApiStatus: 500 },
+) {}
+
+export const ConfigReloadError = [ConfigReloadInvalidError, ConfigReloadBusyError, ConfigReloadInternalError] as const
+
 export const GlobalPaths = {
   health: "/global/health",
   event: "/global/event",
   config: "/global/config",
+  configReload: "/global/config/reload",
   projects: "/global/projects",
   dispose: "/global/dispose",
   upgrade: "/global/upgrade",
@@ -123,12 +148,23 @@ export const GlobalApi = HttpApi.make("global").add(
       HttpApiEndpoint.patch("configUpdate", GlobalPaths.config, {
         payload: ConfigV1.Info,
         success: described(ConfigV1.Info, "Successfully updated global config"),
-        error: HttpApiError.BadRequest,
+        error: ConfigReloadError,
       }).annotateMerge(
         OpenApi.annotations({
           identifier: "global.config.update",
           summary: "Update global configuration",
           description: "Update global OpenCode configuration settings and preferences.",
+        }),
+      ),
+      HttpApiEndpoint.post("configReload", GlobalPaths.configReload, {
+        success: described(Schema.Literal(true), "Configuration reloaded"),
+        error: ConfigReloadError,
+      }).annotateMerge(
+        OpenApi.annotations({
+          identifier: "global.config.reload",
+          summary: "Reload configuration",
+          description:
+            "Reload configuration and loaded project caches without disposing instances, while the runtime is idle.",
         }),
       ),
       HttpApiEndpoint.get("projectsList", GlobalPaths.projects, {
@@ -149,8 +185,7 @@ export const GlobalApi = HttpApi.make("global").add(
         OpenApi.annotations({
           identifier: "global.projects.update",
           summary: "Update added projects",
-          description:
-            "Add, remove, reorder, or merge project directories in the server-wide added project list.",
+          description: "Add, remove, reorder, or merge project directories in the server-wide added project list.",
         }),
       ),
       HttpApiEndpoint.post("dispose", GlobalPaths.dispose, {

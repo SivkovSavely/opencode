@@ -355,6 +355,7 @@ const layer = Layer.effect(
           read: tool.read,
         }
       }),
+      { reloadable: true },
     )
 
     const all: Interface["all"] = Effect.fn("ToolRegistry.all")(function* () {

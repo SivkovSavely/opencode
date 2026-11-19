@@ -43,6 +43,7 @@ export interface Interface {
   readonly getForUrl: (mcpName: string, serverUrl: string) => Effect.Effect<Entry | undefined>
   readonly set: (mcpName: string, entry: Entry, serverUrl?: string) => Effect.Effect<void>
   readonly remove: (mcpName: string) => Effect.Effect<void>
+  readonly invalidate: (mcpName: string, serverUrl: string, type: "all" | "client" | "tokens") => Effect.Effect<void>
   readonly updateTokens: (mcpName: string, tokens: Tokens, serverUrl?: string) => Effect.Effect<void>
   readonly updateClientInfo: (mcpName: string, clientInfo: ClientInfo, serverUrl?: string) => Effect.Effect<void>
   readonly updateCodeVerifier: (mcpName: string, codeVerifier: string) => Effect.Effect<void>
@@ -109,10 +110,30 @@ const layer = Layer.effect(
       })
     })
 
+    const invalidate = Effect.fn("McpAuth.invalidate")(function* (
+      mcpName: string,
+      serverUrl: string,
+      type: "all" | "client" | "tokens",
+    ) {
+      yield* mutate((data) => {
+        const entry = data[mcpName]
+        if (!entry || entry.serverUrl !== serverUrl) return
+        if (type === "all") {
+          const next = { ...data }
+          delete next[mcpName]
+          return next
+        }
+        if (type === "client") delete entry.clientInfo
+        if (type === "tokens") delete entry.tokens
+        return { ...data, [mcpName]: entry }
+      })
+    })
+
     const updateField = <K extends keyof Entry>(field: K, spanName: string) =>
       Effect.fn(`McpAuth.${spanName}`)(function* (mcpName: string, value: NonNullable<Entry[K]>, serverUrl?: string) {
         yield* mutate((data) => {
-          const entry = data[mcpName] ?? {}
+          // A URL change must not bind retained tokens or client secrets to the new server.
+          const entry = serverUrl && data[mcpName]?.serverUrl !== serverUrl ? {} : (data[mcpName] ?? {})
           entry[field] = value
           if (serverUrl) entry.serverUrl = serverUrl
           return { ...data, [mcpName]: entry }
@@ -147,6 +168,7 @@ const layer = Layer.effect(
       getForUrl,
       set,
       remove,
+      invalidate,
       updateTokens,
       updateClientInfo,
       updateCodeVerifier,

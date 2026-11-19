@@ -350,6 +350,7 @@ const layer = Layer.effect(
           defaultAgent,
         } satisfies State
       }),
+      { reloadable: true },
     )
 
     return Service.of({

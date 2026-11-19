@@ -7,6 +7,7 @@ import { Cause, Deferred, Duration, Effect, Exit, Layer, Context, Scope, Schema,
 import * as Stream from "effect/Stream"
 import { Agent } from "@/agent/agent"
 import { Config } from "@/config/config"
+import { withInstanceActivity } from "@/effect/instance-registry"
 import { Permission } from "@/permission"
 import { Plugin } from "@/plugin"
 import { Snapshot } from "@/snapshot"
@@ -551,7 +552,7 @@ const layer = Layer.effect(
                   sessionID: ctx.sessionID,
                   messageID: ctx.assistantMessage.parentID,
                 })
-                .pipe(Effect.ignore, Effect.forkIn(scope))
+                .pipe(Effect.ignore, withInstanceActivity, Effect.forkIn(scope))
             if (
               !ctx.assistantMessage.summary &&
               isOverflow({ cfg: yield* config.get(), tokens: usage.tokens, model: ctx.model })

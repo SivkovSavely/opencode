@@ -1,13 +1,23 @@
 import { describe, expect } from "bun:test"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
-import { Deferred, Effect, Fiber, Layer } from "effect"
-import { InstanceRef } from "../../src/effect/instance-ref"
-import { registerDisposer } from "../../src/effect/instance-registry"
+import { NodeHttpServer } from "@effect/platform-node"
+import { WorkspaceV2 } from "@opencode-ai/core/workspace"
+import { Deferred, Effect, Exit, Fiber, Layer } from "effect"
+import { HttpEffect, HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/unstable/http"
+import { HttpApi, HttpApiBuilder, HttpApiEndpoint, HttpApiGroup } from "effect/unstable/httpapi"
+import { InstanceRef, WorkspaceRef } from "../../src/effect/instance-ref"
+import { InstanceReloadBusyError, registerDisposer, withInstanceReload } from "../../src/effect/instance-registry"
 import { InstanceBootstrap } from "../../src/project/bootstrap"
 import { InstanceStore } from "../../src/project/instance-store"
+import { markInstanceForReload } from "../../src/server/routes/instance/httpapi/lifecycle"
+import {
+  InstanceContextMiddleware,
+  instanceContextLayer,
+} from "../../src/server/routes/instance/httpapi/middleware/instance-context"
+import { WorkspaceRouteContext } from "../../src/server/routes/instance/httpapi/middleware/workspace-routing"
 import { tmpdirScoped } from "../fixture/fixture"
-import { testEffect } from "../lib/effect"
+import { awaitWithTimeout, testEffect } from "../lib/effect"
 
 let bootstrapRun: Effect.Effect<void> = Effect.void
 const noopBootstrap = Layer.succeed(
@@ -39,6 +49,177 @@ const registerDisposerScoped = (disposer: (directory: string) => Promise<void>) 
   )
 
 describe("InstanceStore", () => {
+  it.live("lists a stable snapshot while awaiting pending loads", () =>
+    Effect.gen(function* () {
+      const first = yield* tmpdirScoped()
+      const pending = yield* tmpdirScoped()
+      const later = yield* tmpdirScoped()
+      const store = yield* InstanceStore.Service
+      const loaded = yield* store.load({ directory: first })
+      const started = yield* Deferred.make<void>()
+      const release = yield* Deferred.make<void>()
+      yield* setBootstrap(
+        Effect.gen(function* () {
+          if ((yield* InstanceRef)?.directory !== pending) return
+          yield* Deferred.succeed(started, undefined)
+          yield* Deferred.await(release)
+        }),
+      )
+      const load = yield* store.load({ directory: pending }).pipe(Effect.forkScoped)
+      yield* Deferred.await(started)
+      const listing = yield* Effect.suspend(() => store.list()).pipe(Effect.forkScoped({ startImmediately: true }))
+      yield* store.load({ directory: later })
+      yield* Deferred.succeed(release, undefined)
+      const ctx = yield* Fiber.join(load)
+      expect(yield* Fiber.join(listing)).toEqual([loaded, ctx])
+      expect((yield* withInstanceReload(store.list())).map((ctx) => ctx.directory)).toEqual([first, pending, later])
+    }),
+  )
+
+  for (const operation of ["load", "reload"] as const) {
+    it.live(`keeps cancelled ${operation} bootstrap active until completion`, () =>
+      Effect.gen(function* () {
+        const dir = yield* tmpdirScoped()
+        const store = yield* InstanceStore.Service
+        if (operation === "reload") yield* store.load({ directory: dir })
+        const started = yield* Deferred.make<void>()
+        const release = yield* Deferred.make<void>()
+        yield* setBootstrap(
+          Effect.gen(function* () {
+            yield* Deferred.succeed(started, undefined)
+            yield* Deferred.await(release)
+          }),
+        )
+        const caller = yield* store[operation]({ directory: dir }).pipe(Effect.forkScoped)
+        yield* Deferred.await(started)
+        const cancelled = yield* Fiber.interrupt(caller).pipe(Effect.forkScoped({ startImmediately: true }))
+        const result = yield* withInstanceReload(Effect.void).pipe(Effect.result)
+        yield* Deferred.succeed(release, undefined)
+        yield* Fiber.join(cancelled)
+        const ctx = yield* store.load({ directory: dir })
+        expect(result._tag).toBe("Failure")
+        if (result._tag === "Failure") expect(result.failure).toBeInstanceOf(InstanceReloadBusyError)
+        expect(Exit.hasInterrupts(yield* Fiber.await(caller))).toBe(true)
+        expect(yield* withInstanceReload(store.list())).toEqual([ctx])
+      }),
+    )
+  }
+
+  it.live("counts the provided handler and allows concurrent and nested instance operations", () =>
+    Effect.gen(function* () {
+      const dir = yield* tmpdirScoped()
+      const other = yield* tmpdirScoped()
+      const store = yield* InstanceStore.Service
+      const ctx = yield* store.load({ directory: dir })
+      const started = yield* Deferred.make<void>()
+      const release = yield* Deferred.make<void>()
+      const request = yield* store
+        .provide(
+          { directory: dir },
+          Effect.gen(function* () {
+            expect(yield* InstanceRef).toBe(ctx)
+            expect(yield* store.load({ directory: dir })).toBe(ctx)
+            yield* Deferred.succeed(started, undefined)
+            yield* Deferred.await(release)
+            yield* store.reload({ directory: dir })
+          }),
+        )
+        .pipe(Effect.forkScoped)
+      yield* Deferred.await(started)
+      const result = yield* withInstanceReload(Effect.void).pipe(Effect.result)
+      const concurrent = yield* awaitWithTimeout(store.load({ directory: other }), "ordinary instance reads serialized")
+      yield* Deferred.succeed(release, undefined)
+      yield* awaitWithTimeout(Fiber.join(request), "nested instance reload deadlocked")
+      expect(result._tag).toBe("Failure")
+      expect(concurrent.directory).toBe(other)
+      expect((yield* withInstanceReload(store.list())).length).toBe(2)
+    }),
+  )
+
+  it.live("keeps HTTP handlers active and permits pre-response instance reload", () =>
+    Effect.gen(function* () {
+      const dir = yield* tmpdirScoped()
+      const store = yield* InstanceStore.Service
+      const ctx = yield* store.load({ directory: dir })
+      const workspaceID = WorkspaceV2.ID.make("wrk_activity_test")
+      const started = yield* Deferred.make<{ instance: typeof ctx | undefined; workspace: string | undefined }>()
+      const release = yield* Deferred.make<void>()
+      const api = HttpApi.make("instance-activity").add(
+        HttpApiGroup.make("probe").add(HttpApiEndpoint.get("get", "/activity")).middleware(InstanceContextMiddleware),
+      )
+      const handler = yield* HttpRouter.toHttpEffect(
+        HttpApiBuilder.layer(api).pipe(
+          Layer.provide(
+            HttpApiBuilder.group(api, "probe", (handlers) =>
+              handlers.handleRaw("get", () =>
+                Effect.gen(function* () {
+                  const instance = yield* InstanceRef
+                  yield* Deferred.succeed(started, { instance, workspace: yield* WorkspaceRef })
+                  yield* Deferred.await(release)
+                  if (instance) yield* markInstanceForReload(instance, { directory: dir })
+                  return HttpServerResponse.empty()
+                }),
+              ),
+            ),
+          ),
+          Layer.provide(instanceContextLayer),
+          Layer.provide(Layer.succeed(WorkspaceRouteContext, { directory: dir, workspaceID })),
+          Layer.provide(NodeHttpServer.layerHttpServices),
+        ),
+      )
+      const status = yield* Deferred.make<number>()
+      const request = yield* HttpEffect.toHandled(handler, (_request, response) =>
+        Deferred.succeed(status, response.status),
+      ).pipe(
+        Effect.provideService(
+          HttpServerRequest.HttpServerRequest,
+          HttpServerRequest.fromWeb(new Request("http://localhost/activity")),
+        ),
+        Effect.provideService(WorkspaceRouteContext, { directory: dir, workspaceID }),
+        Effect.forkScoped,
+      )
+      const observed = yield* Deferred.await(started)
+      const result = yield* withInstanceReload(Effect.void).pipe(Effect.result)
+      yield* Deferred.succeed(release, undefined)
+      yield* awaitWithTimeout(Fiber.join(request), "pre-response instance reload deadlocked")
+      expect(observed).toEqual({ instance: ctx, workspace: workspaceID })
+      expect(result._tag).toBe("Failure")
+      expect(yield* Deferred.await(status)).toBe(204)
+      expect(yield* store.load({ directory: dir })).not.toBe(ctx)
+    }),
+  )
+
+  for (const operation of ["dispose", "disposeDirectory", "disposeAll"] as const) {
+    it.live(`keeps cancelled ${operation} active until Promise disposers finish`, () =>
+      Effect.gen(function* () {
+        const dir = yield* tmpdirScoped()
+        const store = yield* InstanceStore.Service
+        const ctx = yield* store.load({ directory: dir })
+        const release = yield* Deferred.make<() => void>()
+        yield* registerDisposerScoped(
+          () =>
+            new Promise<void>((resolve) => {
+              Deferred.doneUnsafe(release, Effect.succeed(resolve))
+            }),
+        )
+        const caller = yield* (
+          operation === "dispose"
+            ? store.dispose(ctx)
+            : operation === "disposeDirectory"
+              ? store.disposeDirectory(dir)
+              : store.disposeAll()
+        ).pipe(Effect.forkScoped)
+        const finish = yield* Deferred.await(release)
+        const cancelled = yield* Fiber.interrupt(caller).pipe(Effect.forkScoped({ startImmediately: true }))
+        const result = yield* withInstanceReload(Effect.void).pipe(Effect.result)
+        yield* Effect.sync(finish)
+        yield* Fiber.join(cancelled)
+        expect(result._tag).toBe("Failure")
+        expect(Exit.hasInterrupts(yield* Fiber.await(caller))).toBe(true)
+      }),
+    )
+  }
+
   it.live("loads instance context", () =>
     Effect.gen(function* () {
       const dir = yield* tmpdirScoped({ git: true })
