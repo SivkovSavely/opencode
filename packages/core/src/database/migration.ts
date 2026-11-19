@@ -18,6 +18,7 @@ import handoffNotificationGuards from "./migration/20261115221828_session_handof
 import handoffControl from "./migration/20261116001000_session_handoff_control"
 import handoffRecoveryHistory from "./migration/20261116002000_session_handoff_recovery_history"
 import handoffRecoveryQueueBlock from "./migration/20261116003000_session_handoff_recovery_queue_block"
+import { journal } from "./migration/20261119170251_session_orchestration"
 
 type Database = EffectDrizzleSqlite.EffectSQLiteDatabase
 type Transaction = Parameters<Parameters<Database["transaction"]>[0]>[0]
@@ -53,6 +54,7 @@ export function apply(db: Database) {
           yield* handoffControl.up(tx)
           yield* handoffRecoveryHistory.up(tx)
           yield* handoffRecoveryQueueBlock.up(tx)
+          yield* journal(tx)
           yield* tx.run(
             sql`CREATE TABLE ${sql.identifier("migration")} (id TEXT PRIMARY KEY, time_completed INTEGER NOT NULL)`,
           )

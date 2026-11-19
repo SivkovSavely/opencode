@@ -69,6 +69,7 @@ import { SessionHandoffNotification } from "@opencode-ai/core/session/handoff-no
 import { SessionHandoffStore } from "@opencode-ai/core/session/handoff-store"
 import { SessionHandoffControl } from "@opencode-ai/core/session/handoff-control"
 import { SessionHandoffRecovery } from "@opencode-ai/core/session/handoff-recovery"
+import { SessionWatchStore } from "@opencode-ai/core/session/watch-store"
 import { ManagedWorkspace } from "@/server/managed-workspace"
 import { SkillTool } from "@/tool/skill"
 import { Skill } from "@/skill"
@@ -164,6 +165,22 @@ export class InputError extends Schema.TaggedErrorClass<InputError>()("PromptInp
 }) {}
 
 export interface Interface {
+  readonly textPayload: (
+    sessionID: SessionID,
+    text: string,
+    selection?: {
+      agent?: string
+      model?: { providerID: string; modelID: string }
+      variant?: string
+      synthetic?: boolean
+    },
+  ) => Effect.Effect<SessionQueueV1.Payload>
+  readonly queueWake: (sessionID: SessionID) => Effect.Effect<void>
+  readonly controlSteer: (sessionID: SessionID, payload: SessionQueueV1.Payload, id: string) => Effect.Effect<void>
+  readonly controlCancel: (
+    sessionID: SessionID,
+    expected: RuntimeLifecycle.CancellationTarget,
+  ) => Effect.Effect<boolean>
   readonly cancel: (sessionID: SessionID) => Effect.Effect<void>
   readonly prompt: (
     input: PromptInput,
@@ -200,6 +217,7 @@ export interface Interface {
 }
 
 type TaskAdmission = {
+  guarded?: boolean
   managedChildAuthorization?: { prompt: object; runner: object }
   parentMessageID?: MessageID
   parentCallID?: string
@@ -318,6 +336,54 @@ const layer = Layer.effect(
         () => state.cancel(sessionID),
         (owner) => (owner ? runtime.finishCancel(sessionID) : Effect.void),
       )
+    })
+
+    const controlCancel = Effect.fn("SessionPrompt.controlCancel")(function* (
+      sessionID: SessionID,
+      expected: RuntimeLifecycle.CancellationTarget,
+    ) {
+      return yield* Effect.acquireUseRelease(
+        runtime.cancel(sessionID, expected),
+        (owner) =>
+          Effect.gen(function* () {
+            if (!owner) return false
+            yield* queue.block(sessionID).pipe(Effect.orDie)
+            const flush = yield* InstanceState.get(queueState)
+            flush.delete(sessionID)
+            yield* state.cancel(sessionID)
+            return true
+          }),
+        (owner) => (owner ? runtime.finishCancel(sessionID) : Effect.void),
+      )
+    })
+
+    const controlSteer = Effect.fn("SessionPrompt.controlSteer")(function* (
+      sessionID: SessionID,
+      payload: SessionQueueV1.Payload,
+      id: string,
+    ) {
+      if (payload.kind !== "prompt") return yield* Effect.die(new Error("Steering requires a text prompt"))
+      const snapshot = yield* queue.list(sessionID).pipe(Effect.orDie)
+      if (snapshot.paused || snapshot.blocked)
+        return yield* Effect.die(new Error("Steering is held while the target queue is paused or blocked"))
+      yield* prompt(
+        {
+          sessionID,
+          messageID: MessageID.make(id),
+          noReply: true,
+          idempotent: true,
+          agent: payload.agent,
+          model: {
+            providerID: ProviderV2.ID.make(payload.model.providerID),
+            modelID: ModelV2.ID.make(payload.model.modelID),
+          },
+          variant: payload.variant,
+          selection: payload.selection,
+          parts: payload.parts.map((part, index) => ({ ...part, id: PartID.make(`prt_${id}_${index}`) })),
+        },
+        { guarded: true },
+      ).pipe(Effect.orDie)
+      yield* wakeQueue(sessionID, false, true)
     })
 
     const resolvePromptParts = Effect.fn("SessionPrompt.resolvePromptParts")(function* (template: string) {
@@ -870,6 +936,8 @@ const layer = Layer.effect(
       input: ShellInput & { variant?: string },
       ready?: Latch.Latch,
       delivery?: SessionQueueV1.Entry,
+      // Queued shells report through their model continuation instead.
+      recordExit?: (messageID: MessageID, code: number) => Effect.Effect<void>,
     ) {
       requireUnmanagedShell()
       const reservation = ulid()
@@ -1027,7 +1095,7 @@ const layer = Layer.effect(
                   }
                 }),
               )
-              yield* handle.exitCode
+              return yield* handle.exitCode
             }).pipe(Effect.scoped, Effect.orDie),
           ).pipe(Effect.exit)
 
@@ -1039,6 +1107,7 @@ const layer = Layer.effect(
           if (Exit.isFailure(exit) && !aborted && !Cause.hasInterruptsOnly(exit.cause)) {
             return yield* Effect.failCause(exit.cause)
           }
+          if (Exit.isSuccess(exit) && !aborted && recordExit) yield* recordExit(msg.id, exit.value)
 
           return { info: msg, parts: [part], aborted }
         }),
@@ -1091,6 +1160,46 @@ const layer = Layer.effect(
       return fence === undefined
         ? undefined
         : { ownerLineage: runtime.identity.lineage, ownerInstance: runtime.identity.instance, fence }
+    })
+
+    const textPayload = Effect.fn("SessionPrompt.textPayload")(function* (
+      sessionID: SessionID,
+      text: string,
+      selection?: {
+        agent?: string
+        model?: { providerID: string; modelID: string }
+        variant?: string
+        synthetic?: boolean
+      },
+    ) {
+      const session = yield* sessions.get(sessionID).pipe(Effect.orDie)
+      const name = selection?.agent ?? session.agent
+      const agent = name ? yield* agents.get(name) : yield* agents.defaultInfo()
+      if (!agent) return yield* Effect.die(new Error("Session agent is unavailable"))
+      const model =
+        selection?.model ??
+        (!selection?.agent && session.model
+          ? yield* currentModel(sessionID)
+          : (agent.model ?? (yield* currentModel(sessionID))))
+      const full = yield* provider
+        .getModel(ProviderV2.ID.make(model.providerID), ModelV2.ID.make(model.modelID))
+        .pipe(Effect.orDie)
+      const same = agent.model?.providerID === model.providerID && agent.model.modelID === model.modelID
+      const variant =
+        selection?.variant ??
+        ("variant" in model && typeof model.variant === "string" ? model.variant : undefined) ??
+        (same && agent.variant && Object.hasOwn(full.variants ?? {}, agent.variant) ? agent.variant : undefined) ??
+        "default"
+      if (variant !== "default" && !Object.hasOwn(full.variants ?? {}, variant))
+        return yield* Effect.die(new Error(`Variant not found: ${variant}`))
+      return {
+        kind: "prompt" as const,
+        agent: agent.name,
+        model,
+        variant,
+        selection: { variant, inheritActive: true, ...(selection?.model ? { model: selection.model } : {}) },
+        parts: [{ type: "text" as const, text, ...(selection?.synthetic ? { synthetic: true } : {}) }],
+      }
     })
 
     const prepareUserMessage = Effect.fn("SessionPrompt.prepareUserMessage")(function* (
@@ -1753,6 +1862,24 @@ const layer = Layer.effect(
       return prepared.message
     })
 
+    const recordWatchFailure = Effect.fnUntraced(function* (
+      sessionID: SessionID,
+      executionFence: number | undefined,
+      exit: Exit.Exit<unknown, unknown>,
+    ) {
+      if (executionFence === undefined || Exit.isSuccess(exit) || Cause.hasInterrupts(exit.cause)) return
+      const error = Cause.squash(exit.cause)
+      if (error instanceof Runner.Cancelled || error instanceof Runner.Interrupted) return
+      if ((yield* runtime.ownershipFence(sessionID)) !== executionFence) return
+      yield* SessionWatchStore.result(database, sessionID, {
+        ownerLineage: runtime.identity.lineage,
+        ownerInstance: runtime.identity.instance,
+        fence: executionFence,
+        outcome: "failed",
+        summary: "Execution failed during preparation or execution. Inspect session errors or history for details.",
+      })
+    })
+
     const prompt: (
       input: PromptInput,
       task?: TaskAdmission,
@@ -1915,10 +2042,10 @@ const layer = Layer.effect(
               parentMessageID: task?.parentMessageID,
               parentCallID: task?.parentCallID,
               parentMode: task?.parentMode,
-              rejectCancelled: task?.notification || input.noReply,
-              rejectRecoveryNeeded: task?.notification,
+              rejectCancelled: task?.notification || task?.guarded || input.noReply,
+              rejectRecoveryNeeded: task?.notification || task?.guarded,
               recoveryFence: task?.recoveryFence,
-              manualRecovery: task === undefined || task.admission !== undefined,
+              manualRecovery: !task?.guarded && (task === undefined || task.admission !== undefined),
             })
             .pipe(Effect.tapError((error) => (task?.admission ? Deferred.fail(task.admission, error) : Effect.void))),
           (admission) =>
@@ -1997,12 +2124,14 @@ const layer = Layer.effect(
                 }),
               ),
             ),
-          (admission) =>
-            interrupted
-              ? Effect.gen(function* () {
-                  yield* releaseInterrupted(input.sessionID, admission.fence)
-                })
-              : runtime.release(input.sessionID, admission.fence),
+          (admission, exit) =>
+            recordWatchFailure(input.sessionID, admission.fence, exit).pipe(
+              Effect.ensuring(
+                interrupted
+                  ? releaseInterrupted(input.sessionID, admission.fence)
+                  : runtime.release(input.sessionID, admission.fence),
+              ),
+            ),
         )
       }, Effect.scoped)
 
@@ -2234,11 +2363,15 @@ const layer = Layer.effect(
               (acquire) =>
                 Effect.acquireRelease(
                   acquire,
-                  (admission) => {
+                  (admission, exit) => {
                     if (!admission) return Effect.void
-                    return interrupted
-                      ? releaseInterrupted(sessionID, admission.fence).pipe(Effect.asVoid)
-                      : runtime.release(sessionID, admission.fence)
+                    return recordWatchFailure(sessionID, admission.fence, exit).pipe(
+                      Effect.ensuring(
+                        interrupted
+                          ? releaseInterrupted(sessionID, admission.fence).pipe(Effect.asVoid)
+                          : runtime.release(sessionID, admission.fence),
+                      ),
+                    )
                   },
                   { interruptible: true },
                 ),
@@ -3056,6 +3189,12 @@ const layer = Layer.effect(
               bypassAgentCheck,
               messages: msgs,
               promptOps,
+              sessionControlOps: {
+                textPayload,
+                queueWake: (id) => wakeQueue(id, false, true),
+                controlSteer,
+                controlCancel,
+              },
               requestCompaction: () =>
                 compaction.create({
                   sessionID,
@@ -3249,6 +3388,32 @@ const layer = Layer.effect(
         managedChildAuthorization,
       ) =>
         effect.pipe(
+          Effect.onExit((exit) => {
+            if (executionFence === undefined) return Effect.void
+            const owner = {
+              ownerLineage: runtime.identity.lineage,
+              ownerInstance: runtime.identity.instance,
+              fence: executionFence,
+            }
+            if (Exit.isFailure(exit)) {
+              return recordWatchFailure(sessionID, executionFence, exit)
+            }
+            const message = exit.value.info
+            if (message.role !== "assistant") return Effect.void
+            const completed =
+              !!message.time.completed &&
+              !message.error &&
+              (isStructuredOutputComplete(message) ||
+                (!!message.finish && !["tool-calls", "unknown"].includes(message.finish)))
+            return SessionWatchStore.result(database, sessionID, {
+              ...owner,
+              outcome: completed ? "completed" : "failed",
+              messageID: message.id,
+              summary: completed
+                ? "Execution completed successfully. Inspect session history for output."
+                : "Execution ended without a successful response. Inspect session history for details.",
+            })
+          }),
           Effect.onExit((exit) =>
             Effect.gen(function* () {
               const flush = yield* InstanceState.get(queueState)
@@ -3299,9 +3464,13 @@ const layer = Layer.effect(
               }).pipe(Effect.orDie),
               () => effect,
               (admission, exit) =>
-                Exit.isFailure(exit) && Cause.hasInterrupts(exit.cause)
-                  ? releaseInterrupted(sessionID, admission.fence)
-                  : runtime.release(sessionID, admission.fence),
+                recordWatchFailure(sessionID, admission.fence, exit).pipe(
+                  Effect.ensuring(
+                    Exit.isFailure(exit) && Cause.hasInterrupts(exit.cause)
+                      ? releaseInterrupted(sessionID, admission.fence)
+                      : runtime.release(sessionID, admission.fence),
+                  ),
+                ),
             ),
     )
 
@@ -3340,7 +3509,10 @@ const layer = Layer.effect(
             )
           }),
         )
-        .pipe(Effect.exit)
+        .pipe(
+          Effect.onExit((exit) => recordWatchFailure(sessionID, executionFence, exit)),
+          Effect.exit,
+        )
       const error = Exit.isFailure(exit) ? Cause.squash(exit.cause) : undefined
       if (error instanceof Runner.Cancelled) return
       if (
@@ -3373,13 +3545,28 @@ const layer = Layer.effect(
           parentSessionID: session.parentID,
           manualRecovery: true,
         }),
-        () =>
+        (admission) =>
           Effect.gen(function* () {
             const ready = yield* Latch.make()
             return yield* state.startShell(
               input.sessionID,
               lastAssistant(input.sessionID),
-              shellImpl(input, ready).pipe(
+              shellImpl(input, ready, undefined, (messageID, code) =>
+                Effect.gen(function* () {
+                  if ((yield* runtime.ownershipFence(input.sessionID)) !== admission.fence) return
+                  yield* SessionWatchStore.result(database, input.sessionID, {
+                    ownerLineage: runtime.identity.lineage,
+                    ownerInstance: runtime.identity.instance,
+                    fence: admission.fence,
+                    outcome: code === 0 ? "completed" : "failed",
+                    messageID,
+                    summary:
+                      code === 0
+                        ? "Shell command completed successfully. Inspect session history for output."
+                        : `Shell command exited with status ${code}. Inspect session history for output.`,
+                  })
+                }),
+              ).pipe(
                 Effect.onExit((exit) =>
                   Effect.gen(function* () {
                     if (Exit.isSuccess(exit)) return
@@ -3392,7 +3579,10 @@ const layer = Layer.effect(
               ready,
             )
           }),
-        (admission) => runtime.release(input.sessionID, admission.fence),
+        (admission, exit) =>
+          recordWatchFailure(input.sessionID, admission.fence, exit).pipe(
+            Effect.ensuring(runtime.release(input.sessionID, admission.fence)),
+          ),
       )
     })
 
@@ -3424,7 +3614,12 @@ const layer = Layer.effect(
               ),
             ),
           ),
-        (admission) => (released ? Effect.void : runtime.release(input.sessionID, admission.fence)),
+        (admission, exit) =>
+          released
+            ? Effect.void
+            : recordWatchFailure(input.sessionID, admission.fence, exit).pipe(
+                Effect.ensuring(runtime.release(input.sessionID, admission.fence)),
+              ),
       )
     })
 
@@ -3597,6 +3792,10 @@ const layer = Layer.effect(
     }, Effect.scoped)
 
     return Service.of({
+      textPayload,
+      queueWake: (sessionID) => wakeQueue(sessionID, false, true),
+      controlSteer,
+      controlCancel,
       cancel,
       prompt,
       loop,

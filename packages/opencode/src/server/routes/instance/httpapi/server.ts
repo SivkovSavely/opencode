@@ -34,6 +34,7 @@ import { LLM } from "@/session/llm"
 import { SessionProcessor } from "@/session/processor"
 import { SessionPrompt } from "@/session/prompt"
 import { SessionQueue } from "@/session/queue"
+import { SessionWatch } from "@/session/watch"
 import { SessionSchedule } from "@/session/schedule"
 import { ServerScheduler } from "@/server/scheduler"
 import { SessionRevert } from "@/session/revert"
@@ -138,12 +139,14 @@ const startupLayer = Layer.effect(
   Effect.gen(function* () {
     const recovery = yield* ServerRecovery.Service
     const scheduler = yield* ServerScheduler.Service
+    const watches = yield* SessionWatch.Service
     const lifecycle = yield* RuntimeLifecycle.Service
     const context = yield* Effect.context<never>()
     const initialize = yield* Effect.cached(
       recovery.initialize.pipe(
         Effect.andThen(lifecycle.finishStartupRecovery()),
         Effect.andThen(scheduler.start),
+        Effect.andThen(watches.start),
         // Startup is invoked outside layer construction; retain server logging for the TUI.
         Effect.provide(context),
       ),
@@ -361,6 +364,7 @@ export function createRoutes(
     Layer.provideMerge(startupLayer),
     Layer.provideMerge(ServerRecovery.layer),
     Layer.provideMerge(ServerScheduler.layer),
+    Layer.provideMerge(SessionWatch.layer),
     Layer.provide(AppNodeBuilderV1.build(app)),
     Layer.provide(lifecycle),
     // Must stay last: layers provided later in this pipe build beneath earlier ones,

@@ -15,6 +15,7 @@ import { Truncate } from "@/tool/truncate"
 
 import { Plugin } from "@/plugin"
 import type { TaskPromptOps } from "@/tool/task"
+import type { SessionControlOps } from "@/tool/session-control"
 import { type Tool as AITool, tool, jsonSchema, type ToolExecutionOptions, asSchema } from "ai"
 import { Effect } from "effect"
 import { MessageV2 } from "./message-v2"
@@ -51,6 +52,7 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
   bypassAgentCheck: boolean
   messages: SessionV1.WithParts[]
   promptOps: TaskPromptOps
+  sessionControlOps?: SessionControlOps
   requestCompaction?: () => Effect.Effect<void>
   executionFence?: number
   managedRuntime?: Tool.Context["managedRuntime"]
@@ -89,6 +91,7 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
       model: input.model,
       bypassAgentCheck: input.bypassAgentCheck,
       promptOps: input.promptOps,
+      sessionControlOps: input.sessionControlOps,
       requestCompaction: input.requestCompaction,
       mcpActivated: activated,
     },

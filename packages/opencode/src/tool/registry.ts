@@ -10,6 +10,9 @@ import { GlobTool } from "./glob"
 import { GrepTool } from "./grep"
 import { ReadTool } from "./read"
 import { TaskTool } from "./task"
+import { SessionWatchTool, SessionWatchManageTool } from "./session-watch"
+import { SessionControlTool } from "./session-control"
+import { SessionQueue } from "@/session/queue"
 import { CompressTool } from "./compress"
 import { Database } from "@opencode-ai/core/database/database"
 import { TodoWriteTool } from "./todo"
@@ -111,6 +114,9 @@ const layer = Layer.effect(
 
     const invalid = yield* InvalidTool
     const task = yield* TaskTool
+    const sessionWatch = yield* SessionWatchTool
+    const sessionWatchManage = yield* SessionWatchManageTool
+    const sessionControl = yield* SessionControlTool
     const compress = yield* CompressTool
     const read = yield* ReadTool
     const question = yield* QuestionTool
@@ -315,6 +321,9 @@ const layer = Layer.effect(
           edit: Tool.init(edit),
           write: Tool.init(writetool),
           task: Tool.init(task),
+          sessionWatch: Tool.init(sessionWatch),
+          sessionWatchManage: Tool.init(sessionWatchManage),
+          sessionControl: Tool.init(sessionControl),
           compress: Tool.init(compress),
           fetch: Tool.init(webfetch),
           todo: Tool.init(todo),
@@ -340,6 +349,7 @@ const layer = Layer.effect(
             tool.edit,
             tool.write,
             tool.task,
+            ...(!ManagedSkill.enabled ? [tool.sessionWatch, tool.sessionWatchManage, tool.sessionControl] : []),
             ...(process.env.OPENCODE_MANAGED_PROFILE === "1" ? [tool.compress] : []),
             tool.fetch,
             tool.todo,
@@ -564,6 +574,7 @@ export const node = LayerNode.make({
     Agent.node,
     Skill.node,
     Session.node,
+    SessionQueue.node,
     BackgroundJob.node,
     Provider.node,
     LSP.node,

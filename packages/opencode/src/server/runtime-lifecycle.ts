@@ -99,6 +99,8 @@ export function withRecoveryPhase(phase: string) {
     )
 }
 
+export type CancellationTarget = { ownerLineage: string; ownerInstance: string; fence: number }
+
 export type Interface = {
   readonly identity: {
     readonly lineage: string
@@ -140,7 +142,7 @@ export type Interface = {
   ) => Effect.Effect<T, ManagedCommand.AdmissionError>
   readonly commandStatus: (rootSessionID: string) => Effect.Effect<ManagedCommand.Status>
   /** Acquire in a caller-side mask/acquireUseRelease so success installs finishCancel before interruption. */
-  readonly cancel: (sessionID: string) => Effect.Effect<boolean>
+  readonly cancel: (sessionID: string, expected?: CancellationTarget) => Effect.Effect<boolean>
   readonly waitCancel: (sessionID: string) => Effect.Effect<void>
   /** Wait for local execution slots and every admitted owner to release; does not interrupt work. */
   readonly waitForIdle: (sessionID: string) => Effect.Effect<void>
@@ -1451,11 +1453,22 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
     return { ...state, leases }
   })
 
-  const acquireCancellation = Effect.fnUntraced(function* (sessionID: string) {
-    retryWakes.delete(sessionID)
+  const acquireCancellation = Effect.fnUntraced(function* (sessionID: string, expected?: CancellationTarget) {
     const decision = yield* SynchronizedRef.modifyEffect(
       ref,
       Effect.fnUntraced(function* (state) {
+        if (expected) {
+          const row = yield* read(sessionID)
+          if (
+            !row ||
+            row.owner_lineage !== expected.ownerLineage ||
+            row.owner_instance !== expected.ownerInstance ||
+            row.fence !== expected.fence ||
+            row.desired_active !== 1
+          )
+            return [{ owner: false as boolean, cancelled: [] as string[], skipped: true }, state] as const
+        }
+        retryWakes.delete(sessionID)
         if (state.cancelling.has(sessionID))
           return [{ owner: false as boolean, cancelled: [] as string[] }, state] as const
         const cancelling = new Map(state.cancelling)
@@ -1556,11 +1569,12 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
     return decision
   })
 
-  const cancel = Effect.fn("RuntimeLifecycle.cancel")((sessionID: string) =>
+  const cancel = Effect.fn("RuntimeLifecycle.cancel")((sessionID: string, expected?: CancellationTarget) =>
     Effect.acquireUseRelease(
-      acquireCancellation(sessionID),
+      acquireCancellation(sessionID, expected),
       (decision) =>
         Effect.gen(function* () {
+          if ("skipped" in decision) return false
           for (const id of [sessionID, ...decision.cancelled]) retryWakes.delete(id)
           if (managed.size > 0) {
             const database = databaseRef.current ?? (yield* Database.Service)
