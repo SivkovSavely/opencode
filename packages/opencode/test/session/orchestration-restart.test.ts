@@ -4,6 +4,7 @@ import { Effect, Layer } from "effect"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { tmpdirScoped } from "../fixture/fixture"
+import { markPluginDependenciesReady } from "../fixture/plugin"
 import { testEffect } from "../lib/effect"
 import { TestLLMServer } from "../lib/llm-server"
 import { testProviderConfig } from "../lib/test-provider"
@@ -42,8 +43,40 @@ it.live(
   30_000,
 )
 
-const child = (directory: string, home: string, phase: string) =>
+it.live(
+  "restart fixtures finish dependencies without background catalog or package-registry requests",
+  () =>
+    Effect.gen(function* () {
+      const llm = yield* TestLLMServer
+      const requests: string[] = []
+      const network = yield* Effect.acquireRelease(
+        Effect.sync(() =>
+          Bun.serve({
+            hostname: "127.0.0.1",
+            port: 0,
+            fetch(request) {
+              requests.push(new URL(request.url).pathname)
+              return Response.json({})
+            },
+          }),
+        ),
+        (server) => Effect.promise(() => server.stop(true)),
+      )
+      const home = yield* tmpdirScoped()
+      const directory = yield* tmpdirScoped({
+        git: true,
+        config: { ...testProviderConfig(llm.url), model: "test/test-model", snapshot: false },
+      })
+      expect(yield* child(directory, home, "seed", network.url.toString())).toMatchObject({ code: 0 })
+      expect(requests).toEqual([])
+      expect(yield* llm.calls).toBe(0)
+    }),
+  30_000,
+)
+
+const child = (directory: string, home: string, phase: string, networkURL?: string) =>
   Effect.promise(async () => {
+    await markPluginDependenciesReady(path.join(home, "config", "opencode"))
     const child = Bun.spawn(["bun", "run", "./test/session/fixtures/session-orchestration.ts"], {
       cwd: process.cwd(),
       env: {
@@ -56,6 +89,10 @@ const child = (directory: string, home: string, phase: string) =>
         XDG_STATE_HOME: path.join(home, "state"),
         OPENCODE_DISABLE_FFF: "1",
         OPENCODE_DB: path.join(home, "restart.db"),
+        OPENCODE_MODELS_URL: networkURL ?? process.env.OPENCODE_MODELS_URL,
+        npm_config_registry: networkURL ?? process.env.npm_config_registry,
+        // The explicit model snapshot needs no network refresh during restart probes.
+        OPENCODE_DISABLE_MODELS_FETCH: "1",
         TEST_DIRECTORY: directory,
         TEST_PHASE: phase,
         OPENCODE_MANAGED_PROFILE: phase === "managed" ? "1" : undefined,
@@ -69,5 +106,6 @@ const child = (directory: string, home: string, phase: string) =>
       new Response(child.stderr).text(),
       child.exited,
     ])
+    expect(stdout).toContain(`orchestration-fixture-closed ${phase}`)
     return { code, stdout, stderr }
   })

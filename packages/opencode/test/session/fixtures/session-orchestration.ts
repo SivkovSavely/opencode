@@ -8,6 +8,7 @@ import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { SessionWatchStore } from "@opencode-ai/core/session/watch-store"
 import { Agent } from "@/agent/agent"
+import { Config } from "@/config/config"
 import { AppNodeBuilderV1 } from "@/effect/app-node-builder-v1"
 import { InstanceStore } from "@/project/instance-store"
 import { Provider } from "@/provider/provider"
@@ -44,6 +45,7 @@ await Effect.runPromise(
             Database.node,
             SessionProjector.node,
             Agent.node,
+            Config.node,
             Provider.node,
             FSUtil.node,
             Truncate.node,
@@ -61,6 +63,8 @@ await Effect.runPromise(
           const queue = yield* SessionQueue.Service
           const agents = yield* Agent.Service
           const registry = yield* ToolRegistry.Service
+          const config = yield* Config.Service
+          yield* config.waitForDependencies()
           const ctx: Tool.Context = {
             sessionID: SessionID.make("ses_managed"),
             messageID: MessageID.ascending(),
@@ -166,3 +170,4 @@ await Effect.runPromise(
     }),
   ),
 )
+console.log("orchestration-fixture-closed", process.env.TEST_PHASE)

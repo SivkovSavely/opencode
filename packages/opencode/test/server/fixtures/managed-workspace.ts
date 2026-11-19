@@ -4,6 +4,8 @@ import { Context, Effect, Layer, Schema } from "effect"
 import { HttpClient, HttpClientRequest, HttpRouter, HttpServerResponse } from "effect/unstable/http"
 import { HttpApi, HttpApiBuilder, HttpApiEndpoint, HttpApiGroup } from "effect/unstable/httpapi"
 import * as Socket from "effect/unstable/socket/Socket"
+import { Project } from "@opencode-ai/schema/project"
+import { InstanceRef } from "../../../src/effect/instance-ref"
 import { InstanceStore } from "../../../src/project/instance-store"
 import { Session } from "../../../src/session/session"
 import {
@@ -204,10 +206,21 @@ it.live("denies cross-slot hints and workspace routing before instance loading",
       ),
       Layer.provide(
         Layer.mock(InstanceStore.Service)({
-          load: (input) =>
-            Effect.sync(() => {
+          provide: (input, effect) =>
+            Effect.suspend(() => {
               loads.push(input.directory)
-              return { directory: input.directory, worktree: input.directory, project: { id: "global" } } as never
+              return effect.pipe(
+                Effect.provideService(InstanceRef, {
+                  directory: input.directory,
+                  worktree: input.directory,
+                  project: {
+                    id: Project.ID.make("global"),
+                    worktree: input.directory,
+                    time: { created: 0, updated: 0 },
+                    sandboxes: [],
+                  },
+                }),
+              )
             }),
         }),
       ),
