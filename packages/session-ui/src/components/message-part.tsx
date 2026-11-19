@@ -68,6 +68,7 @@ import { taskSession } from "./task-session"
 import { formatTimestamp, formatToolTimestamp } from "./timestamp"
 import { SessionProgressIndicatorV2 } from "../v2/components/session-progress-indicator-v2"
 import { RawToolDetails, rawToolRequest, rawToolResponse } from "./raw-tool-details"
+import { ShellOutput } from "./shell-output"
 
 async function writeClipboard(text: string): Promise<boolean> {
   const body = typeof document === "undefined" ? undefined : document.body
@@ -2148,30 +2149,24 @@ ToolRegistry.register({
 ToolRegistry.register({
   name: "shell",
   render(props) {
+    const data = useData()
     const i18n = useI18n()
     const pending = () => props.status === "pending" || props.status === "running"
     const sawPending = pending()
-    const text = createMemo(() => {
-      const cmd = props.input.command ?? props.metadata.command ?? ""
-      const out = stripAnsi(props.output || props.metadata.output || "").replace(/\r\n?/g, "\n")
-      return `$ ${cmd}${out ? "\n\n" + out : ""}`
-    })
-    const [copied, setCopied] = createSignal(false)
-
-    const handleCopy = async () => {
-      const content = text()
-      if (!content) return
-      if (await writeClipboard(content)) {
-        setCopied(true)
-        setTimeout(() => setCopied(false), 2000)
-      }
-    }
+    const command = createMemo(() => props.input.command ?? props.metadata.command ?? "")
+    const output = createMemo(() => stripAnsi(props.output || props.metadata.output || "").replace(/\r\n?/g, "\n"))
+    const shell = createMemo(() =>
+      [props.metadata.shell, data.store.config?.shell].find(
+        (shell): shell is string => typeof shell === "string" && !!shell.trim(),
+      ),
+    )
 
     return (
       <BasicTool
         {...props}
         icon="console"
         allowOpenWhilePending
+        defer
         trigger={(open) => (
           <div data-slot="basic-tool-tool-info-structured">
             <div data-slot="basic-tool-tool-info-main">
@@ -2185,31 +2180,7 @@ ToolRegistry.register({
           </div>
         )}
       >
-        <div data-component="bash-output" dir="ltr">
-          <div data-slot="bash-copy">
-            <TooltipV2 value={copied() ? i18n.t("ui.message.copied") : i18n.t("ui.message.copy")} placement="top">
-              <IconButtonV2
-                icon={<IconV2 name={copied() ? "check" : "outline-copy"} size="small" />}
-                size="normal"
-                variant="ghost-muted"
-                onMouseDown={(e) => e.preventDefault()}
-                onClick={handleCopy}
-                aria-label={copied() ? i18n.t("ui.message.copied") : i18n.t("ui.message.copy")}
-              />
-            </TooltipV2>
-          </div>
-          <div
-            data-slot="bash-scroll"
-            data-scrollable
-            tabIndex={0}
-            role="region"
-            aria-label={i18n.t("ui.scrollView.ariaLabel")}
-          >
-            <pre data-slot="bash-pre">
-              <code>{text()}</code>
-            </pre>
-          </div>
-        </div>
+        <ShellOutput command={command()} output={output()} shell={shell()} onCopy={writeClipboard} />
       </BasicTool>
     )
   },

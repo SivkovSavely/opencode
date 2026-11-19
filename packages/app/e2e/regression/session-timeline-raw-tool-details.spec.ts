@@ -88,7 +88,7 @@ test("keeps shell output and live raw details together", async ({ page }) => {
   await expect(trigger).toHaveAttribute("aria-expanded", "true")
   await expect(wrapper.locator('[data-component="bash-output"]')).toContainText(output)
   await expect(raw.locator('[data-slot="raw-tool-details-body"]').last()).toHaveText(output)
-  await expect(wrapper.locator('[data-slot="bash-copy"] button')).toBeAttached()
+  await expect(wrapper.locator('[data-slot="bash-result"] [data-slot="bash-copy"] button')).toBeAttached()
 })
 
 test("opens a running non-shell request and updates its response when complete", async ({ page }) => {

@@ -16,6 +16,9 @@ export type NormalizedProviderListResponse = {
 }
 
 type Data = {
+  config?: {
+    shell?: string
+  }
   agent?: {
     name: string
     color?: string
