@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, test } from "bun:test"
 import { plugin } from "bun"
 import { createRequire } from "node:module"
+import { Suspense, type JSX } from "solid-js"
 import { createComponent, render } from "solid-js/web"
 import { createStore } from "solid-js/store"
 import { createGlobalEmitter } from "@solid-primitives/event-bus"
@@ -20,10 +21,14 @@ plugin({
           presets: [[require.resolve("babel-preset-solid"), { generate: "dom" }]],
           parserOpts: { plugins: ["typescript", "jsx"] },
         })
-      ).code.replace(/(["'])@\/(?:context\/server-sdk|utils\/toast)\1/g, (match: string) =>
-        path.endsWith("/server-lifecycle-commands.tsx") || path.endsWith("/context/server-sync.tsx")
-          ? JSON.stringify(import.meta.path)
-          : match,
+      ).code.replace(
+        /(["'])@\/(?:context\/(?:server-sdk|sdk|sync|file|layout|comments|permission)|components\/prompt-input\/submit|utils\/toast)\1/g,
+        (match: string) =>
+          path.endsWith("/server-lifecycle-commands.tsx") || path.endsWith("/context/server-sync.tsx")
+            ? JSON.stringify(import.meta.path)
+            : /\/components\/prompt-input(?:-v2)?\.tsx$/.test(path)
+              ? JSON.stringify(import.meta.path)
+              : match,
       ),
       loader: "tsx",
     }))
@@ -37,15 +42,45 @@ const { DialogProvider } = await import("@opencode-ai/ui/context/dialog")
 const { CommandProvider, useCommand } = await import("../src/context/command")
 const { ServerLifecycleCommands } = await import("../src/components/server-lifecycle-commands")
 const { createServerSyncContextInner } = await import("../src/context/server-sync")
-const { createSdkForServer } = await import("../src/utils/server")
+const { createSdkForServer, createApiForServer } = await import("../src/utils/server")
 const { ServerScope } = await import("../src/utils/server-scope")
 const { ServerConnection } = await import("../src/context/server")
 const { pathKey } = await import("../src/utils/path-key")
+const { createPromptState } = await import("../src/context/prompt-state")
+const { PromptInputV2Composer, usePromptInputV2Controller } = await import("../src/components/prompt-input-v2")
+const { PromptInput } = await import("../src/components/prompt-input")
+const { getCursorPosition } = await import("../src/components/prompt-input/editor-dom")
 
 let selected: () => Pick<ServerSDK, "client" | "server">
 const toasts: ToastOptions[] = []
 export const useServerSDK = () => () => selected()
 export const showToast = (options: ToastOptions) => toasts.push(options)
+let composerSDK: () => unknown
+export const useSDK = () => composerSDK
+export const useSync = () => () => ({
+  data: {
+    reference: [],
+    mcp_resource: {},
+    command: [],
+    agent: [],
+    message: {},
+    session_diff: {},
+    session_message: {},
+    part: {},
+    session_working: () => false,
+  },
+  session: { get: () => undefined },
+})
+export const useFile = () => ({
+  pathFromTab: () => undefined,
+  tab: (path: string) => path,
+  searchFilesAndDirectories: async () => [],
+})
+export const selectionFromLines = (selection: unknown) => selection
+export const useLayout = () => ({})
+export const useComments = () => ({ all: () => [] })
+export const usePermission = () => ({ isAutoAcceptingDirectory: () => false, isAutoAccepting: () => false })
+export const createPromptSubmit = () => ({ handleSubmit() {}, abort() {} })
 
 const cleanup: (() => void)[] = []
 afterEach(() => {
@@ -53,8 +88,9 @@ afterEach(() => {
   toasts.length = 0
 })
 
-function mount(run: () => null) {
+function mount(run: () => JSX.Element) {
   const host = document.createElement("div")
+  document.body.append(host)
   const dispose = render(
     () =>
       createComponent(PlatformProvider, {
@@ -70,7 +106,12 @@ function mount(run: () => null) {
       }),
     host,
   )
-  cleanup.push(dispose)
+  const unmount = () => {
+    dispose()
+    host.remove()
+  }
+  cleanup.push(unmount)
+  return { host, dispose: unmount }
 }
 
 function server(name: string, reload: () => Promise<Response> = async () => Response.json(true)) {
@@ -500,3 +541,490 @@ describe("configuration reload synchronization", () => {
     expect(child[0].config).toEqual({})
   })
 })
+
+function skillServer(name: string, protocol: "v1" | "v2" = "v1") {
+  const emitter = createGlobalEmitter<{ [key: string]: ServerEvent }>()
+  const requests: Request[] = []
+  const responses: Promise<Response>[] = []
+  const skills = { current: [{ name: "old", description: "old description", location: "/old", content: "old" }] }
+  const connection: ServerConnection.Http = {
+    type: "http",
+    http: { url: `https://${name}.example`, username: name, password: "secret" },
+  }
+  const fetch = Object.assign(
+    async (input: string | URL | Request, init?: RequestInit) => {
+      requests.push(new Request(input, init))
+      return responses.shift() ?? Response.json(protocol === "v1" ? skills.current : { data: skills.current })
+    },
+    { preconnect() {} },
+  )
+  const client = createSdkForServer({ server: connection.http, fetch, directory: "/project" })
+  const api = createApiForServer({ server: connection.http, fetch })
+  const server = { server: connection, client, event: { listen: emitter.listen.bind(emitter) } }
+  const directory = { client, api, protocol: Promise.resolve(protocol), directory: "/project" }
+  return {
+    server,
+    directory,
+    skills,
+    requests,
+    responses,
+    emitter,
+    emit: (name = "global", type = "config.reloaded") =>
+      emitter.emit(name, { type, properties: {} } as unknown as ServerEvent),
+  }
+}
+
+const composerControls = {
+  agents: { available: [], options: [], current: "", loading: false, visible: false, select() {} },
+  model: {
+    loading: true,
+    paid: false,
+    selection: {
+      current: () => undefined,
+      list: () => [],
+      variant: { current: () => undefined, list: () => [], set() {} },
+    },
+  },
+  session: {
+    tabs: { active: () => undefined, all: () => [], open() {}, setActive() {} },
+    reviewPanel: { opened: () => false, open() {} },
+  },
+}
+
+function composer(layout: "v1" | "v2", initial: ReturnType<typeof skillServer>, suspense = false) {
+  const servers = [initial]
+  const [selection, setSelection] = createStore({ index: 0 })
+  selected = () => servers[selection.index]!.server
+  composerSDK = () => servers[selection.index]!.directory
+  const state = createPromptState()
+  const result: { controller?: ReturnType<typeof usePromptInputV2Controller>; editor?: HTMLDivElement } = {}
+  const props = {
+    state,
+    controls: composerControls,
+    history: { entries: () => [], add() {} },
+    submission: { handleSubmit() {}, abort() {} },
+    ref: (element: HTMLDivElement) => {
+      result.editor = element
+    },
+  } as Parameters<typeof PromptInput>[0]
+  const content = () => {
+    if (layout === "v1") return createComponent(PromptInput, props)
+    result.controller = usePromptInputV2Controller(props)
+    return suspense ? createComponent(PromptInputV2Composer, { controller: result.controller }) : null
+  }
+  const mounted = mount(() =>
+    createComponent(SettingsProvider, {
+      get children() {
+        return createComponent(DialogProvider, {
+          get children() {
+            return createComponent(CommandProvider, {
+              get children() {
+                if (!suspense) return createComponent(content, {})
+                const fallback = document.createElement("div")
+                fallback.dataset.testid = "composer-fallback"
+                return createComponent(Suspense, {
+                  fallback,
+                  get children() {
+                    return createComponent(content, {})
+                  },
+                })
+              },
+            })
+          },
+        })
+      },
+    }),
+  )
+  return {
+    ...mounted,
+    state,
+    result,
+    select: (next: ReturnType<typeof skillServer>) => {
+      servers.push(next)
+      setSelection("index", servers.length - 1)
+    },
+  }
+}
+
+test.each(["v1", "v2"] as const)("V1 composer reloads actual skill suggestions using %s protocol", async (protocol) => {
+  const server = skillServer("legacy", protocol)
+  server.skills.current = [{ name: "skill-old", description: "old", location: "/old", content: "old" }]
+  const mounted = composer("v1", server)
+  await waitFor(() => server.requests.length === 1)
+  const editor = mounted.result.editor!
+  editor.textContent = "$s"
+  const range = document.createRange()
+  range.setStart(editor.firstChild!, 2)
+  range.collapse(true)
+  window.getSelection()!.removeAllRanges()
+  window.getSelection()!.addRange(range)
+  editor.dispatchEvent(new InputEvent("input", { bubbles: true }))
+  await new Promise((resolve) => setTimeout(resolve, 50))
+  expect(getCursorPosition(editor)).toBe(2)
+  await waitFor(() => mounted.host.textContent!.includes("skill-old"))
+  server.skills.current = [{ name: "skill-new", description: "changed", location: "/new", content: "new" }]
+  server.emit()
+  await waitFor(() => mounted.host.textContent!.includes("skill-new"))
+  expect(mounted.host.textContent).not.toContain("skill-old")
+  expect(mounted.result.editor).toBe(editor)
+  expect(server.requests).toHaveLength(2)
+  expect(server.requests[0]!.headers.get("authorization")).toBe(`Basic ${btoa("legacy:secret")}`)
+  expect(new URL(server.requests[0]!.url).pathname).toBe(protocol === "v1" ? "/skill" : "/api/skill")
+  if (protocol === "v2") expect(server.requests[0]!.url).toContain("%2Fproject")
+})
+
+test.each(["v1", "v2"] as const)("V2 controller uses %s protocol and follows the selected server", async (protocol) => {
+  const first = skillServer("first", protocol)
+  const second = skillServer("second", protocol)
+  second.skills.current = [
+    { name: "second", description: "second description", location: "/second", content: "second" },
+  ]
+  const mounted = composer("v2", first)
+  const controller = mounted.result.controller!
+  controller.onInput("$")
+  await waitFor(() => controller.suggestions().some((item) => item.id === "skill:old"))
+  expect(first.requests).toHaveLength(1)
+  expect(first.requests[0]!.headers.get("authorization")).toBe(`Basic ${btoa("first:secret")}`)
+  expect(new URL(first.requests[0]!.url).pathname).toBe(protocol === "v1" ? "/skill" : "/api/skill")
+  if (protocol === "v2") expect(first.requests[0]!.url).toContain("%2Fproject")
+  second.emit()
+  first.emit("/project")
+  first.emit("global", "server.connected")
+  await new Promise((resolve) => setTimeout(resolve, 30))
+  expect(first.requests).toHaveLength(1)
+  expect(second.requests).toHaveLength(0)
+  mounted.select(second)
+  await waitFor(() => controller.suggestions().some((item) => item.id === "skill:second"))
+  first.emit()
+  await new Promise((resolve) => setTimeout(resolve, 30))
+  expect(first.requests).toHaveLength(1)
+  expect(second.requests).toHaveLength(1)
+  second.skills.current = [{ name: "second", description: "updated", location: "/second", content: "updated" }]
+  second.emit()
+  await waitFor(() =>
+    controller.suggestions().some((item) => item.id === "skill:second" && item.description === "updated"),
+  )
+  expect(mounted.result.controller).toBe(controller)
+  mounted.dispose()
+  second.emit()
+  await new Promise((resolve) => setTimeout(resolve, 30))
+  expect(second.requests).toHaveLength(2)
+})
+
+test("V2 controller ignores stale initial, reload, and previous server skill responses", async () => {
+  const first = skillServer("first")
+  const initial = Promise.withResolvers<Response>()
+  const reload = Promise.withResolvers<Response>()
+  first.responses.push(initial.promise, reload.promise)
+  const mounted = composer("v2", first)
+  const controller = mounted.result.controller!
+  controller.onInput("$")
+  await waitFor(() => first.requests.length === 1)
+  first.emit()
+  await waitFor(() => first.requests.length === 2)
+  first.skills.current = [{ name: "latest", description: "latest", location: "/latest", content: "latest" }]
+  first.emit()
+  await waitFor(() => controller.suggestions().some((item) => item.id === "skill:latest"))
+  initial.resolve(
+    Response.json([{ name: "stale-initial", description: "stale", location: "/stale", content: "stale" }]),
+  )
+  reload.resolve(Response.json([{ name: "stale-reload", description: "stale", location: "/stale", content: "stale" }]))
+  await new Promise((resolve) => setTimeout(resolve, 30))
+  expect(
+    controller
+      .suggestions()
+      .filter((item) => item.kind === "skill")
+      .map((item) => item.id),
+  ).toEqual(["skill:latest"])
+  const pending = Promise.withResolvers<Response>()
+  first.responses.push(pending.promise)
+  first.emit()
+  await waitFor(() => first.requests.length === 4)
+  const second = skillServer("second")
+  second.skills.current = [{ name: "new-server", description: "new", location: "/new", content: "new" }]
+  mounted.select(second)
+  await waitFor(() => controller.suggestions().some((item) => item.id === "skill:new-server"))
+  pending.resolve(Response.json([{ name: "stale-server", description: "stale", location: "/stale", content: "stale" }]))
+  await new Promise((resolve) => setTimeout(resolve, 30))
+  expect(
+    controller
+      .suggestions()
+      .filter((item) => item.kind === "skill")
+      .map((item) => item.id),
+  ).toEqual(["skill:new-server"])
+})
+
+test("two same-batch reloads start distinct skill requests", async () => {
+  const server = skillServer("batch")
+  const mounted = composer("v2", server)
+  const controller = mounted.result.controller!
+  controller.onInput("$")
+  await waitFor(() => controller.suggestions().some((item) => item.id === "skill:old"))
+  const stale = Promise.withResolvers<Response>()
+  server.responses.push(stale.promise)
+  server.skills.current = [{ name: "latest", description: "latest", location: "/latest", content: "latest" }]
+  server.emit()
+  server.emit()
+  await waitFor(() => controller.suggestions().some((item) => item.id === "skill:latest"))
+  expect(server.requests).toHaveLength(3)
+  stale.resolve(Response.json([{ name: "stale", description: "stale", location: "/stale", content: "stale" }]))
+  await new Promise((resolve) => setTimeout(resolve, 30))
+  expect(
+    controller
+      .suggestions()
+      .filter((item) => item.kind === "skill")
+      .map((item) => item.id),
+  ).toEqual(["skill:latest"])
+})
+
+test("all mounted composers refresh without replacing their drafts, caret, attachment, or editor", async () => {
+  const server = skillServer("shared")
+  server.skills.current = [{ name: "skill-old", description: "old", location: "/old", content: "old" }]
+  const legacy = composer("v1", server)
+  const modern = composer("v2", server)
+  const controller = modern.result.controller!
+  const editor = legacy.result.editor!
+  const modernEditor = document.createElement("div")
+  controller.setEditor(modernEditor)
+  editor.textContent = "$s"
+  const range = document.createRange()
+  range.setStart(editor.firstChild!, 2)
+  range.collapse(true)
+  window.getSelection()!.removeAllRanges()
+  window.getSelection()!.addRange(range)
+  editor.dispatchEvent(new InputEvent("input", { bubbles: true }))
+  controller.onInput("$s")
+  await waitFor(
+    () =>
+      legacy.host.textContent!.includes("skill-old") &&
+      controller.suggestions().some((item) => item.id === "skill:skill-old"),
+  )
+  const image = {
+    type: "image" as const,
+    id: "image",
+    filename: "image.png",
+    mime: "image/png",
+    blob: { id: "blob", url: "data:image/png;base64,AA==" },
+  }
+  legacy.state.set([...legacy.state.current(), image], 2)
+  modern.state.set([...modern.state.current(), image], 2)
+  const snapshot = (state: ReturnType<typeof createPromptState>) => ({
+    parts: Array.from(state.current(), (part) =>
+      part.type === "image" ? { ...part, blob: { ...part.blob } } : { ...part },
+    ),
+    cursor: state.cursor(),
+  })
+  const beforeLegacy = snapshot(legacy.state)
+  const beforeModern = snapshot(modern.state)
+  expect(beforeLegacy.parts.some((part) => part.type === "image")).toBe(true)
+  expect(beforeModern.parts.some((part) => part.type === "image")).toBe(true)
+  expect(getCursorPosition(editor)).toBe(2)
+  server.skills.current = [{ name: "skill-new", description: "new description", location: "/new", content: "new" }]
+  server.emit()
+  await waitFor(
+    () =>
+      legacy.host.textContent!.includes("skill-new") &&
+      controller.suggestions().some((item) => item.id === "skill:skill-new"),
+  )
+  expect(server.requests).toHaveLength(4)
+  expect(legacy.host.textContent).not.toContain("skill-old")
+  expect(
+    controller
+      .suggestions()
+      .filter((item) => item.kind === "skill")
+      .map((item) => [item.id, item.description]),
+  ).toEqual([["skill:skill-new", "new description"]])
+  expect(snapshot(legacy.state)).toEqual(beforeLegacy)
+  expect(snapshot(modern.state)).toEqual(beforeModern)
+  expect(legacy.result.editor).toBe(editor)
+  expect(modern.result.controller).toBe(controller)
+  expect(modern.result.editor).toBe(modernEditor)
+  expect(getCursorPosition(editor)).toBe(2)
+})
+
+test("V1 composer switches servers and unsubscribes on disposal", async () => {
+  const first = skillServer("first")
+  const second = skillServer("second")
+  const mounted = composer("v1", first)
+  await waitFor(() => first.requests.length === 1)
+  first.emit("/project")
+  first.emit("global", "server.connected")
+  second.emit()
+  await new Promise((resolve) => setTimeout(resolve, 30))
+  expect(first.requests).toHaveLength(1)
+  mounted.select(second)
+  await waitFor(() => second.requests.length === 1)
+  first.emit()
+  await new Promise((resolve) => setTimeout(resolve, 30))
+  expect(first.requests).toHaveLength(1)
+  second.emit()
+  await waitFor(() => second.requests.length === 2)
+  mounted.dispose()
+  second.emit()
+  await new Promise((resolve) => setTimeout(resolve, 30))
+  expect(second.requests).toHaveLength(2)
+})
+
+test("V1 composer rejects stale initial, batched reload, and prior server responses", async () => {
+  const first = skillServer("first")
+  const initial = Promise.withResolvers<Response>()
+  const reload = Promise.withResolvers<Response>()
+  first.responses.push(initial.promise, reload.promise)
+  const mounted = composer("v1", first)
+  const editor = mounted.result.editor!
+  editor.textContent = "$s"
+  const range = document.createRange()
+  range.setStart(editor.firstChild!, 2)
+  range.collapse(true)
+  window.getSelection()!.removeAllRanges()
+  window.getSelection()!.addRange(range)
+  editor.dispatchEvent(new InputEvent("input", { bubbles: true }))
+  await waitFor(() => first.requests.length === 1)
+  first.skills.current = [{ name: "skill-latest", description: "latest", location: "/latest", content: "latest" }]
+  first.emit()
+  first.emit()
+  await waitFor(() => mounted.host.textContent!.includes("skill-latest"))
+  expect(first.requests).toHaveLength(3)
+  initial.resolve(
+    Response.json([{ name: "skill-stale-initial", description: "stale", location: "/stale", content: "stale" }]),
+  )
+  reload.resolve(
+    Response.json([{ name: "skill-stale-reload", description: "stale", location: "/stale", content: "stale" }]),
+  )
+  await new Promise((resolve) => setTimeout(resolve, 30))
+  expect(mounted.host.textContent).not.toContain("skill-stale")
+  const pending = Promise.withResolvers<Response>()
+  first.responses.push(pending.promise)
+  first.emit()
+  await waitFor(() => first.requests.length === 4)
+  const second = skillServer("second")
+  second.skills.current = [{ name: "skill-second", description: "new", location: "/new", content: "new" }]
+  mounted.select(second)
+  await waitFor(() => mounted.host.textContent!.includes("skill-second"))
+  pending.resolve(
+    Response.json([{ name: "skill-stale-server", description: "stale", location: "/stale", content: "stale" }]),
+  )
+  await new Promise((resolve) => setTimeout(resolve, 30))
+  expect(mounted.host.textContent).not.toContain("skill-stale")
+  expect(mounted.host.textContent).toContain("skill-second")
+})
+
+test.each(["v1", "v2"] as const)(
+  "%s composer receives reloads while its initial skills are pending under Suspense",
+  async (layout) => {
+    const server = skillServer(`initial-${layout}`)
+    const initial = Promise.withResolvers<Response>()
+    server.responses.push(initial.promise)
+    const mounted = composer(layout, server, true)
+    server.skills.current = [{ name: "skill-new", description: "new description", location: "/new", content: "new" }]
+    // Publish before the initial render's suspended effects can run.
+    server.emit()
+    await waitFor(() => server.requests.length === 2)
+    await waitFor(() => !!mounted.result.editor?.isConnected)
+    const editor = mounted.result.editor!
+    editor.focus()
+    editor.textContent = "$s"
+    const range = document.createRange()
+    range.setStart(editor.firstChild!, 2)
+    range.collapse(true)
+    window.getSelection()!.removeAllRanges()
+    window.getSelection()!.addRange(range)
+    editor.dispatchEvent(new InputEvent("input", { bubbles: true }))
+    await waitFor(() => mounted.host.textContent!.includes("skill-new"))
+    initial.resolve(
+      Response.json([{ name: "skill-stale", description: "stale", location: "/stale", content: "stale" }]),
+    )
+    await new Promise((resolve) => setTimeout(resolve, 30))
+    expect(mounted.host.textContent).toContain("skill-new")
+    expect(mounted.host.textContent).not.toContain("skill-stale")
+    expect(server.requests).toHaveLength(2)
+  },
+)
+
+test.each(["v1", "v2"] as const)(
+  "%s composer keeps its focused editor and draft mounted during a pending reload under Suspense",
+  async (layout) => {
+    const server = skillServer(`focused-${layout}`)
+    server.skills.current = [{ name: "skill-old", description: "old description", location: "/old", content: "old" }]
+    const mounted = composer(layout, server, true)
+    await waitFor(() => !!mounted.result.editor?.isConnected && server.requests.length === 1)
+    const editor = mounted.result.editor!
+    const controller = mounted.result.controller
+    const image = {
+      type: "image" as const,
+      id: "image",
+      filename: "image.png",
+      mime: "image/png",
+      blob: { id: "blob", url: "data:image/png;base64,AA==" },
+    }
+    mounted.state.set([{ type: "text", content: "", start: 0, end: 0 }, image], 0)
+    editor.focus()
+    editor.textContent = "$s tail"
+    const range = document.createRange()
+    range.setStart(editor.firstChild!, 2)
+    range.collapse(true)
+    window.getSelection()!.removeAllRanges()
+    window.getSelection()!.addRange(range)
+    editor.dispatchEvent(new InputEvent("input", { bubbles: true }))
+    await waitFor(() => mounted.host.textContent!.includes("skill-old"))
+    const snapshot = () => ({
+      parts: Array.from(mounted.state.current(), (part) =>
+        part.type === "image" ? { ...part, blob: { ...part.blob } } : { ...part },
+      ),
+      cursor: mounted.state.cursor(),
+    })
+    const before = snapshot()
+    const session = mounted.state.capture()
+    expect(document.activeElement).toBe(editor)
+    expect(getCursorPosition(editor)).toBe(2)
+    expect(before.parts).toHaveLength(2)
+    expect(before.parts[1]).toEqual(image)
+    const pending = Promise.withResolvers<Response>()
+    server.responses.push(pending.promise)
+    server.emit()
+    await waitFor(() => server.requests.length === 2)
+    expect(editor.isConnected).toBe(true)
+    expect(mounted.host.querySelector('[data-testid="composer-fallback"]')).toBeNull()
+    expect(document.activeElement).toBe(editor)
+    expect(getCursorPosition(editor)).toBe(2)
+    expect(snapshot()).toEqual(before)
+    pending.resolve(
+      Response.json([{ name: "skill-new", description: "new description", location: "/new", content: "new" }]),
+    )
+    await waitFor(() => mounted.host.textContent!.includes("skill-new"))
+    expect(mounted.host.textContent).not.toContain("skill-old")
+    expect(mounted.result.editor).toBe(editor)
+    expect(mounted.result.controller).toBe(controller)
+    expect(mounted.state.capture()).toBe(session)
+    expect(document.activeElement).toBe(editor)
+    expect(getCursorPosition(editor)).toBe(2)
+    expect(snapshot()).toEqual(before)
+  },
+)
+
+test.each(["v1", "v2"] as const)(
+  "%s composer switches server subscriptions and disposes them under Suspense",
+  async (layout) => {
+    const first = skillServer(`previous-${layout}`)
+    const second = skillServer(`current-${layout}`)
+    const mounted = composer(layout, first, true)
+    await waitFor(() => !!mounted.result.editor?.isConnected && first.requests.length === 1)
+    first.emit("/project")
+    first.emit("global", "server.connected")
+    second.emit()
+    await new Promise((resolve) => setTimeout(resolve, 30))
+    expect(first.requests).toHaveLength(1)
+    expect(second.requests).toHaveLength(0)
+    mounted.select(second)
+    await waitFor(() => second.requests.length === 1)
+    first.emit()
+    await new Promise((resolve) => setTimeout(resolve, 30))
+    expect(first.requests).toHaveLength(1)
+    second.emit()
+    await waitFor(() => second.requests.length === 2)
+    mounted.dispose()
+    second.emit()
+    await new Promise((resolve) => setTimeout(resolve, 30))
+    expect(second.requests).toHaveLength(2)
+  },
+)

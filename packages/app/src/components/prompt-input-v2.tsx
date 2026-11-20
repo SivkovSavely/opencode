@@ -7,7 +7,7 @@ import { Icon } from "@opencode-ai/ui/v2/icon"
 import { KeybindV2 } from "@opencode-ai/ui/v2/keybind-v2"
 import { TooltipV2 } from "@opencode-ai/ui/v2/tooltip-v2"
 import type { ReferenceInfo } from "@opencode-ai/sdk/v2/client"
-import { createEffect, createMemo, createResource, on, Show } from "solid-js"
+import { createEffect, createMemo, createRenderEffect, createResource, on, onCleanup, Show } from "solid-js"
 import { createStore } from "solid-js/store"
 import { ModelSelectorPopoverV2 } from "@/components/dialog-select-model"
 import { DialogSelectModelUnpaidV2 } from "@/components/dialog-select-model-unpaid-v2"
@@ -33,6 +33,7 @@ import { useSettings } from "@/context/settings"
 import { type ImageAttachmentPart, usePrompt } from "@/context/prompt"
 import { usePlatform } from "@/context/platform"
 import { useSDK } from "@/context/sdk"
+import { useServerSDK } from "@/context/server-sdk"
 import { useSync } from "@/context/sync"
 import { createSessionTabs } from "@/pages/session/helpers"
 import { showToast } from "@/utils/toast"
@@ -98,6 +99,7 @@ export function PromptInputV2Composer(props: PromptInputV2ComposerProps) {
 
 export function usePromptInputV2Controller(props: PromptInputV2ControllerProps): PromptInputV2ComposerController {
   const sdk = useSDK()
+  const serverSDK = useServerSDK()
   const sync = useSync()
   const files = useFile()
   const layout = useLayout()
@@ -109,7 +111,7 @@ export function usePromptInputV2Controller(props: PromptInputV2ControllerProps):
   const language = useLanguage()
   const platform = usePlatform()
   const prompt = props.state ?? usePrompt()
-  const [skills] = createResource(sdk, (source) =>
+  const [skills, skillsActions] = createResource(sdk, (source) =>
     (async () => {
       if ((await resolveServerProtocol(source.protocol)) === "v1") {
         return (await source.client.app.skills()).data ?? []
@@ -124,6 +126,16 @@ export function usePromptInputV2Controller(props: PromptInputV2ControllerProps):
       return []
     }),
   )
+  createRenderEffect(() => {
+    onCleanup(
+      serverSDK().event.listen((event) => {
+        const type: string = event.details.type
+        if (event.name !== "global" || type !== "config.reloaded") return
+        // Reloads in the same event batch must supersede any earlier request.
+        void skillsActions.refetch(false)
+      }),
+    )
+  })
   const [submitState, setSubmitState] = createStore({ preparing: false })
   let editor: HTMLDivElement | undefined
 
@@ -260,7 +272,7 @@ export function usePromptInputV2Controller(props: PromptInputV2ControllerProps):
       props.onPreparing?.(value)
     },
     model: props.controls.model.selection,
-    skills: () => (skills() ?? []).map((skill) => skill.name),
+    skills: () => (skills.latest ?? []).map((skill) => skill.name),
   })
 
   const referenceDescription = (reference: ReferenceInfo) =>
@@ -365,7 +377,7 @@ export function usePromptInputV2Controller(props: PromptInputV2ControllerProps):
       label: variant,
       mention: { type: "variant" as const, variant, content: `@variant:${variant}`, start: 0, end: 0 },
     })),
-    ...(skills() ?? []).map((skill) => ({
+    ...(skills.latest ?? []).map((skill) => ({
       id: `skill:${skill.name}`,
       kind: "skill" as const,
       label: `$${skill.name}`,

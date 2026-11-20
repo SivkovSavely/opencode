@@ -3,6 +3,7 @@ import fuzzysort from "fuzzysort"
 import { useSpring } from "@opencode-ai/ui/motion-spring"
 import {
   createEffect,
+  createRenderEffect,
   on,
   Component,
   Show,
@@ -28,6 +29,7 @@ import {
 } from "@/context/prompt"
 import { useLayout } from "@/context/layout"
 import { useSDK } from "@/context/sdk"
+import { useServerSDK } from "@/context/server-sdk"
 import { useSync } from "@/context/sync"
 import { useComments } from "@/context/comments"
 import { Button } from "@opencode-ai/ui/button"
@@ -132,6 +134,7 @@ const EXAMPLES = [
 
 export const PromptInput: Component<PromptInputProps> = (props) => {
   const sdk = useSDK()
+  const serverSDK = useServerSDK()
 
   const sync = useSync()
   const files = useFile()
@@ -670,7 +673,7 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
     ),
   )
 
-  const [skills] = createResource(sdk, (source) =>
+  const [skills, skillsActions] = createResource(sdk, (source) =>
     (async () => {
       if ((await resolveServerProtocol(source.protocol)) === "v1") return (await source.client.app.skills()).data ?? []
       return (await source.api.skill.list({ location: { directory: source.directory } })).data
@@ -683,6 +686,17 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
       return []
     }),
   )
+
+  createRenderEffect(() => {
+    onCleanup(
+      serverSDK().event.listen((event) => {
+        const type: string = event.details.type
+        if (event.name !== "global" || type !== "config.reloaded") return
+        // Reloads in the same event batch must supersede any earlier request.
+        void skillsActions.refetch(false)
+      }),
+    )
+  })
 
   const handleAtSelect = (option: AtOption | undefined) => {
     if (!option) return
@@ -769,7 +783,7 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
     items: async (query) => {
       const trigger = editorRef && promptTrigger(parseFromDOM(), getCursorPosition(editorRef))
       if (trigger?.type === "skill") {
-        const available = skills() ?? []
+        const available = skills.latest ?? []
         return (query ? fuzzysort.go(query, available, { key: "name" }).map((item) => item.obj) : available).map(
           (item): AtOption => ({ type: "skill", name: item.name, display: item.name }),
         )
@@ -1425,7 +1439,7 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
         props.onPreparing?.(value)
       },
       model: props.controls.model.selection,
-      skills: () => (skills() ?? []).map((skill) => skill.name),
+      skills: () => (skills.latest ?? []).map((skill) => skill.name),
     })
 
   const handleKeyDown = (event: KeyboardEvent) => {
