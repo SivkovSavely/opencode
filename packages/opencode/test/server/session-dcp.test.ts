@@ -1,6 +1,6 @@
 import { describe, expect } from "bun:test"
 import { ConfigProvider, Effect, Layer } from "effect"
-import { mkdir, rm } from "node:fs/promises"
+import { mkdir, rm, symlink } from "node:fs/promises"
 import path from "node:path"
 import { testEffect } from "../lib/effect"
 import { tmpdirScoped } from "../fixture/fixture"
@@ -67,6 +67,14 @@ describe("session DCP HTTP endpoint", () => {
         state: "available",
         stats: { historicalRemovedTokens: 12 },
       })
+      const alias = path.join(other, "canonical-alias")
+      yield* Effect.promise(() => symlink(directory, alias))
+      const canonical = yield* requestInDirectory(
+        `/session/${session.id}/dcp?directory=${encodeURIComponent(alias)}`,
+        alias,
+      )
+      expect(canonical.status).toBe(200)
+      expect(yield* canonical.json).toMatchObject({ sessionID: session.id, stats: { historicalRemovedTokens: 12 } })
       const foreign = yield* requestInDirectory(`/session/${session.id}/dcp`, other)
       expect(foreign.status).toBe(403)
       const header = yield* requestInDirectory(`/session/${session.id}/dcp`, directory, {

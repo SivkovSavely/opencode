@@ -2,8 +2,8 @@ import { expect } from "bun:test"
 import { NodeHttpServer } from "@effect/platform-node"
 import { ConfigProvider, Context, Effect, Layer, Schema } from "effect"
 import { HttpClient, HttpClientRequest, HttpServer, HttpServerRequest, HttpServerResponse } from "effect/unstable/http"
-import { mkdir, rm } from "node:fs/promises"
-import { createServer } from "node:http"
+import { mkdir, rename, rm, stat } from "node:fs/promises"
+import { createServer, request } from "node:http"
 import path from "node:path"
 import { registerAdapter } from "../../src/control-plane/adapters"
 import { Project } from "../../src/project/project"
@@ -27,7 +27,7 @@ const it = testEffect(
   ),
 )
 
-it.live("DCP uses recorded remote placement and rejects conflicting scope before proxying", () =>
+it.live("DCP proxies a remote-only session directory and rejects every conflicting selector", () =>
   Effect.gen(function* () {
     const directory = yield* tmpdirScoped({ git: true })
     const other = yield* tmpdirScoped()
@@ -81,7 +81,9 @@ it.live("DCP uses recorded remote placement and rejects conflicting scope before
         Effect.ignore,
       ),
     )
-    const created = yield* requestInDirectory("/session", directory, {
+    const sessionDirectory = path.join(directory, "remote project, feature")
+    yield* Effect.promise(() => mkdir(sessionDirectory))
+    const created = yield* requestInDirectory("/session", sessionDirectory, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ title: "Remote DCP", workspaceID: workspace.id }),
@@ -91,23 +93,110 @@ it.live("DCP uses recorded remote placement and rejects conflicting scope before
     const sessions = yield* Session.Service
     yield* sessions.setWorkspace({ sessionID: SessionID.make(session.id), workspaceID: workspace.id })
     expect((yield* sessions.get(SessionID.make(session.id))).workspaceID).toBe(workspace.id)
+    // The admitted path is now present only on the remote host, not on the origin.
+    yield* Effect.promise(() => rename(sessionDirectory, path.join(directory, "relocated session")))
+    expect(
+      yield* Effect.tryPromise({ try: () => stat(sessionDirectory), catch: (error) => error }).pipe(Effect.flip),
+    ).toMatchObject({ code: "ENOENT" })
+    expect((yield* sessions.get(SessionID.make(session.id))).directory).toBe(sessionDirectory)
     const file = path.join(process.env.XDG_DATA_HOME ?? "", "opencode/storage/plugin/dcp", `${session.id}.json`)
     yield* Effect.promise(() => mkdir(path.dirname(file), { recursive: true }))
     yield* Effect.addFinalizer(() => Effect.promise(() => rm(file, { force: true })))
     yield* Effect.promise(() => Bun.write(file, '{"prune":{},"stats":{"totalPruneTokens":111}}'))
-    const response = yield* requestInDirectory(`/session/${session.id}/dcp`, directory)
+    const response = yield* requestInDirectory(`/session/${session.id}/dcp`, sessionDirectory)
     expect(response.status).toBe(200)
     expect(yield* response.json).toMatchObject({ sessionID: session.id, stats: { historicalRemovedTokens: 321 } })
     expect(requests).toHaveLength(1)
     expect(requests[0].headers).toMatchObject({ authorization: "Bearer remote-credential" })
     expect(requests[0].headers).not.toHaveProperty("x-opencode-directory")
     expect(new URL(requests[0].url).searchParams.has("workspace")).toBe(false)
-    const foreign = yield* requestInDirectory(`/session/${session.id}/dcp`, other)
-    expect(foreign.status).toBe(403)
-    const mixed = yield* HttpClientRequest.get(
-      `/session/${session.id}/dcp?directory=${encodeURIComponent(directory)}&workspace=wrk_wrong`,
-    ).pipe(HttpClientRequest.setHeader("x-opencode-directory", directory), HttpClient.execute)
-    expect(mixed.status).toBe(403)
-    expect(requests).toHaveLength(1)
+    const encoded = encodeURIComponent(sessionDirectory)
+    const queryOnly = yield* HttpClientRequest.get(`/session/${session.id}/dcp?directory=${encoded}`).pipe(
+      HttpClient.execute,
+    )
+    expect(queryOnly.status).toBe(200)
+    expect(yield* queryOnly.json).toMatchObject({ sessionID: session.id, stats: { historicalRemovedTokens: 321 } })
+    for (const query of [
+      `directory=${encoded}`,
+      `directory=${encoded}&directory=${encoded}&workspace=${workspace.id}&workspace=${workspace.id}`,
+    ]) {
+      const repeated = yield* requestInDirectory(`/session/${session.id}/dcp?${query}`, encoded, {
+        headers: { "x-opencode-workspace": workspace.id },
+      })
+      expect(repeated.status).toBe(200)
+      expect(yield* repeated.json).toMatchObject({ sessionID: session.id, stats: { historicalRemovedTokens: 321 } })
+    }
+    expect(requests).toHaveLength(4)
+    for (const input of [
+      { query: "", directory: other },
+      { query: `directory=${encoded}`, directory: other },
+      { query: `directory=${encodeURIComponent(other)}`, directory: sessionDirectory },
+      { query: `directory=${encoded}&directory=${encodeURIComponent(other)}`, directory: sessionDirectory },
+      { query: `directory=${encodeURIComponent(other)}&directory=${encoded}`, directory: sessionDirectory },
+      { query: `workspace=${workspace.id}&workspace=wrk_wrong`, directory: sessionDirectory },
+      { query: `workspace=wrk_wrong&workspace=${workspace.id}`, directory: sessionDirectory },
+      { query: `workspace=${workspace.id}`, directory: sessionDirectory, workspace: "wrk_wrong" },
+      { query: "workspace=wrk_wrong", directory: sessionDirectory, workspace: workspace.id },
+    ]) {
+      const denied = yield* requestInDirectory(`/session/${session.id}/dcp?${input.query}`, input.directory, {
+        headers: input.workspace === undefined ? {} : { "x-opencode-workspace": input.workspace },
+      })
+      expect(denied.status).toBe(403)
+      expect(requests).toHaveLength(4)
+    }
+    const server = yield* HttpServer.HttpServer
+    const rawRequest = (headers: string[], query = "") =>
+      Effect.callback<number | undefined, Error>((resume) => {
+        const url = new URL(`/session/${session.id}/dcp${query}`, HttpServer.formatAddress(server.address))
+        const client = request(url, { headers: ["Host", url.host, ...headers], agent: false }, (response) => {
+          response.once("error", (error) => resume(Effect.fail(error)))
+          response.once("end", () => resume(Effect.succeed(response.statusCode)))
+          response.resume()
+        })
+        client.once("error", (error) => resume(Effect.fail(error)))
+        client.end()
+        return Effect.sync(() => {
+          client.destroy()
+        })
+      })
+    for (const value of [sessionDirectory, encoded]) {
+      expect(yield* rawRequest(["x-opencode-directory", value, "x-opencode-workspace", workspace.id])).toBe(200)
+    }
+    expect(requests).toHaveLength(6)
+    for (const input of [
+      { headers: ["X-OpenCode-Directory", path.join(directory, "remote project"), "x-opencode-directory", "feature"] },
+      {
+        headers: ["x-opencode-directory", path.join(directory, "remote project"), "X-OpenCode-Directory", "feature"],
+        query: `?directory=${encoded}`,
+      },
+      { headers: ["x-opencode-directory", sessionDirectory, "x-opencode-directory", sessionDirectory] },
+      { headers: ["x-opencode-directory", sessionDirectory, "x-opencode-directory", other] },
+      {
+        headers: [
+          "x-opencode-directory",
+          sessionDirectory,
+          "x-opencode-workspace",
+          workspace.id,
+          "X-OpenCode-Workspace",
+          workspace.id,
+        ],
+      },
+      {
+        headers: [
+          "x-opencode-directory",
+          sessionDirectory,
+          "x-opencode-workspace",
+          workspace.id,
+          "X-OpenCode-Workspace",
+          "wrk_wrong",
+        ],
+        query: `?workspace=${workspace.id}`,
+      },
+      { headers: ["x-opencode-directory", sessionDirectory], query: `?directory=${encodeURIComponent(other)}` },
+      { headers: ["x-opencode-directory", other], query: `?directory=${encoded}` },
+    ]) {
+      expect(yield* rawRequest(input.headers, input.query)).toBe(403)
+      expect(requests).toHaveLength(6)
+    }
   }),
 )

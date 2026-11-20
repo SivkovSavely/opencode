@@ -15,6 +15,7 @@ import * as Socket from "effect/unstable/socket/Socket"
 import { ForbiddenError, InvalidRequestError } from "../errors"
 import { ManagedWorkspace } from "@/server/managed-workspace"
 import { realpath } from "node:fs/promises"
+import { IncomingMessage } from "node:http"
 import path from "node:path"
 
 // Query fields this middleware reads from the URL. Spread into every
@@ -280,12 +281,21 @@ function routeHttpApiWorkspace<E>(
         }),
         { status: 403 },
       )
+      // Node joins physical header fields with commas, which are valid path characters.
+      const source = request.source
+      if (
+        source instanceof IncomingMessage &&
+        ["x-opencode-directory", "x-opencode-workspace"].some((name) => (source.headersDistinct[name]?.length ?? 0) > 1)
+      )
+        return denied
       const workspaces = [
         ...url.searchParams.getAll("workspace"),
         ...(request.headers["x-opencode-workspace"] === undefined ? [] : [request.headers["x-opencode-workspace"]]),
       ]
       if (workspaces.some((workspace) => workspace !== session.workspaceID)) return denied
       for (const directory of [...url.searchParams.getAll("directory"), ...(decoded === undefined ? [] : [decoded])]) {
+        // A recorded remote directory need not exist on the control-plane host.
+        if (directory === session.directory) continue
         const canonical = yield* Effect.tryPromise(() => realpath(path.resolve(directory))).pipe(
           Effect.catch(() => Effect.void),
         )
