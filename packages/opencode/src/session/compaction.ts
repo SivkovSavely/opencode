@@ -4,6 +4,7 @@ import { ConfigV1 } from "@opencode-ai/core/v1/config/config"
 import { Session } from "./session"
 import { SessionID, MessageID, PartID } from "./schema"
 import { Provider } from "@/provider/provider"
+import { ModelReference } from "@/provider/model-reference"
 import { MessageV2 } from "./message-v2"
 import { Token } from "@/util/token"
 import { SessionProcessor } from "./processor"
@@ -375,6 +376,7 @@ const layer = Layer.effect(
             .getModel(ProviderV2.ID.make(fallback.providerID), ModelV2.ID.make(fallback.modelID))
             .pipe(Effect.orDie)
       const variant = agent.model ? (agent.variant ?? "default") : (fallback.variant ?? "default")
+      if (agent.model) ModelReference.validateVariant(model, agent.variant)
       if (action && variant !== "default" && !model.variants?.[variant])
         throw new Error("unsupported_variant: compaction selection is unavailable")
       const configuredSelection = agent.model

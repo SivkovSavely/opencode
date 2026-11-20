@@ -1498,6 +1498,136 @@ const queuedPrompt = (text: string): SessionQueueV1.Payload => ({
   parts: [{ type: "text", text }],
 })
 
+for (const selection of [
+  { model: "unavailable/model", expected: undefined },
+  { model: "unavailable/model#high", expected: undefined },
+  { model: "test/sol#unsupported", expected: undefined },
+  { model: "test/sol#default", expected: "default" },
+  { model: "test/sol#xhigh", expected: "xhigh" },
+  { model: "test/sol#unsupported", variant: "xhigh", expected: "xhigh" },
+]) {
+  it.instance(`selected agent model ${JSON.stringify(selection)} is validated before execution`, () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig((url) => ({
+        ...composerConfig(url),
+        agent: { optional: { model: selection.model } },
+      }))
+      const { prompt, sessions, chat } = yield* boot()
+      const agents = yield* AgentSvc.Service
+      expect((yield* agents.get("build")).name).toBe("build")
+      const before = yield* sessions.messages({ sessionID: chat.id })
+      const invalid = selection.expected === undefined
+      for (const queued of [false, true]) {
+        const exit = queued
+          ? yield* prompt
+              .textPayload(chat.id, "selected agent", { agent: "optional", variant: selection.variant })
+              .pipe(Effect.asVoid, Effect.exit)
+          : yield* prompt
+              .prompt({
+                sessionID: chat.id,
+                agent: "optional",
+                variant: selection.variant,
+                noReply: true,
+                parts: [{ type: "text", text: "selected agent" }],
+              })
+              .pipe(Effect.asVoid, Effect.exit)
+        if (invalid) {
+          expect(Exit.isFailure(exit)).toBe(true)
+          if (Exit.isFailure(exit))
+            expect(Cause.pretty(exit.cause)).toContain(
+              selection.model.startsWith("unavailable/") ? "unavailable" : "Variant",
+            )
+          expect(yield* sessions.messages({ sessionID: chat.id })).toEqual(before)
+        }
+        if (!invalid) {
+          expect(Exit.isSuccess(exit)).toBe(true)
+          const users = (yield* sessions.messages({ sessionID: chat.id })).filter((msg) => msg.info.role === "user")
+          expect(users[0]?.info).toMatchObject({
+            model: { providerID: "test", modelID: "sol", variant: selection.expected },
+          })
+        }
+      }
+      expect(yield* llm.calls).toBe(0)
+    }),
+  )
+}
+
+for (const variant of ["default", "xhigh"]) {
+  it.instance(`stored session variants override invalid agent defaults: ${variant}`, () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig((url) => ({
+        ...composerConfig(url),
+        agent: { optional: { model: "test/sol#unsupported" } },
+      }))
+      const { prompt, sessions, chat } = yield* boot()
+      yield* sessions.setAgentModel({
+        sessionID: chat.id,
+        agent: "optional",
+        model: { providerID: ref.providerID, id: ModelV2.ID.make("sol"), variant },
+        time: Date.now(),
+      })
+      const payload = yield* prompt.textPayload(chat.id, "use the stored variant")
+      expect(payload.variant).toBe(variant)
+      expect(payload.selection?.variant).toBe(variant)
+      if (payload.kind !== "prompt") throw new Error("Expected a prompt payload")
+      const message = yield* prompt.prompt({
+        ...payload,
+        sessionID: chat.id,
+        model: {
+          providerID: ProviderV2.ID.make(payload.model.providerID),
+          modelID: ModelV2.ID.make(payload.model.modelID),
+        },
+        noReply: true,
+      })
+      expect(message.info).toMatchObject({
+        agent: "optional",
+        model: { providerID: "test", modelID: "sol", variant },
+      })
+      expect(yield* llm.calls).toBe(0)
+    }),
+  )
+}
+
+for (const selection of [
+  { model: "test/sol#unsupported", valid: false },
+  { model: "test/sol#default", valid: true },
+  { model: "test/sol#unsupported", variant: "xhigh", valid: true },
+]) {
+  it.instance(`automatic title validates its selected agent: ${JSON.stringify(selection)}`, () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig((url) => ({
+        ...composerConfig(url),
+        agent: { title: { model: selection.model, variant: selection.variant } },
+      }))
+      const { prompt, sessions, chat } = yield* boot({})
+      const logs: string[] = []
+      yield* llm.textMatch((hit) => hit.body.model === "luna", "Main response")
+      yield* prompt
+        .prompt({
+          sessionID: chat.id,
+          model: { providerID: ref.providerID, modelID: ModelV2.ID.make("luna") },
+          parts: [{ type: "text", text: "hello" }],
+        })
+        .pipe(Effect.provide(Logger.layer([Logger.make((options) => logs.push(Bun.inspect(options.message)))])))
+      yield* pollWithTimeout(
+        sessions
+          .get(chat.id)
+          .pipe(
+            Effect.map((session) =>
+              session.title !== chat.title || logs.some((log) => log.includes("Variant")) ? true : undefined,
+            ),
+          ),
+        "automatic title did not finish",
+      )
+      const requests = yield* llm.inputs
+      expect(requests.filter((input) => input.model === "sol")).toHaveLength(selection.valid ? 1 : 0)
+      expect(requests.filter((input) => input.model === "luna")).toHaveLength(1)
+      expect((yield* sessions.get(chat.id)).title).toBe(selection.valid ? "E2E Title" : chat.title)
+      if (!selection.valid) expect(logs.join("\n")).toContain('Variant "unsupported"')
+    }),
+  )
+}
+
 it.instance("composer selection inherits admitted parent pairs without changing persistent fallback", () =>
   Effect.gen(function* () {
     const { llm } = yield* useServerConfig((url) => ({

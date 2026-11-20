@@ -286,10 +286,6 @@ const layer = Layer.effect(
           }
           item.variant = value.variant ?? item.variant
           if (item.variant === "") throw new Error("Model variant must not be empty")
-          if (item.model && item.variant !== undefined) {
-            const model = yield* provider.getModel(item.model.providerID, item.model.modelID).pipe(Effect.orDie)
-            ModelReference.validateVariant(model, item.variant)
-          }
           item.prompt = value.prompt ?? item.prompt
           item.description = value.description ?? item.description
           item.temperature = value.temperature ?? item.temperature

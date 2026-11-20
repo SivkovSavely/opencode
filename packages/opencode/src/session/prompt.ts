@@ -10,6 +10,7 @@ import { Session } from "./session"
 import { McpActivation } from "./mcp-activation"
 import { Agent } from "../agent/agent"
 import { Provider } from "@/provider/provider"
+import { ModelReference } from "@/provider/model-reference"
 
 import { type Tool as AITool, tool, jsonSchema } from "ai"
 import type { JSONSchema7 } from "@ai-sdk/provider"
@@ -451,6 +452,10 @@ const layer = Layer.effect(
         ? yield* provider.getModel(ag.model.providerID, ag.model.modelID)
         : ((yield* provider.getSmallModel(input.providerID)) ??
           (yield* provider.getModel(input.providerID, input.modelID)))
+      if (ag.model)
+        yield* Effect.sync(() => ModelReference.validateVariant(mdl, ag.variant)).pipe(
+          Effect.onError((cause) => Effect.logError("invalid title agent variant", { error: Cause.squash(cause) })),
+        )
       const msgs = onlySubtasks
         ? [{ role: "user" as const, content: subtasks.map((p) => p.prompt).join("\n") }]
         : yield* MessageV2.toModelMessagesEffect(context, mdl)
@@ -1183,7 +1188,11 @@ const layer = Layer.effect(
       const model =
         selection?.model ??
         (!selection?.agent && session.model
-          ? yield* currentModel(sessionID)
+          ? {
+              providerID: session.model.providerID,
+              modelID: session.model.id,
+              variant: session.model.variant,
+            }
           : (agent.model ?? (yield* currentModel(sessionID))))
       const full = yield* provider
         .getModel(ProviderV2.ID.make(model.providerID), ModelV2.ID.make(model.modelID))
@@ -1192,7 +1201,7 @@ const layer = Layer.effect(
       const variant =
         selection?.variant ??
         ("variant" in model && typeof model.variant === "string" ? model.variant : undefined) ??
-        (same && agent.variant && Object.hasOwn(full.variants ?? {}, agent.variant) ? agent.variant : undefined) ??
+        (same ? agent.variant : undefined) ??
         "default"
       if (variant !== "default" && !Object.hasOwn(full.variants ?? {}, variant))
         return yield* Effect.die(new Error(`Variant not found: ${variant}`))
@@ -1236,16 +1245,10 @@ const layer = Layer.effect(
 
       const model = input.model ?? ag.model ?? (yield* currentModel(input.sessionID))
       const same = ag.model && model.providerID === ag.model.providerID && model.modelID === ag.model.modelID
-      const full =
-        !resolved && !input.variant && ag.variant && same
-          ? yield* provider
-              .getModel(model.providerID, model.modelID)
-              .pipe(Effect.catchIf(Provider.ModelNotFoundError.isInstance, () => Effect.succeed(undefined)))
-          : undefined
       const variant =
         input.variant ??
         (input.selection && "variant" in model && typeof model.variant === "string" ? model.variant : undefined) ??
-        (!resolved && ag.variant && full?.variants?.[ag.variant] ? ag.variant : undefined)
+        (!resolved && same ? ag.variant : undefined)
 
       if (!notificationLink) {
         yield* SessionHandoffEnrollment.preparing(database, input.sessionID, reservation).pipe(Effect.orDie)
@@ -1690,7 +1693,7 @@ const layer = Layer.effect(
 
       const save = (active?: SessionV1.User["model"], cancelledFence?: number) =>
         Effect.gen(function* () {
-          if ((input.selection || input.variant) && !resolved) {
+          if ((input.selection || input.variant || same) && !resolved) {
             const inherited = input.selection?.inheritActive ? active : undefined
             const selected = input.selection?.model ?? inherited ?? info.model
             const full = yield* getModel(
@@ -1700,17 +1703,26 @@ const layer = Layer.effect(
             )
             const variant = input.selection?.variant ?? inherited?.variant ?? info.model.variant ?? "default"
             const supported = variant === "default" || Object.hasOwn(full.variants ?? {}, variant)
-            if ((input.selection ? input.selection.variant !== undefined : input.variant) && !supported) {
+            const configured =
+              selected.providerID === ag.model?.providerID &&
+              selected.modelID === ag.model.modelID &&
+              variant === ag.variant
+            if (
+              ((input.selection ? input.selection.variant !== undefined : input.variant) || configured) &&
+              !supported
+            ) {
               if (delivery?.origin?.type === "scheduled" && delivery.state === "claimed")
                 yield* queue.releaseClaim(input.sessionID, delivery.id).pipe(Effect.orDie)
               return yield* new InputError({
                 message: `Variant not found: "${variant}" for ${selected.providerID}/${selected.modelID}`,
               })
             }
-            info.model = {
-              providerID: ProviderV2.ID.make(selected.providerID),
-              modelID: ModelV2.ID.make(selected.modelID),
-              variant: supported ? variant : "default",
+            if (input.selection || input.variant) {
+              info.model = {
+                providerID: ProviderV2.ID.make(selected.providerID),
+                modelID: ModelV2.ID.make(selected.modelID),
+                variant: supported ? variant : "default",
+              }
             }
           }
           yield* db

@@ -276,8 +276,6 @@ for (const input of [
   { model: "test/nested/model#", variant: undefined },
   { model: "test/nested/model#high#low", variant: undefined },
   { model: "test/nested/model", variant: "" },
-  { model: "test/nested/model#unsupported", variant: undefined },
-  { model: "test/nested/model", variant: "unsupported" },
 ]) {
   it.instance(
     `agent model reference rejects ${input.model} with variant ${input.variant}`,
@@ -296,6 +294,33 @@ for (const input of [
           },
         },
         agent: { build: { model: input.model, variant: input.variant } },
+      },
+    },
+  )
+}
+
+for (const model of ["unavailable/model", "unavailable/model#high", "test/nested/model#unsupported"]) {
+  it.instance(
+    `unused optional agent ${model} does not prevent registry access`,
+    () =>
+      Effect.gen(function* () {
+        const agents = yield* Agent.Service
+        expect((yield* agents.list()).map((agent) => agent.name)).toContain("optional")
+        expect((yield* agents.get("build")).variant).toBe("high")
+        expect((yield* agents.defaultInfo()).name).toBe("build")
+        expect(yield* agents.defaultAgent()).toBe("build")
+        expect((yield* agents.get("optional")).variant).toBe(model.split("#")[1])
+      }),
+    {
+      config: {
+        provider: {
+          test: {
+            npm: "@ai-sdk/openai-compatible",
+            models: { "nested/model": { variants: { high: {} } } },
+            options: { apiKey: "test-key" },
+          },
+        },
+        agent: { build: { model: "test/nested/model#high" }, optional: { model } },
       },
     },
   )

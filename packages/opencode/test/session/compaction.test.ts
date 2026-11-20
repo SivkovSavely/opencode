@@ -818,6 +818,26 @@ describe("session.compaction.prune", () => {
 })
 
 describe("session.compaction.process", () => {
+  it.instance(
+    "rejects an unsupported configured compaction variant only when selected",
+    () =>
+      Effect.gen(function* () {
+        const agents = yield* Agent.Service
+        expect((yield* agents.get("build")).name).toBe("build")
+        const sessions = yield* SessionNs.Service
+        const session = yield* sessions.create({})
+        const parent = yield* createUserMessage(session.id, "hello")
+        const messages = yield* sessions.messages({ sessionID: session.id })
+        const exit = yield* SessionCompaction.use
+          .process({ parentID: parent.id, messages, sessionID: session.id, auto: false })
+          .pipe(Effect.exit)
+        expect(Exit.isFailure(exit)).toBe(true)
+        if (Exit.isFailure(exit)) expect(Cause.pretty(exit.cause)).toContain("Model has no variants")
+        expect(yield* sessions.messages({ sessionID: session.id })).toEqual(messages)
+      }),
+    { config: { agent: { compaction: { model: "test/test-model#unsupported" } } } },
+  )
+
   itCompaction.instance("native compress queues history and keeps the summary provider inside the root permit", () => {
     const provider = llm()
     return Effect.gen(function* () {
