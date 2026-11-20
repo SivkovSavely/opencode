@@ -7,7 +7,7 @@ import { DataProvider } from "@opencode-ai/session-ui/context"
 import "../../src/index.css"
 
 const params = new URLSearchParams(location.search)
-document.documentElement.dataset.newLayoutDesigns = params.get("layout") ?? "true"
+document.body.toggleAttribute("data-new-layout", params.get("layout") !== "false")
 document.documentElement.dir = params.get("dir") ?? "ltr"
 document.documentElement.lang = params.get("lang") ?? "en"
 localStorage.setItem("opencode-color-scheme", params.get("theme") ?? "light")
@@ -60,16 +60,14 @@ function Fixture() {
                 session_diff: {},
                 message: {},
                 part: {},
-                get config() {
-                  return { shell: state.shell }
-                },
+                config: { shell: "bash" },
               }}
             >
               <Dynamic
                 component={getTool(tool)}
                 tool={tool}
                 input={{ command: state.command }}
-                metadata={{}}
+                metadata={{ shell: state.shell || undefined }}
                 output={state.output}
                 status={state.status}
               />

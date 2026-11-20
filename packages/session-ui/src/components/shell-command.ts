@@ -71,7 +71,8 @@ export function formatShellCommand(source: string, shell?: string): string {
     boundaries.push({
       start: index,
       end: end + next,
-      text: char === ";" ? ";\n" : `${/[ \t]/.test(source[index - 1] ?? "") ? "" : " "}\\\n  ${pair} `,
+      // Escaping the newline also keeps semicolon lists on one logical line for alias parsing.
+      text: char === ";" ? "; \\\n" : `${/[ \t]/.test(source[index - 1] ?? "") ? "" : " "}\\\n  ${pair} `,
     })
     command = false
     checked = false

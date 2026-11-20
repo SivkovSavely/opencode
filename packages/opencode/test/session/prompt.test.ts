@@ -50,6 +50,7 @@ import { SessionStatus } from "../../src/session/status"
 import { SessionV2 } from "@opencode-ai/core/session"
 import { SessionExecution } from "@opencode-ai/core/session/execution"
 import { InstanceStore } from "@/project/instance-store"
+import { InstanceState } from "@/effect/instance-state"
 import { Skill } from "../../src/skill"
 import { SystemPrompt } from "../../src/session/system"
 import { Shell } from "@opencode-ai/core/shell"
@@ -7079,6 +7080,66 @@ noLLMServer.instance("assertNotBusy succeeds when idle", () =>
 
 // Shell semantics
 
+for (const configured of [undefined, "/bin/bash"]) {
+  unixNoLLMServer(
+    `shell records its selected ${configured ?? "default"} interpreter independently of later config`,
+    () =>
+      withSh(() =>
+        Effect.gen(function* () {
+          const instance = yield* TestInstance
+          const config = yield* Config.Service
+          const events = yield* EventV2Bridge.Service
+          const { prompt, sessions, chat } = yield* boot()
+          const updates: { shell: unknown; output: unknown }[] = []
+          const decode = Schema.decodeUnknownExit(MessageV2.Event.PartUpdated.data)
+          const off = yield* events.listen((event) => {
+            if (event.type !== MessageV2.Event.PartUpdated.type) return Effect.void
+            const data = decode(event.data)
+            if (Exit.isFailure(data)) return Effect.void
+            const part = data.value.part
+            if (
+              part.sessionID === chat.id &&
+              part.type === "tool" &&
+              part.state.status === "running" &&
+              part.state.metadata
+            ) {
+              updates.push({ shell: part.state.metadata.shell, output: part.state.metadata.output })
+            }
+            return Effect.void
+          })
+          yield* Effect.addFinalizer(() => off)
+          const result = yield* prompt.shell({ sessionID: chat.id, agent: "build", command: "printf interpreter" })
+          yield* off
+
+          const selected = configured ?? "/bin/sh"
+          expect(completedTool(result.parts)?.state).toMatchObject({
+            input: { command: "printf interpreter" },
+            metadata: { shell: selected, output: "interpreter" },
+            output: "interpreter",
+          })
+          expect(updates[0]).toEqual({ shell: selected, output: "" })
+          expect(updates.some((update) => update.output === "interpreter")).toBe(true)
+          expect(updates.every((update) => update.shell === selected)).toBe(true)
+
+          const changed = configured ? "/bin/sh" : "/bin/bash"
+          yield* writeConfig(instance.directory, { ...cfg, shell: changed })
+          const context = yield* InstanceState.context
+          yield* config.reload(InstanceState.reload([context]))
+          expect((yield* config.get()).shell).toBe(changed)
+          const stored = (yield* sessions.messages({ sessionID: chat.id })).find(
+            (message) => message.info.id === result.info.id,
+          )
+          expect(completedTool(stored?.parts ?? [])?.state.metadata).toEqual({
+            shell: selected,
+            output: "interpreter",
+          })
+        }),
+      ),
+    { config: { ...cfg, ...(configured ? { shell: configured } : {}) } },
+    10_000,
+  )
+}
+
 unixNoLLMServer(
   "managed profile rejects session shell and command expansion before execution",
   () =>
@@ -7314,7 +7375,10 @@ unixNoLLMServer(
             const msgs = yield* MessageV2.filterCompactedEffect(chat.id)
             const taskMsg = msgs.find((item) => item.info.role === "assistant")
             const tool = taskMsg ? toolPart(taskMsg.parts) : undefined
-            if (tool?.state.status === "running" && tool.state.metadata?.output.includes("first")) return true
+            if (tool?.state.status === "running" && tool.state.metadata?.output.includes("first")) {
+              expect(tool.state.metadata.shell).toBe("/bin/sh")
+              return true
+            }
           }),
           "timed out waiting for running shell metadata",
         )
@@ -7468,6 +7532,7 @@ unixNoLLMServer(
           const tool = completedTool(exit.value.parts)
           if (tool) {
             expect(tool.state.output).toContain("User aborted the command")
+            expect(tool.state.metadata.shell).toBe("/bin/sh")
           }
         }
       }),

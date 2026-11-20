@@ -1,5 +1,5 @@
 import { PermissionV1 } from "@opencode-ai/core/v1/permission"
-import { describe, expect } from "bun:test"
+import { describe, expect, spyOn } from "bun:test"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { Cause, Deferred, Effect, Exit, Fiber, Layer, Option, Stream } from "effect"
 import type * as Scope from "effect/Scope"
@@ -27,6 +27,8 @@ import { ManagedCommand } from "@opencode-ai/core/managed-command"
 import { RuntimeLifecycle } from "../../src/server/runtime-lifecycle"
 import { sql } from "drizzle-orm"
 import { randomUUID } from "node:crypto"
+import { InstanceState } from "@/effect/instance-state"
+import { ManagedLinux } from "../../src/tool/shell/managed-linux"
 
 const shellLayer = Layer.mergeAll(
   LayerNode.compile(
@@ -189,6 +191,149 @@ const mustTruncate = (result: {
 }
 
 describe("tool.shell", () => {
+  for (const configured of [undefined, "/bin/bash"]) {
+    wintest(
+      `records the effective interpreter in all metadata for ${configured ?? "the default shell"}`,
+      () =>
+        withShell(
+          { label: "sh", shell: "/bin/sh" },
+          Effect.gen(function* () {
+            const updates: unknown[] = []
+            const result = yield* run(
+              { command: "printf interpreter", timeout: 2000 },
+              {
+                ...ctx,
+                metadata: (value) =>
+                  Effect.sync(() => {
+                    updates.push(value.metadata?.shell)
+                  }),
+              },
+            )
+            expect(result.output).toBe("interpreter")
+            expect(result.metadata.shell).toBe(configured ?? "/bin/sh")
+            expect(updates.length).toBeGreaterThan(1)
+            expect(updates.every((shell) => shell === (configured ?? "/bin/sh"))).toBe(true)
+          }),
+        ),
+      { config: configured ? { shell: configured } : {} },
+    )
+  }
+
+  wintest(
+    "records the initialized interpreter rather than a later config snapshot",
+    () =>
+      Effect.gen(function* () {
+        const config = yield* Config.Service
+        const instance = yield* TestInstance
+        const tool = yield* initShell()
+        yield* Effect.promise(() =>
+          Bun.write(path.join(instance.directory, "opencode.json"), JSON.stringify({ shell: "/bin/sh" })),
+        )
+        const context = yield* InstanceState.context
+        yield* config.reload(InstanceState.reload([context]))
+        expect((yield* config.get()).shell).toBe("/bin/sh")
+        const result = yield* tool.execute({ command: 'printf "%s" "${BASH_VERSION:+bash}"', timeout: 2000 }, ctx)
+        expect(result.output).toBe("bash")
+        expect(result.metadata.shell).toBe("/bin/bash")
+      }),
+    { config: { shell: "/bin/bash" } },
+  )
+
+  wintest(
+    "records the managed forced interpreter when the tool was initialized with bash",
+    () =>
+      Effect.gen(function* () {
+        const tool = yield* initShell()
+        const updates: unknown[] = []
+        const commands: string[][] = []
+        yield* Effect.acquireUseRelease(
+          Effect.sync(() => {
+            const previous = process.env.OPENCODE_MANAGED_PROFILE
+            process.env.OPENCODE_MANAGED_PROFILE = "1"
+            const result: ManagedLinux.Result = {
+              reason: "exit",
+              shellStatus: 7,
+              exitCode: 7,
+              signal: null,
+              termination: { kind: "exit", exitCode: 7 },
+              supervisorSignal: null,
+              stdout: Buffer.from("managed"),
+              stderr: Buffer.alloc(0),
+              truncated: false,
+              cleanup: "confirmed",
+            }
+            const spy = spyOn(ManagedLinux, "prepare").mockImplementation(async (options) => {
+              commands.push([...options.argv])
+              return {
+                start: async () => result,
+                cancel: async () => result,
+                startPaused: async () => true,
+                authorize: () => true,
+                authorizationAcknowledged: Promise.resolve(true),
+                completion: Promise.resolve(result),
+                phase: "completed",
+                async [Symbol.asyncDispose]() {},
+              }
+            })
+            return { previous, spy }
+          }),
+          () =>
+            Effect.gen(function* () {
+              const managedRuntime: NonNullable<Tool.Context["managedRuntime"]> = {
+                runManagedCommand: (_sessionID, prepare) =>
+                  Effect.promise(async () => {
+                    const handle = await prepare(async (open) => {
+                      open()
+                      return true
+                    })
+                    return handle.start()
+                  }),
+              }
+              const result = yield* tool.execute(
+                { command: "printf managed; exit 7", timeout: 2000 },
+                {
+                  ...ctx,
+                  managedRuntime,
+                  executionFence: 1,
+                  metadata: (value) =>
+                    Effect.sync(() => {
+                      updates.push(value.metadata?.shell)
+                    }),
+                },
+              )
+              expect(result.output).toBe("managed")
+              expect(result.metadata.exit).toBe(7)
+              expect(result.metadata.shell).toBe("/bin/sh")
+              expect(updates).toEqual(["/bin/sh"])
+              expect(commands).toHaveLength(1)
+              expect(commands[0]?.[0]).toBe("/bin/sh")
+              expect(commands[0]?.[2]).toContain("exec /bin/sh")
+              expect(commands[0]?.at(-1)).toBe("printf managed; exit 7")
+              const controller = new AbortController()
+              controller.abort()
+              const aborted = yield* tool.execute(
+                { command: "printf managed", timeout: 2000 },
+                {
+                  ...ctx,
+                  abort: controller.signal,
+                  managedRuntime: { runManagedCommand: () => Effect.never },
+                  executionFence: 1,
+                },
+              )
+              expect(aborted.output).toContain("aborted")
+              expect(aborted.metadata.shell).toBe("/bin/sh")
+            }),
+          ({ previous, spy }) =>
+            Effect.sync(() => {
+              spy.mockRestore()
+              if (previous === undefined) delete process.env.OPENCODE_MANAGED_PROFILE
+              else process.env.OPENCODE_MANAGED_PROFILE = previous
+            }),
+        )
+      }),
+    { config: { shell: "/bin/bash" } },
+  )
+
   wintest(
     "coalesces concurrent output without losing final output or publishing after completion",
     () =>
@@ -205,6 +350,7 @@ describe("tool.shell", () => {
                 Effect.sleep("40 millis").pipe(
                   Effect.andThen(
                     Effect.sync(() => {
+                      expect(value.metadata?.shell).toBe(Shell.acceptable())
                       snapshots[index].push(String(value.metadata?.output ?? ""))
                     }),
                   ),
@@ -511,6 +657,7 @@ describe("tool.shell", () => {
               expect(result.output).toContain("managed")
               expect(result.output).toContain("error")
               expect(result.metadata.exit).toBe(7)
+              expect(result.metadata.shell).toBe("/bin/sh")
               const absolute = yield* run(
                 { command: `printf mapped > '${instance.directory}/absolute'; cat '${instance.directory}/absolute'` },
                 context,
@@ -692,6 +839,7 @@ describe("tool.shell", () => {
           )
           expect(result.metadata.exit).toBe(0)
           expect(result.output).toContain("fallback")
+          expect(result.metadata.shell).toBe(Shell.acceptable("fish"))
         }),
       )
     }),

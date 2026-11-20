@@ -107,10 +107,13 @@ describe("shell output renderer", () => {
     "the registered %s renderer is lazy, normalizes output, and survives completion and collapse",
     async (tool) => {
       const spy = spyOn(commandModule, "highlightShellCommand")
+      const formatting = spyOn(commandModule, "formatShellCommand")
       cleanup.push(() => spy.mockRestore())
+      cleanup.push(() => formatting.mockRestore())
       const [open, setOpen] = createSignal(false)
       const [status, setStatus] = createSignal("running")
       const [output, setOutput] = createSignal("\u001b[31mfirst\u001b[0m\r\n")
+      const [metadata, setMetadata] = createSignal({ shell: "/bin/bash", output: "" })
       const host = document.createElement("div")
       document.body.append(host)
       cleanup.push(() => host.remove())
@@ -121,7 +124,9 @@ describe("shell output renderer", () => {
               {
                 tool,
                 input: { command: "echo first; echo second" },
-                metadata: {},
+                get metadata() {
+                  return metadata()
+                },
                 get output() {
                   return output()
                 },
@@ -142,12 +147,14 @@ describe("shell output renderer", () => {
       expect(spy).not.toHaveBeenCalled()
       setOpen(true)
       await highlighted(host)
-      expect(host.querySelector('[data-slot="bash-command"] code')?.textContent).toBe("echo first;\necho second")
+      expect(host.querySelector('[data-slot="bash-command"] code')?.textContent).toBe("echo first; \\\necho second")
       expect(host.querySelector('[data-slot="bash-result"] code')?.textContent).toBe("first\n")
       setOutput("\u001b[32mdone\u001b[0m\r\n\rfinal")
+      setMetadata({ shell: "/bin/bash", output: "done\n\nfinal" })
       setStatus("completed")
       expect(host.querySelector('[data-slot="bash-result"] code')?.textContent).toBe("done\n\nfinal")
       expect(spy).toHaveBeenCalledTimes(1)
+      expect(formatting).toHaveBeenCalledTimes(1)
       setOpen(false)
       expect(host.querySelector('[data-component="bash-output"]')).toBeNull()
       setOpen(true)
@@ -158,7 +165,7 @@ describe("shell output renderer", () => {
   )
 
   test.each(["bash", "shell"])(
-    "normal %s calls follow the selected server/directory config and reliable historical metadata",
+    "historical %s calls require recorded interpreter metadata, independent of later server/directory config",
     async (tool) => {
       const [target, setTarget] = createStore({ server: "one", directory: "/repo" })
       const [configs, setConfigs] = createStore<Record<string, Record<string, { shell?: string }>>>({
@@ -187,26 +194,28 @@ describe("shell output renderer", () => {
       )
       await highlighted(host)
       const text = () => host.querySelector('[data-slot="bash-command"] code')?.textContent
-      expect(text()).toBe("echo first;\necho second")
+      expect(text()).toBe(input.command)
       setTarget("server", "two")
       expect(text()).toBe(input.command)
       setTarget("directory", "/worktree")
-      expect(text()).toBe("echo first;\necho second")
+      expect(text()).toBe(input.command)
       setTarget("server", "one")
       expect(text()).toBe(input.command)
       setConfigs("one", "/worktree", "shell", "/bin/bash")
-      expect(text()).toBe("echo first;\necho second")
+      expect(text()).toBe(input.command)
       setConfigs("one", "/worktree", "shell", undefined)
       expect(text()).toBe(input.command)
       setMetadata("shell", "/bin/bash")
-      expect(text()).toBe("echo first;\necho second")
+      expect(text()).toBe("echo first; \\\necho second")
+      setConfigs("one", "/worktree", "shell", "pwsh")
+      expect(text()).toBe("echo first; \\\necho second")
       setMetadata("shell", "pwsh")
       setConfigs("one", "/worktree", "shell", "/bin/bash")
       expect(text()).toBe(input.command)
       setMetadata("shell", { invalid: true })
-      expect(text()).toBe("echo first;\necho second")
+      expect(text()).toBe(input.command)
       setMetadata("shell", "")
-      expect(text()).toBe("echo first;\necho second")
+      expect(text()).toBe(input.command)
       expect(input.command).toBe("echo first; echo second")
       expect(host.querySelector('[data-slot="bash-result"] code')?.textContent).toBe("plain output")
     },
@@ -217,7 +226,7 @@ describe("shell output renderer", () => {
     const output = "<script>alert(1)</script>\n  echo --flag\n\n"
     const { host } = setup(source, output)
     await highlighted(host)
-    expect(host.querySelector('[data-slot="bash-command"] code')?.textContent).toBe(source.replace("; ", ";\n"))
+    expect(host.querySelector('[data-slot="bash-command"] code')?.textContent).toBe(source.replace("; ", "; \\\n"))
     expect(host.querySelector('[data-slot="bash-result"] code')?.textContent).toBe(output)
     expect(host.querySelectorAll('[data-slot="bash-result"] code span')).toHaveLength(0)
     expect(host.querySelectorAll("img, script")).toHaveLength(0)

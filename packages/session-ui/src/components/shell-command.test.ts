@@ -46,21 +46,21 @@ const redirectedAssignments = [
 describe("shell command formatting", () => {
   test.each([
     ["echo hello", "echo hello"],
-    ["echo one; echo two", "echo one;\necho two"],
+    ["echo one; echo two", "echo one; \\\necho two"],
     [
       'git status --short && git diff --stat; echo "Finished"',
-      'git status --short \\\n  && git diff --stat;\necho "Finished"',
+      'git status --short \\\n  && git diff --stat; \\\necho "Finished"',
     ],
     ["false || echo fallback && printf x | wc -c", "false \\\n  || echo fallback \\\n  && printf x | wc -c"],
-    ['echo "a; b && c || d"; echo next', 'echo "a; b && c || d";\necho next'],
-    ["echo 'literal $(pwd); &&'; echo next", "echo 'literal $(pwd); &&';\necho next"],
-    [String.raw`echo a\;b \&\& c; echo next`, "echo a\\;b \\&\\& c;\necho next"],
-    [String.raw`printf '%s' "alias" 'set' a\lias; echo next`, "printf '%s' \"alias\" 'set' a\\lias;\necho next"],
-    ["VALUE='a>b'; echo next", "VALUE='a>b';\necho next"],
-    [String.raw`VALUE=a\>b; echo next`, "VALUE=a\\>b;\necho next"],
+    ['echo "a; b && c || d"; echo next', 'echo "a; b && c || d"; \\\necho next'],
+    ["echo 'literal $(pwd); &&'; echo next", "echo 'literal $(pwd); &&'; \\\necho next"],
+    [String.raw`echo a\;b \&\& c; echo next`, "echo a\\;b \\&\\& c; \\\necho next"],
+    [String.raw`printf '%s' "alias" 'set' a\lias; echo next`, "printf '%s' \"alias\" 'set' a\\lias; \\\necho next"],
+    ["VALUE='a>b'; echo next", "VALUE='a>b'; \\\necho next"],
+    [String.raw`VALUE=a\>b; echo next`, "VALUE=a\\>b; \\\necho next"],
     [
       "printf first > artifact; cat < artifact; printf second >> artifact",
-      "printf first > artifact;\ncat < artifact;\nprintf second >> artifact",
+      "printf first > artifact; \\\ncat < artifact; \\\nprintf second >> artifact",
     ],
     ["", ""],
     [" \t ", " \t "],
@@ -143,6 +143,78 @@ describe("shell command formatting", () => {
     expect(input.command).toBe(source)
     expect(formatShellCommand(display, "bash")).toBe(display)
   })
+
+  test("preserves logical-line alias parsing from an isolated BASH_ENV", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "opencode-shell-alias-"))
+    const source = "f; hi"
+    const display = formatShellCommand(source, "bash")
+    try {
+      await Bun.write(join(dir, "environment"), "shopt -s expand_aliases\nf() { alias hi='echo REPLACED'; }\n")
+      const results = []
+      for (const command of [source, display]) {
+        const child = Bun.spawn(["bash", "--noprofile", "--norc", "-c", command], {
+          cwd: dir,
+          env: { PATH: "/usr/bin:/bin", HOME: dir, LC_ALL: "C", BASH_ENV: join(dir, "environment") },
+          stdout: "pipe",
+          stderr: "pipe",
+          timeout: 2000,
+        })
+        results.push({
+          stdout: await new Response(child.stdout).text(),
+          stderr: await new Response(child.stderr).text(),
+          exit: await child.exited,
+        })
+      }
+      expect(results[0]?.exit).toBe(127)
+      expect(results[0]?.stdout).toBe("")
+      // A display line break changes diagnostic line numbers, but not alias expansion or execution.
+      expect(results[0]?.stderr).toBe("bash: line 1: hi: command not found\n")
+      expect(results[1]).toEqual({ ...results[0], stderr: "bash: line 2: hi: command not found\n" })
+      expect(display).toBe("f; \\\nhi")
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  test.each(["bash", "sh", "dash", "ash", "ksh", "zsh"].filter((shell) => Bun.which(shell)))(
+    "preserves mixed-list syntax and observable behavior with continuations in %s",
+    async (shell) => {
+      const source = 'printf "%s\\n" "first; literal" > artifact; cat artifact && false || printf "%s" last'
+      const display = formatShellCommand(source, shell)
+      const dir = await mkdtemp(join(tmpdir(), "opencode-shell-dialect-"))
+      try {
+        const syntax = Bun.spawn([shell, "-n", "-c", display], {
+          env: { PATH: "/usr/bin:/bin", HOME: dir, LC_ALL: "C" },
+          stdout: "pipe",
+          stderr: "pipe",
+          timeout: 2000,
+        })
+        expect(await new Response(syntax.stderr).text()).toBe("")
+        expect(await syntax.exited).toBe(0)
+        const results = []
+        for (const command of [source, display]) {
+          const child = Bun.spawn([shell, "-c", command], {
+            cwd: dir,
+            env: { PATH: "/usr/bin:/bin", HOME: dir, LC_ALL: "C" },
+            stdout: "pipe",
+            stderr: "pipe",
+            timeout: 2000,
+          })
+          results.push({
+            stdout: await new Response(child.stdout).text(),
+            stderr: await new Response(child.stderr).text(),
+            exit: await child.exited,
+            file: await readFile(join(dir, "artifact"), "utf8"),
+          })
+        }
+        expect(display).not.toBe(source)
+        expect(results[0]).toEqual({ stdout: "first; literal\nlast", stderr: "", exit: 0, file: "first; literal\n" })
+        expect(results[1]).toEqual(results[0])
+      } finally {
+        await rm(dir, { recursive: true, force: true })
+      }
+    },
+  )
 
   test.each([
     ...[

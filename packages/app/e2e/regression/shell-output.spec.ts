@@ -1,7 +1,7 @@
 import { expect, test } from "@playwright/test"
 
 const source = 'git status --short && printf "%s" "$HOME"; echo "Finished"'
-const formatted = 'git status --short \\\n  && printf "%s" "$HOME";\necho "Finished"'
+const formatted = 'git status --short \\\n  && printf "%s" "$HOME"; \\\necho "Finished"'
 
 for (const layout of ["false", "true"]) {
   for (const theme of ["light", "dark"]) {
@@ -14,6 +14,8 @@ for (const layout of ["false", "true"]) {
         await page.goto(
           `/e2e/fixtures/shell-output.html?layout=${layout}&theme=${theme}&tool=${tool}&dir=${theme === "dark" ? "rtl" : "ltr"}`,
         )
+        if (layout === "true") await expect(page.locator("body")).toHaveAttribute("data-new-layout", "")
+        else await expect(page.locator("body")).not.toHaveAttribute("data-new-layout")
         const wrapper = page.getByRole("region", { name: "Shell tool", exact: true })
         const trigger = wrapper.locator('[data-slot="collapsible-trigger"]')
         await expect(trigger).toHaveAttribute("aria-expanded", "false")
@@ -30,6 +32,22 @@ for (const layout of ["false", "true"]) {
           theme === "dark" ? "44px" : "12px",
         )
         await expect(wrapper.locator('[data-component="bash-output"]')).toHaveCSS("border-radius", "6px")
+        // Fractional border widths can round up; their resolved theme colors identify the active layout rule.
+        const borders = await page.evaluate(() => {
+          const probe = document.createElement("span")
+          document.body.append(probe)
+          const colors = ["var(--border-weak-base)", "var(--v2-border-border-base)"].map((color) => {
+            probe.style.color = color
+            return getComputedStyle(probe).color
+          })
+          probe.remove()
+          return colors
+        })
+        expect(borders[0]).not.toBe(borders[1])
+        await expect(wrapper.locator('[data-component="bash-output"]')).toHaveCSS(
+          "border-top-color",
+          borders[layout === "true" ? 1 : 0]!,
+        )
         expect(
           await output.evaluate((node) =>
             Number.parseFloat(getComputedStyle(node.closest('[data-slot="bash-result"]')!).borderBlockStartWidth),
@@ -87,7 +105,7 @@ for (const layout of ["false", "true"]) {
   }
 }
 
-test("command-only and output-only sections have no divider; unsupported interpreters remain verbatim", async ({
+test("command-only and output-only sections have no divider; missing or unsupported recorded interpreters remain verbatim", async ({
   page,
 }) => {
   await page.goto("/e2e/fixtures/shell-output.html")
@@ -95,6 +113,10 @@ test("command-only and output-only sections have no divider; unsupported interpr
   await wrapper.locator('[data-slot="collapsible-trigger"]').click()
   const command = wrapper.locator('[data-slot="bash-command"] code')
   await expect(command.locator("span")).not.toHaveCount(0)
+  await page.getByRole("textbox", { name: "Interpreter", exact: true }).fill("")
+  await expect(command).toHaveJSProperty("textContent", source)
+  await page.getByRole("textbox", { name: "Interpreter", exact: true }).fill("bash")
+  await expect(command).toHaveJSProperty("textContent", formatted)
   await page.getByRole("textbox", { name: "Interpreter", exact: true }).fill("pwsh")
   await expect(command).toHaveJSProperty("textContent", source)
   await page.getByRole("textbox", { name: "Output", exact: true }).fill("")

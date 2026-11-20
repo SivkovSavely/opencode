@@ -1062,7 +1062,7 @@ const layer = Layer.effect(
                   time: { ...part.state.time, end: completed },
                   input: part.state.input,
                   title: "",
-                  metadata: { output },
+                  metadata: { shell: sh, output },
                   output,
                 }
                 yield* sessions.updatePart(part)
@@ -1072,6 +1072,10 @@ const layer = Layer.effect(
 
           const exit = yield* restore(
             Effect.gen(function* () {
+              if (part.state.status === "running") {
+                part.state.metadata = { shell: sh, output }
+                yield* sessions.updatePart(part)
+              }
               const shellEnv = yield* plugin.trigger(
                 "shell.env",
                 { cwd, sessionID: input.sessionID, callID: part.callID },
@@ -1090,7 +1094,7 @@ const layer = Layer.effect(
                 Effect.gen(function* () {
                   output += chunk
                   if (part.state.status === "running") {
-                    part.state.metadata = { output }
+                    part.state.metadata = { shell: sh, output }
                     yield* sessions.updatePart(part)
                   }
                 }),

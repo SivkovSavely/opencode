@@ -478,6 +478,7 @@ export const ShellTool = Tool.define(
 
       yield* ctx.metadata({
         metadata: {
+          shell: input.shell,
           output: "",
         },
       })
@@ -495,7 +496,9 @@ export const ShellTool = Tool.define(
               while (true) {
                 yield* Effect.sleep("250 millis")
                 yield* Queue.take(updates)
-                yield* ctx.metadata({ metadata: { output: last, ...(file ? { outputPath: file } : {}) } })
+                yield* ctx.metadata({
+                  metadata: { shell: input.shell, output: last, ...(file ? { outputPath: file } : {}) },
+                })
               }
             }),
           )
@@ -529,7 +532,9 @@ export const ShellTool = Tool.define(
                 }
 
                 if (!published) {
-                  yield* ctx.metadata({ metadata: { output: last, ...(file ? { outputPath: file } : {}) } })
+                  yield* ctx.metadata({
+                    metadata: { shell: input.shell, output: last, ...(file ? { outputPath: file } : {}) },
+                  })
                   published = true
                   yield* Deferred.succeed(first, undefined)
                   return
@@ -619,6 +624,7 @@ export const ShellTool = Tool.define(
       return {
         title: input.command,
         metadata: {
+          shell: input.shell,
           output: last || preview(output),
           exit: code,
           truncated: cut,
@@ -685,6 +691,7 @@ export const ShellTool = Tool.define(
                 const { ManagedLinux } = yield* Effect.promise(() => import("./shell/managed-linux"))
                 const gitDirectory = yield* Effect.promise(() => ManagedGit.directory(workspace))
                 const limits = yield* trunc.limits()
+                yield* ctx.metadata({ metadata: { shell: executionShell, output: "" } })
                 const abort = Effect.callback<null>((resume) => {
                   if (ctx.abort.aborted) return resume(Effect.succeed(null))
                   const handler = () => resume(Effect.succeed(null))
@@ -725,7 +732,7 @@ export const ShellTool = Tool.define(
                 if (!result)
                   return {
                     title: params.command,
-                    metadata: { output: "", exit: null, truncated: false },
+                    metadata: { shell: executionShell, output: "", exit: null, truncated: false },
                     output: "User aborted the command",
                   }
                 const raw = [result.stdout.toString("utf8"), result.stderr.toString("utf8")].filter(Boolean).join("\n")
@@ -743,7 +750,12 @@ export const ShellTool = Tool.define(
                   (notes.length ? `\n\n<shell_metadata>\n${notes.join("\n")}\n</shell_metadata>` : "")
                 return {
                   title: params.command,
-                  metadata: { output: preview(output), exit: result.shellStatus, truncated: cut },
+                  metadata: {
+                    shell: executionShell,
+                    output: preview(output),
+                    exit: result.shellStatus,
+                    truncated: cut,
+                  },
                   output,
                 }
               }

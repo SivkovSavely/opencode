@@ -2149,17 +2149,12 @@ ToolRegistry.register({
 ToolRegistry.register({
   name: "shell",
   render(props) {
-    const data = useData()
     const i18n = useI18n()
     const pending = () => props.status === "pending" || props.status === "running"
     const sawPending = pending()
     const command = createMemo(() => props.input.command ?? props.metadata.command ?? "")
     const output = createMemo(() => stripAnsi(props.output || props.metadata.output || "").replace(/\r\n?/g, "\n"))
-    const shell = createMemo(() =>
-      [props.metadata.shell, data.store.config?.shell].find(
-        (shell): shell is string => typeof shell === "string" && !!shell.trim(),
-      ),
-    )
+    const shell = createMemo(() => (typeof props.metadata.shell === "string" ? props.metadata.shell : undefined))
 
     return (
       <BasicTool

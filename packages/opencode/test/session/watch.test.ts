@@ -247,7 +247,7 @@ it.live("direct shell success publishes one completed outcome and automatically 
               status: "completed",
               input: { command: "printf SHELL_SUCCESS" },
               output: "SHELL_SUCCESS",
-              metadata: { output: "SHELL_SUCCESS" },
+              metadata: { shell: "/bin/sh", output: "SHELL_SUCCESS" },
               title: "",
             },
           },
@@ -256,7 +256,7 @@ it.live("direct shell success publishes one completed outcome and automatically 
           result.parts.map((part) =>
             part.type === "tool" && part.state.status === "completed" ? part.state.metadata : undefined,
           ),
-        ).toEqual([{ output: "SHELL_SUCCESS" }])
+        ).toEqual([{ shell: "/bin/sh", output: "SHELL_SUCCESS" }])
         expect(
           yield* f.database.db.get(
             sql`SELECT state, result, message_id FROM session_watch_execution WHERE session_id = ${source.id}`,
@@ -318,7 +318,7 @@ it.live("direct shell nonzero exit records failure without changing its returned
               status: "completed",
               input: { command: "printf SHELL_FAILURE; exit 7" },
               output: "SHELL_FAILURE",
-              metadata: { output: "SHELL_FAILURE" },
+              metadata: { shell: "/bin/sh", output: "SHELL_FAILURE" },
               title: "",
             },
           },
@@ -327,7 +327,7 @@ it.live("direct shell nonzero exit records failure without changing its returned
           result.parts.map((part) =>
             part.type === "tool" && part.state.status === "completed" ? part.state.metadata : undefined,
           ),
-        ).toEqual([{ output: "SHELL_FAILURE" }])
+        ).toEqual([{ shell: "/bin/sh", output: "SHELL_FAILURE" }])
         expect(
           (yield* sessions.messages({ sessionID: source.id })).find((item) => item.info.id === result.info.id)?.parts,
         ).toEqual(result.parts)
