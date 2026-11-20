@@ -25,17 +25,9 @@ import { Filesystem } from "@/util/filesystem"
 import { createOpencodeClient, type OpencodeClient, type ToolPart } from "@opencode-ai/sdk/v2"
 import { FormatError, FormatUnknownError } from "../error"
 import { INTERACTIVE_INPUT_ERROR, resolveInteractiveStdin } from "./run/runtime.stdin"
+import { ModelReference } from "@/provider/model-reference"
 
 type ModelInput = Parameters<OpencodeClient["session"]["prompt"]>[0]["model"]
-
-function pick(value: string | undefined): ModelInput | undefined {
-  if (!value) return undefined
-  const [providerID, ...rest] = value.split("/")
-  return {
-    providerID,
-    modelID: rest.join("/"),
-  } as ModelInput
-}
 
 function resolveRunInput(value?: string, piped?: string): string | undefined {
   if (!value) {
@@ -165,7 +157,7 @@ export const RunCommand = effectCmd({
       .option("model", {
         type: "string",
         alias: ["m"],
-        describe: "model to use in the format of provider/model",
+        describe: "model to use in the format provider/model[#variant]",
       })
       .option("agent", {
         type: "string",
@@ -211,7 +203,7 @@ export const RunCommand = effectCmd({
       })
       .option("variant", {
         type: "string",
-        describe: "model variant (provider-specific reasoning effort, e.g., high, max, minimal)",
+        describe: "model variant (overrides #variant in --model; e.g., high, max, minimal)",
       })
       .option("thinking", {
         type: "boolean",
@@ -269,6 +261,10 @@ export const RunCommand = effectCmd({
     const flags = yield* RuntimeFlags.Service
     const localInstance = yield* InstanceRef
     yield* Effect.promise(async () => {
+      const selection = args.model !== undefined ? ModelReference.parse(args.model, args.variant) : undefined
+      const model = selection ? { providerID: selection.providerID, modelID: selection.modelID } : undefined
+      const variant = selection?.variant ?? args.variant
+      if (variant === "") throw new Error("Model variant must not be empty")
       const rawMessage = [...args.message, ...(args["--"] || [])].join(" ")
       const interactive = args.mini
       const auto = args.auto || args.yolo || args["dangerously-skip-permissions"]
@@ -846,10 +842,10 @@ export const RunCommand = effectCmd({
             const result = await client.session.command({
               sessionID,
               agent,
-              model: args.model,
+              model: model ? `${model.providerID}/${model.modelID}` : undefined,
               command: args.command,
               arguments: message,
-              variant: args.variant,
+              variant,
             })
             if (result.error) {
               if (!emit("error", { error: result.error })) UI.error(formatRunError(result.error))
@@ -860,12 +856,11 @@ export const RunCommand = effectCmd({
             return
           }
 
-          const model = pick(args.model)
           const result = await client.session.prompt({
             sessionID,
             agent,
             model,
-            variant: args.variant,
+            variant,
             parts: [...files, { type: "text", text: message }],
           })
           if (result.error) {
@@ -877,7 +872,6 @@ export const RunCommand = effectCmd({
           return
         }
 
-        const model = pick(args.model)
         const { runInteractiveMode } = await import("./run/runtime")
         try {
           await runInteractiveMode({
@@ -890,7 +884,7 @@ export const RunCommand = effectCmd({
             replayLimit: args["replay-limit"],
             agent,
             model,
-            variant: args.variant,
+            variant,
             files,
             initialInput,
             createSession: createFreshSession,
@@ -905,7 +899,6 @@ export const RunCommand = effectCmd({
       }
 
       if (interactive && !args.attach && !args.session && !args.continue) {
-        const model = pick(args.model)
         const { runInteractiveLocalMode } = await import("./run/runtime")
         const fetchFn = (async (input: RequestInfo | URL, init?: RequestInit) => {
           const { Server } = await import("@/server/server")
@@ -926,7 +919,7 @@ export const RunCommand = effectCmd({
             createSession: createFreshSession,
             agent: args.agent,
             model,
-            variant: args.variant,
+            variant,
             replay,
             replayLimit: args["replay-limit"],
             files,

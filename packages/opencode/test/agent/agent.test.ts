@@ -236,6 +236,71 @@ it.instance(
   },
 )
 
+for (const input of [
+  { model: "test/nested/model#high", variant: undefined, expected: "high" },
+  { model: "test/nested/model#high", variant: "low", expected: "low" },
+  { model: "test/nested/model#unsupported", variant: "low", expected: "low" },
+  { model: "test/nested/model", variant: "high", expected: "high" },
+  { model: "test/nested/model#default", variant: undefined, expected: "default" },
+  { model: "test/nested/model", variant: undefined, expected: undefined },
+]) {
+  it.instance(
+    `agent model reference resolves ${input.model} with variant ${input.variant}`,
+    () =>
+      Effect.gen(function* () {
+        const agent = yield* load((svc) => svc.get("build"))
+        expect(String(agent.model?.providerID)).toBe("test")
+        expect(String(agent.model?.modelID)).toBe("nested/model")
+        expect(agent.variant).toBe(input.expected)
+      }),
+    {
+      config: {
+        provider: {
+          test: {
+            npm: "@ai-sdk/openai-compatible",
+            models: { "nested/model": { variants: { low: {}, high: {} } } },
+            options: { apiKey: "test-key" },
+          },
+        },
+        agent: { build: { model: input.model, variant: input.variant } },
+      },
+    },
+  )
+}
+
+for (const input of [
+  { model: "missing-provider", variant: undefined },
+  { model: "/model", variant: undefined },
+  { model: "test/", variant: undefined },
+  { model: "", variant: undefined },
+  { model: "test/nested/model#", variant: undefined },
+  { model: "test/nested/model#high#low", variant: undefined },
+  { model: "test/nested/model", variant: "" },
+  { model: "test/nested/model#unsupported", variant: undefined },
+  { model: "test/nested/model", variant: "unsupported" },
+]) {
+  it.instance(
+    `agent model reference rejects ${input.model} with variant ${input.variant}`,
+    () =>
+      Effect.gen(function* () {
+        const exit = yield* load((svc) => svc.get("build")).pipe(Effect.exit)
+        expect(Exit.isFailure(exit)).toBe(true)
+      }),
+    {
+      config: {
+        provider: {
+          test: {
+            npm: "@ai-sdk/openai-compatible",
+            models: { "nested/model": { variants: { low: {}, high: {} } } },
+            options: { apiKey: "test-key" },
+          },
+        },
+        agent: { build: { model: input.model, variant: input.variant } },
+      },
+    },
+  )
+}
+
 it.instance(
   "agent disable removes agent from list",
   () =>

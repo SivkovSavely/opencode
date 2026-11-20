@@ -6,8 +6,16 @@ export const Parameters = Schema.Struct({
   directory: Schema.optional(Schema.String.check(Schema.isMaxLength(4096))),
   title: Schema.optional(Schema.String.check(Schema.isMaxLength(256))),
   agent: Schema.optional(Schema.String.check(Schema.isMaxLength(128))),
-  model: Schema.optional(Schema.String.check(Schema.isMaxLength(256))),
-  variant: Schema.optional(Schema.String.check(Schema.isMaxLength(128))),
+  model: Schema.optional(
+    Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(256)).annotate({
+      description: "Model reference as provider/model or provider/model#variant. Model IDs may contain slashes.",
+    }),
+  ),
+  variant: Schema.optional(
+    Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(128)).annotate({
+      description: "Overrides the model suffix. Use default for the model's default behavior.",
+    }),
+  ),
   prompt: Schema.optional(Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(32000))),
   start: Schema.optional(Schema.Boolean),
   requestID: Schema.optional(Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(128))),

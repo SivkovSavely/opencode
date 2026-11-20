@@ -90,6 +90,402 @@ const control = Effect.gen(function* () {
   return { sessions, prompt, queue, caller, tool, ctx, permissions }
 })
 
+const modelFixture = Effect.gen(function* () {
+  const f = yield* fixture
+  const config = testProviderConfig(f.llm.url)
+  const directory = yield* tmpdirScoped({
+    git: true,
+    config: {
+      ...config,
+      model: "test/test-model",
+      provider: {
+        test: {
+          ...config.provider.test,
+          models: {
+            ...config.provider.test.models,
+            "selected/nested": {
+              ...config.provider.test.models["test-model"],
+              id: "selected/nested",
+              variants: { deep: {}, shallow: {} },
+            },
+          },
+        },
+      },
+      agent: {
+        build: { model: "test/selected/nested", variant: "deep" },
+        plain: { mode: "primary", model: "test/test-model" },
+      },
+    },
+  })
+  return { ...f, directory, controllerDirectory: f.directory }
+})
+
+for (const action of ["create", "prompt", "steer"] as const) {
+  it.live(`${action} normalizes model suffixes and explicit variant precedence`, () =>
+    Effect.gen(function* () {
+      const f = yield* modelFixture
+      yield* f.store.provide(
+        { directory: f.directory },
+        Effect.gen(function* () {
+          const c = yield* control
+          for (const [index, input] of [
+            { model: "test/selected/nested#deep", expected: "deep", persisted: "deep" },
+            { model: "test/selected/nested#deep", variant: "shallow", expected: "shallow", persisted: "shallow" },
+            { model: "test/selected/nested#deep", variant: "default", expected: "default", persisted: "default" },
+            {
+              model: "test/selected/nested#unsupported",
+              variant: "shallow",
+              expected: "shallow",
+              persisted: "shallow",
+            },
+            { model: "test/selected/nested", variant: "shallow", expected: "shallow", persisted: "shallow" },
+            { model: "test/selected/nested", expected: "deep", persisted: "default" },
+            { variant: "shallow", expected: "shallow", persisted: "shallow" },
+            { variant: "default", expected: "default", persisted: "default" },
+          ].entries()) {
+            const target =
+              action !== "create"
+                ? yield* c.sessions.create({
+                    title: "model selection",
+                    agent: "build",
+                    model: {
+                      providerID: ProviderV2.ID.make("test"),
+                      id: ModelV2.ID.make("selected/nested"),
+                      variant: "deep",
+                    },
+                  })
+                : undefined
+            if (target && action === "prompt")
+              yield* c.queue.update(target.id, {
+                revision: (yield* c.queue.list(target.id)).revision,
+                mutation: { action: "pause", paused: true },
+              })
+            if (action === "steer") yield* f.llm.text("selected response")
+            const params = {
+              action,
+              sessionID: target?.id,
+              model: input.model,
+              variant: input.variant,
+              prompt: "selected input",
+              ...(action === "create" ? { start: false } : {}),
+              requestID: `selection-${index}`,
+            }
+            const result = JSON.parse((yield* c.tool.execute(params, c.ctx)).output)
+            const id = SessionID.make(result.sessionID)
+            if (action === "steer") {
+              yield* awaitWithTimeout(f.llm.wait(index + 1), "selected steer did not start")
+              yield* awaitWithTimeout(f.runtime.waitForIdle(id), "selected steer did not finish")
+              const users = (yield* c.sessions.messages({ sessionID: id })).filter(
+                (message) => message.info.role === "user",
+              )
+              expect(users).toHaveLength(1)
+              expect(users[0]?.info).toMatchObject({
+                model: { providerID: "test", modelID: "selected/nested", variant: input.expected },
+              })
+            }
+            if (action !== "steer") {
+              const items = (yield* c.queue.list(id)).items
+              expect(items).toHaveLength(1)
+              expect(items[0]?.payload).toMatchObject({
+                model: { providerID: "test", modelID: "selected/nested" },
+                variant: input.expected,
+              })
+              expect(items[0]?.payload.selection).toMatchObject({ variant: input.expected, inheritActive: true })
+            }
+            if (action === "create")
+              expect((yield* c.sessions.get(id)).model).toEqual({
+                providerID: ProviderV2.ID.make("test"),
+                id: ModelV2.ID.make("selected/nested"),
+                variant: input.persisted,
+              })
+            const retry = JSON.parse((yield* c.tool.execute(params, { ...c.ctx, callID: randomUUID() })).output)
+            expect(retry.sessionID).toBe(id)
+            expect(retry.requestID).toBe(result.requestID)
+            expect(
+              (yield* Effect.exit(c.tool.execute({ ...params, variant: "deep", prompt: "conflict" }, c.ctx)))._tag,
+            ).toBe("Failure")
+          }
+          if (action !== "steer") expect(yield* f.llm.calls).toBe(0)
+        }).pipe(Effect.provide(f.context), Effect.provideService(RuntimeLifecycle.Service, f.runtime)),
+      )
+    }),
+  )
+
+  it.live(`${action} rejects invalid model selections before durable admission`, () =>
+    Effect.gen(function* () {
+      const f = yield* modelFixture
+      yield* f.store.provide(
+        { directory: f.directory },
+        Effect.gen(function* () {
+          const c = yield* control
+          const target = yield* c.sessions.create({
+            title: "invalid selection target",
+            model: {
+              providerID: ProviderV2.ID.make("test"),
+              id: ModelV2.ID.make("selected/nested"),
+              variant: "deep",
+            },
+          })
+          const sessions = yield* f.database.db.all(sql`SELECT id FROM session`)
+          const requests = yield* f.database.db.all(sql`SELECT id FROM session_control_request`)
+          for (const [index, selection] of [
+            { model: "test/selected/nested#unsupported" },
+            { model: "test/selected/nested#deep", variant: "unsupported" },
+            { model: "test/selected/nested", variant: "unsupported" },
+            { variant: "unsupported" },
+            { agent: "plain", variant: "deep" },
+            { model: "" },
+            { model: "selected" },
+            { model: "#deep" },
+            { model: "/selected/nested" },
+            { model: "test/" },
+            { model: "test/selected/nested#" },
+            { model: "test/selected/nested#deep#shallow" },
+            { model: "test/selected/nested#deep#shallow", variant: "deep" },
+            { model: "test/selected/nested#", variant: "deep" },
+            { model: "test/selected/nested#deep", variant: "" },
+            { variant: "" },
+          ].entries()) {
+            const result = yield* Effect.exit(
+              c.tool.execute(
+                {
+                  action,
+                  ...(action !== "create" ? { sessionID: target.id } : {}),
+                  ...selection,
+                  prompt: "must not be admitted",
+                  ...(action === "create" ? { start: false } : {}),
+                  requestID: `invalid-${index}`,
+                },
+                c.ctx,
+              ),
+            )
+            expect(result._tag).toBe("Failure")
+            expect(yield* f.database.db.all(sql`SELECT id FROM session`)).toEqual(sessions)
+            expect(yield* f.database.db.all(sql`SELECT id FROM session_control_request`)).toEqual(requests)
+            expect((yield* c.queue.list(target.id)).items).toHaveLength(0)
+            expect(yield* c.sessions.messages({ sessionID: target.id })).toHaveLength(0)
+          }
+          expect(yield* f.llm.calls).toBe(0)
+        }).pipe(Effect.provide(f.context), Effect.provideService(RuntimeLifecycle.Service, f.runtime)),
+      )
+    }),
+  )
+}
+
+for (const action of ["prompt", "steer"] as const) {
+  it.live(`${action} validates variant-only input against the session model without revalidating an exact retry`, () =>
+    Effect.gen(function* () {
+      const f = yield* modelFixture
+      yield* f.store.provide(
+        { directory: f.directory },
+        Effect.gen(function* () {
+          const c = yield* control
+          const target = yield* c.sessions.create({
+            title: "session overrides agent model",
+            agent: "plain",
+            model: {
+              providerID: ProviderV2.ID.make("test"),
+              id: ModelV2.ID.make("selected/nested"),
+              variant: "deep",
+            },
+          })
+          if (action === "prompt")
+            yield* c.queue.update(target.id, {
+              revision: (yield* c.queue.list(target.id)).revision,
+              mutation: { action: "pause", paused: true },
+            })
+          if (action === "steer") yield* f.llm.text("session selection")
+          const params = {
+            action,
+            sessionID: target.id,
+            variant: "shallow",
+            prompt: "remember this selection",
+            requestID: "variant-only-retry",
+          }
+          const first = JSON.parse((yield* c.tool.execute(params, c.ctx)).output)
+          if (action === "steer") {
+            yield* awaitWithTimeout(f.llm.wait(1), "variant-only steer did not start")
+            yield* awaitWithTimeout(f.runtime.waitForIdle(target.id), "variant-only steer did not finish")
+            const users = (yield* c.sessions.messages({ sessionID: target.id })).filter(
+              (message) => message.info.role === "user",
+            )
+            expect(users).toHaveLength(1)
+            expect(users[0]?.info).toMatchObject({
+              agent: "plain",
+              model: { providerID: "test", modelID: "selected/nested", variant: "shallow" },
+            })
+          }
+          const snapshot = yield* c.queue.list(target.id)
+          if (action === "prompt")
+            expect(snapshot.items[0]?.payload).toMatchObject({
+              agent: "plain",
+              model: { providerID: "test", modelID: "selected/nested" },
+              variant: "shallow",
+            })
+          yield* c.sessions.setAgentModel({
+            sessionID: target.id,
+            agent: "plain",
+            model: {
+              providerID: ProviderV2.ID.make("test"),
+              id: ModelV2.ID.make("test-model"),
+              variant: "default",
+            },
+            time: Date.now(),
+          })
+          const requests = yield* f.database.db.all(sql`SELECT id FROM session_control_request`)
+          const retry = JSON.parse((yield* c.tool.execute(params, c.ctx)).output)
+          expect(retry.requestID).toBe(first.requestID)
+          expect(yield* c.queue.list(target.id)).toEqual(snapshot)
+          expect(
+            (yield* Effect.exit(c.tool.execute({ ...params, requestID: "new-unsupported-selection" }, c.ctx)))._tag,
+          ).toBe("Failure")
+          expect(yield* f.database.db.all(sql`SELECT id FROM session_control_request`)).toEqual(requests)
+          expect(yield* c.queue.list(target.id)).toEqual(snapshot)
+        }).pipe(Effect.provide(f.context), Effect.provideService(RuntimeLifecycle.Service, f.runtime)),
+      )
+    }),
+  )
+}
+
+it.live("cross-directory model variants are normalized and validated using the destination configuration", () =>
+  Effect.gen(function* () {
+    const f = yield* modelFixture
+    yield* f.store.provide(
+      { directory: f.controllerDirectory },
+      Effect.gen(function* () {
+        const c = yield* control
+        const result = JSON.parse(
+          (yield* c.tool.execute(
+            {
+              action: "create",
+              directory: f.directory,
+              variant: "shallow",
+              prompt: "destination defaults",
+              start: false,
+              requestID: "destination-create",
+            },
+            c.ctx,
+          )).output,
+        )
+        const id = SessionID.make(result.sessionID)
+        expect((yield* c.sessions.get(id)).model).toMatchObject({
+          providerID: "test",
+          id: "selected/nested",
+          variant: "shallow",
+        })
+        expect(c.permissions).toContain("external_directory")
+        yield* f.store.provide(
+          { directory: f.directory },
+          Effect.gen(function* () {
+            yield* c.queue.update(id, {
+              revision: (yield* c.queue.list(id)).revision,
+              mutation: { action: "pause", paused: true },
+            })
+          }),
+        )
+        yield* c.tool.execute(
+          {
+            action: "prompt",
+            sessionID: id,
+            model: "test/selected/nested#deep",
+            prompt: "destination suffix",
+            requestID: "destination-prompt",
+          },
+          c.ctx,
+        )
+        const snapshot = yield* f.store.provide({ directory: f.directory }, c.queue.list(id))
+        expect(snapshot.items).toHaveLength(2)
+        expect(snapshot.items.map((item) => item.payload.model)).toEqual([
+          { providerID: "test", modelID: "selected/nested" },
+          { providerID: "test", modelID: "selected/nested" },
+        ])
+        expect(snapshot.items.map((item) => item.payload.variant)).toEqual(["shallow", "deep"])
+        const requests = yield* f.database.db.all(sql`SELECT id FROM session_control_request`)
+        expect(
+          (yield* Effect.exit(
+            c.tool.execute(
+              {
+                action: "prompt",
+                sessionID: id,
+                agent: "plain",
+                variant: "deep",
+                prompt: "unsupported destination agent selection",
+                requestID: "destination-invalid",
+              },
+              c.ctx,
+            ),
+          ))._tag,
+        ).toBe("Failure")
+        expect(yield* f.database.db.all(sql`SELECT id FROM session_control_request`)).toEqual(requests)
+        expect(yield* f.store.provide({ directory: f.directory }, c.queue.list(id))).toEqual(snapshot)
+        expect(yield* f.llm.calls).toBe(0)
+      }).pipe(Effect.provide(f.context), Effect.provideService(RuntimeLifecycle.Service, f.runtime)),
+    )
+  }),
+)
+
+it.live("create without a prompt validates selections before creating roots and never admits queue input", () =>
+  Effect.gen(function* () {
+    const f = yield* modelFixture
+    yield* f.store.provide(
+      { directory: f.directory },
+      Effect.gen(function* () {
+        const c = yield* control
+        for (const [index, selection] of [
+          { model: "test/selected/nested#shallow", expected: "shallow" },
+          { agent: "build", model: "test/selected/nested", expected: "default" },
+          { agent: "plain", model: "test/selected/nested#deep", expected: "deep" },
+          { variant: "shallow", expected: "shallow" },
+        ].entries()) {
+          const params = {
+            action: "create",
+            model: selection.model,
+            agent: selection.agent,
+            variant: selection.variant,
+            requestID: `no-prompt-${index}`,
+          }
+          const result = JSON.parse((yield* c.tool.execute(params, c.ctx)).output)
+          const id = SessionID.make(result.sessionID)
+          expect(result.state).toBe("done")
+          expect((yield* c.sessions.get(id)).model).toMatchObject({
+            providerID: "test",
+            id: "selected/nested",
+            variant: selection.expected,
+          })
+          expect((yield* c.queue.list(id)).items).toHaveLength(0)
+          expect(yield* c.sessions.messages({ sessionID: id })).toHaveLength(0)
+          expect(JSON.parse((yield* c.tool.execute(params, c.ctx)).output).sessionID).toBe(id)
+        }
+        const sessions = yield* f.database.db.all(sql`SELECT id FROM session`)
+        const requests = yield* f.database.db.all(sql`SELECT id FROM session_control_request`)
+        for (const [index, selection] of [
+          { model: "test/selected/nested#unsupported" },
+          { model: "test/test-model#deep" },
+          { agent: "build", model: "test/test-model", variant: "deep" },
+          { model: "test/missing" },
+          { variant: "unsupported" },
+          { agent: "missing" },
+          { model: "selected" },
+          { model: "test/selected/nested#" },
+          { model: "test/selected/nested#deep#shallow" },
+          { model: "" },
+          { variant: "" },
+        ].entries()) {
+          expect(
+            (yield* Effect.exit(
+              c.tool.execute({ action: "create", ...selection, requestID: `no-prompt-invalid-${index}` }, c.ctx),
+            ))._tag,
+          ).toBe("Failure")
+          expect(yield* f.database.db.all(sql`SELECT id FROM session`)).toEqual(sessions)
+          expect(yield* f.database.db.all(sql`SELECT id FROM session_control_request`)).toEqual(requests)
+          expect(yield* f.database.db.all(sql`SELECT id FROM session_queue`)).toHaveLength(0)
+        }
+        expect(yield* f.llm.calls).toBe(0)
+      }).pipe(Effect.provide(f.context), Effect.provideService(RuntimeLifecycle.Service, f.runtime)),
+    )
+  }),
+)
+
 it.live("native create produces one independent root on exact retries without copying caller grants", () =>
   Effect.gen(function* () {
     const f = yield* fixture

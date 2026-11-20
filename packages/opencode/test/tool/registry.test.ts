@@ -149,6 +149,19 @@ afterEach(async () => {
 })
 
 describe("tool.registry", () => {
+  it.instance("exposes model_catalog as a normal built-in tool", () =>
+    Effect.gen(function* () {
+      const registry = yield* ToolRegistry.Service
+      const agents = yield* Agent.Service
+      expect(yield* registry.ids()).toContain("model_catalog")
+      const tools = yield* registry.tools({
+        providerID: ProviderV2.ID.opencode,
+        modelID: ModelV2.ID.make("test"),
+        agent: yield* agents.defaultInfo(),
+      })
+      expect(tools.map((tool) => tool.id)).toContain("model_catalog")
+    }),
+  )
   it.instance("does not expose task_status", () =>
     Effect.gen(function* () {
       const registry = yield* ToolRegistry.Service

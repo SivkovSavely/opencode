@@ -11,6 +11,7 @@ import { deriveSubagentSessionPermission } from "../agent/subagent-permissions"
 import type { SessionPrompt } from "../session/prompt"
 import { Config } from "@/config/config"
 import { Provider } from "@/provider/provider"
+import { ModelReference } from "@/provider/model-reference"
 import { Cause, Effect, Exit, Fiber, Schema, Scope } from "effect"
 import { EffectBridge } from "@/effect/bridge"
 import { RuntimeFlags } from "@/effect/runtime-flags"
@@ -63,7 +64,11 @@ const BaseParameterFields = {
   subagent_type: Schema.String.annotate({ description: "The type of specialized agent to use for this task" }),
   model: Schema.optional(Schema.String).annotate({
     description:
-      'NEVER set this unless the user explicitly asks for a particular model or variant. Use "providerID/modelID" or "providerID/modelID#variant". Omitting the variant uses the model default, ignoring agent and parent variants.',
+      'Only set when the user requests a model or variant. Use model_catalog for exact IDs. Format: "providerID/modelID[#variant]". Model-only uses the model default, not agent or parent variants.',
+  }),
+  variant: Schema.optional(Schema.String).annotate({
+    description:
+      "Only set when requested by the user. Overrides #variant; without model, applies to the selected subagent model.",
   }),
   task_id: Schema.optional(Schema.String).annotate({
     description:
@@ -111,13 +116,9 @@ export const TaskTool = Tool.define(
     const database = yield* Database.Service
     const provider = yield* Provider.Service
 
-    const resolveModel = Effect.fn("TaskTool.resolveModel")(function* (input: string) {
-      const [value, variant, ...rest] = input.split("#")
-      const selected = Provider.parseModel(value)
-      if (!selected.providerID || !selected.modelID || rest.length > 0 || variant === "")
-        return yield* Effect.fail(
-          new Error(`Invalid model "${input}". Use "providerID/modelID" or "providerID/modelID#variant".`),
-        )
+    const resolveModel = Effect.fn("TaskTool.resolveModel")(function* (input: string, variant?: string) {
+      const reference = ModelReference.parse(input, variant)
+      const selected = { providerID: reference.providerID, modelID: reference.modelID }
       const available = yield* provider.list()
       if (
         !Object.hasOwn(available, selected.providerID) ||
@@ -125,20 +126,13 @@ export const TaskTool = Tool.define(
       )
         return yield* new Provider.ModelNotFoundError(selected)
       const model = available[selected.providerID].models[selected.modelID]
-      if (variant !== undefined && !Object.hasOwn(model.variants ?? {}, variant)) {
-        const variants = Object.keys(model.variants ?? {})
-        return yield* Effect.fail(
-          new Error(
-            variants.length === 0
-              ? `Model "${value}" has no variants. Omit the variant.`
-              : `Variant "${variant}" is not available for "${value}". Available: ${variants.join(", ")}.`,
-          ),
-        )
-      }
+      ModelReference.validateVariant(model, reference.variant)
       if (!model.capabilities.input.text || !model.capabilities.output.text)
-        return yield* Effect.fail(new Error(`Model "${value}" must support both text input and text output.`))
+        return yield* Effect.fail(
+          new Error(`Model "${selected.providerID}/${selected.modelID}" must support both text input and text output.`),
+        )
       // Empty bypasses SessionPrompt's nullish agent fallback without selecting a named variant.
-      return { model: selected, variant: variant ?? "" }
+      return { model: selected, variant: reference.variant ?? "" }
     })
 
     const run = Effect.fn("TaskTool.execute")(function* (
@@ -236,13 +230,17 @@ export const TaskTool = Tool.define(
       )
       if (msg.info.role !== "assistant") return yield* Effect.fail(new Error("Not an assistant message"))
       const variant = msg.info.variant
-      const override = params.model ? yield* resolveModel(params.model) : undefined
+      const override = params.model ? yield* resolveModel(params.model, params.variant) : undefined
       const model = override?.model ??
         next.model ?? {
           modelID: msg.info.modelID,
           providerID: msg.info.providerID,
         }
-      const childVariant = override?.variant ?? (next.model ? undefined : variant)
+      const childVariant = params.variant ?? override?.variant ?? (next.model ? undefined : variant)
+      if (!override && params.variant !== undefined) {
+        const full = yield* provider.getModel(model.providerID, model.modelID)
+        ModelReference.validateVariant(full, childVariant ?? next.variant)
+      }
 
       const previousTask = session?.metadata?.task
       const reusableMessageID =
@@ -262,7 +260,7 @@ export const TaskTool = Tool.define(
         parentCallID: ctx.callID,
         messageID: childMessageID,
         model,
-        inheritVariant: override === undefined && next.model === undefined,
+        inheritVariant: override === undefined && params.variant === undefined && next.model === undefined,
         variant: childVariant,
         ...(runInBackground ? { background: true } : {}),
       }

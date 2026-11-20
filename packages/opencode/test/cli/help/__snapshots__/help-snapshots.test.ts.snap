@@ -86,7 +86,7 @@ Options:
   -s, --session      session id to continue                                                 [string]
       --fork         fork the session before continuing (requires --continue or --session) [boolean]
       --share        share the session                                                     [boolean]
-  -m, --model        model to use in the format of provider/model                           [string]
+  -m, --model        model to use in the format provider/model[#variant]                    [string]
       --agent        agent to use                                                           [string]
       --format       format: default (formatted) or json (raw JSON events)
                                           [string] [choices: "default", "json"] [default: "default"]
@@ -99,8 +99,7 @@ Options:
       --dir          directory to run in, path on remote server if attaching                [string]
       --port         port for the local server (defaults to random port if no value provided)
                                                                                             [number]
-      --variant      model variant (provider-specific reasoning effort, e.g., high, max, minimal)
-                                                                                            [string]
+      --variant      model variant (overrides #variant in --model; e.g., high, max, minimal)[string]
       --thinking     show thinking blocks                                                  [boolean]
   -i, --interactive  run in direct interactive split-footer mode          [boolean] [default: false]
       --auto         auto-approve permissions that are not explicitly denied (dangerous!)

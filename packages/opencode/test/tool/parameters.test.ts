@@ -15,6 +15,7 @@ import { Parameters as Glob } from "../../src/tool/glob"
 import { Parameters as Grep } from "../../src/tool/grep"
 import { Parameters as Invalid } from "../../src/tool/invalid"
 import { Parameters as Lsp } from "../../src/tool/lsp"
+import { Parameters as ModelCatalog } from "../../src/tool/model-catalog"
 import { Parameters as Plan } from "../../src/tool/plan"
 import { Parameters as Question } from "../../src/tool/question"
 import { Parameters as Read } from "../../src/tool/read"
@@ -35,6 +36,14 @@ const accepts = (schema: Schema.Decoder<unknown>, input: unknown): boolean =>
 const toJsonSchema = ToolJsonSchema.fromSchema
 
 describe("tool parameters", () => {
+  test("model catalog accepts optional filters and enforces limits", () => {
+    expect(accepts(ModelCatalog, {})).toBe(true)
+    expect(accepts(ModelCatalog, { query: "alpha", provider: "acme", variant: "fast", limit: 20 })).toBe(true)
+    expect(accepts(ModelCatalog, { limit: 0 })).toBe(false)
+    expect(accepts(ModelCatalog, { limit: 21 })).toBe(false)
+    expect(accepts(ModelCatalog, { limit: 1.5 })).toBe(false)
+    expect(accepts(ModelCatalog, { query: "x".repeat(257) })).toBe(false)
+  })
   describe("JSON Schema (wire shape)", () => {
     test("apply_patch", () => expect(toJsonSchema(ApplyPatch)).toMatchSnapshot())
     test("bash", () => expect(toJsonSchema(Shell)).toMatchSnapshot())
@@ -43,6 +52,7 @@ describe("tool parameters", () => {
     test("grep", () => expect(toJsonSchema(Grep)).toMatchSnapshot())
     test("invalid", () => expect(toJsonSchema(Invalid)).toMatchSnapshot())
     test("lsp", () => expect(toJsonSchema(Lsp)).toMatchSnapshot())
+    test("model_catalog", () => expect(toJsonSchema(ModelCatalog)).toMatchSnapshot())
     test("plan", () => expect(toJsonSchema(Plan)).toMatchSnapshot())
     test("question", () => expect(toJsonSchema(Question)).toMatchSnapshot())
     test("read", () => expect(toJsonSchema(Read)).toMatchSnapshot())

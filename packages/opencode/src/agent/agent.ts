@@ -3,6 +3,7 @@ import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { Config } from "@/config/config"
 import { serviceUse } from "@opencode-ai/core/effect/service-use"
 import { Provider } from "@/provider/provider"
+import { ModelReference } from "@/provider/model-reference"
 
 import { generateObject, streamObject, type ModelMessage } from "ai"
 import { Truncate } from "@/tool/truncate"
@@ -278,8 +279,17 @@ const layer = Layer.effect(
               options: {},
               native: false,
             }
-          if (value.model) item.model = Provider.parseModel(value.model)
+          if (value.model !== undefined) {
+            const model = ModelReference.parse(value.model, value.variant)
+            item.model = { providerID: model.providerID, modelID: model.modelID }
+            item.variant = model.variant ?? item.variant
+          }
           item.variant = value.variant ?? item.variant
+          if (item.variant === "") throw new Error("Model variant must not be empty")
+          if (item.model && item.variant !== undefined) {
+            const model = yield* provider.getModel(item.model.providerID, item.model.modelID).pipe(Effect.orDie)
+            ModelReference.validateVariant(model, item.variant)
+          }
           item.prompt = value.prompt ?? item.prompt
           item.description = value.description ?? item.description
           item.temperature = value.temperature ?? item.temperature

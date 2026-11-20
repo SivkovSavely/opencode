@@ -7,8 +7,106 @@ import { describe, expect } from "bun:test"
 import { Effect } from "effect"
 import { reply } from "../../lib/llm-server"
 import { cliIt } from "../../lib/cli-process"
+import { testProviderConfig } from "../../lib/test-provider"
+import { createOpencodeClient } from "@opencode-ai/sdk/v2"
 
 describe("opencode run (non-interactive subprocess)", () => {
+  for (const command of [false, true]) {
+    cliIt.concurrent(
+      `paired model reference ${command ? "command" : "prompt"} resolves a suffix and explicit override`,
+      ({ llm, opencode }) =>
+        Effect.gen(function* () {
+          const base = testProviderConfig(llm.url)
+          const env = {
+            OPENCODE_CONFIG_CONTENT: JSON.stringify({
+              ...base,
+              provider: {
+                test: {
+                  ...base.provider.test,
+                  models: {
+                    "nested/model": {
+                      ...base.provider.test.models["test-model"],
+                      id: "nested/model",
+                      variants: {
+                        high: { reasoningEffort: "high" },
+                        low: { reasoningEffort: "low" },
+                      },
+                    },
+                  },
+                },
+              },
+              agent: { build: { model: "test/nested/model#high" } },
+              command: { check: { template: "$ARGUMENTS" } },
+            }),
+          }
+          yield* llm.text("suffix selected")
+          const suffix = yield* opencode.run("check model", {
+            model: "test/nested/model#high",
+            command: command ? "check" : undefined,
+            env,
+          })
+          opencode.expectExit(suffix, 0)
+          expect(suffix.stdout).toBe("suffix selected\n")
+          expect((yield* llm.inputs).at(-1)).toMatchObject({ model: "nested/model", reasoning_effort: "high" })
+
+          yield* llm.text("explicit selected")
+          const explicit = yield* opencode.run("check override", {
+            model: "test/nested/model#unsupported",
+            command: command ? "check" : undefined,
+            extraArgs: ["--variant", "low"],
+            env,
+          })
+          opencode.expectExit(explicit, 0)
+          expect(explicit.stdout).toBe("explicit selected\n")
+          expect((yield* llm.inputs).at(-1)).toMatchObject({ model: "nested/model", reasoning_effort: "low" })
+
+          yield* llm.text("agent default retained")
+          const implicit = yield* opencode.run("check agent default", {
+            model: "test/nested/model",
+            command: command ? "check" : undefined,
+            env,
+          })
+          opencode.expectExit(implicit, 0)
+          expect((yield* llm.inputs).at(-1)).toMatchObject({ model: "nested/model", reasoning_effort: "high" })
+
+          yield* llm.text("model default selected")
+          const defaulted = yield* opencode.run("check explicit default", {
+            model: "test/nested/model#default",
+            command: command ? "check" : undefined,
+            env,
+          })
+          opencode.expectExit(defaulted, 0)
+          expect((yield* llm.inputs).at(-1)).not.toHaveProperty("reasoning_effort")
+        }),
+      60_000,
+    )
+  }
+
+  cliIt.concurrent(
+    "paired model reference rejects malformed input and unsupported variants before provider execution",
+    ({ llm, opencode }) =>
+      Effect.gen(function* () {
+        yield* llm.text("must not execute")
+        for (const extraArgs of [
+          ["--model", "test-model"],
+          ["--model", "/test-model"],
+          ["--model", "test/"],
+          ["--model", "test/test-model#"],
+          ["--model", "test/test-model#high#low"],
+          ["--model", "test/test-model", "--variant", ""],
+          ["--model", "test/test-model#unsupported"],
+          ["--model", "test/test-model", "--variant", "unsupported"],
+          ["--variant", "unsupported"],
+        ]) {
+          const result = yield* opencode.spawn(["run", ...extraArgs, "check invalid input"])
+          expect(result.exitCode).not.toBe(0)
+          expect(result.stderr).toMatch(/[Ii]nvalid model|[Mm]odel reference|[Vv]ariant/)
+          expect(yield* llm.calls).toBe(0)
+        }
+      }),
+    60_000,
+  )
+
   // Happy path: prompt completes, output reaches stdout, process exits 0.
   // If this fails, all the others likely will too — debug here first.
   cliIt.concurrent(
@@ -280,6 +378,125 @@ describe("opencode run (non-interactive subprocess)", () => {
         opencode.expectExit(explicitlyDenied, 0)
         expect(explicitlyDenied.stdout).toContain("continued after explicit denial")
         expect(yield* Effect.promise(() => Bun.file(`${home}/explicitly-denied`).exists())).toBe(false)
+      }),
+    60_000,
+  )
+
+  cliIt.live(
+    "resumed CLI selections persist model and variant defaults for prompts and commands",
+    ({ llm, opencode }) =>
+      Effect.gen(function* () {
+        const base = testProviderConfig(llm.url)
+        const env = {
+          OPENCODE_CONFIG_CONTENT: JSON.stringify({
+            ...base,
+            provider: {
+              test: {
+                ...base.provider.test,
+                models: {
+                  ...base.provider.test.models,
+                  selected: {
+                    ...base.provider.test.models["test-model"],
+                    id: "selected",
+                    variants: {
+                      high: { reasoningEffort: "high" },
+                      low: { reasoningEffort: "low" },
+                    },
+                  },
+                },
+              },
+            },
+            command: { check: { template: "$ARGUMENTS" } },
+          }),
+        }
+        const server = yield* opencode.serve({ env })
+        const sdk = createOpencodeClient({ baseUrl: server.url, throwOnError: true })
+        for (const command of [false, true]) {
+          const session = (yield* Effect.promise(() => sdk.session.create({ title: "CLI variant persistence" }))).data
+          if (!session) throw new Error("Session was not created")
+          const args = ["run", "--attach", server.url, "--session", session.id]
+          if (command) args.push("--command", "check")
+          yield* llm.text("original model")
+          opencode.expectExit(yield* opencode.spawn([...args, "--model", "test/test-model", "initialize defaults"]), 0)
+          for (const selection of [
+            ["--model", "test/selected#high"],
+            ["--model", "test/selected#high", "--variant", "low"],
+            ["--variant", "high"],
+          ]) {
+            const variant = selection.at(-1) === "low" ? "low" : "high"
+            yield* llm.text("updated defaults")
+            opencode.expectExit(yield* opencode.spawn([...args, ...selection, "change selection"]), 0)
+            expect((yield* llm.inputs).at(-1)).toMatchObject({ model: "selected", reasoning_effort: variant })
+            const stored = (yield* Effect.promise(() => sdk.session.get({ sessionID: session.id }))).data
+            expect(stored?.model).toMatchObject({ providerID: "test", id: "selected", variant })
+          }
+          yield* llm.text("resumed model")
+          opencode.expectExit(yield* opencode.spawn([...args, "use stored model"]), 0)
+          expect((yield* llm.inputs).at(-1)).toMatchObject({ model: "selected" })
+        }
+      }),
+    60_000,
+  )
+
+  cliIt.live(
+    "attach variant-only selection uses the server default agent, not sorted agent order",
+    ({ llm, opencode }) =>
+      Effect.gen(function* () {
+        const base = testProviderConfig(llm.url)
+        const env = {
+          OPENCODE_CONFIG_CONTENT: JSON.stringify({
+            ...base,
+            provider: {
+              test: {
+                ...base.provider.test,
+                models: {
+                  "test-model": {
+                    ...base.provider.test.models["test-model"],
+                    variants: { high: { reasoningEffort: "high" } },
+                  },
+                  plain: { ...base.provider.test.models["test-model"], id: "plain" },
+                },
+              },
+            },
+            agent: {
+              build: { disable: true },
+              plan: { model: "test/test-model" },
+              aaa: { mode: "primary", model: "test/plain" },
+            },
+          }),
+        }
+        const server = yield* opencode.serve({ env })
+        yield* llm.text("server default selected")
+        const valid = yield* opencode.spawn([
+          "run",
+          "--attach",
+          server.url,
+          "--variant",
+          "high",
+          "use the default agent",
+        ])
+        opencode.expectExit(valid, 0)
+        expect(valid.stdout).toBe("server default selected\n")
+        expect((yield* llm.inputs).at(-1)).toMatchObject({ model: "test-model", reasoning_effort: "high" })
+
+        const calls = yield* llm.calls
+        const sdk = createOpencodeClient({ baseUrl: server.url, throwOnError: true })
+        const rejected = (yield* Effect.promise(() => sdk.session.create({ title: "Rejected variant" }))).data
+        if (!rejected) throw new Error("Session was not created")
+        const invalid = yield* opencode.spawn([
+          "run",
+          "--attach",
+          server.url,
+          "--session",
+          rejected.id,
+          "--variant",
+          "unsupported",
+          "reject before execution",
+        ])
+        expect(invalid.exitCode).not.toBe(0)
+        expect(invalid.stderr).toContain("Variant not found")
+        expect(yield* llm.calls).toBe(calls)
+        expect((yield* Effect.promise(() => sdk.session.messages({ sessionID: rejected.id }))).data).toEqual([])
       }),
     60_000,
   )

@@ -12,6 +12,7 @@ import { InstanceState } from "@/effect/instance-state"
 import { WorkspaceRef } from "@/effect/instance-ref"
 import { InstanceStore } from "@/project/instance-store"
 import { Provider } from "@/provider/provider"
+import { ModelReference } from "@/provider/model-reference"
 import { Flag } from "@opencode-ai/core/flag/flag"
 import { RuntimeLifecycle } from "@/server/runtime-lifecycle"
 import { Session } from "@/session/session"
@@ -43,7 +44,7 @@ export const SessionControlTool = Tool.define(
     const db = database.db
     return {
       description:
-        "Control independent root sessions without waiting for execution. Actions: create (directory, title, agent, model provider/model, variant, optional prompt; start defaults to whether prompt exists), prompt (durable ordered queue), steer (existing safe-boundary steering), status, read (bounded previews, limit <=20, before message ID), cancel (active execution only). Existing sessions always retain their original directory/project/workspace. Every operation is permission checked; IDs and creator metadata are not grants. Use a stable requestID for retry-safe mutations; reusing it with different arguments fails. Paused, cancelled and recovery-held work is never implicitly resumed. Self-cancellation is forbidden. No transcript or tool output is returned unbounded.",
+        "Control independent root sessions without waiting for execution. Actions: create (directory, title, agent, model provider/model or provider/model#variant, variant, optional prompt; start defaults to whether prompt exists), prompt (durable ordered queue), steer (existing safe-boundary steering), status, read (bounded previews, limit <=20, before message ID), cancel (active execution only). An explicit variant overrides the model suffix. Existing sessions always retain their original directory/project/workspace. Every operation is permission checked; IDs and creator metadata are not grants. Use a stable requestID for retry-safe mutations; reusing it with different arguments fails. Paused, cancelled and recovery-held work is never implicitly resumed. Self-cancellation is forbidden. No transcript or tool output is returned unbounded.",
       parameters: SessionControlV1.Parameters,
       execute: (
         params: typeof SessionControlV1.Parameters.Type,
@@ -191,22 +192,30 @@ export const SessionControlTool = Tool.define(
                 .get()
               const agent = params.agent && !prior ? yield* agents.get(params.agent) : undefined
               if (params.agent && !prior && !agent) throw new Error("Agent is unavailable in the target directory")
-              const model = params.model
-                ? Provider.parseModel(params.model)
-                : params.action === "create" && params.variant
+              const reference =
+                params.model !== undefined ? ModelReference.parse(params.model, params.variant) : undefined
+              const variant = reference?.variant ?? params.variant
+              const selection = {
+                agent: params.agent,
+                model: reference ? { providerID: reference.providerID, modelID: reference.modelID } : undefined,
+                variant,
+              }
+              const model =
+                reference ??
+                (params.action === "create" && variant !== undefined
                   ? ((agent ?? (yield* agents.defaultInfo())).model ?? (yield* provider.defaultModel()))
-                  : undefined
+                  : undefined)
               if (model && !prior) {
                 const full = yield* provider.getModel(model.providerID, model.modelID)
-                if (
-                  params.variant &&
-                  params.variant !== "default" &&
-                  !Object.hasOwn(full.variants ?? {}, params.variant)
-                )
-                  throw new Error("Model variant is unavailable")
+                ModelReference.validateVariant(full, variant)
               }
               if (params.action === "create" && (params.start ?? Boolean(params.prompt)) && !params.prompt)
                 throw new Error("An initial prompt is required to start a new session")
+              // Validate inherited selections before admission; exact retries retain their saved payload.
+              const prepared =
+                !prior && (params.action === "prompt" || params.action === "steer")
+                  ? yield* ops.textPayload(selected.id, params.prompt ?? "", selection)
+                  : undefined
               const request = yield* runtime.withDurableAdmission(
                 db.transaction(
                   () =>
@@ -234,7 +243,7 @@ export const SessionControlTool = Tool.define(
                                 ? {
                                     id: model.modelID,
                                     providerID: model.providerID,
-                                    variant: params.variant ?? "default",
+                                    variant: variant ?? "default",
                                   }
                                 : undefined,
                               metadata: { orchestration: { creatorSessionID: ctx.sessionID, requestID: id } },
@@ -320,11 +329,7 @@ export const SessionControlTool = Tool.define(
                   .get()
                 const payload =
                   !queued && request.state === "created"
-                    ? yield* ops.textPayload(session.id, params.prompt ?? "", {
-                        agent: params.agent,
-                        model: params.model ? Provider.parseModel(params.model) : undefined,
-                        variant: params.variant,
-                      })
+                    ? (prepared ?? (yield* ops.textPayload(session.id, params.prompt ?? "", selection)))
                     : undefined
                 if (params.action === "steer" && payload) yield* ops.controlSteer(session.id, payload, request.queue_id)
                 yield* runtime.withDurableAdmission(

@@ -1690,17 +1690,17 @@ const layer = Layer.effect(
 
       const save = (active?: SessionV1.User["model"], cancelledFence?: number) =>
         Effect.gen(function* () {
-          if (input.selection && !resolved) {
-            const inherited = input.selection.inheritActive ? active : undefined
-            const selected = input.selection.model ?? inherited ?? info.model
+          if ((input.selection || input.variant) && !resolved) {
+            const inherited = input.selection?.inheritActive ? active : undefined
+            const selected = input.selection?.model ?? inherited ?? info.model
             const full = yield* getModel(
               ProviderV2.ID.make(selected.providerID),
               ModelV2.ID.make(selected.modelID),
               input.sessionID,
             )
-            const variant = input.selection.variant ?? inherited?.variant ?? info.model.variant ?? "default"
+            const variant = input.selection?.variant ?? inherited?.variant ?? info.model.variant ?? "default"
             const supported = variant === "default" || Object.hasOwn(full.variants ?? {}, variant)
-            if (input.selection.variant !== undefined && !supported) {
+            if ((input.selection ? input.selection.variant !== undefined : input.variant) && !supported) {
               if (delivery?.origin?.type === "scheduled" && delivery.state === "claimed")
                 yield* queue.releaseClaim(input.sessionID, delivery.id).pipe(Effect.orDie)
               return yield* new InputError({

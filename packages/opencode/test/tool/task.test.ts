@@ -341,6 +341,50 @@ describe("tool.task", () => {
         inheritVariant: false,
       },
       {
+        name: "separate variant overrides the suffix",
+        agent: "configured",
+        model: "test/org/override-model#unsupported",
+        explicitVariant: "high",
+        modelID: "org/override-model",
+        variant: "high",
+        savedVariant: "high",
+        effort: "high",
+        inheritVariant: false,
+      },
+      {
+        name: "separate model and variant",
+        agent: "configured",
+        model: "test/org/override-model",
+        explicitVariant: "low",
+        modelID: "org/override-model",
+        variant: "low",
+        savedVariant: "low",
+        effort: "low",
+        inheritVariant: false,
+      },
+      {
+        name: "variant-only override of configured model",
+        agent: "configured",
+        model: undefined,
+        explicitVariant: "low",
+        modelID: "configured-model",
+        variant: "low",
+        savedVariant: "low",
+        effort: "low",
+        inheritVariant: false,
+      },
+      {
+        name: "variant-only override of inherited model",
+        agent: "inherited",
+        model: "",
+        explicitVariant: "xhigh",
+        modelID: "test-model",
+        variant: "xhigh",
+        savedVariant: "xhigh",
+        effort: "xhigh",
+        inheritVariant: false,
+      },
+      {
         name: "model-only override does not inherit the parent variant",
         agent: "inherited",
         model: "test/test-model",
@@ -368,6 +412,7 @@ describe("tool.task", () => {
                 prompt: "inspect",
                 subagent_type: selection.agent,
                 model: selection.model,
+                variant: selection.explicitVariant,
               },
               {
                 sessionID: chat.id,
@@ -463,7 +508,7 @@ describe("tool.task", () => {
     }
   }
 
-  for (const [model, error] of [
+  for (const [model, error, variant] of [
     [" ", "Invalid model"],
     ["test-model", "Invalid model"],
     ["/test-model", "Invalid model"],
@@ -486,7 +531,11 @@ describe("tool.task", () => {
     ["test/image-output-model", 'Model "test/image-output-model" must support both text input and text output.'],
     ["test/image-input-model", 'Model "test/image-input-model" must support both text input and text output.'],
     ["test/image-only-model", 'Model "test/image-only-model" must support both text input and text output.'],
-  ]) {
+    [undefined, 'Variant "unsupported"', "unsupported"],
+    ["", "Model variant must not be empty", ""],
+    ["test/org/override-model#low", 'Variant "unsupported"', "unsupported"],
+    ["test/org/override-model#", "Invalid model", "high"],
+  ] as const) {
     it.instance(
       `rejects explicit model ${JSON.stringify(model)} before creating or resuming a child`,
       () =>
@@ -502,7 +551,7 @@ describe("tool.task", () => {
           for (const task_id of [undefined, child.id]) {
             const exit = yield* tool
               .execute(
-                { description: "invalid model", prompt: "inspect", subagent_type: "general", model, task_id },
+                { description: "invalid model", prompt: "inspect", subagent_type: "general", model, variant, task_id },
                 {
                   sessionID: chat.id,
                   messageID: assistant.id,
@@ -545,6 +594,13 @@ describe("tool.task", () => {
           { model: "test/configured-model", modelID: "configured-model", variant: "" },
           { model: "test/configured-model#low", modelID: "configured-model", variant: "low" },
           { model: "", modelID: "configured-model", variant: "high" },
+          {
+            model: "test/configured-model#unsupported",
+            explicitVariant: "low",
+            modelID: "configured-model",
+            variant: "low",
+          },
+          { model: undefined, explicitVariant: "low", modelID: "configured-model", variant: "low" },
         ].entries()) {
           const result = yield* tool.execute(
             {
@@ -552,6 +608,7 @@ describe("tool.task", () => {
               prompt: `follow-up ${index}`,
               subagent_type: "configured",
               model: selection.model,
+              variant: selection.explicitVariant,
               task_id: childIDs[0],
             },
             {
@@ -607,7 +664,8 @@ describe("tool.task", () => {
         const schema = tool.jsonSchema ?? ToolJsonSchema.fromSchema(tool.parameters)
         expect(schema.properties?.model).toMatchObject({ type: "string" })
         expect(schema.required).not.toContain("model")
-        expect(schema.properties).not.toHaveProperty("variant")
+        expect(schema.properties?.variant).toMatchObject({ type: "string" })
+        expect(schema.required).not.toContain("variant")
         expect(schema.properties?.background !== undefined).toBe(enabled)
       }),
     )

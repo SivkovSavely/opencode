@@ -186,6 +186,36 @@ exports[`tool parameters JSON Schema (wire shape) lsp 1`] = `
 }
 `;
 
+exports[`tool parameters JSON Schema (wire shape) model_catalog 1`] = `
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "properties": {
+    "limit": {
+      "description": "Maximum results, default 10",
+      "maximum": 20,
+      "minimum": 1,
+      "type": "integer",
+    },
+    "provider": {
+      "description": "Exact provider ID",
+      "maxLength": 256,
+      "type": "string",
+    },
+    "query": {
+      "description": "Model or provider search text",
+      "maxLength": 256,
+      "type": "string",
+    },
+    "variant": {
+      "description": "Exact variant name",
+      "maxLength": 256,
+      "type": "string",
+    },
+  },
+  "type": "object",
+}
+`;
+
 exports[`tool parameters JSON Schema (wire shape) plan 1`] = `
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -318,7 +348,7 @@ exports[`tool parameters JSON Schema (wire shape) task 1`] = `
       "type": "string",
     },
     "model": {
-      "description": "NEVER set this unless the user explicitly asks for a particular model or variant. Use "providerID/modelID" or "providerID/modelID#variant". Omitting the variant uses the model default, ignoring agent and parent variants.",
+      "description": "Only set when the user requests a model or variant. Use model_catalog for exact IDs. Format: "providerID/modelID[#variant]". Model-only uses the model default, not agent or parent variants.",
       "type": "string",
     },
     "prompt": {
@@ -331,6 +361,10 @@ exports[`tool parameters JSON Schema (wire shape) task 1`] = `
     },
     "task_id": {
       "description": "This should only be set if you mean to resume a previous task (you can pass a prior task_id and the task will continue the same subagent session as before instead of creating a fresh one)",
+      "type": "string",
+    },
+    "variant": {
+      "description": "Only set when requested by the user. Overrides #variant; without model, applies to the selected subagent model.",
       "type": "string",
     },
   },
