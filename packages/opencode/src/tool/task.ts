@@ -237,7 +237,7 @@ export const TaskTool = Tool.define(
           providerID: msg.info.providerID,
         }
       const childVariant = params.variant ?? override?.variant ?? (next.model ? undefined : variant)
-      if (!override && params.variant !== undefined) {
+      if (!override && (next.model || params.variant !== undefined)) {
         const full = yield* provider.getModel(model.providerID, model.modelID)
         ModelReference.validateVariant(full, childVariant ?? next.variant)
       }

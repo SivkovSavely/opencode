@@ -205,9 +205,15 @@ export const SessionControlTool = Tool.define(
                 (params.action === "create" && variant !== undefined
                   ? ((agent ?? (yield* agents.defaultInfo())).model ?? (yield* provider.defaultModel()))
                   : undefined)
-              if (model && !prior) {
-                const full = yield* provider.getModel(model.providerID, model.modelID)
-                ModelReference.validateVariant(full, variant)
+              if (!prior && (model || (params.action === "create" && params.prompt))) {
+                const launchAgent =
+                  params.action === "create" && params.prompt ? (agent ?? (yield* agents.defaultInfo())) : undefined
+                const effective = model ?? launchAgent?.model ?? (yield* provider.defaultModel())
+                const full = yield* provider.getModel(effective.providerID, effective.modelID)
+                const same =
+                  launchAgent?.model?.providerID === effective.providerID &&
+                  launchAgent.model.modelID === effective.modelID
+                ModelReference.validateVariant(full, variant ?? (same ? launchAgent.variant : undefined))
               }
               if (params.action === "create" && (params.start ?? Boolean(params.prompt)) && !params.prompt)
                 throw new Error("An initial prompt is required to start a new session")

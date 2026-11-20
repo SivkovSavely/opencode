@@ -4,6 +4,7 @@ import type { ConfigV1 } from "@opencode-ai/core/v1/config/config"
 import { Database } from "@opencode-ai/core/database/database"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
+import { sql } from "drizzle-orm"
 import { Cause, Deferred, Effect, Exit, Fiber, Layer } from "effect"
 import path from "path"
 import { Agent } from "../../src/agent/agent"
@@ -394,6 +395,37 @@ describe("tool.task", () => {
         effort: undefined,
         inheritVariant: false,
       },
+      {
+        name: "model override bypasses an unavailable configured model",
+        agent: "invalid-model",
+        model: "test/org/override-model#low",
+        modelID: "org/override-model",
+        variant: "low",
+        savedVariant: "low",
+        effort: "low",
+        inheritVariant: false,
+      },
+      {
+        name: "model-only override bypasses an unsupported configured variant",
+        agent: "invalid-variant",
+        model: "test/configured-model",
+        modelID: "configured-model",
+        variant: "",
+        savedVariant: "",
+        effort: "low",
+        inheritVariant: false,
+      },
+      {
+        name: "variant-only override bypasses an unsupported configured variant",
+        agent: "invalid-variant",
+        model: undefined,
+        explicitVariant: "low",
+        modelID: "configured-model",
+        variant: "low",
+        savedVariant: "low",
+        effort: "low",
+        inheritVariant: false,
+      },
     ]) {
       it.instance(
         `${selection.name} (${source})`,
@@ -489,6 +521,8 @@ describe("tool.task", () => {
             agent: {
               inherited: { mode: "subagent", variant: "high" },
               nonchat: { mode: "subagent", model: "test/image-only-model" },
+              "invalid-model": { mode: "subagent", model: "missing/model#unsupported" },
+              "invalid-variant": { mode: "subagent", model: "test/configured-model#unsupported" },
               ...(source === "json"
                 ? { configured: { mode: "subagent", model: "test/configured-model", variant: "high" } }
                 : {}),
@@ -506,6 +540,63 @@ describe("tool.task", () => {
         },
       )
     }
+  }
+
+  for (const model of ["missing/model", "test/unavailable-model", "test/configured-model#unsupported"]) {
+    background.instance(
+      `rejects configured model ${model} before creating, resuming, or backgrounding a child`,
+      () =>
+        Effect.gen(function* () {
+          const sessions = yield* Session.Service
+          const prompt = yield* SessionPrompt.Service
+          const database = yield* Database.Service
+          const { chat, assistant } = yield* seed()
+          const child = yield* sessions.create({ parentID: chat.id, title: "Existing child" })
+          const tool = yield* TaskTool.pipe(Effect.flatMap((tool) => tool.init()))
+          const rows = yield* database.db.all(sql`SELECT id FROM session`)
+          const requests = yield* database.db.all(sql`SELECT id FROM session_control_request`)
+          const queued = yield* database.db.all(sql`SELECT id FROM session_queue`)
+          let prompts = 0
+          let metadata = 0
+          for (const background of [false, true]) {
+            for (const task_id of [undefined, child.id]) {
+              const exit = yield* tool
+                .execute(
+                  { description: "invalid default", prompt: "inspect", subagent_type: "optional", task_id, background },
+                  {
+                    sessionID: chat.id,
+                    messageID: assistant.id,
+                    agent: "build",
+                    abort: new AbortController().signal,
+                    extra: {
+                      promptOps: {
+                        ...stubOps(),
+                        prompt: (input, parent) => {
+                          prompts++
+                          return prompt.prompt({ ...input, noReply: true }, parent).pipe(Effect.orDie)
+                        },
+                      } satisfies TaskPromptOps,
+                    },
+                    messages: [],
+                    metadata: () => Effect.sync(() => void metadata++),
+                    ask: () => Effect.void,
+                  },
+                )
+                .pipe(Effect.exit)
+              expect(Exit.isFailure(exit)).toBe(true)
+              if (Exit.isFailure(exit))
+                expect(Cause.pretty(exit.cause)).toContain(model.includes("#") ? "unsupported" : "Model not found")
+              expect(yield* database.db.all(sql`SELECT id FROM session`)).toEqual(rows)
+              expect(yield* database.db.all(sql`SELECT id FROM session_control_request`)).toEqual(requests)
+              expect(yield* database.db.all(sql`SELECT id FROM session_queue`)).toEqual(queued)
+              expect(yield* sessions.get(child.id)).toEqual(child)
+            }
+          }
+          expect(prompts).toBe(0)
+          expect(metadata).toBe(0)
+        }),
+      { config: { ...modelConfig, agent: { optional: { mode: "subagent", model } } } },
+    )
   }
 
   for (const [model, error, variant] of [

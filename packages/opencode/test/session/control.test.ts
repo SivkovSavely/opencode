@@ -120,6 +120,148 @@ const modelFixture = Effect.gen(function* () {
   return { ...f, directory, controllerDirectory: f.directory }
 })
 
+const launchFixture = Effect.gen(function* () {
+  const f = yield* fixture
+  const directory = yield* tmpdirScoped({
+    git: true,
+    config: {
+      ...testProviderConfig(f.llm.url),
+      model: "test/test-model",
+      default_agent: "invalid-model",
+      agent: {
+        "invalid-model": { mode: "primary", model: "test/missing", variant: "unsupported" },
+        "invalid-variant": { mode: "primary", model: "test/test-model", variant: "unsupported" },
+        valid: { mode: "primary", model: "test/test-model" },
+      },
+    },
+  })
+  return { ...f, directory, controllerDirectory: f.directory }
+})
+
+it.live("create preflights selected configured defaults before persisting roots or inputs", () =>
+  Effect.gen(function* () {
+    const f = yield* launchFixture
+    yield* f.store.provide(
+      { directory: f.controllerDirectory },
+      Effect.gen(function* () {
+        const c = yield* control
+        const sessions = yield* f.database.db.all(sql`SELECT id FROM session`)
+        const requests = yield* f.database.db.all(sql`SELECT id FROM session_control_request`)
+        for (const [index, selection] of [
+          {},
+          { agent: "invalid-model" },
+          { agent: "invalid-variant" },
+          { agent: "invalid-variant", model: "test/test-model" },
+        ].entries()) {
+          const result = yield* Effect.exit(
+            c.tool.execute(
+              {
+                action: "create",
+                directory: f.directory,
+                ...selection,
+                prompt: "must not be admitted",
+                requestID: `configured-invalid-${index}`,
+              },
+              c.ctx,
+            ),
+          )
+          expect(result._tag).toBe("Failure")
+          expect(yield* f.database.db.all(sql`SELECT id FROM session`)).toEqual(sessions)
+          expect(yield* f.database.db.all(sql`SELECT id FROM session_control_request`)).toEqual(requests)
+          expect(yield* f.database.db.all(sql`SELECT id FROM session_queue`)).toHaveLength(0)
+        }
+        for (const [index, agent] of [undefined, "invalid-model", "invalid-variant"].entries()) {
+          const result = JSON.parse(
+            (yield* c.tool.execute(
+              { action: "create", directory: f.directory, agent, requestID: `configured-no-prompt-${index}` },
+              c.ctx,
+            )).output,
+          )
+          expect(result.state).toBe("done")
+          expect((yield* c.sessions.get(SessionID.make(result.sessionID))).model).toBeUndefined()
+          expect(yield* f.database.db.all(sql`SELECT id FROM session_queue`)).toHaveLength(0)
+        }
+        expect(c.permissions).toContain("external_directory")
+        expect(yield* f.llm.calls).toBe(0)
+      }).pipe(Effect.provide(f.context), Effect.provideService(RuntimeLifecycle.Service, f.runtime)),
+    )
+  }),
+)
+
+it.live("create accepts overrides of invalid defaults and retains admitted selections on configuration changes", () =>
+  Effect.gen(function* () {
+    const f = yield* launchFixture
+    yield* f.store.provide(
+      { directory: f.controllerDirectory },
+      Effect.gen(function* () {
+        const c = yield* control
+        for (const [index, selection] of [
+          { model: "test/test-model", expectedAgent: "invalid-model" },
+          { agent: "invalid-model", model: "test/test-model#default", expectedAgent: "invalid-model" },
+          { agent: "invalid-variant", variant: "default", expectedAgent: "invalid-variant" },
+          {
+            agent: "invalid-variant",
+            model: "test/test-model#unsupported",
+            variant: "default",
+            expectedAgent: "invalid-variant",
+          },
+          { agent: "valid", expectedAgent: "valid" },
+        ].entries()) {
+          const params = {
+            action: "create",
+            directory: f.directory,
+            agent: selection.agent,
+            model: selection.model,
+            variant: selection.variant,
+            prompt: "valid override",
+            start: false,
+            requestID: `configured-override-${index}`,
+          }
+          const first = JSON.parse((yield* c.tool.execute(params, c.ctx)).output)
+          const id = SessionID.make(first.sessionID)
+          expect((yield* c.sessions.get(id)).directory).toBe(f.directory)
+          const snapshot = yield* f.store.provide({ directory: f.directory }, c.queue.list(id))
+          expect(snapshot.items).toHaveLength(1)
+          expect(snapshot.items[0]?.payload).toMatchObject({
+            agent: selection.expectedAgent,
+            model: { providerID: "test", modelID: "test-model" },
+            variant: "default",
+          })
+          if (selection.agent === "valid") {
+            yield* Effect.promise(() =>
+              Bun.write(
+                `${f.directory}/opencode.json`,
+                JSON.stringify({
+                  ...testProviderConfig(f.llm.url),
+                  model: "test/test-model",
+                  agent: { valid: { mode: "primary", model: "test/missing", variant: "unsupported" } },
+                }),
+              ),
+            )
+            yield* f.store.disposeDirectory(f.directory)
+          }
+          const sessions = yield* f.database.db.all(sql`SELECT id FROM session`)
+          const requests = yield* f.database.db.all(sql`SELECT id FROM session_control_request`)
+          const retry = JSON.parse((yield* c.tool.execute(params, { ...c.ctx, callID: randomUUID() })).output)
+          expect(retry.sessionID).toBe(id)
+          expect(retry.requestID).toBe(first.requestID)
+          expect(yield* f.store.provide({ directory: f.directory }, c.queue.list(id))).toEqual(snapshot)
+          expect(
+            (yield* Effect.exit(c.tool.execute({ ...params, variant: "default", prompt: "conflict" }, c.ctx)))._tag,
+          ).toBe("Failure")
+          if (selection.agent === "valid")
+            expect(
+              (yield* Effect.exit(c.tool.execute({ ...params, requestID: "changed-config-new-request" }, c.ctx)))._tag,
+            ).toBe("Failure")
+          expect(yield* f.database.db.all(sql`SELECT id FROM session`)).toEqual(sessions)
+          expect(yield* f.database.db.all(sql`SELECT id FROM session_control_request`)).toEqual(requests)
+        }
+        expect(yield* f.llm.calls).toBe(0)
+      }).pipe(Effect.provide(f.context), Effect.provideService(RuntimeLifecycle.Service, f.runtime)),
+    )
+  }),
+)
+
 for (const action of ["create", "prompt", "steer"] as const) {
   it.live(`${action} normalizes model suffixes and explicit variant precedence`, () =>
     Effect.gen(function* () {
