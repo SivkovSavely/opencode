@@ -4,8 +4,9 @@ import type { ConfigV1 } from "@opencode-ai/core/v1/config/config"
 import { Database } from "@opencode-ai/core/database/database"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
+import { SessionHandoffRecovery } from "@opencode-ai/core/session/handoff-recovery"
 import { sql } from "drizzle-orm"
-import { Cause, Deferred, Effect, Exit, Fiber, Layer } from "effect"
+import { Cause, Deferred, Effect, Exit, Fiber, Layer, Schema } from "effect"
 import path from "path"
 import { Agent } from "../../src/agent/agent"
 import { BackgroundJob } from "@/background/job"
@@ -514,6 +515,43 @@ describe("tool.task", () => {
             })
             expect(yield* agents.get("configured")).toEqual(before)
             expect((yield* MessageV2.get({ sessionID: chat.id, messageID: assistant.id })).info).toEqual(assistant)
+            const database = yield* Database.Service
+            const runtime = RuntimeLifecycle.make({ lineage: "task-selection" }, yield* Effect.scope, database)
+            yield* runtime.admit({
+              sessionID: SessionID.make(result.metadata.sessionId),
+              directory: chat.directory,
+              parentSessionID: chat.id,
+              parentMessageID: assistant.id,
+              parentCallID: "selection",
+              parentMode: "foreground",
+            })
+            yield* sessions.updatePart({
+              id: PartID.ascending(),
+              sessionID: chat.id,
+              messageID: assistant.id,
+              type: "tool",
+              tool: "task",
+              callID: "selection",
+              state: {
+                status: "completed",
+                input: { prompt: "inspect", subagent_type: selection.agent },
+                metadata: result.metadata,
+                title: result.title,
+                output: result.output,
+                time: { start: 1, end: 2 },
+              },
+            })
+            const evidence = yield* SessionHandoffRecovery.inspect(database, chat.id, runtime.verifyOwner)
+            Schema.decodeUnknownSync(SessionHandoffRecovery.Evidence)(evidence)
+            expect(evidence.descendants[0]).toMatchObject({
+              proof: "verified",
+              selection: {
+                providerID: "test",
+                modelID: selection.modelID,
+                variant: selection.savedVariant || "default",
+              },
+            })
+            expect(yield* MessageV2.get({ sessionID: saved.info.sessionID, messageID: saved.info.id })).toEqual(saved)
           }),
         {
           config: {
@@ -669,6 +707,106 @@ describe("tool.task", () => {
       { config: modelConfig },
     )
   }
+
+  it.instance(
+    "mixed descendants remain inspectable through fresh explicit-variant tasks and model-only resumption",
+    () =>
+      Effect.gen(function* () {
+        const sessions = yield* Session.Service
+        const prompt = yield* SessionPrompt.Service
+        const database = yield* Database.Service
+        const runtime = RuntimeLifecycle.make({ lineage: "mixed-task-selection" }, yield* Effect.scope, database)
+        const { chat, assistant } = yield* seed()
+        const tool = yield* TaskTool.pipe(Effect.flatMap((tool) => tool.init()))
+        const children: string[] = []
+        for (const [index, selection] of [
+          { agent: "inherited", variant: undefined, model: undefined, expected: "xhigh" },
+          { agent: "configured", variant: undefined, model: undefined, expected: "high" },
+          { agent: "configured", variant: undefined, model: "test/configured-model", expected: "default" },
+          { agent: "configured", variant: "high", model: "test/configured-model", expected: "high" },
+          { agent: "configured", variant: undefined, model: "test/configured-model", expected: "default" },
+        ].entries()) {
+          const result = yield* tool.execute(
+            {
+              description: "mixed selection",
+              prompt: `inspect ${index}`,
+              subagent_type: selection.agent,
+              model: selection.model,
+              variant: selection.variant,
+              task_id: index === 4 ? children[2] : undefined,
+            },
+            {
+              sessionID: chat.id,
+              messageID: assistant.id,
+              callID: `mixed-${index}`,
+              agent: "build",
+              abort: new AbortController().signal,
+              extra: {
+                promptOps: {
+                  ...stubOps(),
+                  prompt: (input, parent) => prompt.prompt({ ...input, noReply: true }, parent).pipe(Effect.orDie),
+                } satisfies TaskPromptOps,
+              },
+              messages: [],
+              metadata: () => Effect.void,
+              ask: () => Effect.void,
+            },
+          )
+          children.push(result.metadata.sessionId)
+          yield* runtime.admit({
+            sessionID: SessionID.make(result.metadata.sessionId),
+            directory: chat.directory,
+            parentSessionID: chat.id,
+            parentMessageID: assistant.id,
+            parentCallID: `mixed-${index}`,
+            parentMode: "foreground",
+          })
+          yield* sessions.updatePart({
+            id: PartID.ascending(),
+            sessionID: chat.id,
+            messageID: assistant.id,
+            type: "tool",
+            tool: "task",
+            callID: `mixed-${index}`,
+            state: {
+              status: "completed",
+              input: { prompt: `inspect ${index}`, subagent_type: selection.agent },
+              metadata: result.metadata,
+              title: result.title,
+              output: result.output,
+              time: { start: 1, end: 2 },
+            },
+          })
+          const evidence = yield* SessionHandoffRecovery.inspect(database, chat.id, runtime.verifyOwner)
+          Schema.decodeUnknownSync(SessionHandoffRecovery.Evidence)(evidence)
+          expect(
+            evidence.descendants.find((child) => child.childSessionID === result.metadata.sessionId),
+          ).toMatchObject({
+            // Multiple original inputs or call links must never gain recovery authority.
+            proof: index === 4 ? "ambiguous_lineage" : "verified",
+            selection: index === 4 ? null : { variant: selection.expected },
+          })
+          if (index === 4) {
+            const saved = yield* MessageV2.get({
+              sessionID: SessionID.make(result.metadata.sessionId),
+              messageID: MessageID.make(result.metadata.messageID),
+            })
+            expect(saved.info.role === "user" && saved.info.model.variant).toBe("")
+          }
+        }
+        expect(children[4]).toBe(children[2])
+        expect(yield* sessions.children(chat.id)).toHaveLength(4)
+      }),
+    {
+      config: {
+        ...modelConfig,
+        agent: {
+          inherited: { mode: "subagent" },
+          configured: { mode: "subagent", model: "test/configured-model", variant: "high" },
+        },
+      },
+    },
+  )
 
   it.instance(
     "task_id model overrides are per-call and omitted or empty model restores V1 agent selection",

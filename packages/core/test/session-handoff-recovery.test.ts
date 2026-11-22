@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test"
 import { EffectDrizzleSqlite } from "@opencode-ai/effect-drizzle-sqlite"
 import { sql } from "drizzle-orm"
-import { Effect } from "effect"
+import { Effect, Schema } from "effect"
 import { DatabaseMigration } from "../src/database/migration"
 import { layer } from "../src/database/sqlite.bun"
 import { SessionHandoffRecovery } from "../src/session/handoff-recovery"
@@ -65,15 +65,19 @@ test("startup holds the enrolled root and ambiguous projected, runtime and metad
   )
 })
 
-const seedLinked = Effect.fnUntraced(function* (db: SessionHandoffRecovery.Connection["db"], directory: string) {
-  const model = { providerID: "synthetic", modelID: "reviewer", variant: "max" }
+const seedLinked = Effect.fnUntraced(function* (
+  db: SessionHandoffRecovery.Connection["db"],
+  directory: string,
+  variant = "max",
+) {
+  const model = { providerID: "synthetic", modelID: "reviewer", variant }
   const task = {
     parentSessionId: "root",
     parentMessageID: "assistant",
     parentCallID: "call",
     messageID: "child-user",
     model,
-    variant: "max",
+    variant,
   }
   yield* db.run(
     sql`INSERT INTO project (id, worktree, time_created, time_updated, sandboxes) VALUES ('project', ${directory}, 1, 1, '[]')`,
@@ -96,13 +100,91 @@ const seedLinked = Effect.fnUntraced(function* (db: SessionHandoffRecovery.Conne
     sql`INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES ('task', 'assistant', 'root', 1, 1, ${JSON.stringify({ type: "tool", tool: "task", callID: "call", state: { status: "running", input: { prompt: "review", subagent_type: "reviewer" }, metadata: { ...task, sessionId: "child" }, time: { start: 1 } } })})`,
   )
   yield* db.run(
-    sql`INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES ('child-user', 'child', 2, 2, ${JSON.stringify({ role: "user", agent: "reviewer", model, variant: "max", time: { created: 2 } })})`,
+    sql`INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES ('child-user', 'child', 2, 2, ${JSON.stringify({ role: "user", agent: "reviewer", model, variant, time: { created: 2 } })})`,
   )
   yield* db.run(
     sql`INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES ('child-text', 'child-user', 'child', 2, 2, '{"type":"text","text":"review"}')`,
   )
   yield* SessionHandoffRecovery.installStartupHolds({ db }, "current")
 })
+
+test("verified model-only descendant retains schema-valid evidence without changing its input", async () => {
+  await using tmp = await tmpdir()
+  await run(`${tmp.path}/empty-variant.db`, (db) =>
+    Effect.gen(function* () {
+      yield* seedLinked(db, tmp.path, "")
+      // V1 persists the sentinel inside model, not as a top-level user variant.
+      yield* db.run(sql`UPDATE message SET data=json_remove(data,'$.variant') WHERE id='child-user'`)
+      const original = yield* db.get(sql`SELECT * FROM message WHERE id='child-user'`)
+      const key = { sessionID: "root", queueID: "queue", userMessageID: "user" }
+      yield* SessionHandoffStore.persistAction(
+        { db },
+        {
+          ...key,
+          directory: tmp.path,
+          baselineSelection: { providerID: "synthetic", modelID: "reviewer", variant: "max" },
+          createdAt: 1,
+        },
+      )
+      const dead = () => Effect.succeed("dead" as const)
+      const snapshot = yield* SessionHandoffRecovery.inspect({ db }, "root", dead)
+      Schema.decodeUnknownSync(SessionHandoffRecovery.Evidence)(snapshot)
+      expect(snapshot.descendants[0]).toMatchObject({
+        proof: "verified",
+        selection: { providerID: "synthetic", modelID: "reviewer", variant: "default" },
+      })
+      yield* SessionHandoffRecovery.retain({ db }, key, snapshot)
+      expect(yield* SessionHandoffRecovery.retained({ db }, key)).toEqual(snapshot)
+      yield* SessionHandoffRecovery.captureCurrent({ db }, "child", dead)
+      expect(yield* db.get(sql`SELECT * FROM message WHERE id='child-user'`)).toEqual(original)
+    }),
+  )
+})
+
+for (const [name, mutation] of [
+  ["call variant", sql`UPDATE part SET data=json_set(data,'$.state.metadata.variant','default') WHERE id='task'`],
+  ["session variant", sql`UPDATE session SET metadata=json_set(metadata,'$.task.variant','default') WHERE id='child'`],
+  ["call model", sql`UPDATE part SET data=json_set(data,'$.state.metadata.model.modelID','other') WHERE id='task'`],
+  [
+    "session model",
+    sql`UPDATE session SET metadata=json_set(metadata,'$.task.model.providerID','other') WHERE id='child'`,
+  ],
+  [
+    "persisted variant",
+    sql`UPDATE message SET data=json_set(data,'$.model.variant','high','$.variant','high') WHERE id='child-user'`,
+  ],
+  ["prompt text", sql`UPDATE part SET data=json_set(data,'$.text','changed') WHERE id='child-text'`],
+] as const) {
+  test(`model-only descendant rejects changed ${name}`, async () => {
+    await using tmp = await tmpdir()
+    await run(`${tmp.path}/mismatch.db`, (db) =>
+      Effect.gen(function* () {
+        yield* seedLinked(db, tmp.path, "")
+        const dead = () => Effect.succeed("dead" as const)
+        const original = yield* SessionHandoffRecovery.inspect({ db }, "root", dead)
+        yield* db.run(mutation)
+        const snapshot = yield* SessionHandoffRecovery.inspect({ db }, "root", dead)
+        expect(snapshot.descendants[0]?.proof).toBe("ambiguous_input")
+        expect(snapshot.descendantDigest).not.toBe(original.descendantDigest)
+        const before = yield* db.all(sql`SELECT * FROM runtime_execution ORDER BY session_id`)
+        expect(
+          yield* SessionHandoffRecovery.claim(
+            { db },
+            {
+              sessionID: "root",
+              expectedDescendantDigest: snapshot.descendantDigest,
+              children: snapshot.descendants.map(expectation),
+              owner: { lineage: "lineage", instance: "current" },
+            },
+            dead,
+            () => Effect.die("ambiguous input must not transition the root"),
+          ).pipe(Effect.flip),
+        ).toMatchObject({ code: "ambiguous_input" })
+        expect(yield* db.all(sql`SELECT * FROM runtime_execution ORDER BY session_id`)).toEqual(before)
+      }),
+    )
+  })
+}
 
 function expectation(child: SessionHandoffRecovery.TaskDescendant): SessionHandoffRecovery.ChildExpectation {
   if (
@@ -142,7 +224,7 @@ for (const blocked of [
     await using tmp = await tmpdir()
     await run(`${tmp.path}/recovery.db`, (db) =>
       Effect.gen(function* () {
-        yield* seedLinked(db, tmp.path)
+        yield* seedLinked(db, tmp.path, "")
         if (blocked === "orphan-task")
           yield* db.run(
             sql`INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES ('orphan', 'assistant', 'root', 3, 3, '{"type":"tool","tool":"task","callID":"orphan","state":{"status":"running"}}')`,
@@ -584,7 +666,7 @@ test("retained action closure survives reopened SQLite and later reused child me
   const key = { sessionID: "root", queueID: "queue", userMessageID: "user" }
   const saved = await run(filename, (db) =>
     Effect.gen(function* () {
-      yield* seedLinked(db, tmp.path)
+      yield* seedLinked(db, tmp.path, "")
       yield* SessionHandoffStore.persistAction(
         { db },
         {

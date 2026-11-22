@@ -680,7 +680,8 @@ export const inspect = Effect.fn("SessionHandoffRecovery.inspect")(function* (
       parentSessionID: session?.parent_id ?? runtime?.parent_session_id ?? null,
       proof: !lineage ? "ambiguous_lineage" : !validInput ? "ambiguous_input" : "verified",
       state: terminal ? "terminal" : (yield* held(database, id)) ? "held" : "active",
-      selection,
+      // Report the model default only after verifying the original sentinel against Task metadata.
+      selection: selection?.variant === "" ? { ...selection, variant: "default" } : selection,
       agent: typeof user.agent === "string" ? user.agent : null,
       inputDigest: digest({
         input,

@@ -610,6 +610,7 @@ for (const scenario of ["root", "terminal", "new_tasks", "compaction"] as const)
               parentCallID: "review-call",
               messageID: childUserID,
               model,
+              ...(newTasks ? { variant: "" } : {}),
             }
             const child = yield* f.sessions.create({
               title: "reviewer",
@@ -677,7 +678,7 @@ for (const scenario of ["root", "terminal", "new_tasks", "compaction"] as const)
               sessionID: child.id,
               role: "user",
               agent: "general",
-              model,
+              model: newTasks ? { ...model, variant: "" } : model,
               time: { created: 3 },
             })
             yield* f.sessions.updatePart({
@@ -801,12 +802,15 @@ for (const scenario of ["root", "terminal", "new_tasks", "compaction"] as const)
                         reply().tool("task", {
                           description: "second reviewer",
                           subagent_type: "general",
+                          model: "test/test-model",
                           prompt: "Perform a new second review.",
                         }),
                         reply().wait(reviewerGate.promise).text("Second reviewer actual result").stop(),
                         reply().tool("task", {
                           description: "audit",
                           subagent_type: "audit",
+                          model: "test/test-model",
+                          variant: "high",
                           prompt: "Perform a new audit.",
                         }),
                         reply().text("Audit actual result").stop(),
@@ -995,7 +999,11 @@ for (const scenario of ["root", "terminal", "new_tasks", "compaction"] as const)
                     state: "terminal",
                     resultState: "completed",
                     fence: 0,
-                    selection: { providerID: "test", modelID: "test-model", variant: "high" },
+                    selection: {
+                      providerID: "test",
+                      modelID: "test-model",
+                      variant: item.agent === "audit" ? "high" : "default",
+                    },
                   })
                   expect(typeof item.resultAssistantMessageID).toBe("string")
                   expect(
@@ -1069,7 +1077,7 @@ for (const scenario of ["root", "terminal", "new_tasks", "compaction"] as const)
                     ? [
                         { model: "test-model", effort: undefined },
                         { model: "test-model", effort: "high" },
-                        { model: "test-model", effort: "high" },
+                        { model: "test-model", effort: undefined },
                         { model: "test-model", effort: "high" },
                         { model: "test-model", effort: "high" },
                         { model: "test-model", effort: "high" },
