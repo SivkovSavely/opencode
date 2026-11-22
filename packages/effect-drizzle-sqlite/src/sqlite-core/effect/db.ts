@@ -25,6 +25,7 @@ import { SQLiteEffectRaw } from "./raw"
 import { SQLiteEffectSelectBuilder } from "./select"
 import type { SQLiteEffectSelectBase } from "./select"
 import type { SQLiteEffectSession, SQLiteEffectTransaction } from "./session"
+import { captureSqlOrigin, withSqlOrigin } from "./sql-origin"
 import { SQLiteEffectUpdateBuilder } from "./update"
 
 export class SQLiteEffectDatabase<
@@ -208,8 +209,9 @@ export class SQLiteEffectDatabase<
     execute: (query: SQL) => Effect.Effect<TResult, TEffectHKT["error"], TEffectHKT["context"]>,
   ): SQLiteEffectRaw<TResult, TEffectHKT> {
     const sequel = typeof query === "string" ? sql.raw(query) : query.getSQL()
+    const origin = captureSqlOrigin()
     return new SQLiteEffectRaw(
-      () => execute(sequel),
+      () => withSqlOrigin(execute(sequel), origin),
       () => sequel,
       action,
       this.dialect,

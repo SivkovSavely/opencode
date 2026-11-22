@@ -1,6 +1,7 @@
 /* oxlint-disable */
 import type * as Effect from "effect/Effect"
-import { applyEffectWrapper, type QueryEffectHKTBase } from "drizzle-orm/effect-core/query-effect"
+import type { QueryEffectHKTBase } from "drizzle-orm/effect-core/query-effect"
+import { applySqlEffectWrapper } from "./sql-origin"
 import { entityKind } from "drizzle-orm/entity"
 import {
   type BuildQueryResult,
@@ -195,4 +196,4 @@ export class SQLiteEffectRelationalQuery<TResult, TEffectHKT extends QueryEffect
   }
 }
 
-applyEffectWrapper(SQLiteEffectRelationalQuery)
+applySqlEffectWrapper(SQLiteEffectRelationalQuery)

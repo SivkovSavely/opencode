@@ -15,6 +15,7 @@ import { classifySqliteError, SqlError } from "effect/unstable/sql/SqlError"
 import * as Statement from "effect/unstable/sql/Statement"
 import { Sqlite } from "./sqlite"
 import { DatabaseDiagnostics } from "./diagnostics"
+import { sqliteExecution } from "./sqlite-execution"
 
 const ATTR_DB_SYSTEM_NAME = "db.system.name"
 
@@ -62,37 +63,54 @@ const make = (options: Config) =>
 
     const run = (query: string, params: ReadonlyArray<unknown> = []) =>
       Effect.withFiber<Array<Record<string, unknown>>, SqlError>((fiber) => {
-        const statement = native.query(query)
-        // @ts-ignore bun-types missing safeIntegers method, fixed in https://github.com/oven-sh/bun/pull/26627
-        statement.safeIntegers(Context.get(fiber.context, Client.SafeIntegers))
+        const finish = sqliteExecution?.start(query, "rows", fiber, tracker?.id)
+        let executing = false
+        let success = false
         try {
+          const statement = native.query(query)
+          // @ts-ignore bun-types missing safeIntegers method, fixed in https://github.com/oven-sh/bun/pull/26627
+          statement.safeIntegers(Context.get(fiber.context, Client.SafeIntegers))
+          executing = true
           const rows = (statement.all(...(params as any)) ?? []) as Array<Record<string, unknown>>
+          success = true
           tracker?.query(query, fiber.id)
           return Effect.succeed(rows)
         } catch (cause) {
+          // Preparation defects are not classified as execution errors.
+          if (!executing) throw cause
           return Effect.fail(
             new SqlError({
               reason: classifySqliteError(cause, { message: "Failed to execute statement", operation: "execute" }),
             }),
           )
+        } finally {
+          finish?.(success)
         }
       })
 
     const runValues = (query: string, params: ReadonlyArray<unknown> = []) =>
       Effect.withFiber<Array<unknown[]>, SqlError>((fiber) => {
-        const statement = native.query(query)
-        // @ts-ignore bun-types missing safeIntegers method, fixed in https://github.com/oven-sh/bun/pull/26627
-        statement.safeIntegers(Context.get(fiber.context, Client.SafeIntegers))
+        const finish = sqliteExecution?.start(query, "values", fiber, tracker?.id)
+        let executing = false
+        let success = false
         try {
+          const statement = native.query(query)
+          // @ts-ignore bun-types missing safeIntegers method, fixed in https://github.com/oven-sh/bun/pull/26627
+          statement.safeIntegers(Context.get(fiber.context, Client.SafeIntegers))
+          executing = true
           const rows = (statement.values(...(params as any)) ?? []) as Array<unknown[]>
+          success = true
           tracker?.query(query, fiber.id)
           return Effect.succeed(rows)
         } catch (cause) {
+          if (!executing) throw cause
           return Effect.fail(
             new SqlError({
               reason: classifySqliteError(cause, { message: "Failed to execute statement", operation: "execute" }),
             }),
           )
+        } finally {
+          finish?.(success)
         }
       })
 
@@ -161,7 +179,11 @@ const nativeLayer = (config: Config) =>
       if (config.filename !== ":memory:" && existsSync(config.filename)) {
         const probe = new Database(config.filename, { readonly: true })
         try {
-          DatabaseCompatibility.check(config.filename, (sql) => probe.query(sql).all())
+          DatabaseCompatibility.check(config.filename, (sql) =>
+            sqliteExecution
+              ? sqliteExecution.startup(sql, "compatibility", () => probe.query(sql).all())
+              : probe.query(sql).all(),
+          )
         } finally {
           probe.close()
         }
@@ -172,7 +194,11 @@ const nativeLayer = (config: Config) =>
         create: config.create ?? true,
       })
       yield* Effect.addFinalizer(() => Effect.sync(() => native.close()))
-      if (config.disableWAL !== true) native.run("PRAGMA journal_mode = WAL;")
+      if (config.disableWAL !== true) {
+        const sql = "PRAGMA journal_mode = WAL;"
+        if (sqliteExecution) sqliteExecution.startup(sql, "wal", () => native.run(sql))
+        else native.run(sql)
+      }
       return native
     }),
   )

@@ -1,7 +1,8 @@
 /* oxlint-disable */
 import type * as Effect from "effect/Effect"
 import type { CacheConfig } from "drizzle-orm/cache/core/types"
-import { applyEffectWrapper, type QueryEffectHKTBase } from "drizzle-orm/effect-core/query-effect"
+import type { QueryEffectHKTBase } from "drizzle-orm/effect-core/query-effect"
+import { applySqlEffectWrapper } from "./sql-origin"
 import { entityKind, is } from "drizzle-orm/entity"
 import type {
   BuildSubquerySelection,
@@ -274,6 +275,6 @@ export class SQLiteEffectSelectBase<
   }
 }
 
-applyEffectWrapper(SQLiteEffectSelectBase)
+applySqlEffectWrapper(SQLiteEffectSelectBase)
 
 export type AnySQLiteEffectSelect = SQLiteEffectSelectBase<any, any, any, any, any, any, any, any, any, any>

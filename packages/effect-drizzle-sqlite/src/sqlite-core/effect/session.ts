@@ -1,4 +1,5 @@
 /* oxlint-disable */
+import { captureSqlOrigin, withSqlOrigin } from "./sql-origin"
 import * as Cause from "effect/Cause"
 import * as Effect from "effect/Effect"
 import type { SqlError } from "effect/unstable/sql/SqlError"
@@ -210,7 +211,8 @@ export class SQLiteEffectPreparedQuery<
     executeMethod: SQLiteEffectExecuteMethod,
     mapResult?: (result: A) => B,
   ) {
-    return Effect.gen({ self: this }, function* () {
+    const origin = captureSqlOrigin()
+    const effect = Effect.gen({ self: this }, function* () {
       const params = fillPlaceholders(this.query.params, placeholderValues ?? {})
 
       yield* this.logger.logQuery(this.query.sql, params)
@@ -222,6 +224,7 @@ export class SQLiteEffectPreparedQuery<
         mapResult,
       )
     })
+    return withSqlOrigin(effect, origin)
   }
 
   private mapCachedResult<A, B>(result: A, mapResult: ((result: A) => B) | undefined) {

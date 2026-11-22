@@ -1,6 +1,7 @@
 /* oxlint-disable */
 import type * as Effect from "effect/Effect"
-import { applyEffectWrapper, type QueryEffectHKTBase } from "drizzle-orm/effect-core/query-effect"
+import type { QueryEffectHKTBase } from "drizzle-orm/effect-core/query-effect"
+import { applySqlEffectWrapper } from "./sql-origin"
 import { entityKind, is } from "drizzle-orm/entity"
 import type { SelectResultFields } from "drizzle-orm/query-builders/select.types"
 import type { RunnableQuery } from "drizzle-orm/runnable-query"
@@ -346,4 +347,4 @@ export class SQLiteEffectInsertBase<
   }
 }
 
-applyEffectWrapper(SQLiteEffectInsertBase)
+applySqlEffectWrapper(SQLiteEffectInsertBase)

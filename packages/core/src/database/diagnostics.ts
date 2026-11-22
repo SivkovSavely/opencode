@@ -82,6 +82,7 @@ function makeDatabase(id: number) {
   }
 
   return {
+    id,
     wait(kind: Kind, fiberID: number) {
       const waiter = { kind, fiberID, startedAt: Date.now(), waiting: true }
       waiting++

@@ -15,6 +15,7 @@ import { classifySqliteError, SqlError } from "effect/unstable/sql/SqlError"
 import * as Statement from "effect/unstable/sql/Statement"
 import { Sqlite } from "./sqlite"
 import { DatabaseDiagnostics } from "./diagnostics"
+import { sqliteExecution } from "./sqlite-execution"
 
 const ATTR_DB_SYSTEM_NAME = "db.system.name"
 
@@ -62,36 +63,52 @@ const make = (options: Config) =>
 
     const run = (query: string, params: ReadonlyArray<unknown> = []) =>
       Effect.withFiber<Array<Record<string, unknown>>, SqlError>((fiber) => {
-        const statement = native.prepare(query)
-        statement.setReadBigInts(Context.get(fiber.context, Client.SafeIntegers))
+        const finish = sqliteExecution?.start(query, "rows", fiber, tracker?.id)
+        let executing = false
+        let success = false
         try {
+          const statement = native.prepare(query)
+          statement.setReadBigInts(Context.get(fiber.context, Client.SafeIntegers))
+          executing = true
           const rows = statement.all(...(params as SQLInputValue[])) as Array<Record<string, unknown>>
+          success = true
           tracker?.query(query, fiber.id)
           return Effect.succeed(rows)
         } catch (cause) {
+          if (!executing) throw cause
           return Effect.fail(
             new SqlError({
               reason: classifySqliteError(cause, { message: "Failed to execute statement", operation: "execute" }),
             }),
           )
+        } finally {
+          finish?.(success)
         }
       })
 
     const runValues = (query: string, params: ReadonlyArray<unknown> = []) =>
       Effect.withFiber<ReadonlyArray<ReadonlyArray<unknown>>, SqlError>((fiber) => {
-        const statement = native.prepare(query)
-        statement.setReadBigInts(Context.get(fiber.context, Client.SafeIntegers))
-        statement.setReturnArrays(true)
+        const finish = sqliteExecution?.start(query, "values", fiber, tracker?.id)
+        let executing = false
+        let success = false
         try {
+          const statement = native.prepare(query)
+          statement.setReadBigInts(Context.get(fiber.context, Client.SafeIntegers))
+          statement.setReturnArrays(true)
+          executing = true
           const rows = statement.all(...(params as SQLInputValue[])) as unknown as ReadonlyArray<ReadonlyArray<unknown>>
+          success = true
           tracker?.query(query, fiber.id)
           return Effect.succeed(rows)
         } catch (cause) {
+          if (!executing) throw cause
           return Effect.fail(
             new SqlError({
               reason: classifySqliteError(cause, { message: "Failed to execute statement", operation: "execute" }),
             }),
           )
+        } finally {
+          finish?.(success)
         }
       })
 
@@ -152,7 +169,11 @@ const nativeLayer = (config: Config) =>
       if (config.filename !== ":memory:" && existsSync(config.filename)) {
         const probe = new DatabaseSync(config.filename, { readOnly: true })
         try {
-          DatabaseCompatibility.check(config.filename, (sql) => probe.prepare(sql).all())
+          DatabaseCompatibility.check(config.filename, (sql) =>
+            sqliteExecution
+              ? sqliteExecution.startup(sql, "compatibility", () => probe.prepare(sql).all())
+              : probe.prepare(sql).all(),
+          )
         } finally {
           probe.close()
         }
@@ -165,7 +186,11 @@ const nativeLayer = (config: Config) =>
         open: true,
       })
       yield* Effect.addFinalizer(() => Effect.sync(() => native.close()))
-      if (config.disableWAL !== true && config.readonly !== true) native.exec("PRAGMA journal_mode = WAL;")
+      if (config.disableWAL !== true && config.readonly !== true) {
+        const sql = "PRAGMA journal_mode = WAL;"
+        if (sqliteExecution) sqliteExecution.startup(sql, "wal", () => native.exec(sql))
+        else native.exec(sql)
+      }
       return native
     }),
   )

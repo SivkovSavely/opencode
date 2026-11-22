@@ -19,6 +19,7 @@ import type { SQLiteAsyncDialect } from "drizzle-orm/sqlite-core/dialect"
 import { SQLiteEffectPreparedQuery, SQLiteEffectSession, SQLiteEffectTransaction } from "../sqlite-core/effect/session"
 import type { SelectedFieldsOrdered } from "drizzle-orm/sqlite-core/query-builders/select.types"
 import type { PreparedQueryConfig, SQLiteExecuteMethod, SQLiteTransactionConfig } from "drizzle-orm/sqlite-core/session"
+import { captureSqlOrigin, withSqlOrigin } from "../sqlite-core/effect/sql-origin"
 
 export interface EffectSQLiteQueryEffectHKT extends QueryEffectHKTBase {
   readonly error: EffectDrizzleQueryError
@@ -112,11 +113,16 @@ export class EffectSQLiteSession<TRelations extends AnyRelations> extends SQLite
     return Effect.serviceOption(this.client.transactionService).pipe(Effect.map((option) => option._tag === "Some"))
   }
 
-  private executeTransactionStatement(connection: Effect.Success<SqlClient["reserve"]>, query: string) {
-    return connection.executeUnprepared(query, [], undefined).pipe(Effect.asVoid)
+  private executeTransactionStatement(
+    connection: Effect.Success<SqlClient["reserve"]>,
+    query: string,
+    origin: string[] | undefined,
+  ) {
+    return withSqlOrigin(connection.executeUnprepared(query, [], undefined).pipe(Effect.asVoid), origin)
   }
 
   private withTransaction<A, E, R>(effect: Effect.Effect<A, E, R>, config: SQLiteTransactionConfig | undefined) {
+    const origin = captureSqlOrigin()
     return Effect.uninterruptibleMask((restore) =>
       Effect.withFiber<A, E | SqlError, R>((fiber) => {
         const services = fiber.context
@@ -144,6 +150,7 @@ export class EffectSQLiteSession<TRelations extends AnyRelations> extends SQLite
             const transaction = this.executeTransactionStatement(
               connection,
               id === 0 ? `begin ${config?.behavior ?? "deferred"}` : `savepoint effect_sql_${id}`,
+              origin,
             ).pipe(
               Effect.flatMap(() =>
                 Effect.provideContext(
@@ -154,21 +161,29 @@ export class EffectSQLiteSession<TRelations extends AnyRelations> extends SQLite
                   Effect.flatMap((exit) => {
                     const finalize = Exit.isSuccess(exit)
                       ? id === 0
-                        ? this.executeTransactionStatement(connection, "commit").pipe(
+                        ? this.executeTransactionStatement(connection, "commit", origin).pipe(
                             // SQLite keeps the transaction open after deferred constraint commit failures.
                             Effect.catch((error) =>
-                              this.executeTransactionStatement(connection, "rollback").pipe(
+                              this.executeTransactionStatement(connection, "rollback", origin).pipe(
                                 Effect.catch(() => Effect.void),
                                 Effect.andThen(Effect.fail(error)),
                               ),
                             ),
                           )
-                        : this.executeTransactionStatement(connection, `release savepoint effect_sql_${id}`)
+                        : this.executeTransactionStatement(connection, `release savepoint effect_sql_${id}`, origin)
                       : id === 0
-                        ? this.executeTransactionStatement(connection, "rollback")
-                        : this.executeTransactionStatement(connection, `rollback to savepoint effect_sql_${id}`).pipe(
+                        ? this.executeTransactionStatement(connection, "rollback", origin)
+                        : this.executeTransactionStatement(
+                            connection,
+                            `rollback to savepoint effect_sql_${id}`,
+                            origin,
+                          ).pipe(
                             Effect.andThen(
-                              this.executeTransactionStatement(connection, `release savepoint effect_sql_${id}`),
+                              this.executeTransactionStatement(
+                                connection,
+                                `release savepoint effect_sql_${id}`,
+                                origin,
+                              ),
                             ),
                           )
 
