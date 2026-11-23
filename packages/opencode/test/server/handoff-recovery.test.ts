@@ -8,7 +8,7 @@ import { ModelV2 } from "@opencode-ai/core/model"
 import { SessionHandoffRecovery } from "@opencode-ai/core/session/handoff-recovery"
 import { SessionHandoffStore } from "@opencode-ai/core/session/handoff-store"
 import { sql } from "drizzle-orm"
-import { Context, Deferred, Effect, Layer } from "effect"
+import { Context, Deferred, Effect, Fiber, Layer } from "effect"
 import { randomUUID } from "node:crypto"
 import { RuntimeLifecycle } from "../../src/server/runtime-lifecycle"
 import { ServerRecovery } from "../../src/server/recovery"
@@ -339,6 +339,60 @@ it.live("enrolled unknown owner is held before automatic recovery and cannot use
     expect(
       yield* database.db.get(sql`SELECT fence, owner_instance, state FROM runtime_execution WHERE session_id = ${id}`),
     ).toEqual({ fence: 4, owner_instance: "prior", state: "parked" })
+  }),
+)
+
+it.live("runtime admission racing startup protection rejects a new Task-only descendant", () =>
+  Effect.gen(function* () {
+    const database = yield* Database.Service
+    const directory = yield* tmpdirScoped()
+    const root = randomUUID()
+    const child = randomUUID()
+    yield* database.db.run(sql`INSERT INTO project (id,worktree,time_created,time_updated,sandboxes)
+      VALUES (${root},${directory},1,1,'[]')`)
+    for (const id of [root, child])
+      yield* database.db
+        .run(sql`INSERT INTO session (id,project_id,slug,directory,title,version,time_created,time_updated)
+        VALUES (${id},${root},${id},${directory},'test','1',1,1)`)
+    yield* database.db.run(sql`INSERT INTO session_handoff_root
+      (session_id,reservation,state,queue_id,user_message_id,enrolled_request_id)
+      VALUES (${root},'r','active','queue','user','enrolled')`)
+    const runtime = RuntimeLifecycle.make({ lineage: randomUUID() }, yield* Effect.scope, database)
+    const message = randomUUID()
+    const written = yield* Deferred.make<void>()
+    const committing = yield* Deferred.make<void>()
+    const recovery = yield* database.db
+      .transaction(
+        (tx) =>
+          Effect.gen(function* () {
+            yield* SessionHandoffRecovery.installStartupHolds({ db: tx }, "restarted")
+            yield* tx.run(sql`INSERT INTO message (id,session_id,time_created,time_updated,data)
+          VALUES (${message},${root},1,1,'{"role":"assistant","parentID":"user"}')`)
+            yield* tx.run(sql`INSERT INTO part (id,message_id,session_id,time_created,time_updated,data)
+          VALUES (${message},${message},${root},1,1,${JSON.stringify({ type: "tool", tool: "task", state: { metadata: { sessionId: child } } })})`)
+            yield* Deferred.succeed(written, undefined)
+            yield* Deferred.await(committing)
+          }),
+        { behavior: "immediate" },
+      )
+      .pipe(Effect.forkChild)
+    yield* awaitWithTimeout(Deferred.await(written), "startup holds were not installed")
+    const admission = yield* runtime
+      .admit({ sessionID: child, directory, manualRecovery: true })
+      .pipe(Effect.flip, Effect.forkChild({ startImmediately: true }))
+    yield* Deferred.succeed(committing, undefined)
+    yield* Fiber.join(recovery)
+    expect(yield* Fiber.join(admission)).toMatchObject({
+      _tag: "RuntimeDrainingError",
+      message: "Enrolled execution is held for guarded same-input recovery",
+    })
+    expect(
+      yield* database.db.get(sql`SELECT 1 FROM session_handoff_recovery_hold WHERE session_id = ${child}`),
+    ).toBeUndefined()
+    expect(yield* database.db.get(sql`SELECT 1 FROM runtime_execution WHERE session_id = ${child}`)).toBeUndefined()
+    yield* database.db.run(sql`DELETE FROM part WHERE id = ${message}`)
+    expect((yield* runtime.admit({ sessionID: child, directory })).fence).toBe(0)
+    yield* runtime.release(child)
   }),
 )
 

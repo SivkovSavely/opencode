@@ -2,6 +2,7 @@ export * as SessionHandoffRecovery from "./handoff-recovery"
 
 import { createHash } from "node:crypto"
 import { sql } from "drizzle-orm"
+import { EffectDrizzleQueryError } from "drizzle-orm/effect-core/errors"
 import { Context, Effect, Option, Schema } from "effect"
 import type { SessionHandoffStore } from "./handoff-store"
 import { SessionHandoffV1 } from "@opencode-ai/schema/v1/session-handoff"
@@ -129,6 +130,12 @@ type Session = {
 type Message = { id: string; session_id: string; data: string; time_created: number }
 type Part = { id: string; message_id: string; session_id: string; data: string; time_created: number }
 type Generation = { session_id: string; reservation: string; state: string; user_message_id: string | null }
+type Lineage = {
+  sessions: Pick<Session, "id" | "parent_id" | "metadata">[]
+  runtimes: Pick<Runtime, "session_id" | "parent_session_id" | "parent_message_id">[]
+  messages: Pick<Message, "id" | "session_id" | "data">[]
+  parts: Pick<Part, "message_id" | "session_id" | "data">[]
+}
 type Graph = {
   sessions: Session[]
   runtimes: Runtime[]
@@ -263,20 +270,32 @@ export const captureCurrent = Effect.fn("SessionHandoffRecovery.captureCurrent")
   )
 })
 
-const graph = Effect.fnUntraced(function* (database: Connection, roots: readonly string[]) {
+const graphScope = Effect.fnUntraced(function* (database: Connection, roots: readonly string[]) {
+  // Scope the large tables by parent before extracting any Task JSON. Session
+  // metadata has no parent index; extract those edges once, not at each step.
+  // Keep SQLite's text extraction of arrays/objects, as in the full graph:
+  // duplicate keys can turn an ambiguous SQL edge into a string in JSON.parse.
   const ids = yield* database.db.all<{ id: string }>(sql`
-    WITH RECURSIVE edges(parent, child) AS (
-      SELECT parent_id, id FROM session WHERE parent_id IS NOT NULL
-      UNION SELECT parent_session_id, session_id FROM runtime_execution WHERE parent_session_id IS NOT NULL
-      UNION SELECT json_extract(CASE WHEN json_valid(metadata) THEN metadata ELSE '{}' END, '$.task.parentSessionId'), id FROM session
-      UNION SELECT session_id, json_extract(CASE WHEN json_valid(data) THEN data ELSE '{}' END, '$.state.metadata.sessionId') FROM part
-        WHERE json_extract(CASE WHEN json_valid(data) THEN data ELSE '{}' END, '$.type') = 'tool'
-          AND json_extract(CASE WHEN json_valid(data) THEN data ELSE '{}' END, '$.tool') = 'task'
+    WITH RECURSIVE metadata_edges(parent, child) AS MATERIALIZED (
+      SELECT json_extract(CASE WHEN json_valid(metadata) THEN metadata ELSE '{}' END, '$.task.parentSessionId'), id
+      FROM session WHERE metadata IS NOT NULL AND typeof(id) = 'text'
     ), potential(id) AS (
       SELECT value FROM json_each(${JSON.stringify(roots)})
-      UNION SELECT child FROM edges JOIN potential ON edges.parent = potential.id WHERE typeof(child) = 'text'
-    ) SELECT id FROM potential ORDER BY id`)
-  const scope = sql`(SELECT value FROM json_each(${JSON.stringify(ids.map((row) => row.id))}))`
+      UNION SELECT s.id FROM potential a CROSS JOIN session s ON s.parent_id = a.id WHERE typeof(s.id) = 'text'
+      UNION SELECT e.session_id FROM potential a CROSS JOIN runtime_execution e ON e.parent_session_id = a.id
+        WHERE typeof(e.session_id) = 'text'
+      UNION SELECT m.child FROM potential a CROSS JOIN metadata_edges m ON m.parent = a.id
+      UNION SELECT CASE WHEN json_valid(p.data) THEN json_extract(p.data, '$.state.metadata.sessionId') END
+        FROM potential a CROSS JOIN part p ON p.session_id = a.id
+        WHERE CASE WHEN json_valid(p.data) THEN
+          json_extract(p.data, '$.type') = 'tool' AND json_extract(p.data, '$.tool') = 'task'
+          AND typeof(json_extract(p.data, '$.state.metadata.sessionId')) = 'text' END
+    ) SELECT id FROM potential`)
+  return sql`(SELECT value FROM json_each(${JSON.stringify(ids.map((row) => row.id))}))`
+})
+
+const graph = Effect.fnUntraced(function* (database: Connection, roots: readonly string[]) {
+  const scope = yield* graphScope(database, roots)
   const sessions = yield* database.db.all<Session>(
     sql`SELECT id, parent_id, directory, project_id, workspace_id, metadata, permission, agent, model FROM session WHERE id IN ${scope} ORDER BY id`,
   )
@@ -295,11 +314,11 @@ const graph = Effect.fnUntraced(function* (database: Connection, roots: readonly
   const queueStates = yield* database.db.all<Record<string, unknown> & { session_id: string }>(
     sql`SELECT * FROM session_queue_state WHERE session_id IN ${scope} ORDER BY session_id`,
   )
-  return { sessions, runtimes, messages, parts, queues, queueStates }
+  return { sessions, runtimes, messages, parts, queues, queueStates } satisfies Graph
 })
 
 // Potential links intentionally include incomplete and contradictory evidence.
-function closure(data: Graph, root: string, excluded = new Set<string>()) {
+function closure(data: Lineage, root: string, excluded = new Set<string>()) {
   const ids = new Set([root])
   while (true) {
     const size = ids.size
@@ -331,7 +350,7 @@ function closure(data: Graph, root: string, excluded = new Set<string>()) {
   }
 }
 
-function generation(data: Graph, root: Generation, roots: readonly Generation[]) {
+function generation<T extends Lineage>(data: T, root: Generation, roots: readonly Generation[]) {
   if (!root.user_message_id) return { data, ids: closure(data, root.session_id) }
   const otherUsers = new Set(
     roots
@@ -463,34 +482,88 @@ export const installStartupHolds = Effect.fn("SessionHandoffRecovery.installStar
 })
 
 export const held = Effect.fn("SessionHandoffRecovery.held")(function* (database: Connection, sessionID: string) {
-  const row = yield* database.db.get(
-    sql`SELECT 1 FROM session_handoff_recovery_hold WHERE session_id = ${sessionID} LIMIT 1`,
-  )
-  if (row) return true
-  // New ambiguous descendants of an already held root are protected immediately, before another startup scan.
-  const roots = yield* database.db.all<{ root_session_id: string; reservation: string }>(
-    sql`SELECT DISTINCT root_session_id, reservation FROM session_handoff_recovery_hold`,
-  )
-  if (roots.length === 0) return false
-  const data = yield* graph(
-    database,
-    roots.map((root) => root.root_session_id),
-  )
-  const generations = yield* database.db.all<Generation>(
-    sql`SELECT session_id,reservation,state,user_message_id FROM session_handoff_root WHERE enrolled_request_id IS NOT NULL`,
-  )
-  return roots.some((root) =>
-    generation(
-      data,
-      generations.find((item) => item.session_id === root.root_session_id && item.reservation === root.reservation) ?? {
-        session_id: root.root_session_id,
-        reservation: root.reservation,
-        state: "invalidated",
-        user_message_id: null,
-      },
-      generations,
-    ).ids.includes(sessionID),
-  )
+  // Use one read snapshot, including when the caller already owns an admission transaction.
+  return yield* database.db
+    .transaction((tx) =>
+      Effect.gen(function* () {
+        if (yield* tx.get(sql`SELECT 1 FROM session_handoff_recovery_hold WHERE session_id = ${sessionID} LIMIT 1`))
+          return true
+        const roots = yield* tx.all<{ root_session_id: string; reservation: string }>(
+          sql`SELECT DISTINCT root_session_id, reservation FROM session_handoff_recovery_hold`,
+        )
+        if (roots.length === 0) return false
+        // Discover new descendants on every call. Generation checks need only
+        // lineage fields, not the transcripts or queue state used by inspect().
+        const rootIDs = sql`(SELECT DISTINCT root_session_id FROM session_handoff_recovery_hold)`
+        const scope = yield* graphScope(
+          { db: tx },
+          roots.map((root) => root.root_session_id),
+        )
+        const sessions = yield* tx.all<Lineage["sessions"][number]>(
+          sql`SELECT id, parent_id, metadata FROM session WHERE id IN ${scope}`,
+        )
+        const runtimes = yield* tx.all<Lineage["runtimes"][number]>(
+          sql`SELECT session_id, parent_session_id, parent_message_id FROM runtime_execution WHERE session_id IN ${scope}`,
+        )
+        // This is a prefilter, not a JSON interpretation. Even non-Task parts
+        // can contradict generation proof, and escaped or duplicate keys must
+        // still use the same decoder as full inspection. Escaped letters are
+        // in the \u0040 to \u007f range, unlike ANSI escapes such as \u001b.
+        const parts = yield* tx.all<Lineage["parts"][number]>(sql`
+        SELECT message_id, session_id, data FROM part WHERE session_id IN ${scope}
+        AND (instr(data, '"sessionId"') > 0 OR data GLOB ${String.raw`*\u00[4-7]*`})`)
+        const generations = yield* tx.all<Generation>(sql`
+        SELECT session_id, reservation, state, user_message_id FROM session_handoff_root
+        WHERE session_id IN ${rootIDs} AND enrolled_request_id IS NOT NULL`)
+        const needsMessages = generations.some(
+          (item) =>
+            item.user_message_id &&
+            generations.some(
+              (other) =>
+                other.session_id === item.session_id &&
+                other.user_message_id !== null &&
+                other.user_message_id !== item.user_message_id,
+            ),
+        )
+        const parentMessages = needsMessages
+          ? new Set([
+              ...sessions.flatMap((session) => {
+                const id = object(object(json(session.metadata)).task).parentMessageID
+                return typeof id === "string" ? [id] : []
+              }),
+              ...runtimes.flatMap((row) => (row.parent_message_id === null ? [] : [row.parent_message_id])),
+              ...parts.map((part) => part.message_id),
+            ])
+          : new Set<string>()
+        const messages =
+          parentMessages.size > 0
+            ? yield* tx.all<Lineage["messages"][number]>(sql`
+            SELECT id, session_id, data FROM message
+            WHERE id IN (SELECT value FROM json_each(${JSON.stringify([...parentMessages])}))
+            AND session_id IN ${rootIDs}`)
+            : []
+        return roots.some((root) =>
+          generation(
+            { sessions, runtimes, messages, parts },
+            generations.find(
+              (item) => item.session_id === root.root_session_id && item.reservation === root.reservation,
+            ) ?? {
+              session_id: root.root_session_id,
+              reservation: root.reservation,
+              state: "invalidated",
+              user_message_id: null,
+            },
+            generations,
+          ).ids.includes(sessionID),
+        )
+      }),
+    )
+    .pipe(
+      Effect.catchTag(
+        "SqlError",
+        (cause) => new EffectDrizzleQueryError({ query: "Recovery hold read transaction", params: [], cause }),
+      ),
+    )
 })
 
 function resources(data: Graph, sessionID: string, probe?: ResourceProbe): InterruptedResource[] {

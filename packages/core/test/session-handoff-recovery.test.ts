@@ -1,6 +1,9 @@
 import { expect, test } from "bun:test"
+import { Database } from "bun:sqlite"
 import { EffectDrizzleSqlite } from "@opencode-ai/effect-drizzle-sqlite"
 import { sql } from "drizzle-orm"
+import { EffectCache } from "drizzle-orm/cache/core/cache-effect"
+import { EffectLogger } from "drizzle-orm/effect-core"
 import { Effect, Schema } from "effect"
 import { DatabaseMigration } from "../src/database/migration"
 import { layer } from "../src/database/sqlite.bun"
@@ -11,15 +14,80 @@ import { tmpdir } from "./fixture/tmpdir"
 function run<A, E>(
   filename: string,
   body: (db: Effect.Success<ReturnType<typeof EffectDrizzleSqlite.makeWithDefaults>>) => Effect.Effect<A, E>,
+  logger?: Parameters<typeof EffectLogger.fromDrizzle>[0],
 ) {
   return Effect.runPromise(
     Effect.gen(function* () {
-      const db = yield* EffectDrizzleSqlite.makeWithDefaults()
+      const db = yield* logger
+        ? EffectDrizzleSqlite.make().pipe(
+            Effect.provide(EffectCache.Default),
+            Effect.provide(EffectLogger.layerFromDrizzle(logger)),
+          )
+        : EffectDrizzleSqlite.makeWithDefaults()
       yield* DatabaseMigration.apply(db)
       return yield* body(db)
     }).pipe(Effect.provide(layer({ filename })), Effect.scoped),
   )
 }
+
+test("held uses indexed Task lookups without loading historical transcripts on repeated misses", async () => {
+  await using tmp = await tmpdir()
+  const queries = new Map<string, unknown[]>()
+  await run(
+    `${tmp.path}/membership.db`,
+    (db) =>
+      Effect.gen(function* () {
+        yield* seedLinked(db, tmp.path)
+        yield* db.run(sql`INSERT INTO session (id,project_id,slug,directory,title,version,time_created,time_updated)
+          VALUES ('unrelated','project','unrelated',${tmp.path},'unrelated','1',1,1)`)
+        yield* db.run(sql`WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i + 1 FROM n WHERE i < 10000)
+          INSERT INTO message (id,session_id,time_created,time_updated,data)
+          SELECT 'history-' || i, CASE WHEN i <= 2000 THEN 'root' ELSE 'unrelated' END, i, i,
+            json_object('role','assistant','parentID','user','summary',hex(zeroblob(512))) FROM n`)
+        yield* db.run(sql`INSERT INTO part (id,message_id,session_id,time_created,time_updated,data)
+          SELECT id,id,session_id,time_created,time_updated,json_object('type','tool','tool','bash',
+            'state',json_object('status','completed','output',char(27) || '[32m' || hex(zeroblob(2048)),
+            'metadata',json_object('exit',0)))
+          FROM message WHERE id LIKE 'history-%'`)
+        yield* db.run(sql`DELETE FROM session_handoff_recovery_hold WHERE session_id = 'child'`)
+        yield* db.run(
+          sql`INSERT INTO session_handoff_root VALUES ('root','later','terminal','later-queue','later-user',NULL,'later-enrollment')`,
+        )
+        queries.clear()
+        for (let i = 0; i < 12; i++) {
+          expect(yield* SessionHandoffRecovery.held({ db }, "unrelated")).toBe(false)
+          expect(yield* SessionHandoffRecovery.held({ db }, "child")).toBe(true)
+        }
+        const plans: string[] = []
+        const recursivePlans: string[] = []
+        for (const [query, params] of [...queries]) {
+          const recursive = /\bWITH RECURSIVE\b/.test(query)
+          if (!recursive && !/\bFROM part\b/.test(query)) continue
+          const statement = sql.join(
+            query
+              .split("?")
+              .flatMap((chunk, i) => (i === 0 ? [sql.raw(chunk)] : [sql`${params[i - 1]}`, sql.raw(chunk)])),
+          )
+          if (!recursive)
+            expect(
+              yield* db.get(sql`SELECT count(*) AS count FROM (${statement}) WHERE message_id LIKE 'history-%'`),
+            ).toEqual({ count: 0 })
+          const target = recursive ? recursivePlans : plans
+          target.push(
+            ...(yield* db.all<{ detail: string }>(sql`EXPLAIN QUERY PLAN ${statement}`)).map((row) => row.detail),
+          )
+        }
+        expect(plans.some((detail) => /SEARCH .*part_session_idx/.test(detail))).toBe(true)
+        expect(plans.some((detail) => /\bSCAN (?:part|p)\b/.test(detail))).toBe(false)
+        expect(
+          recursivePlans.some((detail) => /SEARCH p USING INDEX part_session_idx \(session_id=\?\)/.test(detail)),
+        ).toBe(true)
+        expect(recursivePlans.some((detail) => /\bSCAN (?:part|p)\b/.test(detail))).toBe(false)
+        expect([...queries.keys()].some((query) => /FROM message WHERE session_id IN/.test(query))).toBe(false)
+      }),
+    { logQuery: (query, params) => queries.set(query, params) },
+  )
+})
 
 test("startup holds the enrolled root and ambiguous projected, runtime and metadata descendants without changing owners", async () => {
   await using tmp = await tmpdir()
@@ -106,6 +174,136 @@ const seedLinked = Effect.fnUntraced(function* (
     sql`INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES ('child-text', 'child-user', 'child', 2, 2, '{"type":"text","text":"review"}')`,
   )
   yield* SessionHandoffRecovery.installStartupHolds({ db }, "current")
+})
+
+test("held keeps a snapshot when a concurrent commit replaces a Task link with a direct hold", async () => {
+  await using tmp = await tmpdir()
+  const filename = `${tmp.path}/membership.db`
+  let commit: (() => void) | undefined
+  await run(
+    filename,
+    (db) =>
+      Effect.gen(function* () {
+        yield* seedLinked(db, tmp.path)
+        yield* db.run(sql`DELETE FROM session_handoff_recovery_hold WHERE session_id = 'child'`)
+        yield* db.run(sql`UPDATE session SET parent_id = NULL, metadata = NULL WHERE id = 'child'`)
+        yield* db.run(sql`UPDATE runtime_execution SET parent_session_id = NULL WHERE session_id = 'child'`)
+        using writer = new Database(filename, { create: false })
+        commit = writer.transaction(() => {
+          writer.run("INSERT INTO session_handoff_recovery_hold VALUES ('root','reservation','child')")
+          writer.run("DELETE FROM part WHERE id = 'task'")
+        })
+        // The child is held in both committed states, for different reasons.
+        expect(yield* SessionHandoffRecovery.held({ db }, "child")).toBe(true)
+        expect(commit).toBeUndefined()
+        expect(yield* SessionHandoffRecovery.held({ db }, "child")).toBe(true)
+      }),
+    {
+      logQuery(query) {
+        // Run the writer after the direct lookup misses but before reading the held roots.
+        if (query !== "SELECT DISTINCT root_session_id, reservation FROM session_handoff_recovery_hold") return
+        commit?.()
+        commit = undefined
+      },
+    },
+  )
+})
+
+test("held sees new descendants and current links and holds, without a startup rescan", async () => {
+  await using tmp = await tmpdir()
+  await run(`${tmp.path}/membership.db`, (db) =>
+    Effect.gen(function* () {
+      yield* seedLinked(db, tmp.path)
+      yield* db.run(sql`DELETE FROM session_handoff_recovery_hold`)
+      expect(yield* SessionHandoffRecovery.held({ db }, "child")).toBe(false)
+      yield* db.run(sql`INSERT INTO session_handoff_recovery_hold VALUES ('root','reservation','root')`)
+      expect(yield* SessionHandoffRecovery.held({ db }, "root")).toBe(true)
+      for (const id of ["projected", "runtime", "metadata", "part-only", "bad-metadata"])
+        yield* db.run(sql`INSERT INTO session (id,project_id,slug,directory,title,version,time_created,time_updated)
+          VALUES (${id}, 'project', ${id}, ${tmp.path}, 'test', '1', 1, 1)`)
+      expect(yield* SessionHandoffRecovery.held({ db }, "metadata")).toBe(false)
+      yield* db.run(sql`UPDATE session SET parent_id = 'child' WHERE id = 'projected'`)
+      yield* db.run(sql`UPDATE session SET metadata = '{"task":{"parentSessionId":"projected"}}' WHERE id = 'metadata'`)
+      yield* db.run(sql`UPDATE session SET metadata = '{"task":{"parentSessionId":"root"}' WHERE id = 'bad-metadata'`)
+      yield* db.run(sql`INSERT INTO runtime_execution
+        (id,session_id,directory,owner_lineage,owner_instance,fence,state,desired_active,parent_session_id,time_created,time_updated)
+        VALUES ('runtime','runtime',${tmp.path},'lineage','prior',2,'completed',0,'metadata',1,1)`)
+      yield* db.run(sql`INSERT INTO message VALUES ('late-task','runtime',1,1,'{"role":"assistant"}')`)
+      yield* db.run(sql`INSERT INTO part (id,message_id,session_id,time_created,time_updated,data)
+        VALUES ('late-task','late-task','runtime',1,1,${String.raw`{"type":"tool","tool":"task","state":{"metadata":{"\u0073essionId":"part-only"}}}`})`)
+      for (const id of ["child", "projected", "runtime", "metadata", "part-only"])
+        expect(yield* SessionHandoffRecovery.held({ db }, id)).toBe(true)
+      expect(yield* SessionHandoffRecovery.held({ db }, "bad-metadata")).toBe(false)
+      yield* db.run(
+        sql`UPDATE part SET data = '{"type":"tool","tool":"task","state":{"metadata":"broken"}}' WHERE id = 'late-task'`,
+      )
+      expect(yield* SessionHandoffRecovery.held({ db }, "part-only")).toBe(false)
+      yield* db.run(sql`UPDATE session SET parent_id = NULL WHERE id = 'projected'`)
+      expect(yield* SessionHandoffRecovery.held({ db }, "runtime")).toBe(false)
+      yield* db.run(sql`DELETE FROM session_handoff_recovery_hold`)
+      expect(yield* SessionHandoffRecovery.held({ db }, "root")).toBe(false)
+      expect(yield* SessionHandoffRecovery.held({ db }, "child")).toBe(false)
+    }),
+  )
+})
+
+test("held excludes only proven other-generation links and rechecks message and part changes", async () => {
+  await using tmp = await tmpdir()
+  await run(`${tmp.path}/membership.db`, (db) =>
+    Effect.gen(function* () {
+      yield* seedLinked(db, tmp.path)
+      yield* db.run(sql`DELETE FROM session_handoff_recovery_hold WHERE session_id = 'child'`)
+      yield* db.run(
+        sql`INSERT INTO session_handoff_root VALUES ('root','later','terminal','later-queue','later-user',NULL,'later-enrollment')`,
+      )
+      yield* db.run(
+        sql`UPDATE message SET data = '{"role":"assistant","parentID":"later-user"}' WHERE id = 'assistant'`,
+      )
+      expect(yield* SessionHandoffRecovery.held({ db }, "child")).toBe(false)
+      yield* db.run(sql`INSERT INTO message VALUES ('conflicting','root',3,3,'{"role":"assistant","parentID":"user"}')`)
+      // A non-Task part is still contradictory evidence for exclusion, even
+      // though it cannot establish reachability on its own.
+      yield* db.run(sql`INSERT INTO part (id,message_id,session_id,time_created,time_updated,data)
+        VALUES ('conflicting','conflicting','root',3,3,${String.raw`{"type":"tool","tool":"other","state":{"metadata":{"session\u0049d":"elsewhere","session\u0049d":"child"}}}`})`)
+      expect(yield* SessionHandoffRecovery.held({ db }, "child")).toBe(true)
+      yield* db.run(sql`UPDATE part SET data = json_set(data, '$.tool', 'task') WHERE id = 'conflicting'`)
+      expect(yield* SessionHandoffRecovery.held({ db }, "child")).toBe(true)
+      yield* db.run(sql`DELETE FROM part WHERE id = 'conflicting'`)
+      yield* db.run(sql`UPDATE runtime_execution SET parent_message_id = NULL WHERE session_id = 'child'`)
+      expect(yield* SessionHandoffRecovery.held({ db }, "child")).toBe(true)
+      yield* db.run(sql`UPDATE runtime_execution SET parent_message_id = 'assistant' WHERE session_id = 'child'`)
+      expect(yield* SessionHandoffRecovery.held({ db }, "child")).toBe(false)
+      yield* db.run(
+        sql`UPDATE message SET data = '{"role":"assistant","parentID":["later-user"]}' WHERE id = 'assistant'`,
+      )
+      expect(yield* SessionHandoffRecovery.held({ db }, "child")).toBe(true)
+      yield* db.run(
+        sql`UPDATE message SET data = '{"role":"assistant","parentID":"later-user"}' WHERE id = 'assistant'`,
+      )
+      yield* db.run(sql`INSERT INTO session_handoff_recovery_hold VALUES ('root','later','root')`)
+      expect(yield* SessionHandoffRecovery.held({ db }, "child")).toBe(true)
+    }),
+  )
+})
+
+test("recovery scopes descendants through ambiguous duplicate Task metadata keys", async () => {
+  await using tmp = await tmpdir()
+  await run(`${tmp.path}/membership.db`, (db) =>
+    Effect.gen(function* () {
+      yield* seedLinked(db, tmp.path)
+      yield* db.run(sql`INSERT INTO session (id,project_id,parent_id,slug,directory,title,version,time_created,time_updated)
+        VALUES ('[]','project',NULL,'ambiguous',${tmp.path},'test','1',1,1),
+               ('leaf','project','[]','leaf',${tmp.path},'test','1',1,1)`)
+      // SQLite reads the first key (an array extracted as SQL text), while
+      // JSON.parse reads the last key. Both can reach the ambiguous session.
+      yield* db.run(sql`INSERT INTO part (id,message_id,session_id,time_created,time_updated,data)
+        VALUES ('ambiguous','assistant','root',3,3,'{"type":"tool","tool":"task","state":{"metadata":{"sessionId":[],"sessionId":"[]"}}}')`)
+      expect(yield* SessionHandoffRecovery.held({ db }, "leaf")).toBe(true)
+      const evidence = yield* SessionHandoffRecovery.inspect({ db }, "root", () => Effect.succeed("unknown" as const))
+      expect(evidence.descendants.map((child) => child.childSessionID)).toContain("leaf")
+      expect(yield* SessionHandoffRecovery.installStartupHolds({ db }, "current")).toContain("leaf")
+    }),
+  )
 })
 
 test("verified model-only descendant retains schema-valid evidence without changing its input", async () => {
