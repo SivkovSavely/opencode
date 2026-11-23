@@ -358,45 +358,43 @@ function generation<T extends Lineage>(data: T, root: Generation, roots: readonl
       .map((item) => item.user_message_id)
       .filter((id) => id !== null),
   )
+  if (otherUsers.size === 0) return { data, ids: closure(data, root.session_id) }
   const otherMessages = new Set(
     data.messages
       .filter((message) => {
+        if (message.session_id !== root.session_id) return false
         const value = object(json(message.data))
-        return (
-          message.session_id === root.session_id &&
-          value.role === "assistant" &&
-          typeof value.parentID === "string" &&
-          otherUsers.has(value.parentID)
-        )
+        return value.role === "assistant" && typeof value.parentID === "string" && otherUsers.has(value.parentID)
       })
       .map((message) => message.id),
   )
+  if (otherMessages.size === 0) return { data, ids: closure(data, root.session_id) }
   // Exclude another generation only when every retained direct link agrees on
-  // its original parent assistant. Missing or contradictory links remain held.
+  // its original parent assistant. Index those links once instead of decoding
+  // the root transcript for each candidate. Unknown links still count.
+  const directParents = new Map<string, Set<unknown>>()
+  const add = (child: string, parent: unknown) => {
+    const parents = directParents.get(child)
+    if (parents) parents.add(parent)
+    else directParents.set(child, new Set([parent]))
+  }
+  for (const row of data.runtimes)
+    if (row.parent_session_id === root.session_id) add(row.session_id, row.parent_message_id)
+  for (const part of data.parts) {
+    if (part.session_id !== root.session_id) continue
+    // Even non-Task parts can contradict the original parent assistant.
+    const child = object(object(object(json(part.data)).state).metadata).sessionId
+    if (typeof child === "string") add(child, part.message_id)
+  }
   const excluded = new Set(
     data.sessions
       .filter((session) => {
         const task = object(object(json(session.metadata)).task)
-        const parents = [
-          ...(session.parent_id === root.session_id || task.parentSessionId === root.session_id
-            ? [task.parentMessageID]
-            : []),
-          ...data.runtimes
-            .filter((row) => row.session_id === session.id && row.parent_session_id === root.session_id)
-            .map((row) => row.parent_message_id),
-          ...data.parts
-            .filter(
-              (part) =>
-                part.session_id === root.session_id &&
-                object(object(object(json(part.data)).state).metadata).sessionId === session.id,
-            )
-            .map((part) => part.message_id),
-        ]
-        return (
-          parents.length > 0 &&
-          new Set(parents).size === 1 &&
-          parents.every((id) => typeof id === "string" && otherMessages.has(id))
-        )
+        if (session.parent_id === root.session_id || task.parentSessionId === root.session_id)
+          add(session.id, task.parentMessageID)
+        const parents = directParents.get(session.id)
+        const parent = parents?.values().next().value
+        return parents?.size === 1 && typeof parent === "string" && otherMessages.has(parent)
       })
       .map((session) => session.id),
   )
@@ -409,6 +407,8 @@ export const installStartupHolds = Effect.fn("SessionHandoffRecovery.installStar
   currentInstance: string,
   liveness?: (sessionID: string) => Effect.Effect<Liveness>,
 ) {
+  const diagnostics = process.env.OPENCODE_STARTUP_RECOVERY_DIAGNOSTICS === "1"
+  const started = diagnostics ? performance.now() : 0
   return yield* database.db.transaction(
     (tx) =>
       Effect.gen(function* () {
@@ -421,7 +421,19 @@ export const installStartupHolds = Effect.fn("SessionHandoffRecovery.installStar
           { db: tx },
           roots.map((root) => root.session_id),
         )
+        if (diagnostics)
+          yield* Effect.logInfo("recovery hold graph loaded", {
+            elapsedMs: performance.now() - started,
+            generations: roots.length,
+            sessions: data.sessions.length,
+            executions: data.runtimes.length,
+            messages: data.messages.length,
+            parts: data.parts.length,
+          })
         const protectedIDs = new Set<string>()
+        const scanStarted = diagnostics ? performance.now() : 0
+        let ownerChecks = 0
+        let holdAttempts = 0
         for (const root of roots) {
           const scoped = generation(data, root, roots)
           const ids = scoped.ids
@@ -458,7 +470,9 @@ export const installStartupHolds = Effect.fn("SessionHandoffRecovery.installStar
           for (const id of ids) protectedIDs.add(id)
           // Generations share the root admission boundary. A live child of an
           // older generation must not be disrupted by a hold on a newer one.
-          const owners = yield* Effect.forEach(closure(data, root.session_id), (id) =>
+          const ownerIDs = closure(data, root.session_id)
+          ownerChecks += ownerIDs.length
+          const owners = yield* Effect.forEach(ownerIDs, (id) =>
             liveness
               ? liveness(id)
               : Effect.succeed(
@@ -470,11 +484,19 @@ export const installStartupHolds = Effect.fn("SessionHandoffRecovery.installStar
           // A second server must not install admission barriers into another live owner's execution tree.
           // The returned closure still excludes this tree from every automatic startup mutation.
           if (owners.includes("live")) continue
+          holdAttempts += ids.length
           for (const id of ids)
             yield* tx.run(sql`
        INSERT OR IGNORE INTO session_handoff_recovery_hold (root_session_id, reservation, session_id)
        VALUES (${root.session_id}, ${root.reservation}, ${id})`)
         }
+        if (diagnostics)
+          yield* Effect.logInfo("recovery hold generation scan complete", {
+            elapsedMs: performance.now() - scanStarted,
+            protectedSessions: protectedIDs.size,
+            ownerChecks,
+            holdAttempts,
+          })
         return [...protectedIDs].sort()
       }),
     { behavior: "immediate" },

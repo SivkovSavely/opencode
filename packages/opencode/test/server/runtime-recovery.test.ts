@@ -2,13 +2,14 @@ import { NodeHttpServer, NodeServices } from "@effect/platform-node"
 import { describe, expect } from "bun:test"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { Database } from "@opencode-ai/core/database/database"
+import { MessageTable } from "@opencode-ai/core/session/sql"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { createOpencodeClient } from "@opencode-ai/sdk/v2"
 import { sql } from "drizzle-orm"
-import { Context, Deferred, Effect, Layer } from "effect"
+import { Context, Deferred, Effect, Layer, Logger, References } from "effect"
 import { HttpRouter, HttpServer, HttpServerRequest, HttpServerResponse } from "effect/unstable/http"
 import { layerWebSocketConstructorGlobal } from "effect/unstable/socket/Socket"
 import { randomUUID } from "node:crypto"
@@ -32,6 +33,218 @@ import { testProviderConfig } from "../lib/test-provider"
 
 const it = testEffect(Layer.mergeAll(TestLLMServer.layer, LayerNode.compile(CrossSpawnSpawner.node)))
 const model = { providerID: ProviderV2.ID.make("test"), modelID: ModelV2.ID.make("test-model") }
+
+describe("startup recovery workload", () => {
+  it.live(
+    "does not repeatedly traverse held trees for settled history",
+    () =>
+      Effect.gen(function* () {
+        const directory = yield* tmpdirScoped({ git: true })
+        const benchmark = process.env.OPENCODE_STARTUP_RECOVERY_BENCHMARK === "1"
+        const settled = benchmark ? 400 : 40
+        const descendants = benchmark ? 400 : 80
+        const history = benchmark ? 4_000 : 400
+        const lineage = randomUUID()
+        const runtime = RuntimeLifecycle.make({ lineage, startupRecovery: true }, yield* Effect.scope)
+        const app = AppNodeBuilderV1.build(
+          LayerNode.group([Session.node, Database.node, InstanceStore.node, SessionProjector.node, SessionPrompt.node]),
+        ).pipe(Layer.provide(Layer.succeed(RuntimeLifecycle.Service)(runtime)))
+        const context = yield* Layer.build(app)
+        const database = Context.get(context, Database.Service)
+        const sessions = Context.get(context, Session.Service)
+        const store = Context.get(context, InstanceStore.Service)
+        const fresh = yield* store.provide(
+          { directory },
+          Effect.gen(function* () {
+            const root = yield* sessions.create({ title: "held root" })
+            yield* database.db.run(sql`
+            INSERT INTO session_handoff_root (session_id, reservation, state, user_message_id, enrolled_request_id)
+            VALUES (${root.id}, 'generation-1', 'terminal', 'user-1', 'request-1'),
+                   (${root.id}, 'generation-2', 'active', 'user-2', 'request-2')
+          `)
+            yield* database.db.run(sql`
+            WITH RECURSIVE numbers(n) AS (VALUES (1) UNION ALL SELECT n + 1 FROM numbers WHERE n < ${descendants})
+            INSERT INTO session (id, project_id, parent_id, slug, directory, title, version, time_created, time_updated)
+            SELECT 'ses_held_' || n, project_id, CASE WHEN n <= ${descendants / 2} THEN ${root.id}
+                   ELSE 'ses_held_' || (n - ${descendants / 2}) END,
+                   'held', directory, 'held', version, time_created, time_updated
+            FROM session, numbers WHERE id = ${root.id}
+          `)
+            yield* database.db.run(sql`
+            WITH RECURSIVE numbers(n) AS (VALUES (1) UNION ALL SELECT n + 1 FROM numbers WHERE n < ${history})
+            INSERT INTO message (id, session_id, time_created, time_updated, data)
+            SELECT 'msg_history_' || n, ${root.id}, n, n,
+                   json_object('role', 'assistant', 'parentID', 'user-1') FROM numbers
+          `)
+            yield* database.db.run(sql`
+            INSERT INTO part (id, message_id, session_id, time_created, time_updated, data)
+            SELECT id, id, session_id, time_created, time_updated,
+              json_object('type','tool','tool','bash','state',json_object('status','completed','output',hex(zeroblob(1024))))
+            FROM message WHERE session_id = ${root.id}
+          `)
+            for (let i = 0; i < settled; i++) {
+              const parent = yield* sessions.create({ title: `settled parent ${i}` })
+              const child = yield* sessions.create({ title: `settled child ${i}`, parentID: parent.id })
+              const user = yield* sessions.updateMessage({
+                id: MessageID.ascending(),
+                sessionID: parent.id,
+                role: "user",
+                agent: "general",
+                model,
+                time: { created: Date.now() },
+              })
+              const assistant = yield* sessions.updateMessage({
+                id: MessageID.ascending(),
+                sessionID: parent.id,
+                role: "assistant",
+                parentID: user.id,
+                mode: "general",
+                agent: "general",
+                path: { cwd: directory, root: directory },
+                cost: 0,
+                tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+                modelID: model.modelID,
+                providerID: model.providerID,
+                finish: "tool-calls",
+                time: { created: Date.now(), completed: Date.now() },
+              })
+              const callID = `settled-${i}`
+              yield* sessions.updatePart({
+                id: PartID.ascending(),
+                messageID: assistant.id,
+                sessionID: parent.id,
+                type: "tool",
+                tool: "task",
+                callID,
+                state: {
+                  status: "completed",
+                  input: { prompt: "task" },
+                  output: "done",
+                  title: "task",
+                  metadata: { sessionId: child.id },
+                  time: { start: 1, end: 2 },
+                },
+              })
+              yield* database.db.run(sql`
+              INSERT INTO runtime_execution (id, session_id, directory, owner_lineage, owner_instance, fence, state,
+                desired_active, parent_session_id, parent_message_id, parent_call_id, parent_mode, time_created, time_updated)
+              VALUES (${child.id}, ${child.id}, ${directory}, ${lineage}, 'dead', 1, 'completed', 1,
+                ${parent.id}, ${assistant.id}, ${callID}, 'foreground', 1, 1)
+            `)
+            }
+            return yield* sessions.create({ title: "waiting for startup" })
+          }),
+        )
+        let scopes = 0
+        let completedScanStarted = false
+        let hostServiced = false
+        let hostServicedDuringScan = false
+        let settlementReads = 0
+        const counted = new Proxy(database.db, {
+          get(target, property, receiver) {
+            if (property === "all")
+              return (query: Parameters<typeof target.all>[0]) => {
+                if (JSON.stringify(query).includes("AND parent_mode =")) {
+                  completedScanStarted = true
+                  setImmediate(() => {
+                    hostServiced = true
+                  })
+                }
+                return target.all(query)
+              }
+            if (property === "select")
+              return (fields?: Parameters<typeof target.select>[0]) => {
+                if (completedScanStarted && scopes === 1 && fields?.id === MessageTable.id) {
+                  settlementReads++
+                  if (settlementReads > 1 && hostServiced) hostServicedDuringScan = true
+                }
+                return fields ? target.select(fields) : target.select()
+              }
+            if (property !== "transaction") return Reflect.get(target, property, receiver)
+            return (
+              callback: Parameters<typeof target.transaction>[0],
+              options: Parameters<typeof target.transaction>[1],
+            ) =>
+              target.transaction(
+                (tx) =>
+                  callback(
+                    new Proxy(tx, {
+                      get(txTarget, key, txReceiver) {
+                        if (key !== "all") return Reflect.get(txTarget, key, txReceiver)
+                        return (query: Parameters<typeof txTarget.all>[0]) => {
+                          if (JSON.stringify(query).includes("metadata_edges(parent, child)")) scopes++
+                          return txTarget.all(query)
+                        }
+                      },
+                    }),
+                  ),
+                options,
+              )
+          },
+        })
+        const recoveryContext = Context.add(
+          Context.add(context, Database.Service, { db: counted }),
+          RuntimeLifecycle.Service,
+          runtime,
+        )
+        const recovery = Context.get(
+          yield* Layer.build(ServerRecovery.layer).pipe(Effect.provide(recoveryContext)),
+          ServerRecovery.Service,
+        )
+        const requested = yield* Deferred.make<void>()
+        const admitted = yield* Deferred.make<void>()
+        yield* Effect.gen(function* () {
+          yield* Deferred.succeed(requested, undefined)
+          const lease = yield* runtime.admit({ sessionID: fresh.id, directory })
+          yield* runtime.release(fresh.id, lease.fence)
+          yield* Deferred.succeed(admitted, undefined)
+        }).pipe(Effect.forkChild)
+        yield* Deferred.await(requested)
+        const start = performance.now()
+        if (benchmark) {
+          let last = start
+          let gap = 0
+          const timer = setInterval(() => {
+            const now = performance.now()
+            gap = Math.max(gap, now - last)
+            last = now
+          }, 10)
+          yield* recovery.initialize.pipe(
+            Effect.provideService(
+              References.CurrentLoggers,
+              new Set([Logger.make((entry) => console.log(entry.message))]),
+            ),
+            Effect.provideService(References.MinimumLogLevel, "Info"),
+            Effect.ensuring(Effect.sync(() => clearInterval(timer))),
+          )
+          gap = Math.max(gap, performance.now() - last)
+          console.log(
+            `startup recovery workload: ${(performance.now() - start).toFixed(1)}ms, ${scopes} graph-scope queries, ${gap.toFixed(1)}ms max timer gap, host serviced during scan: ${hostServicedDuringScan}`,
+          )
+        } else yield* recovery.initialize
+        expect({ scopes, hostServicedDuringScan }).toEqual({ scopes: 2, hostServicedDuringScan: true })
+        expect(settlementReads).toBe(settled)
+        expect(
+          yield* database.db.get<{ count: number }>(
+            sql`SELECT count(*) AS count FROM runtime_execution WHERE state = 'completed'`,
+          ),
+        ).toEqual({ count: settled })
+        expect(
+          yield* database.db.all<{ reservation: string; count: number }>(sql`
+            SELECT reservation, count(*) AS count FROM session_handoff_recovery_hold
+            WHERE reservation IN ('generation-1', 'generation-2') GROUP BY reservation ORDER BY reservation
+          `),
+        ).toEqual([
+          { reservation: "generation-1", count: descendants + 1 },
+          { reservation: "generation-2", count: descendants + 1 },
+        ])
+        expect(yield* Deferred.isDone(admitted)).toBe(false)
+        yield* runtime.finishStartupRecovery()
+        yield* Deferred.await(admitted)
+      }),
+    120_000,
+  )
+})
 
 describe("foreground Task settlement linkage", () => {
   for (const scenario of [

@@ -331,9 +331,20 @@ export const layer = Layer.effect(
     runtime.bindDatabase(database)
     return Service.of({
       initialize: Effect.gen(function* () {
+        const diagnostics = process.env.OPENCODE_STARTUP_RECOVERY_DIAGNOSTICS === "1"
+        const phase = (name: string, start: number, counts?: Record<string, number>) =>
+          diagnostics
+            ? Effect.logInfo("startup recovery phase", {
+                phase: name,
+                ...(counts ? { elapsedMs: performance.now() - start, ...counts } : { started: true }),
+              })
+            : Effect.void
+        let started = diagnostics ? performance.now() : 0
+        yield* phase("startup holds", started)
         const protectedIDs = new Set(
           yield* SessionHandoffRecovery.installStartupHolds(database, runtime.identity.instance, runtime.verifyOwner),
         )
+        yield* phase("startup holds", started, { protectedSessions: protectedIDs.size })
         const { SessionID, MessageID, PartID } = yield* Effect.promise(() => import("../session/schema"))
         const { sql } = yield* Effect.promise(() => import("drizzle-orm"))
         const { renderOutput } = yield* Effect.promise(() => import("../tool/task"))
@@ -343,13 +354,30 @@ export const layer = Layer.effect(
           restartSupported: runtime.identity.restartSupported,
         })
         const childPrompts = new Map<string, SessionPrompt.PromptInput>()
+        // SQLite calls and already-resolved imports need not give timers a turn.
+        let yieldAt = performance.now() + 10
+        let records = 0
+        const yieldToHost = Effect.gen(function* () {
+          if (++records < 16 && performance.now() < yieldAt) return
+          yield* Effect.yieldNow
+          yieldAt = performance.now() + 10
+          records = 0
+        })
+        started = diagnostics ? performance.now() : 0
+        yield* phase("stale parent reconstruction", started)
+        // Reconstruction requires an existing child with this projected parent.
         const staleParents = yield* database.db.all<{ session_id: string; directory: string }>(sql`
-          SELECT session_id, directory FROM runtime_execution
-          WHERE owner_lineage = ${runtime.identity.lineage}
-            AND desired_active = 1 AND state IN ('active', 'waiting_child', 'completed')
+          SELECT e.session_id, e.directory FROM runtime_execution e
+          WHERE e.owner_lineage = ${runtime.identity.lineage}
+            AND e.desired_active = 1 AND e.state IN ('active', 'waiting_child', 'completed')
+            AND EXISTS (SELECT 1 FROM session s WHERE s.parent_id = e.session_id)
         `)
         let reconstructed = 0
+        let histories = 0
+        let messagesRead = 0
+        let partsRead = 0
         for (const parent of staleParents) {
+          yield* yieldToHost
           if (protectedIDs.has(parent.session_id) || (yield* SessionHandoffRecovery.held(database, parent.session_id)))
             continue
           if ((yield* runtime.verifyOwner(parent.session_id)) !== "dead") continue
@@ -365,11 +393,22 @@ export const layer = Layer.effect(
               }),
             )
         }
+        yield* phase("stale parent reconstruction", started, {
+          parents: staleParents.length,
+          histories,
+          messages: messagesRead,
+          parts: partsRead,
+          reconstructed,
+        })
         if (reconstructed > 0)
           yield* Effect.logWarning("runtime recovery reconstructed missing Task child prompts", {
             count: reconstructed,
           })
 
+        started = diagnostics ? performance.now() : 0
+        yield* phase("completed foreground reconciliation", started)
+        let alreadySettled = 0
+        let resultsLoaded = 0
         const children = yield* database.db.all<{
           session_id: string
           directory: string
@@ -394,8 +433,8 @@ export const layer = Layer.effect(
             AND parent_mode = ${"foreground"}
         `)
         for (const child of children) {
-          if (protectedIDs.has(child.session_id) || (yield* SessionHandoffRecovery.held(database, child.session_id)))
-            continue
+          yield* yieldToHost
+          if (protectedIDs.has(child.session_id)) continue
           const record = {
             sessionID: child.session_id,
             directory: child.directory,
@@ -411,10 +450,15 @@ export const layer = Layer.effect(
             parentNotificationState: child.parent_notification_state ?? undefined,
             recoveryAttempts: child.recovery_attempts,
           }
+          // This predicate only reads. Revalidate holds before any repair work.
           const settled = yield* foregroundSettlementComplete({ database, record }).pipe(
             Effect.catchCause(() => Effect.succeed(false)),
           )
-          if (settled) continue
+          if (settled) {
+            alreadySettled++
+            continue
+          }
+          if (yield* SessionHandoffRecovery.held(database, child.session_id)) continue
           const result = yield* store.provide({ directory: record.directory }, childResult(record)).pipe(
             Effect.catchCause((cause) => {
               const error = Cause.squash(cause)
@@ -425,6 +469,7 @@ export const layer = Layer.effect(
               }).pipe(Effect.as(undefined))
             }),
           )
+          if (result) resultsLoaded++
           if (result)
             yield* store
               .provide({ directory: record.directory }, settleForeground({ database, sessions, record, result }))
@@ -439,7 +484,14 @@ export const layer = Layer.effect(
                 }),
               )
         }
+        yield* phase("completed foreground reconciliation", started, {
+          children: children.length,
+          alreadySettled,
+          resultsLoaded,
+        })
 
+        started = diagnostics ? performance.now() : 0
+        yield* phase("runtime recover", started)
         yield* runtime.recover((record) =>
           store.provide(
             { directory: record.directory },
@@ -458,6 +510,7 @@ export const layer = Layer.effect(
             }),
           ),
         )
+        yield* phase("runtime recover", started, {})
 
         function childResult(record: { sessionID: string }) {
           return Effect.gen(function* () {
@@ -474,7 +527,13 @@ export const layer = Layer.effect(
             if (yield* SessionHandoffRecovery.held(database, parentSessionID)) return 0
             const parentID = SessionID.make(parentSessionID)
             const messages = yield* sessions.messages({ sessionID: parentID }).pipe(Effect.orDie)
+            if (diagnostics) {
+              histories++
+              messagesRead += messages.length
+              for (const message of messages) partsRead += message.parts.length
+            }
             let count = 0
+            // Yield between parents, not between reading a transcript and acting on its Task links.
             for (const message of messages) {
               if (message.info.role !== "assistant") continue
               for (const part of message.parts) {
@@ -485,11 +544,6 @@ export const layer = Layer.effect(
                 if (part.state.status === "completed" && metadata.background !== true) continue
                 const childSessionID = metadata.sessionId
                 const childMessageID = metadata.messageID
-                if (
-                  typeof childSessionID === "string" &&
-                  (yield* SessionHandoffRecovery.held(database, childSessionID))
-                )
-                  continue
                 const model = metadata.model
                 const taskInput = part.state.input
                 if (
@@ -507,6 +561,7 @@ export const layer = Layer.effect(
                   model.providerID.length === 0
                 )
                   continue
+                if (yield* SessionHandoffRecovery.held(database, childSessionID)) continue
                 const childID = SessionID.make(childSessionID)
                 const child = yield* sessions.get(childID).pipe(Effect.catchCause(() => Effect.succeed(undefined)))
                 if (!child || child.parentID !== parentSessionID) continue
