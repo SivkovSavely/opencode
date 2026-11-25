@@ -6,6 +6,9 @@ import { ManagedCommand } from "@opencode-ai/core/managed-command"
 import { SessionHandoffRecovery } from "@opencode-ai/core/session/handoff-recovery"
 import { SessionHandoffRecoveryQueue } from "@opencode-ai/core/session/handoff-recovery-queue"
 import { SessionHandoffEnrollment } from "@opencode-ai/core/session/handoff-enrollment"
+import { SessionCooperativePause } from "@opencode-ai/core/session/cooperative-pause"
+import { SessionHandoffStore } from "@opencode-ai/core/session/handoff-store"
+import { SessionHandoffV1 } from "@opencode-ai/schema/v1/session-handoff"
 import { sql } from "drizzle-orm"
 import {
   Cause,
@@ -37,6 +40,7 @@ export type ExecutionState =
   | "completed"
   | "cancelled"
   | "recovery_needed"
+  | "cooperative_paused"
 
 export class RuntimeDrainingError extends Schema.TaggedErrorClass<RuntimeDrainingError>()("RuntimeDrainingError", {
   message: Schema.String,
@@ -166,6 +170,21 @@ export type Interface = {
     onPark?: Effect.Effect<void>,
   ) => Effect.Effect<"absent" | "active" | "parked">
   readonly beforeTurn: (sessionID: string) => Effect.Effect<boolean>
+  readonly cooperativePause: (
+    sessionID: string,
+    directory: string,
+    request: SessionHandoffV1.PauseRequest,
+  ) => Effect.Effect<SessionHandoffV1.CooperativePauseReceipt, unknown>
+  readonly cooperativeBoundary: (
+    sessionID: string,
+    terminal?: boolean,
+  ) => Effect.Effect<"none" | "waiting" | "paused" | "terminal">
+  readonly cooperativeResume: (
+    sessionID: string,
+    directory: string,
+    request: SessionHandoffV1.ResumeRequest,
+    run: (fence: number) => Effect.Effect<unknown, unknown>,
+  ) => Effect.Effect<SessionHandoffV1.CooperativeResumeReceipt, unknown>
   readonly ownershipFence: (sessionID: string) => Effect.Effect<number | undefined>
   readonly checkpoint: (sessionID: string) => Effect.Effect<boolean>
   readonly retry: (sessionID: string, retryAt: number, attempt?: number) => Effect.Effect<void>
@@ -1276,6 +1295,13 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
         Effect.fnUntraced(function* (state) {
           yield* rejectRetired(input)
           const row = yield* read(input.sessionID)
+          if (
+            yield* SessionCooperativePause.active(
+              databaseRef.current ?? (yield* Database.Service),
+              input.sessionID,
+            ).pipe(Effect.orDie)
+          )
+            return yield* rejectAdmission(input, "Session has an explicit cooperative pause barrier", row)
           const local = state.active.get(input.sessionID)
           if (
             input.recoveryFence !== undefined &&
@@ -1454,28 +1480,29 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
   })
 
   const acquireCancellation = Effect.fnUntraced(function* (sessionID: string, expected?: CancellationTarget) {
+    const database = databaseRef.current ?? (yield* Database.Service)
     const decision = yield* SynchronizedRef.modifyEffect(
       ref,
-      Effect.fnUntraced(function* (state) {
-        if (expected) {
-          const row = yield* read(sessionID)
-          if (
-            !row ||
-            row.owner_lineage !== expected.ownerLineage ||
-            row.owner_instance !== expected.ownerInstance ||
-            row.fence !== expected.fence ||
-            row.desired_active !== 1
-          )
-            return [{ owner: false as boolean, cancelled: [] as string[], skipped: true }, state] as const
-        }
-        retryWakes.delete(sessionID)
-        if (state.cancelling.has(sessionID))
-          return [{ owner: false as boolean, cancelled: [] as string[] }, state] as const
-        const cancelling = new Map(state.cancelling)
-        cancelling.set(sessionID, { deferred: Deferred.makeUnsafe<boolean>(), rootSessionID: sessionID })
-        const database = databaseRef.current ?? (yield* Database.Service)
-        // Independent commands use their durable permit as the generation, even without an execution row.
-        yield* database.db.run(sql`
+      Effect.fnUntraced(
+        function* (state) {
+          if (expected) {
+            const row = yield* read(sessionID)
+            if (
+              !row ||
+              row.owner_lineage !== expected.ownerLineage ||
+              row.owner_instance !== expected.ownerInstance ||
+              row.fence !== expected.fence ||
+              row.desired_active !== 1
+            )
+              return [{ owner: false as boolean, cancelled: [] as string[], skipped: true }, state] as const
+          }
+          retryWakes.delete(sessionID)
+          if (state.cancelling.has(sessionID))
+            return [{ owner: false as boolean, cancelled: [] as string[] }, state] as const
+          const cancelling = new Map(state.cancelling)
+          cancelling.set(sessionID, { deferred: Deferred.makeUnsafe<boolean>(), rootSessionID: sessionID })
+          // Independent commands use their durable permit as the generation, even without an execution row.
+          yield* database.db.run(sql`
           WITH RECURSIVE descendants(id) AS (
             SELECT ${sessionID}
             UNION SELECT session_id FROM managed_command WHERE root_session_id = ${sessionID}
@@ -1485,38 +1512,45 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
             WHERE session_id IN (SELECT id FROM descendants) AND owner_instance <> ${identity.instance}
               AND state IN ('pending', 'running')
         `)
-        if (yield* RuntimeRetirement.lookup(database, sessionID)) {
-          const members = yield* database.db.all<{ session_id: string }>(sql`
+          if (yield* RuntimeRetirement.lookup(database, sessionID)) {
+            const members = yield* database.db.all<{ session_id: string }>(sql`
             SELECT session_id FROM runtime_retirement_member WHERE root_session_id = ${sessionID}
             UNION SELECT ${sessionID} AS session_id
           `)
-          for (const member of members) {
-            if (cancelling.has(member.session_id)) continue
-            cancelling.set(member.session_id, { deferred: Deferred.makeUnsafe<boolean>(), rootSessionID: sessionID })
+            for (const member of members) {
+              if (cancelling.has(member.session_id)) continue
+              cancelling.set(member.session_id, { deferred: Deferred.makeUnsafe<boolean>(), rootSessionID: sessionID })
+            }
+            // Fence revocation is not evidence that the caller has interrupted and joined the work.
+            return [
+              { owner: true as boolean, cancelled: members.map((member) => member.session_id) },
+              { ...state, cancelling },
+            ] as const
           }
-          // Fence revocation is not evidence that the caller has interrupted and joined the work.
-          return [
-            { owner: true as boolean, cancelled: members.map((member) => member.session_id) },
-            { ...state, cancelling },
-          ] as const
-        }
-        const row = yield* read(sessionID)
-        if (!row || row.owner_lineage !== identity.lineage)
-          return [
-            { owner: true as boolean, cancelled: [] as string[] },
-            { ...state, cancelling },
-          ] as const
-        if (
-          !["active", "retry_wait", "parked", "waiting_child", "completed", "cancelled", "recovery_needed"].includes(
-            row.state,
+          const row = yield* read(sessionID)
+          if (!row || row.owner_lineage !== identity.lineage)
+            return [
+              { owner: true as boolean, cancelled: [] as string[] },
+              { ...state, cancelling },
+            ] as const
+          if (
+            ![
+              "active",
+              "retry_wait",
+              "parked",
+              "waiting_child",
+              "completed",
+              "cancelled",
+              "recovery_needed",
+              "cooperative_paused",
+            ].includes(row.state)
           )
-        )
-          return [
-            { owner: true as boolean, cancelled: [] as string[] },
-            { ...state, cancelling },
-          ] as const
+            return [
+              { owner: true as boolean, cancelled: [] as string[] },
+              { ...state, cancelling },
+            ] as const
 
-        const updated = yield* database.db.all<{ session_id: string }>(sql`
+          const updated = yield* database.db.all<{ session_id: string }>(sql`
           WITH RECURSIVE descendants(session_id) AS (
             SELECT ${sessionID}
             UNION
@@ -1530,7 +1564,7 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
           WHERE session_id IN (SELECT session_id FROM descendants)
             AND owner_lineage = ${identity.lineage}
             AND (
-              state IN ('active', 'retry_wait', 'parked', 'waiting_child')
+              state IN ('active', 'retry_wait', 'parked', 'waiting_child', 'cooperative_paused')
               OR (session_id = ${sessionID} AND state = ${"completed"})
               OR (session_id = ${sessionID} AND state = ${"recovery_needed"})
             )
@@ -1542,29 +1576,36 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
             )
           RETURNING session_id
         `)
-        const startupPending = new Map(state.startupPending)
-        const parentModeOverrides = new Map(state.parentModeOverrides)
-        for (const item of updated) {
-          parentModeOverrides.delete(item.session_id)
-          if (!cancelling.has(item.session_id))
-            cancelling.set(item.session_id, { deferred: Deferred.makeUnsafe<boolean>(), rootSessionID: sessionID })
-          const recovering = startupPending.get(item.session_id)
-          if (recovering) yield* Deferred.succeed(recovering, false).pipe(Effect.ignore)
-          startupPending.delete(item.session_id)
-        }
-        if (updated.length > 0)
-          yield* Effect.logInfo("runtime execution cancelled by user", {
-            sessionID,
-            previousState: row.state,
-            cancelledExecutions: updated.length,
-            lineage: identity.lineage,
-            instance: identity.instance,
-          })
-        return [
-          { owner: true as boolean, cancelled: updated.map((item) => item.session_id) },
-          { ...state, cancelling, startupPending, parentModeOverrides },
-        ] as const
-      }),
+          const startupPending = new Map(state.startupPending)
+          const parentModeOverrides = new Map(state.parentModeOverrides)
+          for (const item of updated) {
+            yield* SessionCooperativePause.boundary(database, item.session_id, {
+              ownerLineage: row.owner_lineage,
+              ownerInstance: row.owner_instance,
+              fence: row.fence,
+            }).pipe(Effect.orDie)
+            parentModeOverrides.delete(item.session_id)
+            if (!cancelling.has(item.session_id))
+              cancelling.set(item.session_id, { deferred: Deferred.makeUnsafe<boolean>(), rootSessionID: sessionID })
+            const recovering = startupPending.get(item.session_id)
+            if (recovering) yield* Deferred.succeed(recovering, false).pipe(Effect.ignore)
+            startupPending.delete(item.session_id)
+          }
+          if (updated.length > 0)
+            yield* Effect.logInfo("runtime execution cancelled by user", {
+              sessionID,
+              previousState: row.state,
+              cancelledExecutions: updated.length,
+              lineage: identity.lineage,
+              instance: identity.instance,
+            })
+          return [
+            { owner: true as boolean, cancelled: updated.map((item) => item.session_id) },
+            { ...state, cancelling, startupPending, parentModeOverrides },
+          ] as const
+        },
+        (effect) => database.db.transaction(() => effect, { behavior: "immediate" }),
+      ),
     )
     return decision
   })
@@ -2000,8 +2041,15 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
           row.fence !== current.fence ||
           row.owner_instance !== identity.instance ||
           row.owner_lineage !== identity.lineage
-        const nextState = revoked ? "cancelled" : state.phase === "draining" ? "parked" : "completed"
-        if (!revoked)
+        const nextState =
+          row?.state === "cooperative_paused"
+            ? "cooperative_paused"
+            : revoked
+              ? "cancelled"
+              : state.phase === "draining"
+                ? "parked"
+                : "completed"
+        if (!revoked && nextState !== "cooperative_paused")
           yield* update({
             sessionID,
             operation: "release",
@@ -2235,6 +2283,128 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
       })
     return allowed
   })
+
+  const cooperativePause: Interface["cooperativePause"] = (sessionID, directory, request) =>
+    withDurableAdmission(
+      SynchronizedRef.modifyEffect(ref, (state) =>
+        Effect.gen(function* () {
+          const database = databaseRef.current
+          if (!database) return yield* Effect.die("Cooperative pause requires a bound runtime database")
+          const current = state.active.get(sessionID)
+          const receipt = yield* SessionCooperativePause.admit(database, sessionID, directory, request, {
+            ownerLineage: identity.lineage,
+            ownerInstance: identity.instance,
+            fence: current?.mode === "active" ? current.fence : -1,
+          })
+          return [receipt, state] as const
+        }),
+      ),
+    )
+
+  const cooperativeBoundary: Interface["cooperativeBoundary"] = (sessionID, terminal = false) =>
+    withDurablePermit(
+      SynchronizedRef.modifyEffect(ref, (state) =>
+        Effect.gen(function* () {
+          const current = state.active.get(sessionID)
+          if (!current) return ["none" as const, state] as const
+          const database = databaseRef.current
+          if (!database) return yield* Effect.die("Cooperative pause requires a bound runtime database")
+          const result = yield* SessionCooperativePause.boundary(
+            database,
+            sessionID,
+            {
+              ownerLineage: identity.lineage,
+              ownerInstance: identity.instance,
+              fence: current.fence,
+            },
+            terminal,
+            (connection, row) =>
+              Effect.gen(function* () {
+                const snapshot = yield* SessionHandoffRecovery.inspect(
+                  connection,
+                  sessionID,
+                  (id) =>
+                    verifyOwner(id, connection).pipe(Effect.provideService(Database.Service, database), Effect.orDie),
+                  processLiveness,
+                  { queueID: row.queue_id, userMessageID: row.user_message_id },
+                )
+                const resources = [
+                  ...snapshot.interruptedResources.map((resource) => ({ sessionID, resource })),
+                  ...snapshot.descendants.flatMap((child) =>
+                    child.interruptedResources.map((resource) => ({ sessionID: child.childSessionID, resource })),
+                  ),
+                ]
+                for (const entry of resources) {
+                  if (entry.resource.liveness === "dead" || entry.resource.liveness === "not_applicable") continue
+                  if (entry.resource.resourceKind !== "process" || entry.resource.liveness !== "unknown") return false
+                  const reconciled = yield* connection.db
+                    .get(sql`SELECT 1 FROM session_handoff_receipt r, json_each(r.data,'$.legacyResourceReconciliations') a
+            WHERE json_extract(r.data,'$.kind')='recovery' AND json_extract(r.data,'$.state')='applied'
+              AND json_extract(r.data,'$.sessionID')=${sessionID}
+              AND json_extract(r.data,'$.expected.queueID')=${row.queue_id} AND json_extract(r.data,'$.expected.userMessageID')=${row.user_message_id}
+              AND json_extract(a.value,'$.sessionID')=${entry.sessionID} AND json_extract(a.value,'$.partID')=${entry.resource.partID}
+              AND json_extract(a.value,'$.assistantMessageID')=${entry.resource.assistantMessageID} AND json_extract(a.value,'$.callID')=${entry.resource.callID}
+              AND json_extract(a.value,'$.tool')=${entry.resource.tool} AND json_extract(a.value,'$.resourceRef') IS ${entry.resource.resourceRef}
+              AND json_extract(a.value,'$.commandSHA256')=${entry.resource.commandSHA256 ?? null} LIMIT 1`)
+                  if (!reconciled) return false
+                }
+                return true
+              }).pipe(Effect.orDie),
+          ).pipe(Effect.orDie)
+          return [result, state] as const
+        }),
+      ),
+    ).pipe(Effect.orDie)
+
+  const cooperativeResume: Interface["cooperativeResume"] = (sessionID, directory, request, run) =>
+    Effect.uninterruptibleMask((restore) =>
+      Effect.gen(function* () {
+        const database = databaseRef.current
+        if (!database) return yield* Effect.die("Cooperative resume requires a bound runtime database")
+        const retry = yield* SessionHandoffStore.retryRequest(database, {
+          sessionID,
+          directory,
+          queueID: request.expected.queueID,
+          userMessageID: request.expected.userMessageID,
+          requestID: request.requestID,
+          kind: "cooperative_resume",
+          payload: { ...request },
+        })
+        if (retry) return yield* Schema.decodeUnknownEffect(SessionHandoffV1.CooperativeResumeReceipt)(retry)
+        // The old loop must finish finalizers before the original fence can be re-leased.
+        if ((yield* SessionCooperativePause.pending(database, sessionID))?.state === "paused")
+          yield* restore(waitForIdle(sessionID))
+        const result = yield* withDurableAdmission(
+          SynchronizedRef.modifyEffect(ref, (state) =>
+            Effect.gen(function* () {
+              const retry = yield* SessionHandoffStore.receipt(database, sessionID, request.requestID)
+              const receipt = yield* SessionCooperativePause.resume(database, sessionID, directory, request, {
+                ownerLineage: identity.lineage,
+                ownerInstance: identity.instance,
+                fence: request.expected.fence,
+              })
+              if (retry || receipt.state !== "resumed") return [{ receipt, start: Boolean(false) }, state] as const
+              const active = new Map(state.active)
+              active.set(sessionID, { fence: request.expected.fence, leases: 1, mode: "active" })
+              return [
+                { receipt, start: Boolean(true) },
+                { ...state, active, leases: addLease(state, sessionID, request.expected.fence) },
+              ] as const
+            }),
+          ),
+        )
+        if (result.start)
+          yield* run(request.expected.fence).pipe(
+            Effect.catchCause((cause) =>
+              Effect.logError("Cooperative continuation failed", recoveryFailureFields(cause, "cooperative-resume")),
+            ),
+            Effect.ensuring(release(sessionID, request.expected.fence).pipe(Effect.orDie)),
+            Effect.provideService(Database.Service, database),
+            Effect.forkIn(scope),
+          )
+        return result.receipt
+      }),
+    )
 
   const ownershipFence = Effect.fnUntraced(function* (sessionID: string) {
     const state = SynchronizedRef.getUnsafe(ref)
@@ -2586,6 +2756,13 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
     const protectedIDs = yield* SessionHandoffRecovery.installStartupHolds(database, identity.instance, (sessionID) =>
       verifyOwner(sessionID).pipe(Effect.provideService(Database.Service, database), Effect.orDie),
     )
+    const intents = yield* database.db.all<{ session_id: string }>(
+      sql`SELECT session_id FROM session_cooperative_pause WHERE state IN ('accepted','draining')`,
+    )
+    for (const intent of intents)
+      yield* SessionCooperativePause.ownerLost(database, intent.session_id, (connection, sessionID) =>
+        verifyOwner(sessionID, connection).pipe(Effect.provideService(Database.Service, database), Effect.orDie),
+      )
     const candidates = yield* database.db.all<Row>(sql`
       WITH RECURSIVE cancelled(session_id) AS (
         SELECT session_id FROM runtime_execution WHERE state = ${"cancelled"}
@@ -2595,7 +2772,8 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
         JOIN cancelled parent ON child.parent_session_id = parent.session_id
       )
       SELECT * FROM runtime_execution
-      WHERE desired_active = 1 AND state NOT IN ('completed', 'cancelled')
+      WHERE desired_active = 1 AND state NOT IN ('completed', 'cancelled', 'cooperative_paused')
+        AND session_id NOT IN (SELECT session_id FROM session_cooperative_pause WHERE state IN ('accepted','draining','paused'))
         AND session_id NOT IN (SELECT session_id FROM cancelled)
         AND session_id NOT IN (SELECT session_id FROM session_handoff_recovery_hold)
         AND session_id NOT IN (SELECT value FROM json_each(${JSON.stringify(protectedIDs)}))
@@ -3223,6 +3401,9 @@ export function make(input: MakeInput, scope: Scope.Scope, database?: Database.I
     release,
     releaseInterrupted,
     beforeTurn,
+    cooperativePause,
+    cooperativeBoundary,
+    cooperativeResume,
     ownershipFence,
     checkpoint,
     retry,
@@ -3247,6 +3428,11 @@ export function unavailable(): Interface {
   const status = { state: "running" as const, active: 0, parked: 0, ...identity }
   return {
     identity,
+    cooperativePause: () =>
+      Effect.fail(new RuntimeDrainingError({ message: "Cooperative pause requires a tracked runtime" })),
+    cooperativeBoundary: () => Effect.succeed("none"),
+    cooperativeResume: () =>
+      Effect.fail(new RuntimeDrainingError({ message: "Cooperative resume requires a tracked runtime" })),
     withDurableAdmission: (effect) => effect,
     // Embedded runtimes have no lifecycle-owned work to exclude.
     withConfigReload: (effect) => effect,

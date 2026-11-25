@@ -118,6 +118,8 @@ export const SessionPaths = {
   queue: `${root}/:sessionID/queue`,
   queueFlush: `${root}/:sessionID/queue/flush`,
   execution: `${root}/:sessionID/execution`,
+  cooperativePause: `${root}/:sessionID/execution/pause`,
+  cooperativeResume: `${root}/:sessionID/execution/resume`,
   enrollment: `${root}/:sessionID/enrollment`,
   modelControl: `${root}/:sessionID/model-control`,
   recovery: `${root}/:sessionID/recovery`,
@@ -187,6 +189,30 @@ export const SessionApi = HttpApi.make("session")
           error: HandoffErrors,
         }).annotateMerge(
           OpenApi.annotations({ identifier: "session.handoffReceipt", summary: "Get a durable handoff receipt" }),
+        ),
+        HttpApiEndpoint.post("cooperativePause", SessionPaths.cooperativePause, {
+          params: { sessionID: SessionID },
+          query: WorkspaceRoutingQuery,
+          payload: SessionHandoffV1.PauseRequest,
+          success: SessionHandoffV1.CooperativePauseReceipt,
+          error: HandoffErrors,
+        }).annotateMerge(
+          OpenApi.annotations({
+            identifier: "session.cooperativePause",
+            summary: "Cooperatively pause the original queue action",
+          }),
+        ),
+        HttpApiEndpoint.post("cooperativeResume", SessionPaths.cooperativeResume, {
+          params: { sessionID: SessionID },
+          query: WorkspaceRoutingQuery,
+          payload: SessionHandoffV1.ResumeRequest,
+          success: SessionHandoffV1.CooperativeResumeReceipt,
+          error: HandoffErrors,
+        }).annotateMerge(
+          OpenApi.annotations({
+            identifier: "session.cooperativeResume",
+            summary: "Explicitly resume a cooperatively paused action",
+          }),
         ),
         HttpApiEndpoint.get("list", SessionPaths.list, {
           query: ListQuery,

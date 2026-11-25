@@ -4,7 +4,8 @@ import { createHash } from "node:crypto"
 import { sql } from "drizzle-orm"
 import { EffectDrizzleQueryError } from "drizzle-orm/effect-core/errors"
 import { Context, Effect, Option, Schema } from "effect"
-import type { SessionHandoffStore } from "./handoff-store"
+import { SessionHandoffStore } from "./handoff-store"
+import { SessionHandoffNotification } from "./handoff-notification"
 import { SessionHandoffV1 } from "@opencode-ai/schema/v1/session-handoff"
 
 export type Connection = SessionHandoffStore.Connection
@@ -58,6 +59,7 @@ export type InterruptedResource = {
   liveness: Liveness | "not_applicable"
   effect: "uncertain"
   evidence: string | null
+  commandSHA256?: string
 }
 export type TaskDescendant = {
   link: TaskLink | null
@@ -100,6 +102,12 @@ export const ResourceProcessIdentity = Schema.Struct({
   startTime: Schema.String,
 })
 export type ResourceProbe = (identity: typeof ResourceProcessIdentity.Type) => Liveness
+export type InspectionMetrics = {
+  candidatePartVisits: number
+  lineageMessageVisits: number
+  messageDecodeVisits: number
+  partDecodeVisits: number
+}
 type Runtime = {
   session_id: string
   directory: string
@@ -127,7 +135,7 @@ type Session = {
   agent: string | null
   model: string | null
 }
-type Message = { id: string; session_id: string; data: string; time_created: number }
+type Message = { id: string; session_id: string; data: string; time_created: number; position: number }
 type Part = { id: string; message_id: string; session_id: string; data: string; time_created: number }
 type Generation = { session_id: string; reservation: string; state: string; user_message_id: string | null }
 type Lineage = {
@@ -143,6 +151,29 @@ type Graph = {
   parts: Part[]
   queues: (Record<string, unknown> & { session_id: string })[]
   queueStates: (Record<string, unknown> & { session_id: string })[]
+}
+type IndexedMessage = { row: Message; value: Record<string, unknown> }
+type IndexedPart = {
+  row: Part
+  value: Record<string, unknown>
+  state: Record<string, unknown>
+  metadata: Record<string, unknown>
+  input: Record<string, unknown>
+}
+type InspectionIndex = {
+  messages: Map<string, IndexedMessage>
+  dataMessages: Map<string, IndexedMessage>
+  messagesBySession: Map<string, IndexedMessage[]>
+  dataMessagesBySession: Map<string, IndexedMessage[]>
+  latestUserMessageBySession: Map<string, IndexedMessage>
+  assistantsByParent: Map<string, IndexedMessage[]>
+  parts: Map<string, IndexedPart>
+  partsBySession: Map<string, IndexedPart[]>
+  dataPartsBySession: Map<string, IndexedPart[]>
+  dataPartsByMessage: Map<string, IndexedPart[]>
+  partsByMessage: Map<string, IndexedPart[]>
+  taskPartsByChild: Map<string, IndexedPart[]>
+  taskPartsByChildInput: Map<string, IndexedPart[]>
 }
 const ObjectValue = Schema.Record(Schema.String, Schema.Unknown)
 function object(value: unknown): Record<string, unknown> {
@@ -303,7 +334,7 @@ const graph = Effect.fnUntraced(function* (database: Connection, roots: readonly
     sql`SELECT * FROM runtime_execution WHERE session_id IN ${scope} ORDER BY session_id`,
   )
   const messages = yield* database.db.all<Message>(
-    sql`SELECT id, session_id, data, time_created FROM message WHERE session_id IN ${scope} ORDER BY time_created, id`,
+    sql`SELECT id, session_id, data, time_created, rowid AS position FROM message WHERE session_id IN ${scope} ORDER BY time_created, id`,
   )
   const parts = yield* database.db.all<Part>(
     sql`SELECT id, message_id, session_id, data, time_created FROM part WHERE session_id IN ${scope} ORDER BY time_created, id`,
@@ -316,6 +347,113 @@ const graph = Effect.fnUntraced(function* (database: Connection, roots: readonly
   )
   return { sessions, runtimes, messages, parts, queues, queueStates } satisfies Graph
 })
+
+function indexGraph(data: Graph, full: Graph, ids: readonly string[], metrics?: InspectionMetrics): InspectionIndex {
+  const messages = new Map<string, IndexedMessage>()
+  const messagesBySession = new Map<string, IndexedMessage[]>()
+  for (const row of full.messages) {
+    if (metrics) metrics.messageDecodeVisits++
+    const item = { row, value: object(json(row.data)) }
+    messages.set(canonical([row.session_id, row.id]), item)
+    const list = messagesBySession.get(row.session_id)
+    if (list) list.push(item)
+    else messagesBySession.set(row.session_id, [item])
+  }
+  const dataMessagesBySession = new Map<string, IndexedMessage[]>()
+  const dataMessages = new Map<string, IndexedMessage>()
+  for (const row of data.messages) {
+    const item = messages.get(canonical([row.session_id, row.id]))
+    if (!item) continue
+    dataMessages.set(indexKey(row.session_id, row.id), item)
+    const list = dataMessagesBySession.get(row.session_id)
+    if (list) list.push(item)
+    else dataMessagesBySession.set(row.session_id, [item])
+  }
+  const latestUserMessageBySession = new Map<string, IndexedMessage>()
+  for (const [sessionID, list] of dataMessagesBySession) {
+    const latest = list.reduce<IndexedMessage | undefined>(
+      (value, message) =>
+        message.value.role === "user" && (!value || message.row.position > value.row.position) ? message : value,
+      undefined,
+    )
+    if (latest) latestUserMessageBySession.set(sessionID, latest)
+  }
+  const assistantsByParent = new Map<string, IndexedMessage[]>()
+  for (const item of messages.values()) {
+    if (item.value.role !== "assistant" || item.value.summary === true || typeof item.value.parentID !== "string")
+      continue
+    const key = canonical([item.row.session_id, item.value.parentID])
+    const list = assistantsByParent.get(key)
+    if (list) list.push(item)
+    else assistantsByParent.set(key, [item])
+  }
+  const idSet = new Set(ids)
+  const parts = new Map<string, IndexedPart>()
+  const partsBySession = new Map<string, IndexedPart[]>()
+  const partsByMessage = new Map<string, IndexedPart[]>()
+  const taskPartsByChild = new Map<string, IndexedPart[]>()
+  const taskPartsByChildInput = new Map<string, IndexedPart[]>()
+  for (const row of full.parts) {
+    if (metrics) metrics.partDecodeVisits++
+    const value = object(json(row.data))
+    const state = object(value.state)
+    const metadata = object(state.metadata)
+    const item = { row, value, state, metadata, input: object(state.input) }
+    parts.set(row.id, item)
+    const sessionParts = partsBySession.get(row.session_id)
+    if (sessionParts) sessionParts.push(item)
+    else partsBySession.set(row.session_id, [item])
+    const messageKey = canonical([row.session_id, row.message_id])
+    const messageParts = partsByMessage.get(messageKey)
+    if (messageParts) messageParts.push(item)
+    else partsByMessage.set(messageKey, [item])
+    if (value.type !== "tool" || value.tool !== "task" || typeof metadata.sessionId !== "string")
+      continue
+    if (typeof metadata.messageID === "string") {
+      const key = canonical([metadata.sessionId, metadata.messageID])
+      const invocationParts = taskPartsByChildInput.get(key)
+      if (invocationParts) invocationParts.push(item)
+      else taskPartsByChildInput.set(key, [item])
+    }
+    if (idSet.has(row.session_id)) {
+      const childParts = taskPartsByChild.get(metadata.sessionId)
+      if (childParts) childParts.push(item)
+      else taskPartsByChild.set(metadata.sessionId, [item])
+    }
+  }
+  const dataPartsBySession = new Map<string, IndexedPart[]>()
+  const dataPartsByMessage = new Map<string, IndexedPart[]>()
+  for (const row of data.parts) {
+    const item = parts.get(row.id)
+    if (!item) continue
+    const list = dataPartsBySession.get(row.session_id)
+    if (list) list.push(item)
+    else dataPartsBySession.set(row.session_id, [item])
+    const messageKey = canonical([row.session_id, row.message_id])
+    const messageParts = dataPartsByMessage.get(messageKey)
+    if (messageParts) messageParts.push(item)
+    else dataPartsByMessage.set(messageKey, [item])
+  }
+  return {
+    messages,
+    dataMessages,
+    messagesBySession,
+    dataMessagesBySession,
+    latestUserMessageBySession,
+    assistantsByParent,
+    parts,
+    partsBySession,
+    dataPartsBySession,
+    dataPartsByMessage,
+    partsByMessage,
+    taskPartsByChild,
+    taskPartsByChildInput,
+  }
+}
+
+function indexKey(sessionID: string, id: string) {
+  return canonical([sessionID, id])
+}
 
 // Potential links intentionally include incomplete and contradictory evidence.
 function closure(data: Lineage, root: string, excluded = new Set<string>()) {
@@ -588,13 +726,12 @@ export const held = Effect.fn("SessionHandoffRecovery.held")(function* (database
     )
 })
 
-function resources(data: Graph, sessionID: string, probe?: ResourceProbe): InterruptedResource[] {
-  return data.parts
-    .filter((part) => part.session_id === sessionID)
-    .flatMap((part) => {
-      const tool = object(json(part.data))
-      const state = object(tool.state)
-      const metadata = object(state.metadata)
+function resources(parts: readonly IndexedPart[], probe?: ResourceProbe): InterruptedResource[] {
+  return parts.flatMap((part) => {
+      const tool = part.value
+      const state = part.state
+      const metadata = part.metadata
+      const input = part.input
       if (
         tool.type !== "tool" ||
         (state.status !== "running" && state.status !== "pending" && metadata.interrupted !== true)
@@ -607,9 +744,9 @@ function resources(data: Graph, sessionID: string, probe?: ResourceProbe): Inter
       const liveness = task ? ("not_applicable" as const) : identity && probe ? probe(identity) : ("unknown" as const)
       return [
         {
-          assistantMessageID: part.message_id,
-          partID: part.id,
-          callID: typeof tool.callID === "string" ? tool.callID : part.id,
+          assistantMessageID: part.row.message_id,
+          partID: part.row.id,
+          callID: typeof tool.callID === "string" ? tool.callID : part.row.id,
           tool: typeof tool.tool === "string" ? tool.tool : "unknown",
           resourceKind: task ? ("task" as const) : process ? ("process" as const) : ("unknown" as const),
           resourceRef: typeof metadata.outputPath === "string" ? metadata.outputPath : null,
@@ -620,9 +757,12 @@ function resources(data: Graph, sessionID: string, probe?: ResourceProbe): Inter
             : identity && probe
               ? `verified process identity: ${liveness}`
               : null,
+          ...(typeof input.command === "string"
+            ? { commandSHA256: createHash("sha256").update(input.command).digest("hex") }
+            : {}),
         },
       ]
-    })
+  })
 }
 
 export const inspect = Effect.fn("SessionHandoffRecovery.inspect")(function* (
@@ -631,6 +771,7 @@ export const inspect = Effect.fn("SessionHandoffRecovery.inspect")(function* (
   liveness: (sessionID: string) => Effect.Effect<Liveness>,
   probe?: ResourceProbe,
   key?: Pick<SessionHandoffStore.ActionKey, "queueID" | "userMessageID">,
+  metrics?: InspectionMetrics,
 ) {
   const full = yield* graph(database, [rootSessionID])
   const action = key
@@ -647,31 +788,299 @@ export const inspect = Effect.fn("SessionHandoffRecovery.inspect")(function* (
   const scoped = action ? generation(full, action, roots) : { data: full, ids: closure(full, rootSessionID) }
   const data = scoped.data
   const ids = scoped.ids
+  const members = yield* database.db.all<{
+    message_id: string
+    session_id: string
+    queue_id: string
+    user_message_id: string
+    data: string
+  }>(
+    sql`SELECT * FROM session_handoff_assistant WHERE session_id IN (SELECT value FROM json_each(${JSON.stringify(ids)})) ORDER BY position`,
+  )
+  const notifications = yield* database.db.all<{
+    session_id: string
+    reservation: string
+    classification: string
+    user_message_id: string
+    message_id: string
+    data: string
+  }>(sql`SELECT * FROM session_handoff_notification WHERE session_id=${rootSessionID} ORDER BY rowid`)
+  const compactions = yield* database.db.all<{
+    session_id: string
+    reservation: string
+    queue_id: string
+    user_message_id: string
+    kind: string
+    message_id: string
+    data: string
+  }>(sql`SELECT * FROM session_handoff_compaction WHERE session_id=${rootSessionID} ORDER BY rowid`)
+  const history =
+    key && ids.length > 1
+      ? yield* SessionHandoffStore.lookup(database, { ...key, sessionID: rootSessionID }).pipe(
+          Effect.mapError(() => new RecoveryError({ code: "history_unavailable" })),
+        )
+      : undefined
+  const index = indexGraph(data, full, ids, metrics)
+  const currentBoundary = key ? index.messages.get(indexKey(rootSessionID, key.userMessageID)) : undefined
+  const historyAssistantByMessage = new Map(history?.assistants.map((record) => [record.messageID, record]))
+  const memberByMessage = new Map(members.map((row) => [row.message_id, row]))
+  const notificationsByMessage = new Map<string, typeof notifications>()
+  for (const row of notifications) {
+    const list = notificationsByMessage.get(row.message_id)
+    if (list) list.push(row)
+    else notificationsByMessage.set(row.message_id, [row])
+  }
+  const compactionsByMessage = new Map<string, typeof compactions>()
+  const compactionInputs = new Map(compactions.map((row) => [row.message_id, object(json(row.data)).messageData]))
+  for (const row of compactions) {
+    const list = compactionsByMessage.get(row.message_id)
+    if (list) list.push(row)
+    else compactionsByMessage.set(row.message_id, [row])
+  }
+  const deliveredPromptsByMessage = new Map<string, Graph["queues"]>()
+  for (const queue of full.queues) {
+    if (
+      queue.session_id !== rootSessionID ||
+      queue.id === key?.queueID ||
+      queue.state !== "delivered" ||
+      object(json(typeof queue.payload === "string" ? queue.payload : null)).kind !== "prompt" ||
+      typeof queue.message_id !== "string"
+    )
+      continue
+    const list = deliveredPromptsByMessage.get(queue.message_id)
+    if (list) list.push(queue)
+    else deliveredPromptsByMessage.set(queue.message_id, [queue])
+  }
+  const callers = new Map<string, "current" | "historical">()
+  for (const message of index.messagesBySession.get(rootSessionID) ?? []) {
+    if (metrics) metrics.lineageMessageVisits++
+    const info = message.value
+    if (info.role !== "assistant" || info.summary === true) continue
+    if (!key) {
+      callers.set(indexKey(rootSessionID, message.row.id), "current")
+      continue
+    }
+    const record = historyAssistantByMessage.get(message.row.id)
+    const notificationsForParent =
+      typeof info.parentID === "string" ? (notificationsByMessage.get(info.parentID) ?? []) : []
+    const authorized =
+      info.parentID === key.userMessageID ||
+      notificationsForParent.some(
+        (row) =>
+          row.reservation === action?.reservation &&
+          row.classification === "in_action" &&
+          row.user_message_id === key.userMessageID &&
+          row.message_id === info.parentID,
+      ) ||
+      (typeof info.parentID === "string" ? (compactionsByMessage.get(info.parentID) ?? []) : []).some((row) => {
+        const frozen = compactionInputs.get(row.message_id)
+        const actual = index.messages.get(indexKey(rootSessionID, row.message_id))
+        return (
+          row.reservation === action?.reservation &&
+          row.queue_id === key.queueID &&
+          row.user_message_id === key.userMessageID &&
+          ["request", "continuation"].includes(row.kind) &&
+          row.message_id === info.parentID &&
+          typeof frozen === "string" &&
+          !!actual &&
+          SessionHandoffNotification.inputData(frozen) === SessionHandoffNotification.inputData(actual.row.data)
+        )
+      })
+    if (
+      record &&
+      authorized &&
+      record.parentUserMessageID === info.parentID &&
+      record.authorizationUserMessageID === key.userMessageID
+    ) {
+      callers.set(indexKey(rootSessionID, message.row.id), "current")
+      continue
+    }
+    // A separate delivered ordinary input proves history, never current authority.
+    // Missing current membership or an authorized synthetic input is not history.
+    const parent =
+      typeof info.parentID === "string" ? index.messages.get(indexKey(rootSessionID, info.parentID)) : undefined
+    const queue = typeof info.parentID === "string" ? (deliveredPromptsByMessage.get(info.parentID) ?? []) : []
+    const declared = memberByMessage.get(message.row.id)
+    const prior = object(json(declared?.data ?? null))
+    if (
+      !record &&
+      !authorized &&
+      parent &&
+      parent.value.role === "user" &&
+      currentBoundary?.value.role === "user" &&
+      parent.row.time_created < currentBoundary.row.time_created &&
+      message.row.time_created < currentBoundary.row.time_created &&
+      queue.length === 1 &&
+      notificationsForParent.length === 0 &&
+      (typeof info.parentID !== "string" || (compactionsByMessage.get(info.parentID) ?? []).length === 0) &&
+      (!declared ||
+        (declared.queue_id === queue[0]?.id &&
+          declared.user_message_id === info.parentID &&
+          prior.kind === "ordinary" &&
+          prior.messageID === message.row.id &&
+          prior.parentUserMessageID === info.parentID &&
+          prior.authorizationUserMessageID === info.parentID))
+    ) {
+      callers.set(indexKey(rootSessionID, message.row.id), "historical")
+    }
+  }
+  // Descendant callers inherit only an exact frozen invocation's membership.
+  const ambiguousCallers = new Set<string>()
+  const callerQueue = (index.messagesBySession.get(rootSessionID) ?? []).filter((message) =>
+    callers.has(indexKey(rootSessionID, message.row.id)),
+  )
+  for (let cursor = 0; cursor < callerQueue.length; cursor++) {
+    const message = callerQueue[cursor]
+    if (!message) continue
+    if (metrics) metrics.lineageMessageVisits++
+    const key = indexKey(message.row.session_id, message.row.id)
+    const membership = callers.get(key)
+    if (!membership) continue
+    for (const link of index.partsByMessage.get(key) ?? []) {
+      const value = link.value
+      const frozen = link.metadata
+      if (
+        value.type !== "tool" ||
+        value.tool !== "task" ||
+        typeof frozen.sessionId !== "string" ||
+        typeof frozen.messageID !== "string"
+      )
+        continue
+      const childInputID = frozen.messageID
+      const input = index.messages.get(indexKey(frozen.sessionId, childInputID))
+      if (input?.value.role !== "user") continue
+      const links = index.taskPartsByChildInput.get(indexKey(frozen.sessionId, childInputID)) ?? []
+      if (
+        links.length !== 1 ||
+        links[0]?.row.id !== link.row.id ||
+        frozen.parentSessionId !== message.row.session_id ||
+        frozen.parentMessageID !== message.row.id ||
+        frozen.parentCallID !== value.callID
+      )
+        continue
+      for (const childAssistant of index.assistantsByParent.get(indexKey(frozen.sessionId, childInputID)) ?? []) {
+        const childKey = indexKey(childAssistant.row.session_id, childAssistant.row.id)
+        if (ambiguousCallers.has(childKey)) continue
+        const existing = callers.get(childKey)
+        if (existing === undefined) {
+          callers.set(childKey, membership)
+          callerQueue.push(childAssistant)
+          continue
+        }
+        if (existing !== membership) {
+          callers.delete(childKey)
+          ambiguousCallers.add(childKey)
+        }
+      }
+    }
+  }
   const revisions = yield* database.db.all<{ session_id: string; recovery_revision: number }>(
     sql`SELECT session_id, recovery_revision FROM session_handoff_recovery_child`,
   )
+  const revisionsBySession = new Map(revisions.map((revision) => [revision.session_id, revision.recovery_revision]))
+  const sessionsByID = new Map(data.sessions.map((session) => [session.id, session]))
+  const runtimesBySession = new Map(data.runtimes.map((runtime) => [runtime.session_id, runtime]))
+  const tasksBySession = new Map(
+    data.sessions.map((session) => [session.id, object(object(json(session.metadata)).task)]),
+  )
+  const queuesBySession = new Map<string, Graph["queues"]>()
+  for (const queue of data.queues) {
+    const list = queuesBySession.get(queue.session_id)
+    if (list) list.push(queue)
+    else queuesBySession.set(queue.session_id, [queue])
+  }
+  const queueStatesBySession = new Map<string, Graph["queueStates"]>()
+  for (const state of data.queueStates) {
+    const list = queueStatesBySession.get(state.session_id)
+    if (list) list.push(state)
+    else queueStatesBySession.set(state.session_id, [state])
+  }
   const descendants: TaskDescendant[] = []
   for (const id of ids.filter((id) => id !== rootSessionID)) {
-    const session = data.sessions.find((session) => session.id === id)
-    const runtime = data.runtimes.find((runtime) => runtime.session_id === id)
-    const task = object(object(json(session?.metadata ?? null)).task)
-    const candidates = data.parts.filter((part) => {
-      const tool = object(json(part.data))
+    const session = sessionsByID.get(id)
+    const runtime = runtimesBySession.get(id)
+    const task = tasksBySession.get(id) ?? {}
+    const allCandidates = index.taskPartsByChild.get(id) ?? []
+    if (metrics) metrics.candidatePartVisits += allCandidates.length
+    const current = allCandidates.filter((part) => {
+      const tool = part.value
+      const metadata = part.metadata
       return (
-        tool.type === "tool" &&
-        tool.tool === "task" &&
-        object(object(tool.state).metadata).sessionId === id &&
-        ids.includes(part.session_id)
+        runtime?.parent_session_id === part.row.session_id &&
+        runtime.parent_message_id === part.row.message_id &&
+        runtime.parent_call_id === tool.callID &&
+        runtime.parent_mode === (metadata.background === true ? "background" : "foreground")
       )
     })
-    const part = candidates.length === 1 ? candidates[0] : undefined
-    const tool = object(json(part?.data ?? null))
-    const metadata = object(object(tool.state).metadata)
-    const parent = data.sessions.find((session) => session.id === part?.session_id)
+    const latestInput = index.latestUserMessageBySession.get(id)?.row
+    const history = index.dataMessagesBySession.get(id) ?? []
+    const historyParts = index.dataPartsBySession.get(id) ?? []
+    const historyByID = new Map(history.map((message) => [message.row.id, message]))
+    const candidates = allCandidates.filter((candidate) => {
+      if (
+        candidate.state.status !== "error" ||
+        candidate.metadata.interrupted === true ||
+        candidate.metadata.handoffRecovery === true
+      )
+        return true
+      const input =
+        typeof candidate.metadata.messageID === "string"
+          ? historyByID.get(candidate.metadata.messageID)
+          : undefined
+      return input?.value.role === "user"
+    })
+    const historyData = history.map((message) => message.row)
+    const historyPartData = historyParts.map((part) => part.row)
+    const interruptedResources = resources(historyParts, probe)
+    const ownerLiveness = runtime ? yield* liveness(id) : "unknown"
+    const queues = queuesBySession.get(id) ?? []
+    const queueStates = queueStatesBySession.get(id) ?? []
+    const resultsByInput = new Map<string, IndexedMessage>()
+    for (const message of history) {
+      if (message.value.role !== "assistant" || message.value.summary === true || typeof message.value.parentID !== "string")
+        continue
+      const result = resultsByInput.get(message.value.parentID)
+      if (!result || message.row.position > result.row.position) resultsByInput.set(message.value.parentID, message)
+    }
+    const terminalInputs = new Set(
+      history
+        .filter((message) => message.value.role === "user")
+        .filter((message) => {
+          const result = resultsByInput.get(message.row.id)
+          const info = result?.value ?? {}
+          return !!(
+            result &&
+            object(info.time).completed !== undefined &&
+            (info.error || info.finish === "stop" || info.structured !== undefined) &&
+            !queues.some((queue) => ["pending", "claimed", "uncertain"].includes(String(queue.state))) &&
+            !queueStates.some((queue) => queue.paused || queue.blocked)
+          )
+        })
+        .map((message) => message.row.id),
+    )
+    const selected = candidates.filter(
+      (part) => part.metadata.messageID === latestInput?.id && callers.get(indexKey(part.row.session_id, part.row.message_id)) === "current",
+    )
+    const historical = candidates.filter(
+      (part) => part.metadata.messageID === latestInput?.id && callers.get(indexKey(part.row.session_id, part.row.message_id)) === "historical",
+    )
+    const historicalPart =
+      historical.length === 1 && current.length === 1 && historical[0] === current[0] ? historical[0] : undefined
+    const historicalInput =
+      typeof historicalPart?.metadata.messageID === "string"
+        ? historyByID.get(historicalPart.metadata.messageID)
+        : undefined
+    const part =
+      selected.length === 1
+        ? selected[0]
+        : historicalPart ?? (candidates.length === 1 && historical.length === 0 ? candidates[0] : undefined)
+    const tool = part?.value ?? {}
+    const metadata = part?.metadata ?? {}
+    const parent = part && sessionsByID.get(part.row.session_id)
     const mode = metadata.background === true ? "background" : "foreground"
     const inputID = typeof metadata.messageID === "string" ? metadata.messageID : null
-    const input = data.messages.find((message) => message.session_id === id && message.id === inputID)
-    const user = object(json(input?.data ?? null))
+    const input = inputID ? index.dataMessages.get(indexKey(id, inputID)) : undefined
+    const user = input?.value ?? {}
     const model = object(user.model)
     const selection =
       typeof model.providerID === "string" && typeof model.modelID === "string"
@@ -689,32 +1098,23 @@ export const inspect = Effect.fn("SessionHandoffRecovery.inspect")(function* (
     const link: TaskLink | null =
       part && inputID && typeof tool.callID === "string"
         ? {
-            parentSessionID: part.session_id,
-            parentAssistantMessageID: part.message_id,
+            parentSessionID: part.row.session_id,
+            parentAssistantMessageID: part.row.message_id,
             parentCallID: tool.callID,
             childSessionID: id,
             childUserMessageID: inputID,
             mode,
           }
         : null
-    const parentMessage = data.messages.find(
-      (message) => message.id === part?.message_id && message.session_id === part?.session_id,
-    )
-    const lineage = !!(
+    const parentMessage = part && index.messages.get(indexKey(part.row.session_id, part.row.message_id))
+    const lineageFacts = !!(
       link &&
       session &&
       parent &&
       runtime &&
-      candidates.length === 1 &&
-      object(json(parentMessage?.data ?? null)).role === "assistant" &&
+      current.length === 1 &&
+      parentMessage?.value.role === "assistant" &&
       session.parent_id === link.parentSessionID &&
-      runtime.parent_session_id === link.parentSessionID &&
-      runtime.parent_message_id === link.parentAssistantMessageID &&
-      runtime.parent_call_id === link.parentCallID &&
-      runtime.parent_mode === mode &&
-      task.parentSessionId === link.parentSessionID &&
-      task.parentMessageID === link.parentAssistantMessageID &&
-      task.parentCallID === link.parentCallID &&
       metadata.parentSessionId === link.parentSessionID &&
       metadata.parentMessageID === link.parentAssistantMessageID &&
       metadata.parentCallID === link.parentCallID &&
@@ -723,75 +1123,219 @@ export const inspect = Effect.fn("SessionHandoffRecovery.inspect")(function* (
       session.project_id === parent.project_id &&
       session.workspace_id === parent.workspace_id
     )
-    const history = data.messages.filter((message) => message.session_id === id)
-    const historyParts = data.parts.filter((part) => part.session_id === id)
-    const selectedModel = object(metadata.model)
-    const taskInput = object(object(tool.state).input)
+    // Frozen Task parts describe invocations; session.metadata.task describes
+    // creation only. A reused child has one current runtime, not one input.
+    const invocations = candidates.map((candidate) => {
+      const value = candidate.value
+      const state = candidate.state
+      const frozen = candidate.metadata
+      const caller = index.messages.get(indexKey(candidate.row.session_id, candidate.row.message_id))
+      const parent = sessionsByID.get(candidate.row.session_id)
+      const input =
+        typeof frozen.messageID === "string" ? historyByID.get(frozen.messageID) : undefined
+      const user = input?.value ?? {}
+      const model = object(user.model)
+      const selected = object(frozen.model)
+      const request = candidate.input
+      const variant = typeof user.variant === "string" ? user.variant : (model.variant ?? "default")
+      return {
+        candidate,
+        frozen,
+        caller,
+        input,
+        user,
+        variant,
+        returned: state.status === "completed" || state.status === "error",
+        terminalResult: typeof frozen.messageID === "string" && terminalInputs.has(frozen.messageID),
+        membership: callers.get(indexKey(candidate.row.session_id, candidate.row.message_id)),
+        lineage: !!(
+          typeof value.callID === "string" &&
+          typeof frozen.messageID === "string" &&
+          caller?.value.role === "assistant" &&
+          session?.parent_id === candidate.row.session_id &&
+          frozen.parentSessionId === candidate.row.session_id &&
+          frozen.parentMessageID === candidate.row.message_id &&
+          frozen.parentCallID === value.callID &&
+          parent &&
+          session &&
+          session.directory === parent.directory &&
+          session.project_id === parent.project_id &&
+          session.workspace_id === parent.workspace_id
+        ),
+        validInput: !!(
+          input &&
+          user.role === "user" &&
+          typeof user.agent === "string" &&
+          typeof model.providerID === "string" &&
+          typeof model.modelID === "string" &&
+          selected.providerID === model.providerID &&
+          selected.modelID === model.modelID &&
+          (typeof selected.variant !== "string" || selected.variant === variant) &&
+          (typeof frozen.variant !== "string" || frozen.variant === variant) &&
+          (request.task_id === undefined || request.task_id === id) &&
+          request.subagent_type === user.agent &&
+          typeof request.prompt === "string" &&
+          input &&
+          (index.dataPartsByMessage.get(indexKey(id, input.row.id)) ?? [])
+            .map((part) => part.value)
+            .filter((part) => part.type === "text" && part.synthetic !== true)
+            .map((part) => part.text)
+            .join("\n") === request.prompt
+        ),
+      }
+    })
+    const origin = invocations.filter(
+      (invocation) =>
+        invocation.frozen.parentSessionId === task.parentSessionId &&
+        invocation.frozen.parentMessageID === task.parentMessageID &&
+        invocation.frozen.parentCallID === task.parentCallID &&
+        invocation.frozen.messageID === task.messageID,
+    )
+    const originModel = object(origin[0]?.user.model)
     const taskModel = object(task.model)
-    const inputParts = historyParts.filter((part) => part.message_id === inputID).map((part) => object(json(part.data)))
+    const users = history.filter((message) => message.value.role === "user")
+    const invocationIDs = new Set(invocations.map((invocation) => invocation.frozen.messageID))
+    const invocationLineage =
+      invocations.every((invocation) => invocation.lineage && invocation.membership !== undefined) &&
+      new Set(
+        invocations.map((invocation) =>
+          canonical([
+            invocation.candidate.row.session_id,
+            invocation.candidate.row.message_id,
+            invocation.frozen.parentCallID,
+          ]),
+        ),
+      ).size === invocations.length &&
+      invocationIDs.size === invocations.length &&
+      invocations.every((invocation) => invocation.candidate === part || invocation.returned)
     const validInput = !!(
       input &&
       user.role === "user" &&
       selection &&
       typeof user.agent === "string" &&
       user.agent === session?.agent &&
-      selectedModel.providerID === selection.providerID &&
-      selectedModel.modelID === selection.modelID &&
-      task.messageID === inputID &&
-      taskModel.providerID === selection.providerID &&
-      taskModel.modelID === selection.modelID &&
-      taskInput.subagent_type === user.agent &&
-      typeof taskInput.prompt === "string" &&
-      inputParts
-        .filter((part) => part.type === "text" && part.synthetic !== true)
-        .map((part) => part.text)
-        .join("\n") === taskInput.prompt &&
-      (typeof metadata.variant !== "string" || metadata.variant === selection.variant) &&
-      (typeof task.variant !== "string" || task.variant === selection.variant) &&
-      history.filter((message) => object(json(message.data)).role === "user").length === 1 &&
-      history.every((message) => {
-        const info = object(json(message.data))
-        return info.role === "user" || (info.role === "assistant" && info.parentID === inputID)
-      }) &&
+      invocations.every((invocation) => invocation.validInput) &&
+      origin.length === 1 &&
+      taskModel.providerID === originModel.providerID &&
+      taskModel.modelID === originModel.modelID &&
+      (typeof task.variant !== "string" || task.variant === origin[0]?.variant) &&
+      users.length === invocations.length &&
+      latestInput?.id === inputID &&
+      history.every(
+        (message) =>
+          message.value.role === "user" ||
+          (message.value.role === "assistant" && invocationIDs.has(message.value.parentID)),
+      ) &&
       historyParts.every((part) =>
-        history.some(
-          (message) =>
-            message.id === part.message_id &&
-            (object(json(part.data)).type !== "tool" || object(json(message.data)).role === "assistant"),
-        ),
+        historyByID.has(part.row.message_id) &&
+        (part.value.type !== "tool" || historyByID.get(part.row.message_id)?.value.role === "assistant"),
       )
     )
-    const interruptedResources = resources(data, id, probe)
-    const terminal = runtime?.state === "completed" || runtime?.state === "cancelled"
-    const latest = history.findLast((message) => {
-      const info = object(json(message.data))
-      return info.role === "assistant" && info.parentID === inputID
-    })
-    const result = latest && object(object(json(latest.data)).time).completed !== undefined ? latest : undefined
-    const resultInfo = object(json(result?.data ?? null))
+    const latest = history.reduce<IndexedMessage | undefined>(
+      (latest, message) =>
+        message.value.role === "assistant" &&
+        message.value.summary !== true &&
+        message.value.parentID === inputID &&
+        (!latest || message.row.position > latest.row.position)
+          ? message
+          : latest,
+      undefined,
+    )
+    const result = latest && object(latest.value.time).completed !== undefined ? latest : undefined
+    const resultInfo = result?.value ?? {}
+    const allReturned =
+      metadata.handoffRecovery !== true &&
+      invocations.length > 0 &&
+      invocations.every((invocation) => invocation.returned)
+    const settledInput = !!(
+      result &&
+      (resultInfo.error || resultInfo.finish === "stop" || resultInfo.structured !== undefined) &&
+      !(queuesBySession.get(id) ?? []).some(
+        (queue) => queue.session_id === id && ["pending", "claimed", "uncertain"].includes(String(queue.state)),
+      ) &&
+      !(queueStatesBySession.get(id) ?? []).some((queue) => queue.paused || queue.blocked)
+    )
+    const historicalTerminal = !!(
+      historicalPart &&
+      historicalPart === part &&
+      historicalPart === current[0] &&
+      historical.length === 1 &&
+      selected.length === 0 &&
+      current.length === 1 &&
+      currentBoundary?.value.role === "user" &&
+      historicalInput?.value.role === "user" &&
+      historicalInput.row.time_created < currentBoundary.row.time_created &&
+      lineageFacts &&
+      invocationLineage &&
+      validInput &&
+      allReturned &&
+      settledInput &&
+      invocations.length > 0 &&
+      invocations.every(
+        (invocation) =>
+          invocation.returned &&
+          invocation.terminalResult &&
+          invocation.membership === "historical" &&
+          invocation.caller &&
+          invocation.caller.row.time_created < currentBoundary.row.time_created &&
+          invocation.input?.value.role === "user" &&
+          invocation.input.row.time_created < currentBoundary.row.time_created &&
+          invocation.frozen.background !== true &&
+          invocation.frozen.handoffRecovery !== true,
+      ) &&
+      allCandidates.every(
+        (candidate) =>
+          (candidate.state.status === "completed" || candidate.state.status === "error") &&
+          candidate.metadata.interrupted !== true &&
+          candidate.metadata.handoffRecovery !== true,
+      ) &&
+      ownerLiveness === "dead" &&
+      mode === "foreground" &&
+      interruptedResources.length === 0
+    )
+    const lineage = lineageFacts && (selected.length === 1 || historicalTerminal)
+    const observedInvocation = invocations.find((invocation) => invocation.candidate === current[0])
+    const runtimeCorroborated =
+      current[0] === part ||
+      (current.length === 1 && allReturned && settledInput && observedInvocation?.frozen.handoffRecovery !== true)
+    const returned =
+      lineage &&
+      invocationLineage &&
+      runtimeCorroborated &&
+      validInput &&
+      allReturned &&
+      settledInput &&
+      mode === "foreground" &&
+      ownerLiveness === "dead"
+    const terminal = runtime?.state === "completed" || runtime?.state === "cancelled" || returned
     descendants.push({
       link,
       childSessionID: id,
       parentSessionID: session?.parent_id ?? runtime?.parent_session_id ?? null,
-      proof: !lineage ? "ambiguous_lineage" : !validInput ? "ambiguous_input" : "verified",
+      proof:
+        !lineage || !invocationLineage || !runtimeCorroborated
+          ? "ambiguous_lineage"
+          : !validInput || (allReturned && !settledInput && ownerLiveness === "dead")
+            ? "ambiguous_input"
+            : "verified",
       state: terminal ? "terminal" : (yield* held(database, id)) ? "held" : "active",
       // Report the model default only after verifying the original sentinel against Task metadata.
       selection: selection?.variant === "" ? { ...selection, variant: "default" } : selection,
       agent: typeof user.agent === "string" ? user.agent : null,
       inputDigest: digest({
-        input,
+        input: input?.row,
         session,
-        history,
-        parts: historyParts,
-        queues: data.queues.filter((queue) => queue.session_id === id),
-        queueState: data.queueStates.filter((queue) => queue.session_id === id),
+        history: historyData,
+        parts: historyPartData,
+        queues: queuesBySession.get(id) ?? [],
+        queueState: queueStatesBySession.get(id) ?? [],
       }),
       ownerLineage: runtime?.owner_lineage ?? null,
       ownerInstance: runtime?.owner_instance ?? null,
       fence: runtime?.fence ?? null,
       recoveryRevision: revisions.find((revision) => revision.session_id === id)?.recovery_revision ?? 0,
-      ownerLiveness: runtime ? yield* liveness(id) : "unknown",
-      resultAssistantMessageID: result?.id ?? null,
+      ownerLiveness,
+      resultAssistantMessageID: result?.row.id ?? null,
       resultState: !result
         ? "none"
         : interruptedResources.some(
@@ -807,7 +1351,7 @@ export const inspect = Effect.fn("SessionHandoffRecovery.inspect")(function* (
       interruptedResources,
     })
   }
-  const interruptedResources = resources(data, rootSessionID, probe)
+  const interruptedResources = resources(index.dataPartsBySession.get(rootSessionID) ?? [], probe)
   return {
     sealed:
       data.runtimes.some(
@@ -826,7 +1370,10 @@ export const inspect = Effect.fn("SessionHandoffRecovery.inspect")(function* (
       sessions: data.sessions.filter((session) => ids.includes(session.id)),
       runtimes: data.runtimes.filter((runtime) => ids.includes(runtime.session_id)),
       messages: data.messages.filter((message) => ids.includes(message.session_id)),
-      parts: data.parts.filter((part) => ids.includes(part.session_id)),
+      parts: full.parts.filter((part) => ids.includes(part.session_id)),
+      members,
+      notifications,
+      compactions,
       queues: data.queues.filter((queue) => ids.includes(queue.session_id)),
       queueStates: data.queueStates.filter((queue) => ids.includes(queue.session_id)),
     }),
@@ -841,6 +1388,9 @@ export const claim = Effect.fn("SessionHandoffRecovery.claim")(function* <A, E>(
     expectedDescendantDigest: string
     children: readonly ChildExpectation[]
     owner: RuntimeOwner
+    requestID?: string
+    recoveryRevision?: number
+    legacyResourceReconciliations?: readonly SessionHandoffV1.LegacyResourceReconciliation[]
   },
   liveness: (sessionID: string) => Effect.Effect<Liveness>,
   rootTransition: (database: Connection) => Effect.Effect<A, E>,
@@ -911,10 +1461,38 @@ export const claim = Effect.fn("SessionHandoffRecovery.claim")(function* <A, E>(
           if (state !== "dead")
             return yield* new RecoveryError({ code: state === "live" ? "owner_live" : "owner_unknown" })
         }
-        for (const resource of [
-          ...snapshot.interruptedResources,
-          ...snapshot.descendants.flatMap((child) => child.interruptedResources),
-        ]) {
+        const resources = [
+          ...snapshot.interruptedResources.map((resource) => ({ sessionID: input.sessionID, resource })),
+          ...snapshot.descendants.flatMap((child) =>
+            child.interruptedResources.map((resource) => ({ sessionID: child.childSessionID, resource })),
+          ),
+        ]
+        const unknownShells = resources.filter(
+          ({ resource }) =>
+            resource.resourceKind === "process" &&
+            resource.liveness === "unknown" &&
+            ["bash", "shell"].includes(resource.tool),
+        )
+        const reconciliations = input.legacyResourceReconciliations ?? []
+        if (unknownShells.length !== reconciliations.length)
+          return yield* new RecoveryError({ code: "unresolved_resource" })
+        for (const { sessionID, resource } of unknownShells) {
+          const matches = reconciliations.filter(
+            (item) =>
+              item.sessionID === sessionID &&
+              item.assistantMessageID === resource.assistantMessageID &&
+              item.partID === resource.partID &&
+              (item.resourceRef ?? null) === resource.resourceRef &&
+              item.callID === resource.callID &&
+              item.tool === resource.tool &&
+              item.commandSHA256 === resource.commandSHA256 &&
+              item.requestID === input.requestID &&
+              item.recoveryRevision === input.recoveryRevision &&
+              item.descendantDigest === input.expectedDescendantDigest,
+          )
+          if (matches.length !== 1) return yield* new RecoveryError({ code: "unresolved_resource" })
+        }
+        for (const { resource } of resources) {
           if (
             resource.resourceKind === "task" &&
             !snapshot.descendants.some(
@@ -924,7 +1502,11 @@ export const claim = Effect.fn("SessionHandoffRecovery.claim")(function* <A, E>(
             )
           )
             return yield* new RecoveryError({ code: "ambiguous_lineage" })
-          if (resource.resourceKind !== "task" && resource.liveness !== "dead")
+          if (
+            resource.resourceKind !== "task" &&
+            resource.liveness !== "dead" &&
+            !unknownShells.some((item) => item.resource.partID === resource.partID)
+          )
             return yield* new RecoveryError({ code: "unresolved_resource" })
         }
         const records: Runtime[] = []
@@ -968,6 +1550,7 @@ export const claim = Effect.fn("SessionHandoffRecovery.claim")(function* <A, E>(
           const value = object(json(part.data))
           const state = object(value.state)
           if (state.status !== "running" && state.status !== "pending") continue
+          if (unknownShells.some((item) => item.resource.partID === resource.partID)) continue
           yield* tx.run(
             sql`UPDATE part SET data = ${JSON.stringify({ ...value, state: { status: "error", input: state.input ?? {}, error: resource.resourceKind === "task" ? "Interrupted Task execution; child result is reported separately" : "Interrupted tool execution; effects remain uncertain", metadata: { ...object(state.metadata), interrupted: true, handoffRecovery: true }, time: { ...object(state.time), end: Date.now() } } })}, time_updated = ${Date.now()} WHERE id = ${part.id}`,
           )
@@ -1006,7 +1589,12 @@ export const claim = Effect.fn("SessionHandoffRecovery.claim")(function* <A, E>(
 /** Terminal evidence authorizes no continuation and never advances a runtime fence. */
 export const reconcileTerminal = Effect.fn("SessionHandoffRecovery.reconcileTerminal")(function* <A, E>(
   database: Connection,
-  input: SessionHandoffStore.ActionKey & { expectedDescendantDigest: string },
+  input: SessionHandoffStore.ActionKey & {
+    expectedDescendantDigest: string
+    requestID?: string
+    recoveryRevision?: number
+    legacyResourceReconciliations?: readonly SessionHandoffV1.LegacyResourceReconciliation[]
+  },
   liveness: (sessionID: string) => Effect.Effect<Liveness>,
   recordExpiredReceipt: (database: Connection) => Effect.Effect<A, E>,
   probe?: ResourceProbe,
@@ -1032,14 +1620,43 @@ export const reconcileTerminal = Effect.fn("SessionHandoffRecovery.reconcileTerm
         const owner = yield* liveness(input.sessionID)
         if (owner !== "dead")
           return yield* new RecoveryError({ code: owner === "live" ? "owner_live" : "owner_unknown" })
+        const resources = [
+          ...snapshot.interruptedResources.map((resource) => ({ sessionID: input.sessionID, resource })),
+          ...snapshot.descendants.flatMap((child) =>
+            child.interruptedResources.map((resource) => ({ sessionID: child.childSessionID, resource })),
+          ),
+        ]
+        const unknownShells = resources.filter(
+          ({ resource }) =>
+            resource.resourceKind === "process" &&
+            resource.liveness === "unknown" &&
+            ["bash", "shell"].includes(resource.tool),
+        )
+        const reconciliations = input.legacyResourceReconciliations ?? []
+        if (unknownShells.length !== reconciliations.length)
+          return yield* new RecoveryError({ code: "unresolved_resource" })
+        for (const { sessionID, resource } of unknownShells)
+          if (
+            reconciliations.filter(
+              (item) =>
+                item.sessionID === sessionID &&
+                item.assistantMessageID === resource.assistantMessageID &&
+                item.partID === resource.partID &&
+                (item.resourceRef ?? null) === resource.resourceRef &&
+                item.callID === resource.callID &&
+                item.tool === resource.tool &&
+                item.commandSHA256 === resource.commandSHA256 &&
+                item.requestID === input.requestID &&
+                item.recoveryRevision === input.recoveryRevision &&
+                item.descendantDigest === input.expectedDescendantDigest,
+            ).length !== 1
+          )
+            return yield* new RecoveryError({ code: "unresolved_resource" })
         for (const child of snapshot.descendants) {
           if (child.proof !== "verified") return yield* new RecoveryError({ code: child.proof })
           if (child.state !== "terminal") return yield* new RecoveryError({ code: "unresolved_resource" })
         }
-        for (const resource of [
-          ...snapshot.interruptedResources,
-          ...snapshot.descendants.flatMap((child) => child.interruptedResources),
-        ]) {
+        for (const { resource } of resources) {
           if (
             resource.resourceKind === "task" &&
             !snapshot.descendants.some(
@@ -1049,13 +1666,18 @@ export const reconcileTerminal = Effect.fn("SessionHandoffRecovery.reconcileTerm
             )
           )
             return yield* new RecoveryError({ code: "ambiguous_lineage" })
-          if (resource.resourceKind !== "task" && resource.liveness !== "dead")
+          if (
+            resource.resourceKind !== "task" &&
+            resource.liveness !== "dead" &&
+            !unknownShells.some((item) => item.resource.partID === resource.partID)
+          )
             return yield* new RecoveryError({ code: "unresolved_resource" })
           const part = yield* tx.get<Part>(sql`SELECT * FROM part WHERE id = ${resource.partID}`)
           if (!part) continue
           const value = object(json(part.data))
           const state = object(value.state)
           if (state.status !== "running" && state.status !== "pending") continue
+          if (unknownShells.some((item) => item.resource.partID === resource.partID)) continue
           yield* tx.run(
             sql`UPDATE part SET data = ${JSON.stringify({ ...value, state: { status: "error", input: state.input ?? {}, error: "Interrupted execution; terminal child result is reported separately", metadata: { ...object(state.metadata), interrupted: true, handoffRecovery: true }, time: { ...object(state.time), end: Date.now() } } })}, time_updated = ${Date.now()} WHERE id = ${part.id}`,
           )

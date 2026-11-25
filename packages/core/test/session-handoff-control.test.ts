@@ -8,12 +8,360 @@ import { SessionHandoffEnrollment } from "../src/session/handoff-enrollment"
 import { SessionHandoffNotification } from "../src/session/handoff-notification"
 import { SessionHandoffControl } from "../src/session/handoff-control"
 import { SessionHandoffStore } from "../src/session/handoff-store"
+import { SessionCooperativePause } from "../src/session/cooperative-pause"
 import { tmpdir } from "./fixture/tmpdir"
 
 const owner = { ownerLineage: "lineage", ownerInstance: "instance", fence: 1 }
 const baseline = { providerID: "synthetic", modelID: "sol", variant: "max" }
 const target = { providerID: "synthetic", modelID: "terra", variant: "xhigh" }
 const key = { sessionID: "session", queueID: "queue", userMessageID: "user" }
+
+test("cooperative pause is durable and idempotent without changing a blocked empty queue or action identity", () =>
+  run((db, directory) =>
+    Effect.gen(function* () {
+      const view = yield* SessionHandoffControl.execution({ db }, "session", directory)
+      if (!view) throw new Error("Missing action")
+      const request = {
+        requestID: "pause",
+        expectedDirectory: directory,
+        expected: view.identity,
+        expectedRecoveryRevision: 0,
+      }
+      yield* db.run(sql`INSERT INTO session_queue_state (session_id,revision,paused,blocked) VALUES ('session',17,0,1)`)
+      const queueState = yield* db.get(sql`SELECT * FROM session_queue_state WHERE session_id='session'`)
+      expect(
+        yield* db.all(sql`SELECT * FROM session_queue WHERE session_id='session' AND state IN ('pending','claimed')`),
+      ).toEqual([])
+      const queue = yield* db.all(sql`SELECT * FROM session_queue`)
+      const admitted = yield* SessionCooperativePause.admit({ db }, "session", directory, request, owner)
+      expect(admitted).toMatchObject({
+        kind: "cooperative_pause",
+        state: "accepted",
+        pauseRevision: 1,
+        boundaryAssistantMessageID: null,
+      })
+      expect(yield* SessionCooperativePause.admit({ db }, "session", directory, request, owner)).toEqual(admitted)
+      expect(
+        yield* Effect.flip(
+          SessionCooperativePause.admit(
+            { db },
+            "session",
+            directory,
+            { ...request, expectedRecoveryRevision: 1 },
+            owner,
+          ),
+        ),
+      ).toMatchObject({ code: "request_id_conflict" })
+      expect(yield* db.all(sql`SELECT * FROM session_queue`)).toEqual(queue)
+      expect(yield* db.get(sql`SELECT * FROM session_queue_state WHERE session_id='session'`)).toEqual(queueState)
+      expect((yield* SessionHandoffControl.execution({ db }, "session", directory))?.identity).toEqual(view.identity)
+      expect(yield* SessionCooperativePause.active({ db }, "session")).toBe(true)
+      expect(
+        yield* Effect.flip(
+          SessionHandoffControl.admit({ db }, "session", directory, {
+            requestID: "while-paused",
+            expected: view.identity,
+            target,
+          }),
+        ),
+      ).toMatchObject({ code: "pending_conflict" })
+    }),
+  ))
+
+test("cooperative pause refuses stale identities and pending controls without installing a barrier", () =>
+  run((db, directory) =>
+    Effect.gen(function* () {
+      const view = yield* SessionHandoffControl.execution({ db }, "session", directory)
+      if (!view) throw new Error("Missing action")
+      const request = {
+        requestID: "stale",
+        expectedDirectory: directory,
+        expected: { ...view.identity, fence: 99 },
+        expectedRecoveryRevision: 0,
+      }
+      expect(yield* SessionCooperativePause.admit({ db }, "session", directory, request, owner)).toMatchObject({
+        state: "refused",
+        reason: "stale_action",
+      })
+      expect(yield* SessionCooperativePause.active({ db }, "session")).toBe(false)
+      yield* SessionHandoffControl.admit({ db }, "session", directory, {
+        requestID: "control",
+        expected: view.identity,
+        target,
+      })
+      expect(
+        yield* SessionCooperativePause.admit(
+          { db },
+          "session",
+          directory,
+          {
+            ...request,
+            requestID: "pending",
+            expected: (yield* SessionHandoffControl.execution({ db }, "session", directory))!.identity,
+          },
+          owner,
+        ),
+      ).toMatchObject({ state: "refused", reason: "pending_control" })
+      expect(yield* SessionCooperativePause.active({ db }, "session")).toBe(false)
+    }),
+  ))
+
+test("cooperative boundary waits for real tool completion and resumes without changing fence or history", () =>
+  run((db, directory) =>
+    Effect.gen(function* () {
+      const view = yield* SessionHandoffControl.execution({ db }, "session", directory)
+      if (!view) throw new Error("Missing action")
+      const request = {
+        requestID: "pause",
+        expectedDirectory: directory,
+        expected: view.identity,
+        expectedRecoveryRevision: 0,
+      }
+      yield* db.run(
+        sql`INSERT INTO message (id,session_id,time_created,time_updated,data) VALUES ('assistant','session',1,1,'{"role":"assistant","parentID":"user","finish":"tool-calls"}')`,
+      )
+      yield* db.run(
+        sql`INSERT INTO part (id,message_id,session_id,time_created,time_updated,data) VALUES ('tool','assistant','session',1,1,'{"type":"tool","tool":"bash","state":{"status":"running"}}')`,
+      )
+      yield* SessionCooperativePause.admit({ db }, "session", directory, request, owner)
+      expect(yield* SessionCooperativePause.boundary({ db }, "session", owner)).toBe("waiting")
+      expect(yield* SessionHandoffStore.receipt({ db }, "session", "pause")).toMatchObject({ state: "accepted" })
+      yield* db.run(
+        sql`UPDATE part SET data='{"type":"tool","tool":"bash","state":{"status":"completed","output":"actual result"}}' WHERE id='tool'`,
+      )
+      expect(yield* SessionCooperativePause.boundary({ db }, "session", owner)).toBe("paused")
+      expect(yield* SessionHandoffStore.receipt({ db }, "session", "pause")).toMatchObject({
+        state: "paused",
+        boundaryAssistantMessageID: "assistant",
+      })
+      const messages = yield* db.all(sql`SELECT * FROM message`)
+      const parts = yield* db.all(sql`SELECT * FROM part`)
+      const resumed = yield* SessionCooperativePause.resume(
+        { db },
+        "session",
+        directory,
+        {
+          requestID: "resume",
+          pauseRequestID: "pause",
+          expectedDirectory: directory,
+          expected: view.identity,
+          expectedPauseRevision: 1,
+        },
+        owner,
+      )
+      expect(resumed).toMatchObject({ state: "resumed", resumeFence: 1 })
+      expect(yield* db.get(sql`SELECT state,fence FROM runtime_execution WHERE session_id='session'`)).toEqual({
+        state: "active",
+        fence: 1,
+      })
+      expect(yield* db.all(sql`SELECT * FROM message`)).toEqual(messages)
+      expect(yield* db.all(sql`SELECT * FROM part`)).toEqual(parts)
+      expect((yield* SessionHandoffControl.execution({ db }, "session", directory))?.identity).toEqual(view.identity)
+      expect(yield* SessionCooperativePause.active({ db }, "session")).toBe(false)
+    }),
+  ))
+
+test("paused owner loss preserves the barrier and held owner adoption is refused", () =>
+  run((db, directory) =>
+    Effect.gen(function* () {
+      const view = yield* SessionHandoffControl.execution({ db }, "session", directory)
+      if (!view) throw new Error("Missing action")
+      const request = {
+        requestID: "pause",
+        expectedDirectory: directory,
+        expected: view.identity,
+        expectedRecoveryRevision: 0,
+      }
+      yield* db.run(sql`UPDATE runtime_execution SET state='parked' WHERE session_id='session'`)
+      expect(yield* SessionCooperativePause.admit({ db }, "session", directory, request, owner)).toMatchObject({
+        state: "refused",
+        reason: "not_quiet",
+      })
+      expect(yield* SessionCooperativePause.active({ db }, "session")).toBe(false)
+      yield* db.run(sql`UPDATE runtime_execution SET state='active' WHERE session_id='session'`)
+      yield* SessionCooperativePause.admit({ db }, "session", directory, { ...request, requestID: "live-pause" }, owner)
+      expect(yield* SessionCooperativePause.boundary({ db }, "session", owner)).toBe("paused")
+      yield* db.run(
+        sql`INSERT INTO session_handoff_recovery_hold (root_session_id,reservation,session_id) VALUES ('session','root','session')`,
+      )
+      yield* SessionCooperativePause.ownerLost({ db }, "session", () => Effect.succeed("dead"))
+      expect(yield* SessionHandoffStore.receipt({ db }, "session", "live-pause")).toMatchObject({ state: "paused" })
+      expect(
+        yield* SessionCooperativePause.resume(
+          { db },
+          "session",
+          directory,
+          {
+            requestID: "resume",
+            pauseRequestID: "live-pause",
+            expectedDirectory: directory,
+            expected: view.identity,
+            expectedPauseRevision: 1,
+          },
+          { ...owner, ownerInstance: "replacement" },
+        ),
+      ).toMatchObject({ state: "recovery_required", reason: "owner_lost", resumeFence: null })
+      expect(yield* SessionCooperativePause.active({ db }, "session")).toBe(true)
+      expect(yield* db.get(sql`SELECT state,fence FROM runtime_execution WHERE session_id='session'`)).toEqual({
+        state: "cooperative_paused",
+        fence: 1,
+      })
+    }),
+  ))
+
+test("terminal completion wins the cooperative boundary", () =>
+  run((db, directory) =>
+    Effect.gen(function* () {
+      const view = yield* SessionHandoffControl.execution({ db }, "session", directory)
+      if (!view) throw new Error("Missing action")
+      yield* SessionCooperativePause.admit(
+        { db },
+        "session",
+        directory,
+        { requestID: "pause", expectedDirectory: directory, expected: view.identity, expectedRecoveryRevision: 0 },
+        owner,
+      )
+      yield* SessionHandoffEnrollment.close({ db }, "session", "terminal")
+      expect(yield* SessionCooperativePause.boundary({ db }, "session", owner, true)).toBe("terminal")
+      expect(yield* SessionHandoffStore.receipt({ db }, "session", "pause")).toMatchObject({ state: "terminal" })
+      expect(yield* SessionCooperativePause.active({ db }, "session")).toBe(false)
+    }),
+  ))
+
+test("cooperative boundary rechecks action identity before acknowledging", () =>
+  run((db, directory) =>
+    Effect.gen(function* () {
+      const view = yield* SessionHandoffControl.execution({ db }, "session", directory)
+      if (!view) throw new Error("Missing action")
+      yield* SessionCooperativePause.admit(
+        { db },
+        "session",
+        directory,
+        { requestID: "pause", expectedDirectory: directory, expected: view.identity, expectedRecoveryRevision: 0 },
+        owner,
+      )
+      yield* db.run(
+        sql`UPDATE session_handoff_control SET data=json_set(data,'$.identity.revision',99) WHERE session_id='session'`,
+      )
+      expect(yield* SessionCooperativePause.boundary({ db }, "session", owner)).toBe("waiting")
+      expect(yield* SessionHandoffStore.receipt({ db }, "session", "pause")).toMatchObject({
+        state: "accepted",
+        boundaryAssistantMessageID: null,
+      })
+      expect(yield* db.get(sql`SELECT state FROM runtime_execution WHERE session_id='session'`)).toEqual({
+        state: "active",
+      })
+    }),
+  ))
+
+test("terminal cancellation settles accepted pause after revoking its execution fence", () =>
+  run((db, directory) =>
+    Effect.gen(function* () {
+      const view = yield* SessionHandoffControl.execution({ db }, "session", directory)
+      if (!view) throw new Error("Missing action")
+      yield* SessionCooperativePause.admit(
+        { db },
+        "session",
+        directory,
+        { requestID: "pause", expectedDirectory: directory, expected: view.identity, expectedRecoveryRevision: 0 },
+        owner,
+      )
+      yield* db.run(
+        sql`UPDATE runtime_execution SET desired_active=0,fence=fence+1,state='cancelled' WHERE session_id='session'`,
+      )
+      yield* SessionHandoffEnrollment.close({ db }, "session", "terminal")
+      expect(yield* SessionCooperativePause.boundary({ db }, "session", owner)).toBe("terminal")
+      expect(yield* SessionCooperativePause.active({ db }, "session")).toBe(false)
+    }),
+  ))
+
+test("unacknowledged owner loss refuses the exact intent only under a durable recovery hold", () =>
+  run((db, directory) =>
+    Effect.gen(function* () {
+      const view = yield* SessionHandoffControl.execution({ db }, "session", directory)
+      if (!view) throw new Error("Missing action")
+      const request = {
+        requestID: "lost-intent",
+        expectedDirectory: directory,
+        expected: view.identity,
+        expectedRecoveryRevision: 0,
+      }
+      yield* SessionCooperativePause.admit({ db }, "session", directory, request, owner)
+      const execution = yield* db.get(sql`SELECT * FROM runtime_execution WHERE session_id='session'`)
+      yield* SessionCooperativePause.ownerLost({ db }, "session", () => Effect.succeed("unknown"))
+      expect(yield* SessionHandoffStore.receipt({ db }, "session", request.requestID)).toMatchObject({
+        state: "accepted",
+      })
+      yield* db.run(
+        sql`INSERT INTO session_handoff_recovery_hold (root_session_id,reservation,session_id) VALUES ('session','root','session')`,
+      )
+      for (const liveness of ["live", "unknown"] as const) {
+        yield* SessionCooperativePause.ownerLost({ db }, "session", () => Effect.succeed(liveness))
+        expect(yield* SessionHandoffStore.receipt({ db }, "session", request.requestID)).toMatchObject({
+          state: "accepted",
+        })
+      }
+      yield* SessionCooperativePause.ownerLost({ db }, "session", () => Effect.succeed("dead"))
+      const refused = yield* SessionCooperativePause.admit({ db }, "session", directory, request, owner)
+      expect(refused).toMatchObject({ state: "refused", reason: "not_quiet", boundaryAssistantMessageID: null })
+      expect(yield* SessionHandoffStore.receipt({ db }, "session", request.requestID)).toEqual(refused)
+      expect(yield* SessionCooperativePause.active({ db }, "session")).toBe(false)
+      expect(yield* db.get(sql`SELECT * FROM runtime_execution WHERE session_id='session'`)).toEqual(execution)
+      expect(yield* db.all(sql`SELECT * FROM session_handoff_recovery_hold`)).toHaveLength(1)
+      const resume = {
+        requestID: "lost-resume",
+        pauseRequestID: request.requestID,
+        expectedDirectory: directory,
+        expected: view.identity,
+        expectedPauseRevision: 1,
+      }
+      const result = yield* SessionCooperativePause.resume({ db }, "session", directory, resume, {
+        ...owner,
+        ownerInstance: "replacement",
+      })
+      expect(result).toMatchObject({ state: "recovery_required", reason: "owner_lost", resumeFence: null })
+      expect(
+        yield* SessionCooperativePause.resume({ db }, "session", directory, resume, {
+          ...owner,
+          ownerInstance: "replacement",
+        }),
+      ).toEqual(result)
+    }),
+  ))
+
+test("owner-lost intent becomes a root recovery hold without disrupting a live descendant", () =>
+  run((db, directory) =>
+    Effect.gen(function* () {
+      const view = yield* SessionHandoffControl.execution({ db }, "session", directory)
+      if (!view) throw new Error("Missing action")
+      const request = {
+        requestID: "lost-with-child",
+        expectedDirectory: directory,
+        expected: view.identity,
+        expectedRecoveryRevision: 0,
+      }
+      yield* SessionCooperativePause.admit({ db }, "session", directory, request, owner)
+      yield* db.run(
+        sql`INSERT INTO session (id,project_id,slug,directory,title,version,time_created,time_updated) VALUES ('child','project','child',${directory},'child','1',1,1)`,
+      )
+      yield* db.run(
+        sql`INSERT INTO runtime_execution (id,session_id,directory,owner_lineage,owner_instance,fence,state,desired_active,parent_session_id,time_created,time_updated) VALUES ('child','child',${directory},'lineage','child-owner',1,'active',1,'session',1,1)`,
+      )
+      const children = yield* db.all(sql`SELECT * FROM runtime_execution WHERE session_id='child'`)
+      expect(yield* db.all(sql`SELECT * FROM session_handoff_recovery_hold`)).toHaveLength(0)
+      yield* SessionCooperativePause.ownerLost({ db }, "session", () => Effect.succeed("dead"))
+      expect(yield* SessionHandoffStore.receipt({ db }, "session", request.requestID)).toMatchObject({
+        state: "refused",
+        reason: "not_quiet",
+        boundaryAssistantMessageID: null,
+      })
+      expect(yield* SessionCooperativePause.active({ db }, "session")).toBe(false)
+      expect(yield* db.all(sql`SELECT * FROM session_handoff_recovery_hold`)).toEqual([
+        { root_session_id: "session", reservation: "root", session_id: "session" },
+      ])
+      expect(yield* db.all(sql`SELECT * FROM runtime_execution WHERE session_id='child'`)).toEqual(children)
+    }),
+  ))
 
 async function run(
   body: (db: SessionHandoffStore.Connection["db"], directory: string) => Effect.Effect<void, unknown>,

@@ -90,6 +90,17 @@ for (const order of [
         createdAt: 1,
         baselineSelection: { ...model, variant: "default" },
       })
+      yield* SessionHandoffStore.appendAssistant(database, key, {
+        kind: "ordinary",
+        messageID: "task-message",
+        parentUserMessageID: "root-user",
+        authorizationUserMessageID: "root-user",
+        epochSequence: 0,
+        controlRequestID: null,
+        selection: { ...model, variant: "default" },
+        selectionEvidence: "persisted_message",
+        dispatch: "unknown",
+      })
       yield* database.db.run(
         sql`INSERT INTO session_handoff_control (session_id,queue_id,user_message_id,reservation,state,data) VALUES ('root','queue','root-user','reservation','active',${JSON.stringify({ recoveryRevision: 1, identity: { revision: 0, contextDigest: "context", ownerLineage: runtime.identity.lineage, ownerInstance: runtime.identity.instance, fence: 0 } })})`,
       )

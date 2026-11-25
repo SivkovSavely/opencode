@@ -11,7 +11,7 @@ export function useEvent() {
 
   function subscribe(handler: (event: Event, metadata: EventMetadata) => void) {
     return sdk.event.on("event", (event) => {
-      if (event.payload.type === "sync") {
+      if (event.payload.type === "sync" || event.payload.type === "config.reloaded") {
         return
       }
 

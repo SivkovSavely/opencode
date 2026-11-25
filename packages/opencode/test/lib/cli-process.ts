@@ -125,7 +125,7 @@ export type ServeHandle = {
   readonly port: number
   // Sends SIGTERM. The scope finalizer also calls this, so tests rarely need
   // to invoke it directly — useful for tests that assert exit behavior.
-  readonly kill: () => void
+  readonly kill: (signal?: "SIGTERM" | "SIGKILL") => void
   // Resolves with the exit code once the process exits. Bun returns a number.
   readonly exited: Promise<number>
 }
@@ -378,8 +378,8 @@ export function withCliFixture<A, E>(
         url: match.url,
         hostname: match.hostname,
         port: match.port,
-        kill: () => {
-          proc.kill()
+        kill: (signal) => {
+          proc.kill(signal)
         },
         exited: proc.exited as Promise<number>,
       } satisfies ServeHandle

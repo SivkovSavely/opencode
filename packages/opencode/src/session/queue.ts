@@ -324,6 +324,8 @@ export const layer = Layer.effect(
                 })
               return { value: entry(existing), changed: false }
             }
+            if (yield* SessionCooperativePause.active({ db }, sessionID).pipe(Effect.orDie))
+              return yield* new QueueError({ reason: "conflict", message: "Session has a cooperative pause barrier" })
             if (messageID) yield* requireMessage(sessionID, messageID, input.id)
             const group = (yield* rows(sessionID)).filter((row) => row.delivery === delivery)
             const position = group.length
@@ -707,3 +709,4 @@ export const layer = Layer.effect(
 export const node = LayerNode.make({ service: Service, layer, deps: [Database.node, EventV2Bridge.node] })
 
 export * as SessionQueue from "./queue"
+import { SessionCooperativePause } from "@opencode-ai/core/session/cooperative-pause"

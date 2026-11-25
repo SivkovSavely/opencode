@@ -114,6 +114,8 @@ await Bun.write(sseTypesPath, sseTypesPatched)
 
 await $`bun prettier --write src/gen`
 await $`bun prettier --write src/v2`
-await $`rm -rf dist`
-await $`bun tsc`
+if (!process.argv.includes("--generate-only")) {
+  await $`rm -rf dist`
+  await $`bun tsc`
+}
 await $`rm openapi.json`

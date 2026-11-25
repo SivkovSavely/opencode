@@ -159,6 +159,34 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       )
     })
 
+    const cooperativePause = Effect.fn("SessionHttpApi.cooperativePause")(function* (ctx: {
+      params: { sessionID: SessionID }
+      request: HttpServerRequest.HttpServerRequest
+    }) {
+      const payload = yield* ctx.request.json.pipe(
+        Effect.flatMap(Schema.decodeUnknownEffect(SessionHandoffV1.PauseRequest)),
+        Effect.mapError(
+          () => new HandoffBadRequest({ code: "invalid_request", message: "Invalid cooperative pause request" }),
+        ),
+      )
+      yield* requireHandoffSession(ctx.params.sessionID)
+      return yield* SessionHandoff.cooperativePause(ctx.params.sessionID, payload).pipe(Effect.mapError(handoffError))
+    })
+
+    const cooperativeResume = Effect.fn("SessionHttpApi.cooperativeResume")(function* (ctx: {
+      params: { sessionID: SessionID }
+      request: HttpServerRequest.HttpServerRequest
+    }) {
+      const payload = yield* ctx.request.json.pipe(
+        Effect.flatMap(Schema.decodeUnknownEffect(SessionHandoffV1.ResumeRequest)),
+        Effect.mapError(
+          () => new HandoffBadRequest({ code: "invalid_request", message: "Invalid cooperative resume request" }),
+        ),
+      )
+      yield* requireHandoffSession(ctx.params.sessionID)
+      return yield* SessionHandoff.cooperativeResume(ctx.params.sessionID, payload).pipe(Effect.mapError(handoffError))
+    })
+
     const enrollQueueAction = Effect.fn("SessionHttpApi.enrollQueueAction")(function* (ctx: {
       params: { sessionID: SessionID }
       request: HttpServerRequest.HttpServerRequest
@@ -720,6 +748,8 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
     return handlers
       .handle("execution", execution)
       .handle("handoffReceipt", handoffReceipt)
+      .handleRaw("cooperativePause", cooperativePause)
+      .handleRaw("cooperativeResume", cooperativeResume)
       .handleRaw("enrollQueueAction", enrollQueueAction)
       .handleRaw("modelControl", modelControl)
       .handleRaw("recoverQueueAction", recoverQueueAction)

@@ -1,7 +1,7 @@
 export * as SessionHandoffV1 from "./session-handoff"
 
 import { Schema } from "effect"
-import { NonNegativeInt } from "../schema"
+import { NonNegativeInt, optional } from "../schema"
 
 const ID = Schema.String.check(Schema.isNonEmpty())
 const nullableID = Schema.NullOr(ID)
@@ -61,6 +61,62 @@ export const ChildExpectation = Schema.Struct({
   recoveryRevision: NonNegativeInt,
 }).annotate({ identifier: "SessionHandoffV1.ChildExpectation" })
 export interface ChildExpectation extends Schema.Schema.Type<typeof ChildExpectation> {}
+const SHA256 = Schema.String.check(Schema.isPattern(/^[0-9a-f]{64}$/))
+const ScopeUnit = Schema.String.check(Schema.isPattern(/^[a-zA-Z0-9][a-zA-Z0-9_.@:-]*\.scope$/))
+export const LegacyResourceApprovalEntry = Schema.Struct({
+  sessionID: ID,
+  assistantMessageID: ID,
+  partID: ID,
+  resourceRef: optional(Schema.String),
+  callID: ID,
+  tool: ID,
+  commandSHA256: SHA256,
+  unit: ScopeUnit,
+  invocationID: ID,
+  host: ID,
+  bootID: ID,
+  unitStarted: Schema.Literal(true),
+  unitClosed: Schema.Literal(true),
+  workConfinedToUnit: Schema.Literal(true),
+  residualWrapperReadOnlyGit: Schema.Literal(true),
+  historicalSourceUnproven: Schema.Literal(true),
+  pidDeathUnproven: Schema.Literal(true),
+  evidenceSHA256: Schema.Array(SHA256),
+}).annotate({ identifier: "SessionHandoffV1.LegacyResourceApprovalEntry", parseOptions: { onExcessProperty: "error" } })
+export interface LegacyResourceApprovalEntry extends Schema.Schema.Type<typeof LegacyResourceApprovalEntry> {}
+export const LegacyResourceApprovalFile = Schema.Struct({
+  version: Schema.Literal(1),
+  expected: Schema.Struct({
+    queueID: ID,
+    userMessageID: ID,
+    ownerLineage: ID,
+    ownerInstance: ID,
+    fence: NonNegativeInt,
+    revision: NonNegativeInt,
+    contextDigest: ID,
+  }).annotate({ parseOptions: { onExcessProperty: "error" } }),
+  expectedRecoveryRevision: NonNegativeInt,
+  expectedDescendantDigest: ID,
+  resources: Schema.Array(LegacyResourceApprovalEntry),
+}).annotate({ identifier: "SessionHandoffV1.LegacyResourceApprovalFile", parseOptions: { onExcessProperty: "error" } })
+export interface LegacyResourceApprovalFile extends Schema.Schema.Type<typeof LegacyResourceApprovalFile> {}
+// The owner-only approval file is a local operator-role boundary, not isolation from same-UID agents.
+export const LegacyResourceApprovalReference = Schema.Struct({
+  path: Schema.String.check(Schema.isPattern(/^\//)),
+  sha256: SHA256,
+  content: LegacyResourceApprovalFile,
+}).annotate({
+  identifier: "SessionHandoffV1.LegacyResourceApprovalReference",
+  parseOptions: { onExcessProperty: "error" },
+})
+export interface LegacyResourceApprovalReference extends Schema.Schema.Type<typeof LegacyResourceApprovalReference> {}
+export const LegacyResourceReconciliation = Schema.Struct({
+  requestID: ID,
+  recoveryRevision: NonNegativeInt,
+  descendantDigest: ID,
+  ...LegacyResourceApprovalEntry.fields,
+}).annotate({ identifier: "SessionHandoffV1.LegacyResourceReconciliation" })
+export interface LegacyResourceReconciliation extends Schema.Schema.Type<typeof LegacyResourceReconciliation> {}
 export const EnrollRequest = Schema.Struct({
   requestID: ID,
   queueID: ID,
@@ -83,6 +139,7 @@ export const RecoveryRequest = Schema.Struct({
   target: Selection,
   expectedDescendantDigest: ID,
   children: Schema.Array(ChildExpectation),
+  legacyResourceApproval: optional(LegacyResourceApprovalReference),
 }).annotate({ identifier: "SessionHandoffV1.RecoveryRequest", parseOptions: { onExcessProperty: "error" } })
 export interface RecoveryRequest extends Schema.Schema.Type<typeof RecoveryRequest> {}
 export const Boundary = Schema.Struct({
@@ -129,6 +186,7 @@ export const InterruptedResource = Schema.Struct({
   liveness: Schema.Literals(["live", "dead", "unknown", "not_applicable"]),
   effect: Schema.Literal("uncertain"),
   evidence: Schema.NullOr(Schema.String),
+  commandSHA256: optional(SHA256),
 }).annotate({ identifier: "SessionHandoffV1.InterruptedResource" })
 export interface InterruptedResource extends Schema.Schema.Type<typeof InterruptedResource> {}
 export const ChildRecoveryStatus = Schema.Struct({
@@ -204,12 +262,69 @@ export const ControlReceipt = Schema.Struct({
   dispatch: Dispatch,
   recoveryFence: nullableInt,
   interruptedResources: Schema.Array(InterruptedResource),
+  legacyResourceReconciliations: optional(Schema.Array(LegacyResourceReconciliation)),
   createdAt: NonNegativeInt,
   updatedAt: NonNegativeInt,
   children: Schema.Array(ChildRecoveryStatus),
 }).annotate({ identifier: "SessionHandoffV1.ControlReceipt" })
 export interface ControlReceipt extends Schema.Schema.Type<typeof ControlReceipt> {}
-export const Receipt = Schema.Union([EnrollmentReceipt, ControlReceipt]).annotate({
+export const PauseRequest = Schema.Struct({
+  requestID: ID,
+  expectedDirectory: ID,
+  expected: Identity,
+  expectedRecoveryRevision: NonNegativeInt,
+}).annotate({ identifier: "SessionHandoffV1.PauseRequest", parseOptions: { onExcessProperty: "error" } })
+export type PauseRequest = typeof PauseRequest.Type
+export const ResumeRequest = Schema.Struct({
+  requestID: ID,
+  pauseRequestID: ID,
+  expectedDirectory: ID,
+  expected: Identity,
+  expectedPauseRevision: NonNegativeInt,
+}).annotate({ identifier: "SessionHandoffV1.ResumeRequest", parseOptions: { onExcessProperty: "error" } })
+export type ResumeRequest = typeof ResumeRequest.Type
+export const CooperativePauseReceipt = Schema.Struct({
+  kind: Schema.Literal("cooperative_pause"),
+  version: Schema.Literal("cooperative-execution-pause/1"),
+  requestID: ID,
+  sessionID: ID,
+  directory: ID,
+  expected: Identity,
+  expectedRecoveryRevision: NonNegativeInt,
+  pauseRevision: NonNegativeInt,
+  state: Schema.Literals(["accepted", "draining", "paused", "terminal", "refused"]),
+  boundaryAssistantMessageID: nullableID,
+  reason: Schema.NullOr(
+    Schema.Literals(["stale_action", "pending_control", "conflicting_input", "not_quiet", "unresolved_resource"]),
+  ),
+  createdAt: NonNegativeInt,
+  updatedAt: NonNegativeInt,
+}).annotate({ identifier: "SessionHandoffV1.CooperativePauseReceipt" })
+export type CooperativePauseReceipt = typeof CooperativePauseReceipt.Type
+export const CooperativeResumeReceipt = Schema.Struct({
+  kind: Schema.Literal("cooperative_resume"),
+  version: Schema.Literal("cooperative-execution-pause/1"),
+  requestID: ID,
+  pauseRequestID: ID,
+  sessionID: ID,
+  directory: ID,
+  expected: Identity,
+  expectedPauseRevision: NonNegativeInt,
+  state: Schema.Literals(["accepted", "resumed", "terminal", "refused", "recovery_required"]),
+  resumeFence: nullableInt,
+  reason: Schema.NullOr(
+    Schema.Literals(["stale_action", "pending_control", "conflicting_input", "terminal_action", "owner_lost"]),
+  ),
+  createdAt: NonNegativeInt,
+  updatedAt: NonNegativeInt,
+}).annotate({ identifier: "SessionHandoffV1.CooperativeResumeReceipt" })
+export type CooperativeResumeReceipt = typeof CooperativeResumeReceipt.Type
+export const Receipt = Schema.Union([
+  EnrollmentReceipt,
+  ControlReceipt,
+  CooperativePauseReceipt,
+  CooperativeResumeReceipt,
+]).annotate({
   identifier: "SessionHandoffV1.Receipt",
 })
 export type Receipt = typeof Receipt.Type

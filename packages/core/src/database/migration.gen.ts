@@ -73,5 +73,6 @@ export const migrations = (
     import("./migration/20261116002000_session_handoff_recovery_history"),
     import("./migration/20261116003000_session_handoff_recovery_queue_block"),
     import("./migration/20261119170251_session_orchestration"),
+    import("./migration/20261125091701_cooperative_pause"),
   ])
 ).map((module) => module.default) satisfies DatabaseMigration.Migration[]

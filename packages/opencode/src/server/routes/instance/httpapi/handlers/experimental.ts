@@ -42,6 +42,7 @@ export const experimentalHandlers = HttpApiBuilder.group(InstanceHttpApi, "exper
     const capabilities = Effect.fn("ExperimentalHttpApi.capabilities")(function* () {
       return {
         backgroundSubagents: flags.experimentalBackgroundSubagents,
+        cooperativeExecutionPause: { version: "cooperative-execution-pause/1" },
         legacyQueuePromptHandoffRecovery: {
           version: "legacy-queue-prompt-handoff-recovery/4",
           enrollment: true,

@@ -7,6 +7,7 @@ import { SessionHandoffStore } from "./handoff-store"
 import { SessionHandoffNotification } from "./handoff-notification"
 import { SessionHandoffRecovery } from "./handoff-recovery"
 import { SessionHandoffRecoveryQueue } from "./handoff-recovery-queue"
+import { SessionCooperativePause } from "./cooperative-pause"
 
 const ID = Schema.NonEmptyString
 const Sequence = Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))
@@ -292,7 +293,8 @@ export const execution = Effect.fn("SessionHandoffControl.execution")(function* 
         identity: state.identity,
         state:
           row.state === "active"
-            ? (yield* SessionHandoffRecovery.held({ db: tx }, sessionID))
+            ? (yield* SessionHandoffRecovery.held({ db: tx }, sessionID)) ||
+              (yield* SessionCooperativePause.pending({ db: tx }, sessionID))?.state === "paused"
               ? ("held" as const)
               : ("active" as const)
             : row.state === "terminal"
@@ -368,6 +370,8 @@ export const admit = Effect.fn("SessionHandoffControl.admit")(function* (
         const connection = { db: tx }
         const reconciled = yield* reconcileObsolete(connection, sessionID, directory, request)
         if (reconciled) return reconciled
+        if (yield* SessionCooperativePause.active(connection, sessionID))
+          return yield* new ControlError({ code: "pending_conflict" })
         const row = yield* read(connection, key)
         const state = decode(State, row.data)
         if (row.state !== "active")

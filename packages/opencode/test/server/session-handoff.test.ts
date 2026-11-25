@@ -40,6 +40,21 @@ describe("session handoff request schemas", () => {
 
 const it = testEffect(Layer.mergeAll(httpApiLayer, LayerNode.compile(Database.node)))
 
+it.live("cooperative execution routes reject malformed payloads using handoff errors", () =>
+  Effect.gen(function* () {
+    const directory = yield* tmpdirScoped()
+    for (const route of ["execution/pause", "execution/resume"]) {
+      const response = yield* requestInDirectory(`/session/ses_test/${route}`, directory, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: "{}",
+      })
+      expect(response.status).toBe(400)
+      expect(yield* response.json).toMatchObject({ code: "invalid_request" })
+    }
+  }),
+)
+
 const authenticated = testEffect(
   httpApiLayer.pipe(
     Layer.provide(

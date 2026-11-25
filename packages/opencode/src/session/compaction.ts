@@ -16,6 +16,7 @@ import { NotFoundError } from "@/storage/storage"
 import { Effect, Layer, Context, Schema, Option } from "effect"
 import { Database } from "@opencode-ai/core/database/database"
 import { SessionHandoffControl } from "@opencode-ai/core/session/handoff-control"
+import { SessionCooperativePause } from "@opencode-ai/core/session/cooperative-pause"
 import { SessionHandoffRecoveryQueue } from "@opencode-ai/core/session/handoff-recovery-queue"
 import { SessionHandoffEnrollment } from "@opencode-ai/core/session/handoff-enrollment"
 import { SessionHandoffNotification } from "@opencode-ai/core/session/handoff-notification"
@@ -439,23 +440,28 @@ const layer = Layer.effect(
           created: Date.now(),
         },
       }
-      yield* session.updateMessage(msg)
-      if (action)
-        yield* database.db
-          .transaction(
-            () =>
-              SessionHandoffControl.summary(
-                database,
-                input.sessionID,
-                msg.id,
-                input.parentID,
-                configuredSelection,
-                dispatchSelection,
-                false,
-              ),
-            { behavior: "immediate" },
-          )
-          .pipe(Effect.orDie)
+      const dispatch = yield* database.db
+        .transaction(
+          () =>
+            Effect.gen(function* () {
+              if (yield* SessionCooperativePause.active(database, input.sessionID)) return false
+              yield* session.updateMessage(msg)
+              if (action)
+                yield* SessionHandoffControl.summary(
+                  database,
+                  input.sessionID,
+                  msg.id,
+                  input.parentID,
+                  configuredSelection,
+                  dispatchSelection,
+                  false,
+                )
+              return true
+            }),
+          { behavior: "immediate" },
+        )
+        .pipe(Effect.orDie)
+      if (!dispatch) return "continue"
       const processor = yield* processors.create({
         assistantMessage: msg,
         sessionID: input.sessionID,

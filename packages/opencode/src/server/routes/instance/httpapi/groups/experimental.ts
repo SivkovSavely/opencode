@@ -29,6 +29,9 @@ const ConsoleStateResponse = Schema.Struct({
 const CapabilitiesResponse = Schema.Struct({
   backgroundSubagents: Schema.Boolean,
   legacyQueuePromptHandoffRecovery: Schema.optionalKey(SessionHandoffV1.Capability),
+  cooperativeExecutionPause: Schema.optionalKey(
+    Schema.Struct({ version: Schema.Literal("cooperative-execution-pause/1") }),
+  ),
 }).annotate({ identifier: "ExperimentalCapabilities" })
 
 const ConsoleOrgOption = Schema.Struct({

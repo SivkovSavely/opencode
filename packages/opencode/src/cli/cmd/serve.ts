@@ -28,10 +28,11 @@ export const ServeCommand = effectCmd({
     yield* server.lifecycle.awaitStop
     process.off("SIGTERM", requestShutdown)
     process.off("SIGINT", requestShutdown)
+    const action =
+      server.lifecycle.identity.restartSupported && server.lifecycle.identity.lineage
+        ? (yield* server.lifecycle.status()).action
+        : undefined
     yield* Effect.promise(() => server.stop(true))
-    if (server.lifecycle.identity.restartSupported && server.lifecycle.identity.lineage) {
-      const status = yield* server.lifecycle.status()
-      if (status.action === "restart") process.exitCode = 75
-    }
+    if (action === "restart") process.exitCode = 75
   }),
 })

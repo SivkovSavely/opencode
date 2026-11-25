@@ -16,7 +16,7 @@ const Request = Schema.Struct({
   ...Key.fields,
   requestID: ID,
   directory: ID,
-  kind: Schema.Literals(["enrollment", "model_control", "recovery"]),
+  kind: Schema.Literals(["enrollment", "model_control", "recovery", "cooperative_pause", "cooperative_resume"]),
   payload: Schema.Record(Schema.String, Schema.Json),
 })
 const Boundary = Schema.Struct({

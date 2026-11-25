@@ -1,9 +1,9 @@
 {
   "version": "7",
   "dialect": "sqlite",
-  "id": "69ee487d-00d2-4c21-ab2f-8dd61d15852b",
+  "id": "032fcd7f-1144-4c8a-a551-74b0860c5aa4",
   "prevIds": [
-    "94e02199-1e84-4cae-929e-8ee1ccf8fdfa"
+    "69ee487d-00d2-4c21-ab2f-8dd61d15852b"
   ],
   "ddl": [
     {
@@ -52,6 +52,10 @@
     },
     {
       "name": "session_control_request",
+      "entityType": "tables"
+    },
+    {
+      "name": "session_cooperative_pause",
       "entityType": "tables"
     },
     {
@@ -1075,6 +1079,66 @@
       "name": "time_created",
       "entityType": "columns",
       "table": "session_control_request"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "session_id",
+      "entityType": "columns",
+      "table": "session_cooperative_pause"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "queue_id",
+      "entityType": "columns",
+      "table": "session_cooperative_pause"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "user_message_id",
+      "entityType": "columns",
+      "table": "session_cooperative_pause"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "request_id",
+      "entityType": "columns",
+      "table": "session_cooperative_pause"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "revision",
+      "entityType": "columns",
+      "table": "session_cooperative_pause"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "state",
+      "entityType": "columns",
+      "table": "session_cooperative_pause"
     },
     {
       "type": "integer",
@@ -5065,6 +5129,15 @@
       "nameExplicit": false,
       "name": "session_control_request_pk",
       "table": "session_control_request",
+      "entityType": "pks"
+    },
+    {
+      "columns": [
+        "session_id"
+      ],
+      "nameExplicit": false,
+      "name": "session_cooperative_pause_pk",
+      "table": "session_cooperative_pause",
       "entityType": "pks"
     },
     {

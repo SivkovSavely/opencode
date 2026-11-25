@@ -78,6 +78,8 @@ import type {
   FormatterStatusResponses,
   GlobalConfigGetErrors,
   GlobalConfigGetResponses,
+  GlobalConfigReloadErrors,
+  GlobalConfigReloadResponses,
   GlobalConfigUpdateErrors,
   GlobalConfigUpdateResponses,
   GlobalDisposeErrors,
@@ -199,8 +201,14 @@ import type {
   SessionChildrenResponses,
   SessionCommandErrors,
   SessionCommandResponses,
+  SessionCooperativePauseErrors,
+  SessionCooperativePauseResponses,
+  SessionCooperativeResumeErrors,
+  SessionCooperativeResumeResponses,
   SessionCreateErrors,
   SessionCreateResponses,
+  SessionDcpErrors,
+  SessionDcpResponses,
   SessionDeleteErrors,
   SessionDeleteMessageErrors,
   SessionDeleteMessageResponses,
@@ -219,7 +227,9 @@ import type {
   SessionHandoffReceiptResponses,
   SessionHandoffV1ControlRequest,
   SessionHandoffV1EnrollRequest,
+  SessionHandoffV1PauseRequest,
   SessionHandoffV1RecoveryRequest,
+  SessionHandoffV1ResumeRequest,
   SessionInitErrors,
   SessionInitResponses,
   SessionListErrors,
@@ -1384,6 +1394,18 @@ export class Config extends HeyApiClient {
         ...options?.headers,
         ...params.headers,
       },
+    })
+  }
+
+  /**
+   * Reload configuration
+   *
+   * Reload configuration and loaded project caches without disposing instances, while the runtime is idle.
+   */
+  public reload<ThrowOnError extends boolean = false>(options?: Options<never, ThrowOnError>) {
+    return (options?.client ?? this.client).post<GlobalConfigReloadResponses, GlobalConfigReloadErrors, ThrowOnError>({
+      url: "/global/config/reload",
+      ...options,
     })
   }
 }
@@ -3753,6 +3775,36 @@ export class Provider extends HeyApiClient {
 
 export class Session2 extends HeyApiClient {
   /**
+   * Get saved DCP context state
+   */
+  public dcp<ThrowOnError extends boolean = false>(
+    parameters: {
+      sessionID: string
+      directory?: string
+      workspace?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "sessionID" },
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).get<SessionDcpResponses, SessionDcpErrors, ThrowOnError>({
+      url: "/session/{sessionID}/dcp",
+      ...options,
+      ...params,
+    })
+  }
+
+  /**
    * Get queue action execution
    */
   public execution<ThrowOnError extends boolean = false>(
@@ -3940,6 +3992,88 @@ export class Session2 extends HeyApiClient {
       url: "/session/{sessionID}/handoff/{requestID}",
       ...options,
       ...params,
+    })
+  }
+
+  /**
+   * Cooperatively pause the original queue action
+   */
+  public cooperativePause<ThrowOnError extends boolean = false>(
+    parameters: {
+      sessionID: string
+      directory?: string
+      workspace?: string
+      sessionHandoffV1PauseRequest?: SessionHandoffV1PauseRequest
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "sessionID" },
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+            { key: "sessionHandoffV1PauseRequest", map: "body" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).post<
+      SessionCooperativePauseResponses,
+      SessionCooperativePauseErrors,
+      ThrowOnError
+    >({
+      url: "/session/{sessionID}/execution/pause",
+      ...options,
+      ...params,
+      headers: {
+        "Content-Type": "application/json",
+        ...options?.headers,
+        ...params.headers,
+      },
+    })
+  }
+
+  /**
+   * Explicitly resume a cooperatively paused action
+   */
+  public cooperativeResume<ThrowOnError extends boolean = false>(
+    parameters: {
+      sessionID: string
+      directory?: string
+      workspace?: string
+      sessionHandoffV1ResumeRequest?: SessionHandoffV1ResumeRequest
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "sessionID" },
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+            { key: "sessionHandoffV1ResumeRequest", map: "body" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).post<
+      SessionCooperativeResumeResponses,
+      SessionCooperativeResumeErrors,
+      ThrowOnError
+    >({
+      url: "/session/{sessionID}/execution/resume",
+      ...options,
+      ...params,
+      headers: {
+        "Content-Type": "application/json",
+        ...options?.headers,
+        ...params.headers,
+      },
     })
   }
 

@@ -4,6 +4,7 @@ import { SessionHandoffControl } from "@opencode-ai/core/session/handoff-control
 import { SessionHandoffRecovery } from "@opencode-ai/core/session/handoff-recovery"
 import { SessionHandoffRecoveryQueue } from "@opencode-ai/core/session/handoff-recovery-queue"
 import { SessionHandoffStore } from "@opencode-ai/core/session/handoff-store"
+import { SessionCooperativePause } from "@opencode-ai/core/session/cooperative-pause"
 import { SessionHandoffV1 } from "@opencode-ai/schema/v1/session-handoff"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { ProviderV2 } from "@opencode-ai/core/provider"
@@ -13,6 +14,7 @@ import { InstanceState } from "@/effect/instance-state"
 import { Provider } from "@/provider/provider"
 import { RuntimeLifecycle } from "@/server/runtime-lifecycle"
 import { SessionID } from "./schema"
+import { SessionHandoffLegacyApproval } from "./handoff-legacy-approval"
 import { Session } from "./session"
 import { SessionPrompt } from "./prompt"
 import { InstanceStore } from "@/project/instance-store"
@@ -110,6 +112,29 @@ export const modelControl = Effect.fn("SessionHandoff.modelControl")(function* (
   )
 }, Effect.mapError(domainError))
 
+export const cooperativePause = Effect.fn("SessionHandoff.cooperativePause")(function* (
+  sessionID: SessionID,
+  input: unknown,
+) {
+  const request = yield* decode(SessionHandoffV1.PauseRequest, input)
+  const context = yield* scope(sessionID)
+  const runtime = yield* RuntimeLifecycle.Service
+  return yield* runtime.cooperativePause(sessionID, context.directory, request)
+}, Effect.mapError(domainError))
+
+export const cooperativeResume = Effect.fn("SessionHandoff.cooperativeResume")(function* (
+  sessionID: SessionID,
+  input: unknown,
+) {
+  const request = yield* decode(SessionHandoffV1.ResumeRequest, input)
+  const context = yield* scope(sessionID)
+  const runtime = yield* RuntimeLifecycle.Service
+  const prompt = yield* SessionPrompt.Service
+  return yield* runtime.cooperativeResume(sessionID, context.directory, request, (fence) =>
+    prompt.loop({ sessionID, executionFence: fence }),
+  )
+}, Effect.mapError(domainError))
+
 export const recover = Effect.fn("SessionHandoff.recover")(function* (sessionID: SessionID, input: unknown) {
   const request = yield* decode(SessionHandoffV1.RecoveryRequest, input)
   const context = yield* scope(sessionID)
@@ -126,6 +151,11 @@ export const recover = Effect.fn("SessionHandoff.recover")(function* (sessionID:
   }
   const retry = yield* SessionHandoffStore.retryRequest(database, identity)
   if (retry) return yield* Schema.decodeUnknownEffect(SessionHandoffV1.ControlReceipt)(retry)
+  if (yield* SessionCooperativePause.active(database, sessionID))
+    return yield* new HandoffError({
+      code: "pending_conflict",
+      message: "Cooperative pause requires explicit resume; unbound recovery is prohibited",
+    })
   yield* validateSelection(request.target)
   const prompt = yield* SessionPrompt.Service
   const instances = yield* InstanceStore.Service
@@ -159,6 +189,83 @@ export const recover = Effect.fn("SessionHandoff.recover")(function* (sessionID:
             RuntimeLifecycle.processLiveness,
             identity,
           )
+          // V1 has no qualified held-notification delivery operation. Do not claim a recovery that cannot restore.
+          if (current.state !== "terminal")
+            for (const child of snapshot.descendants) {
+              if (
+                child.proof !== "verified" ||
+                child.state !== "terminal" ||
+                (child.resultState !== "completed" && child.resultState !== "error") ||
+                child.link?.mode !== "background"
+              )
+                continue
+              const pending = yield* connection.db.get(sql`SELECT 1 FROM runtime_execution
+                WHERE session_id=${child.childSessionID} AND parent_session_id=${child.link.parentSessionID}
+                AND parent_message_id=${child.link.parentAssistantMessageID} AND parent_call_id=${child.link.parentCallID}
+                AND parent_mode='background' AND COALESCE(parent_notification_state,'pending')!='delivered'`)
+              if (pending && (yield* SessionHandoffRecovery.held(connection, child.childSessionID)))
+                return yield* new HandoffError({
+                  code: "pending_conflict",
+                  message:
+                    "Guarded recovery is held by a pending background notification; v1 cannot deliver it while the recovery hold remains",
+                })
+            }
+          const resources = [
+            ...snapshot.interruptedResources.map((resource) => ({ sessionID, resource })),
+            ...snapshot.descendants.flatMap((child) =>
+              child.interruptedResources.map((resource) => ({ sessionID: child.childSessionID, resource })),
+            ),
+          ]
+          const observed = yield* Effect.forEach(resources, ({ sessionID: resourceSessionID, resource }) =>
+            Effect.gen(function* () {
+              const part = yield* connection.db.get<{ data: string }>(
+                sql`SELECT data FROM part WHERE id = ${resource.partID}`,
+              )
+              const data = part
+                ? Option.getOrNull(Schema.decodeUnknownOption(Schema.UnknownFromJsonString)(part.data))
+                : undefined
+              const state = record(record(data).state)
+              const input = record(state.input)
+              return {
+                sessionID: resourceSessionID,
+                assistantMessageID: resource.assistantMessageID,
+                partID: resource.partID,
+                resourceRef: resource.resourceRef,
+                callID: resource.callID,
+                tool: resource.tool,
+                liveness: resource.liveness,
+                resourceKind: resource.resourceKind,
+                command: typeof input.command === "string" ? input.command : null,
+              }
+            }),
+          )
+          const approvalReference = request.legacyResourceApproval
+          const approvedEntries = approvalReference
+            ? yield* Effect.tryPromise({
+                try: () =>
+                  SessionHandoffLegacyApproval.verify(
+                    approvalReference,
+                    request.expected,
+                    request.expectedRecoveryRevision,
+                    request.expectedDescendantDigest,
+                    observed,
+                  ),
+                catch: () => undefined,
+              })
+            : []
+          if (approvalReference && !approvedEntries)
+            return yield* new HandoffError({
+              code: "unresolved_resource",
+              message: "Local legacy resource approval could not be independently verified",
+            })
+          const legacyResourceReconciliations = approvalReference
+            ? (approvedEntries ?? []).map((entry) => ({
+                requestID: request.requestID,
+                recoveryRevision: request.expectedRecoveryRevision,
+                descendantDigest: request.expectedDescendantDigest,
+                ...entry,
+              }))
+            : undefined
           yield* SessionHandoffRecovery.retain(connection, identity, snapshot)
           // Resolve the retained child configuration without changing any child's selection or authorization.
           for (const child of snapshot.descendants) {
@@ -195,6 +302,7 @@ export const recover = Effect.fn("SessionHandoff.recover")(function* (sessionID:
             dispatch: "none",
             recoveryFence: null,
             interruptedResources: snapshot.interruptedResources,
+            ...(legacyResourceReconciliations ? { legacyResourceReconciliations } : {}),
             children: snapshot.descendants.flatMap((child) =>
               child.link && child.fence !== null
                 ? [
@@ -221,7 +329,13 @@ export const recover = Effect.fn("SessionHandoff.recover")(function* (sessionID:
               })
             const value = yield* SessionHandoffRecovery.reconcileTerminal(
               connection,
-              { ...identity, expectedDescendantDigest: request.expectedDescendantDigest },
+              {
+                ...identity,
+                expectedDescendantDigest: request.expectedDescendantDigest,
+                requestID: request.requestID,
+                recoveryRevision: request.expectedRecoveryRevision,
+                legacyResourceReconciliations,
+              },
               runtime.verifyOwner,
               (db) =>
                 SessionHandoffStore.recordRequest(db, identity, {
@@ -251,6 +365,9 @@ export const recover = Effect.fn("SessionHandoff.recover")(function* (sessionID:
               expectedDescendantDigest: request.expectedDescendantDigest,
               children: request.children,
               owner: { ...runtime.identity, process: RuntimeLifecycle.processIdentity() },
+              requestID: request.requestID,
+              recoveryRevision: request.expectedRecoveryRevision,
+              legacyResourceReconciliations,
             },
             runtime.verifyOwner,
             (db) =>
@@ -295,7 +412,7 @@ export const recover = Effect.fn("SessionHandoff.recover")(function* (sessionID:
             reason: current.state === "terminal" ? "terminal_action" : null,
             boundary,
             recoveryFence: claimed.records.find((record) => record.sessionID === sessionID)?.fence ?? null,
-            children: [...initial.children.filter((child) => child.state === "terminal"), ...claimed.children],
+            children: claimed.children,
             updatedAt: Date.now(),
           }
           yield* SessionHandoffStore.appendReceipt(connection, identity, initial, applied)
@@ -596,6 +713,11 @@ function decode<S extends Schema.Top>(schema: S, input: unknown) {
       () => new HandoffError({ code: "invalid_request", message: "Request does not match the handoff contract" }),
     ),
   )
+}
+
+function record(value: unknown): Record<string, unknown> {
+  const decoded = Schema.decodeUnknownOption(Schema.Record(Schema.String, Schema.Unknown))(value)
+  return Option.isSome(decoded) ? decoded.value : {}
 }
 
 function domainError(error: unknown): HandoffError {

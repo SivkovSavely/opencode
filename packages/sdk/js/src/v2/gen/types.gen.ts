@@ -1630,6 +1630,7 @@ export type GlobalEvent = {
         }
       }
     | EventServerInstanceDisposed
+    | EventConfigReloaded
     | SyncEventSessionCreated
     | SyncEventSessionUpdated
     | SyncEventSessionDeleted
@@ -2063,6 +2064,24 @@ export type Config = {
   }
 }
 
+export type ConfigReloadInvalidError = {
+  _tag: "ConfigReloadError"
+  kind: "invalid"
+  message: string
+}
+
+export type ConfigReloadBusyError = {
+  _tag: "ConfigReloadError"
+  kind: "busy"
+  message: string
+}
+
+export type ConfigReloadInternalError = {
+  _tag: "ConfigReloadError"
+  kind: "internal"
+  message: string
+}
+
 export type EffectHttpApiErrorInternalServerError = {
   _tag: "InternalServerError"
 }
@@ -2200,6 +2219,9 @@ export type Provider = {
 export type ExperimentalCapabilities = {
   backgroundSubagents: boolean
   legacyQueuePromptHandoffRecovery?: SessionHandoffV1Capability
+  cooperativeExecutionPause?: {
+    version: "cooperative-execution-pause/1"
+  }
 }
 
 export type ConsoleState = {
@@ -2617,6 +2639,18 @@ export type ProviderAuthError1 = {
   }
 }
 
+export type NotFoundError = {
+  name: "NotFoundError"
+  data: {
+    message: string
+  }
+}
+
+export type ForbiddenError = {
+  _tag: "ForbiddenError"
+  message: string
+}
+
 export type HandoffBadRequest = {
   code: SessionHandoffV1ErrorCode
   message: string
@@ -2635,13 +2669,6 @@ export type HandoffConflict = {
 export type HandoffUnsupported = {
   code: SessionHandoffV1ErrorCode
   message: string
-}
-
-export type NotFoundError = {
-  name: "NotFoundError"
-  data: {
-    message: string
-  }
 }
 
 export type SessionNotFoundError = {
@@ -2706,11 +2733,6 @@ export type SubtaskPartInput = {
     modelID: string
   }
   command?: string
-}
-
-export type ForbiddenError = {
-  _tag: "ForbiddenError"
-  message: string
 }
 
 export type SessionBusyError = {
@@ -3309,6 +3331,14 @@ export type EventServerInstanceDisposed = {
   type: "server.instance.disposed"
   properties: {
     directory: string
+  }
+}
+
+export type EventConfigReloaded = {
+  id: string
+  type: "config.reloaded"
+  properties: {
+    [key: string]: unknown
   }
 }
 
@@ -3990,6 +4020,71 @@ export type PtyTicketConnectToken = {
   expires_in: number
 }
 
+export type SessionDcpV1Block = {
+  blockId: number
+  status: "active" | "pruned" | "nested" | "superseded" | "user-decompressed" | "inactive" | "unknown"
+  active?: boolean
+  summaryPruned?: boolean
+  topic?: string
+  batchTopic?: string
+  summary?: string
+  mode?: string
+  runId?: number
+  startId?: string
+  endId?: string
+  createdAt?: number
+  deactivatedAt?: number
+  deactivatedByBlockId?: number
+  includedBlockIds?: Array<number>
+  consumedBlockIds?: Array<number>
+  parentBlockIds?: Array<number>
+  directMessageCount?: number
+  directToolCount?: number
+  effectiveMessageCount?: number
+  effectiveToolCount?: number
+  compressedTokens?: number
+  summaryTokens?: number
+  durationMs?: number
+}
+
+export type SessionDcpV1Operation = {
+  id: number
+  type: string
+  timestamp?: number
+  topic?: string
+  blockIds?: Array<number>
+  consumedBlockIds?: Array<number>
+  newlyCoveredMessages?: number
+  existingBlocks?: number
+  savings?: {
+    before?: number
+    after?: number
+    saved?: number
+    reductionPercent?: number
+  }
+}
+
+export type SessionDcpV1Info = {
+  sessionID: string
+  state: "available"
+  lastUpdated?: string
+  blocks: Array<SessionDcpV1Block>
+  stats: {
+    activeSummaryTokens?: number
+    historicalRemovedTokens?: number
+    prunedToolCount?: number
+    prunedMessageCount?: number
+  }
+  operations?: Array<SessionDcpV1Operation>
+}
+
+export type SessionDcpV1Snapshot =
+  | SessionDcpV1Info
+  | {
+      sessionID: string
+      state: "absent" | "invalid" | "too-large" | "unavailable"
+    }
+
 export type SessionHandoffV1Identity = {
   queueID: string
   userMessageID: string
@@ -4056,6 +4151,7 @@ export type SessionHandoffV1InterruptedResource = {
   liveness: "live" | "dead" | "unknown" | "not_applicable"
   effect: "uncertain"
   evidence: string | null
+  commandSHA256?: string
 }
 
 export type SessionHandoffV1TaskLink = {
@@ -4197,6 +4293,30 @@ export type SessionHandoffV1ControlRequest = {
   target: SessionHandoffV1Selection
 }
 
+export type SessionHandoffV1LegacyResourceReconciliation = {
+  requestID: string
+  recoveryRevision: number
+  descendantDigest: string
+  sessionID: string
+  assistantMessageID: string
+  partID: string
+  resourceRef?: string
+  callID: string
+  tool: string
+  commandSHA256: string
+  unit: string
+  invocationID: string
+  host: string
+  bootID: string
+  unitStarted: true
+  unitClosed: true
+  workConfinedToUnit: true
+  residualWrapperReadOnlyGit: true
+  historicalSourceUnproven: true
+  pidDeathUnproven: true
+  evidenceSHA256: Array<string>
+}
+
 export type SessionHandoffV1ChildRecoveryStatus = {
   link: SessionHandoffV1TaskLink
   priorFence: number
@@ -4220,6 +4340,7 @@ export type SessionHandoffV1ControlReceipt = {
   dispatch: "none" | "prepared" | "started_or_unknown" | "completed" | "unknown"
   recoveryFence: number | null
   interruptedResources: Array<SessionHandoffV1InterruptedResource>
+  legacyResourceReconciliations?: Array<SessionHandoffV1LegacyResourceReconciliation>
   createdAt: number
   updatedAt: number
   children: Array<SessionHandoffV1ChildRecoveryStatus>
@@ -4234,6 +4355,49 @@ export type SessionHandoffV1ChildExpectation = {
   recoveryRevision: number
 }
 
+export type SessionHandoffV1LegacyResourceApprovalEntry = {
+  sessionID: string
+  assistantMessageID: string
+  partID: string
+  resourceRef?: string
+  callID: string
+  tool: string
+  commandSHA256: string
+  unit: string
+  invocationID: string
+  host: string
+  bootID: string
+  unitStarted: true
+  unitClosed: true
+  workConfinedToUnit: true
+  residualWrapperReadOnlyGit: true
+  historicalSourceUnproven: true
+  pidDeathUnproven: true
+  evidenceSHA256: Array<string>
+}
+
+export type SessionHandoffV1LegacyResourceApprovalFile = {
+  version: 1
+  expected: {
+    queueID: string
+    userMessageID: string
+    ownerLineage: string
+    ownerInstance: string
+    fence: number
+    revision: number
+    contextDigest: string
+  }
+  expectedRecoveryRevision: number
+  expectedDescendantDigest: string
+  resources: Array<SessionHandoffV1LegacyResourceApprovalEntry>
+}
+
+export type SessionHandoffV1LegacyResourceApprovalReference = {
+  path: string
+  sha256: string
+  content: SessionHandoffV1LegacyResourceApprovalFile
+}
+
 export type SessionHandoffV1RecoveryRequest = {
   requestID: string
   expected: SessionHandoffV1Identity
@@ -4241,9 +4405,61 @@ export type SessionHandoffV1RecoveryRequest = {
   target: SessionHandoffV1Selection
   expectedDescendantDigest: string
   children: Array<SessionHandoffV1ChildExpectation>
+  legacyResourceApproval?: SessionHandoffV1LegacyResourceApprovalReference
 }
 
-export type SessionHandoffV1Receipt = SessionHandoffV1EnrollmentReceipt | SessionHandoffV1ControlReceipt
+export type SessionHandoffV1CooperativePauseReceipt = {
+  kind: "cooperative_pause"
+  version: "cooperative-execution-pause/1"
+  requestID: string
+  sessionID: string
+  directory: string
+  expected: SessionHandoffV1Identity
+  expectedRecoveryRevision: number
+  pauseRevision: number
+  state: "accepted" | "draining" | "paused" | "terminal" | "refused"
+  boundaryAssistantMessageID: string | null
+  reason: "stale_action" | "pending_control" | "conflicting_input" | "not_quiet" | "unresolved_resource" | null
+  createdAt: number
+  updatedAt: number
+}
+
+export type SessionHandoffV1CooperativeResumeReceipt = {
+  kind: "cooperative_resume"
+  version: "cooperative-execution-pause/1"
+  requestID: string
+  pauseRequestID: string
+  sessionID: string
+  directory: string
+  expected: SessionHandoffV1Identity
+  expectedPauseRevision: number
+  state: "accepted" | "resumed" | "terminal" | "refused" | "recovery_required"
+  resumeFence: number | null
+  reason: "stale_action" | "pending_control" | "conflicting_input" | "terminal_action" | "owner_lost" | null
+  createdAt: number
+  updatedAt: number
+}
+
+export type SessionHandoffV1Receipt =
+  | SessionHandoffV1EnrollmentReceipt
+  | SessionHandoffV1ControlReceipt
+  | SessionHandoffV1CooperativePauseReceipt
+  | SessionHandoffV1CooperativeResumeReceipt
+
+export type SessionHandoffV1PauseRequest = {
+  requestID: string
+  expectedDirectory: string
+  expected: SessionHandoffV1Identity
+  expectedRecoveryRevision: number
+}
+
+export type SessionHandoffV1ResumeRequest = {
+  requestID: string
+  pauseRequestID: string
+  expectedDirectory: string
+  expected: SessionHandoffV1Identity
+  expectedPauseRevision: number
+}
 
 export type SessionQueueV1Delivery = "queue" | "steer"
 
@@ -7964,9 +8180,17 @@ export type GlobalConfigUpdateData = {
 
 export type GlobalConfigUpdateErrors = {
   /**
-   * BadRequest | InvalidRequestError
+   * ConfigReloadInvalidError | InvalidRequestError
    */
-  400: EffectHttpApiErrorBadRequest | InvalidRequestError
+  400: ConfigReloadInvalidError | InvalidRequestError
+  /**
+   * ConfigReloadBusyError
+   */
+  409: ConfigReloadBusyError
+  /**
+   * ConfigReloadInternalError
+   */
+  500: ConfigReloadInternalError
 }
 
 export type GlobalConfigUpdateError = GlobalConfigUpdateErrors[keyof GlobalConfigUpdateErrors]
@@ -7979,6 +8203,39 @@ export type GlobalConfigUpdateResponses = {
 }
 
 export type GlobalConfigUpdateResponse = GlobalConfigUpdateResponses[keyof GlobalConfigUpdateResponses]
+
+export type GlobalConfigReloadData = {
+  body?: never
+  path?: never
+  query?: never
+  url: "/global/config/reload"
+}
+
+export type GlobalConfigReloadErrors = {
+  /**
+   * ConfigReloadInvalidError | InvalidRequestError
+   */
+  400: ConfigReloadInvalidError | InvalidRequestError
+  /**
+   * ConfigReloadBusyError
+   */
+  409: ConfigReloadBusyError
+  /**
+   * ConfigReloadInternalError
+   */
+  500: ConfigReloadInternalError
+}
+
+export type GlobalConfigReloadError = GlobalConfigReloadErrors[keyof GlobalConfigReloadErrors]
+
+export type GlobalConfigReloadResponses = {
+  /**
+   * Configuration reloaded
+   */
+  200: true
+}
+
+export type GlobalConfigReloadResponse = GlobalConfigReloadResponses[keyof GlobalConfigReloadResponses]
 
 export type GlobalProjectsListData = {
   body?: never
@@ -10555,6 +10812,44 @@ export type ProviderOauthCallbackResponses = {
 
 export type ProviderOauthCallbackResponse = ProviderOauthCallbackResponses[keyof ProviderOauthCallbackResponses]
 
+export type SessionDcpData = {
+  body?: never
+  path: {
+    sessionID: string
+  }
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/session/{sessionID}/dcp"
+}
+
+export type SessionDcpErrors = {
+  /**
+   * BadRequest | InvalidRequestError
+   */
+  400: EffectHttpApiErrorBadRequest | InvalidRequestError
+  /**
+   * ForbiddenError
+   */
+  403: ForbiddenError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+}
+
+export type SessionDcpError = SessionDcpErrors[keyof SessionDcpErrors]
+
+export type SessionDcpResponses = {
+  /**
+   * SessionDcpV1.Snapshot
+   */
+  200: SessionDcpV1Snapshot
+}
+
+export type SessionDcpResponse = SessionDcpResponses[keyof SessionDcpResponses]
+
 export type SessionExecutionData = {
   body?: never
   path: {
@@ -10769,6 +11064,91 @@ export type SessionHandoffReceiptResponses = {
 }
 
 export type SessionHandoffReceiptResponse = SessionHandoffReceiptResponses[keyof SessionHandoffReceiptResponses]
+
+export type SessionCooperativePauseData = {
+  body?: SessionHandoffV1PauseRequest
+  path: {
+    sessionID: string
+  }
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/session/{sessionID}/execution/pause"
+}
+
+export type SessionCooperativePauseErrors = {
+  /**
+   * HandoffBadRequest | InvalidRequestError
+   */
+  400: HandoffBadRequest | InvalidRequestError
+  /**
+   * HandoffNotFound
+   */
+  404: HandoffNotFound
+  /**
+   * HandoffConflict
+   */
+  409: HandoffConflict
+  /**
+   * HandoffUnsupported
+   */
+  422: HandoffUnsupported
+}
+
+export type SessionCooperativePauseError = SessionCooperativePauseErrors[keyof SessionCooperativePauseErrors]
+
+export type SessionCooperativePauseResponses = {
+  /**
+   * SessionHandoffV1.CooperativePauseReceipt
+   */
+  200: SessionHandoffV1CooperativePauseReceipt
+}
+
+export type SessionCooperativePauseResponse = SessionCooperativePauseResponses[keyof SessionCooperativePauseResponses]
+
+export type SessionCooperativeResumeData = {
+  body?: SessionHandoffV1ResumeRequest
+  path: {
+    sessionID: string
+  }
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/session/{sessionID}/execution/resume"
+}
+
+export type SessionCooperativeResumeErrors = {
+  /**
+   * HandoffBadRequest | InvalidRequestError
+   */
+  400: HandoffBadRequest | InvalidRequestError
+  /**
+   * HandoffNotFound
+   */
+  404: HandoffNotFound
+  /**
+   * HandoffConflict
+   */
+  409: HandoffConflict
+  /**
+   * HandoffUnsupported
+   */
+  422: HandoffUnsupported
+}
+
+export type SessionCooperativeResumeError = SessionCooperativeResumeErrors[keyof SessionCooperativeResumeErrors]
+
+export type SessionCooperativeResumeResponses = {
+  /**
+   * SessionHandoffV1.CooperativeResumeReceipt
+   */
+  200: SessionHandoffV1CooperativeResumeReceipt
+}
+
+export type SessionCooperativeResumeResponse =
+  SessionCooperativeResumeResponses[keyof SessionCooperativeResumeResponses]
 
 export type SessionListData = {
   body?: never

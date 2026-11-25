@@ -17,6 +17,7 @@ it.live("advertises the complete legacy queue prompt handoff recovery v4 capabil
     expect(response.status).toBe(200)
     const body = yield* response.json
     expect(body).toMatchObject({
+      cooperativeExecutionPause: { version: "cooperative-execution-pause/1" },
       legacyQueuePromptHandoffRecovery: {
         version: "legacy-queue-prompt-handoff-recovery/4",
         enrollment: true,

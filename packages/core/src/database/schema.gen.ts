@@ -144,6 +144,16 @@ export default {
         );
       `)
       yield* tx.run(`
+        CREATE TABLE \`session_cooperative_pause\` (
+          \`session_id\` text PRIMARY KEY,
+          \`queue_id\` text NOT NULL,
+          \`user_message_id\` text NOT NULL,
+          \`request_id\` text NOT NULL,
+          \`revision\` integer NOT NULL,
+          \`state\` text NOT NULL
+        );
+      `)
+      yield* tx.run(`
         CREATE TABLE \`session_handoff_attempt\` (
           \`position\` integer PRIMARY KEY AUTOINCREMENT,
           \`message_id\` text NOT NULL,

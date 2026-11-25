@@ -75,6 +75,17 @@ for (const operation of ["release", "complete"] as const) {
             baselineSelection: { providerID: "test", modelID: "test", variant: "default" },
           })
           const key = { sessionID: root, queueID: "queue", userMessageID: "root-user" }
+          yield* SessionHandoffStore.appendAssistant(database, key, {
+            kind: "ordinary",
+            messageID: "assistant",
+            parentUserMessageID: "root-user",
+            authorizationUserMessageID: "root-user",
+            epochSequence: 0,
+            controlRequestID: null,
+            selection: { providerID: "test", modelID: "test", variant: "default" },
+            selectionEvidence: "persisted_message",
+            dispatch: "unknown",
+          })
           yield* SessionHandoffRecovery.retain(
             database,
             key,
@@ -518,6 +529,21 @@ integration.live(
             createdAt: 1,
             baselineSelection: { ...model, variant: "default" },
           })
+          yield* SessionHandoffStore.appendAssistant(
+            database,
+            { sessionID: root.id, queueID: "q", userMessageID: rootUserID },
+            {
+              kind: "ordinary",
+              messageID: parentMessageID,
+              parentUserMessageID: rootUserID,
+              authorizationUserMessageID: rootUserID,
+              epochSequence: 0,
+              controlRequestID: null,
+              selection: { ...model, variant: "default" },
+              selectionEvidence: "persisted_message",
+              dispatch: "unknown",
+            },
+          )
           yield* ServerRecovery.Service.use((recovery) => recovery.initialize).pipe(
             Effect.provide(ServerRecovery.layer),
             Effect.provide(context),

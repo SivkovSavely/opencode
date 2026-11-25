@@ -1,4 +1,5 @@
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
+import { SessionCooperativePause } from "@opencode-ai/core/session/cooperative-pause"
 import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import path from "path"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
@@ -1816,6 +1817,11 @@ const layer = Layer.effect(
                   }
                   yield* sessions.updateMessage(info)
                   for (const part of parts) yield* sessions.updatePart(part)
+                  if (
+                    notification?.classification === "in_action" &&
+                    (yield* SessionCooperativePause.active(database, input.sessionID))
+                  )
+                    return
                   if (delivery && (delivery.delivery === "queue" || delivery.state === "claimed")) {
                     yield* queue.delivered(input.sessionID, delivery.id, info.id)
                     if (reservation && delivery.payload.kind === "prompt")
@@ -1909,6 +1915,13 @@ const layer = Layer.effect(
         resolved = false,
       ) {
         rejectManagedInputParts(input.parts)
+        if (
+          !task?.notification &&
+          (yield* SessionCooperativePause.active(database, input.sessionID).pipe(Effect.orDie))
+        )
+          return yield* new RuntimeLifecycle.RuntimeDrainingError({
+            message: "Session has a cooperative pause barrier",
+          })
         const session = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
         const reservation = ulid()
         const notification = task?.notification
@@ -1950,7 +1963,8 @@ const layer = Layer.effect(
                           )
                         : undefined
                     if (proof) return { link: proof.link, rejected: false }
-                    if (strict) return { link: undefined, rejected: true }
+                    if (strict || (yield* SessionCooperativePause.active(database, input.sessionID)))
+                      return { link: undefined, rejected: true }
                     // Reserve and invalidate the unprovable candidate before plugins, atomically with the proof decision.
                     yield* SessionHandoffEnrollment.reserve(database, input.sessionID, reservation)
                     yield* SessionHandoffEnrollment.preparing(database, input.sessionID, reservation)
@@ -1964,7 +1978,19 @@ const layer = Layer.effect(
           return yield* new InputError({ message: "Background Task notification lineage is unprovable or conflicting" })
         const notificationLink = notification?.link
         if (!task?.notification)
-          yield* SessionHandoffEnrollment.reserve(database, input.sessionID, reservation).pipe(Effect.orDie)
+          yield* db
+            .transaction(
+              () =>
+                Effect.gen(function* () {
+                  if (yield* SessionCooperativePause.active(database, input.sessionID))
+                    return yield* new RuntimeLifecycle.RuntimeDrainingError({
+                      message: "Session has a cooperative pause barrier",
+                    })
+                  yield* SessionHandoffEnrollment.reserve(database, input.sessionID, reservation).pipe(Effect.orDie)
+                }),
+              { behavior: "immediate" },
+            )
+            .pipe(Effect.catchIf((error) => !Schema.is(RuntimeLifecycle.RuntimeDrainingError)(error), Effect.die))
         yield* Effect.addFinalizer(() =>
           SessionHandoffEnrollment.abort(database, input.sessionID, reservation).pipe(Effect.orDie),
         )
@@ -2028,6 +2054,20 @@ const layer = Layer.effect(
           return prepared
         })
 
+        // A verified result belongs to work already admitted by this action. Save it
+        // while draining without taking a new execution lease or dispatching a turn.
+        if (notificationLink && (yield* SessionCooperativePause.active(database, input.sessionID).pipe(Effect.orDie))) {
+          const prepared = yield* work
+          yield* state.admit(input.sessionID, () =>
+            prepared.save().pipe(
+              Effect.map(() => {
+                if (prepared.message.info.role !== "user") throw new Error("Expected notification user message")
+                return prepared.message.info
+              }),
+            ),
+          )
+          return prepared.message
+        }
         if (input.noReply === true && delivery) {
           const prepared = yield* work
           if (delivery.delivery === "queue" || delivery.state === "claimed")
@@ -2311,6 +2351,7 @@ const layer = Layer.effect(
     })
 
     const advanceQueue = Effect.fnUntraced(function* (sessionID: SessionID) {
+      if (yield* SessionCooperativePause.active(database, sessionID).pipe(Effect.orDie)) return false
       if (!(yield* runtime.beforeTurn(sessionID))) return false
       const flush = yield* InstanceState.get(queueState)
       // Reserve durably before resolving commands, attachments, or executing a shell.
@@ -2611,6 +2652,11 @@ const layer = Layer.effect(
     })
 
     const queueFlush = Effect.fn("SessionPrompt.queueFlush")(function* (sessionID: SessionID) {
+      if (yield* SessionCooperativePause.active(database, sessionID).pipe(Effect.orDie))
+        return yield* new SessionQueue.QueueError({
+          reason: "conflict",
+          message: "Session has a cooperative pause barrier",
+        })
       yield* requireManagedRootQueue(sessionID)
       const snapshot = yield* queue.list(sessionID)
       const flush = yield* InstanceState.get(queueState)
@@ -2633,6 +2679,11 @@ const layer = Layer.effect(
         .transaction(
           () =>
             Effect.gen(function* () {
+              if (yield* SessionCooperativePause.active(database, sessionID).pipe(Effect.orDie))
+                return yield* new SessionQueue.QueueError({
+                  reason: "conflict",
+                  message: "Session has a cooperative pause barrier",
+                })
               const snapshot = yield* queue.unblock(sessionID)
               if (snapshot.paused)
                 yield* queue.update(sessionID, {
@@ -2997,12 +3048,19 @@ const layer = Layer.effect(
               ))
             )
               continue
+            yield* runtime.cooperativeBoundary(sessionID, true)
             if (!recovery && !reconcile && !manualRecovery && !lastAssistant.error && (yield* advanceQueue(sessionID)))
               continue
             break
           }
 
           if (snapshot.retired) break
+          const pause = yield* runtime.cooperativeBoundary(sessionID)
+          if (pause === "paused") break
+          if (pause === "waiting") {
+            yield* Effect.sleep("25 millis")
+            continue
+          }
           const action = yield* SessionHandoffControl.beforeTurn(
             database,
             sessionID,
@@ -3053,6 +3111,7 @@ const layer = Layer.effect(
                 ))
               )
                 continue
+              yield* runtime.cooperativeBoundary(sessionID, true)
               const completed = yield* sessions
                 .findMessage(sessionID, (message) => message.info.role === "assistant")
                 .pipe(Effect.orDie)
@@ -3118,32 +3177,6 @@ const layer = Layer.effect(
             time: { created: Date.now() },
             sessionID,
           }
-          yield* db
-            .transaction(
-              () =>
-                Effect.gen(function* () {
-                  yield* sessions.updateMessage(msg)
-                  const membership = yield* SessionHandoffNotification.context(database, sessionID, lastUser.id)
-                  if (membership?.enrolled && membership.epochSequence === 0) {
-                    yield* SessionHandoffStore.appendAssistant(database, membership, {
-                      kind: "ordinary",
-                      messageID: msg.id,
-                      parentUserMessageID: lastUser.id,
-                      authorizationUserMessageID: membership.userMessageID,
-                      epochSequence: 0,
-                      controlRequestID: null,
-                      selection: membership.selection,
-                      selectionEvidence: "persisted_message",
-                      dispatch: "unknown",
-                    })
-                  }
-                  if (membership?.enrolled && membership.epochSequence > 0)
-                    yield* SessionHandoffControl.preparedAssistant(database, membership, msg.id, lastUser.id)
-                }),
-              { behavior: "immediate" },
-            )
-            .pipe(Effect.orDie)
-
           const finalizeFailedAssistant = (cause: Cause.Cause<unknown>) =>
             Effect.gen(function* () {
               if (msg.time.completed) return
@@ -3271,6 +3304,40 @@ const layer = Layer.effect(
             ]
             const format = lastUser.format ?? { type: "text" as const }
             if (format.type === "json_schema") system.push(STRUCTURED_OUTPUT_SYSTEM_PROMPT)
+            // Preparation can yield for plugins or system context. Admit the provider
+            // turn only now, serialized with pause admission, before persisting its assistant.
+            const dispatch = yield* runtime
+              .withDurableAdmission(
+                db.transaction(
+                  () =>
+                    Effect.gen(function* () {
+                      if (yield* SessionCooperativePause.active(database, sessionID)) return false
+                      yield* sessions.updateMessage(msg)
+                      const membership = yield* SessionHandoffNotification.context(database, sessionID, lastUser.id)
+                      if (membership?.enrolled && membership.epochSequence === 0)
+                        yield* SessionHandoffStore.appendAssistant(database, membership, {
+                          kind: "ordinary",
+                          messageID: msg.id,
+                          parentUserMessageID: lastUser.id,
+                          authorizationUserMessageID: membership.userMessageID,
+                          epochSequence: 0,
+                          controlRequestID: null,
+                          selection: membership.selection,
+                          selectionEvidence: "persisted_message",
+                          dispatch: "unknown",
+                        })
+                      if (membership?.enrolled && membership.epochSequence > 0)
+                        yield* SessionHandoffControl.preparedAssistant(database, membership, msg.id, lastUser.id)
+                      return true
+                    }),
+                  { behavior: "immediate" },
+                ),
+              )
+              .pipe(
+                Effect.catchTag("RuntimeDrainingError", () => Effect.succeed(false)),
+                Effect.orDie,
+              )
+            if (!dispatch) return "continue" as const
             const result = yield* handle
               .process({
                 user: lastUser,
@@ -3376,6 +3443,7 @@ const layer = Layer.effect(
               )
               .pipe(Effect.orDie)
             if (!closed) continue
+            yield* runtime.cooperativeBoundary(sessionID, true)
             break
           }
           const checkpoint = yield* runtime.checkpoint(sessionID)

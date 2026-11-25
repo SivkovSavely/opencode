@@ -782,11 +782,16 @@ describe("tool.task", () => {
           expect(
             evidence.descendants.find((child) => child.childSessionID === result.metadata.sessionId),
           ).toMatchObject({
-            // Multiple original inputs or call links must never gain recovery authority.
+            // admit() preserves the live runtime's prior call tuple on reuse.
+            // The latest frozen link is exact, but no settled result corroborates reuse.
             proof: index === 4 ? "ambiguous_lineage" : "verified",
-            selection: index === 4 ? null : { variant: selection.expected },
+            selection: { variant: selection.expected },
           })
           if (index === 4) {
+            expect(
+              evidence.descendants.find((child) => child.childSessionID === result.metadata.sessionId)?.link
+                ?.parentCallID,
+            ).toBe("mixed-4")
             const saved = yield* MessageV2.get({
               sessionID: SessionID.make(result.metadata.sessionId),
               messageID: MessageID.make(result.metadata.messageID),
