@@ -1,7 +1,7 @@
 import { describe, expect } from "bun:test"
 import path from "path"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
-import { Effect, Layer } from "effect"
+import { Effect, Layer, Result } from "effect"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { Global } from "@opencode-ai/core/global"
@@ -9,9 +9,8 @@ import { GlobalProjectList } from "@/server/global-project-list"
 import { tmpdirScoped } from "../fixture/fixture"
 import { testEffect } from "../lib/effect"
 
-const it = testEffect(
-  LayerNode.compile(LayerNode.group([FSUtil.node, CrossSpawnSpawner.node, GlobalProjectList.node])),
-)
+const it = testEffect(LayerNode.compile(LayerNode.group([FSUtil.node, CrossSpawnSpawner.node, GlobalProjectList.node])))
+const posix = process.platform === "win32" ? it.live.skip : it.live
 
 function remap(root: string, file: string) {
   if (file === Global.Path.data) return root
@@ -40,7 +39,8 @@ function remappedFs(root: string) {
 
 // Layer.fresh forces a new GlobalProjectList (and Storage) so each build re-reads
 // the persisted file from `root` instead of reusing an in-memory copy.
-const service = (root: string) => Layer.fresh(LayerNode.compile(GlobalProjectList.node, [[FSUtil.node, remappedFs(root)]]))
+const service = (root: string) =>
+  Layer.fresh(LayerNode.compile(GlobalProjectList.node, [[FSUtil.node, remappedFs(root)]]))
 
 const withService = <A, E>(root: string, run: (svc: GlobalProjectList.Interface) => Effect.Effect<A, E>) =>
   Effect.gen(function* () {
@@ -77,19 +77,11 @@ describe("GlobalProjectList", () => {
 
       yield* withService(root, (svc) =>
         Effect.gen(function* () {
-          expect(yield* svc.apply({ type: "merge", projects: ["/a/", "/b", "/a", "/b/", ""] })).toEqual([
-            "/a/",
-            "/b",
-          ])
+          expect(yield* svc.apply({ type: "merge", projects: ["/a/", "/b", "/a", "/b/", ""] })).toEqual(["/a/", "/b"])
           expect(yield* svc.apply({ type: "add", directory: "/a" })).toEqual(["/a/", "/b"])
           expect(yield* svc.apply({ type: "add", directory: "/c" })).toEqual(["/c", "/a/", "/b"])
           expect(yield* svc.apply({ type: "add", directory: "C:\\repo" })).toEqual(["C:\\repo", "/c", "/a/", "/b"])
-          expect(yield* svc.apply({ type: "add", directory: "C:/repo/" })).toEqual([
-            "C:\\repo",
-            "/c",
-            "/a/",
-            "/b",
-          ])
+          expect(yield* svc.apply({ type: "add", directory: "C:/repo/" })).toEqual(["C:\\repo", "/c", "/a/", "/b"])
           expect(yield* svc.apply({ type: "remove", directory: "/b/" })).toEqual(["C:\\repo", "/c", "/a/"])
           expect(yield* svc.apply({ type: "remove", directory: "C:/repo" })).toEqual(["/c", "/a/"])
         }),
@@ -136,6 +128,38 @@ describe("GlobalProjectList", () => {
           expect(yield* svc.list()).toHaveLength(20)
         }),
       )
+    }),
+  )
+
+  posix("reloads the last saved appearance snapshot after a partial write fails", () =>
+    Effect.gen(function* () {
+      const fs = yield* FSUtil.Service
+      const tmp = yield* tmpdirScoped()
+      const root = path.join(tmp, "opencode")
+      const before = { revision: 2, entries: { "/a": { name: "First" }, "/b": { color: "blue" } } }
+      yield* fs.writeWithDirs(path.join(root, "storage", "global", "project-appearance.json"), JSON.stringify(before))
+
+      // Limit regular file writes only in the child; ignore SIGXFSZ so the write returns EFBIG.
+      const child = yield* Effect.sync(() =>
+        Bun.spawnSync(
+          [
+            "sh",
+            "-c",
+            `trap '' XFSZ && ulimit -f 1 && exec "$@"`,
+            "appearance-write",
+            process.execPath,
+            "run",
+            path.join(import.meta.dir, "fixtures/appearance-write.ts"),
+          ],
+          { env: { ...process.env, XDG_DATA_HOME: tmp }, timeout: 5000 },
+        ),
+      )
+      expect(child.stderr.toString()).toBe("")
+      expect(child.exitCode).toBe(0)
+      expect(child.stdout.toString()).toMatch(/EFBIG|file too large/i)
+
+      const reloaded = yield* withService(root, (svc) => svc.getAppearance().pipe(Effect.result))
+      expect(reloaded).toEqual(Result.succeed(before))
     }),
   )
 })

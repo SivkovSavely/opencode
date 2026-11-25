@@ -311,7 +311,7 @@ function PaletteRow(props: {
               <Show when={session()}>
                 {(session) => (
                   <SessionTabAvatar
-                    project={props.item.project}
+                    project={props.item.presentationProject}
                     directory={session().directory}
                     sessionId={session().sessionID}
                     server={session().server}

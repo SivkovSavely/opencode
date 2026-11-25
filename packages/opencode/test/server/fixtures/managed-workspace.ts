@@ -61,6 +61,8 @@ test("production route tree denies host routes and filters global events", async
   for (const [method, path] of [
     ["GET", "/global/config"],
     ["PATCH", "/global/config"],
+    ["GET", "/global/project-appearance"],
+    ["PATCH", "/global/project-appearance"],
     ["PUT", "/auth/provider"],
     ["GET", "/vcs"],
     ["POST", "/experimental/worktree/reset"],

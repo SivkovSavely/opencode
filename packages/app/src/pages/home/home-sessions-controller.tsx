@@ -12,6 +12,7 @@ import {
   retainHomeSessions,
   type HomeSessionEvents,
 } from "@/context/global-sync/home-session-index"
+import { normalizeProjectInfo } from "@/context/global-sync/utils"
 import type { LocalProject } from "@/context/layout"
 import { useLanguage } from "@/context/language"
 import { ServerConnection } from "@/context/server"
@@ -80,13 +81,7 @@ export function createHomeSessionsController(home: HomeController) {
       enabled: !!ctx,
       queryFn: async () => {
         if (!ctx) return []
-        const result = await ctx.sdk.api.project.list()
-        return result.map((project) => ({
-          id: project.id,
-          name: project.name,
-          worktree: project.worktree,
-          expanded: false,
-        }))
+        return (await ctx.sdk.api.project.list()).map(normalizeProjectInfo)
       },
       retry: false,
       staleTime: 30_000,
@@ -96,24 +91,21 @@ export function createHomeSessionsController(home: HomeController) {
   const sourceSessions = createMemo(() => homeSessions().sessions(sessionLoad.data, sessionEventLoad.data))
   const bookmarkedView = () => home.selection.value().view === "bookmarks"
   const indexedSessions = createMemo(() => retainHomeSessions(sourceSessions(), HOME_SESSION_LIMIT, Date.now()))
-  const projects = createMemo(() => [...home.project.list(), ...(projectLoad.data ?? [])])
-  const projectByID = createMemo(
-    () => new Map(projects().flatMap((project) => (project.id ? [[project.id, project] as const] : []))),
-  )
+  const repositoryProjects = () => projectLoad.data ?? []
   const allRecords = createMemo(() =>
     buildHomeSessionRecords({
       sessions: indexedSessions,
       projectDirectories,
-      projects,
-      projectByID,
+      openedProjects: home.project.list,
+      repositoryProjects,
     }),
   )
   const bookmarkRecords = createMemo(() =>
     buildHomeSessionRecords({
       sessions: () => bookmarkedHomeSessions(sourceSessions()),
       projectDirectories,
-      projects,
-      projectByID,
+      openedProjects: home.project.list,
+      repositoryProjects,
       allDirectories: true,
     }),
   )

@@ -11,7 +11,7 @@ import { useLayout, type LocalProject } from "@/context/layout"
 import { ServerConnection } from "@/context/server"
 import { useServerSDK } from "@/context/server-sdk"
 import { useTabs } from "@/context/tabs"
-import { displayName, projectForSession } from "@/pages/layout/helpers"
+import { displayName, projectForSession, projectForSessionPresentation } from "@/pages/layout/helpers"
 import { createSessionTabs } from "@/pages/session/helpers"
 import { useSessionLayout } from "@/pages/session/session-layout"
 import { normalizeSessionInfo } from "@/utils/session"
@@ -29,6 +29,7 @@ export type CommandPaletteEntry = {
   sessionID?: string
   server?: ServerConnection.Key
   project?: LocalProject
+  presentationProject?: LocalProject
   archived?: number
   updated?: number
 }
@@ -262,11 +263,18 @@ export function createServerSessionEntries(props: {
           .map((session) => {
             const project =
               projectForSession(session, opened, openedByID) ?? projectForSession(session, stored, storedByID)
+            const presentationProject = () => projectForSessionPresentation(session, props.opened(), props.stored)
             return {
               id: `session:${props.server}:${session.id}`,
               type: "session" as const,
               title: session.title || props.untitled(),
-              description: project ? displayName(project) : getFilename(session.directory),
+              get description() {
+                const displayProject = presentationProject()
+                return displayProject ? displayName(displayProject) : getFilename(session.directory)
+              },
+              get presentationProject() {
+                return presentationProject()
+              },
               category: props.category(),
               directory: session.directory,
               sessionID: session.id,

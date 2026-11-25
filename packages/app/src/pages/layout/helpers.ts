@@ -1,8 +1,9 @@
 import { getFilename } from "@opencode-ai/core/util/path"
-import { type Session } from "@opencode-ai/sdk/v2/client"
+import type { Project, Session } from "@opencode-ai/sdk/v2/client"
 import { pathKey } from "@/utils/path-key"
 import type { ServerConnection } from "@/context/server"
-import type { HomeProjectSelection } from "@/context/layout"
+import type { HomeProjectSelection, LocalProject } from "@/context/layout"
+import { OPENCODE_PROJECT_ID } from "@/context/project-appearance"
 
 type SessionStore = {
   session?: Session[]
@@ -84,13 +85,11 @@ export function homeSessionServerStatus(active: boolean, status: () => { working
   return status()
 }
 
-const OPENCODE_PROJECT_ID = "4b0ea68d7af9a6031a7ffda7ad66e0cb83315750"
-
 export function getProjectAvatarSource(id?: string, icon?: { color?: string; url?: string; override?: string }) {
-  if (id === OPENCODE_PROJECT_ID) return "https://opencode.ai/favicon.svg"
   if (icon?.override) return icon.override
+  if (id === OPENCODE_PROJECT_ID && icon?.url !== "") return "https://opencode.ai/favicon.svg"
   if (icon?.color) return undefined
-  return icon?.url
+  return icon?.url || undefined
 }
 
 export function projectForSession<T extends { id?: string; worktree: string; sandboxes?: string[] }>(
@@ -105,6 +104,19 @@ export function projectForSession<T extends { id?: string; worktree: string; san
     (project) =>
       pathKey(project.worktree) === directory || project.sandboxes?.some((sandbox) => pathKey(sandbox) === directory),
   )
+}
+
+export function projectForSessionPresentation(
+  session: Pick<Session, "projectID" | "directory">,
+  opened: LocalProject[],
+  stored: () => Project[],
+): LocalProject | undefined {
+  // Opened projects carry directory overrides, so only an exact match can supply them.
+  const directory = pathKey(session.directory)
+  const exact = opened.find((project) => pathKey(project.worktree) === directory)
+  if (exact) return exact
+  const repository = projectForSession(session, stored())
+  return repository ? { ...repository, expanded: false } : undefined
 }
 
 export const errorMessage = (err: unknown, fallback: string) => {

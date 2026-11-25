@@ -84,6 +84,7 @@ import {
   serverAuthorizationLayer,
 } from "./middleware/authorization"
 import { EventApi } from "./groups/event"
+import { ProjectAppearanceApi } from "./groups/project-appearance"
 import { PtyConnectApi } from "./groups/pty"
 import { eventHandlers } from "./handlers/event"
 import { configHandlers } from "./handlers/config"
@@ -97,6 +98,7 @@ import { TranscriptSearch } from "@opencode-ai/core/session/transcript-search"
 import { instanceHandlers } from "./handlers/instance"
 import { mcpHandlers } from "./handlers/mcp"
 import { permissionHandlers } from "./handlers/permission"
+import { projectAppearanceHandlers } from "./handlers/project-appearance"
 import { projectHandlers } from "./handlers/project"
 import { projectCopyHandlers } from "./handlers/project-copy"
 import { providerHandlers } from "./handlers/provider"
@@ -166,6 +168,7 @@ const cors = (corsOptions?: CorsOptions) =>
 
 // Route tree:
 // - rootApiRoutes: typed /global/* and control routes; auth is declared by RootHttpApi.
+// - projectAppearanceApiRoutes: private browser routes with the same auth as the root API.
 // - eventApiRoutes: typed SSE route with instance routing context and its existing API contract.
 // - ptyConnectApiRoutes: typed WebSocket upgrade route with ticket-aware auth.
 // - instanceApiRoutes: remaining typed instance routes.
@@ -180,6 +183,10 @@ const rootApiRoutes = HttpApiBuilder.layer(RootHttpApi).pipe(
   Layer.provide(TranscriptSearch.layer),
   Layer.provide(schemaErrorLayer),
   Layer.provide(httpApiAuthLayer),
+)
+const projectAppearanceApiRoutes = HttpApiBuilder.layer(ProjectAppearanceApi).pipe(
+  Layer.provide(projectAppearanceHandlers),
+  Layer.provide([schemaErrorLayer, httpApiAuthLayer]),
 )
 const eventApiRoutes = HttpApiBuilder.layer(EventApi).pipe(
   Layer.provide(eventHandlers),
@@ -333,6 +340,7 @@ export function createRoutes(
 
   return Layer.mergeAll(
     rootApiRoutes,
+    projectAppearanceApiRoutes,
     eventApiRoutes,
     ptyConnectApiRoutes,
     instanceRoutes,

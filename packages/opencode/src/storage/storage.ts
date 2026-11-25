@@ -5,6 +5,7 @@ import { FSUtil } from "@opencode-ai/core/fs-util"
 import { Effect, Exit, Layer, Option, RcMap, Schema, Context, TxReentrantLock } from "effect"
 import { NonNegativeInt } from "@opencode-ai/core/schema"
 import { Git } from "@/git"
+import { writePrivateJson } from "@/util/private-file"
 
 type Migration = (dir: string, fs: FSUtil.Interface, git: Git.Interface) => Effect.Effect<void, FSUtil.Error>
 
@@ -55,6 +56,7 @@ export interface Interface {
   readonly read: <T>(key: string[]) => Effect.Effect<T, Error>
   readonly update: <T>(key: string[], fn: (draft: T) => void) => Effect.Effect<T, Error>
   readonly write: <T>(key: string[], content: T) => Effect.Effect<void, FSUtil.Error>
+  readonly writeAtomic: <T>(key: string[], content: T) => Effect.Effect<void, FSUtil.Error>
   readonly list: (prefix: string[]) => Effect.Effect<string[][], FSUtil.Error>
 }
 
@@ -298,6 +300,22 @@ const layer = Layer.effect(
         yield* withResolved(key, (target, rw) => TxReentrantLock.withWriteLock(rw, writeJson(target, content)))
       })
 
+    const writeAtomic = Effect.fn("Storage.writeAtomic")(function* (key: string[], content: unknown) {
+      yield* withResolved(key, (target, rw) =>
+        TxReentrantLock.withWriteLock(
+          rw,
+          Effect.gen(function* () {
+            yield* fs.ensureDir(path.dirname(target))
+            // Hold the lock until the native write settles, even on interruption.
+            yield* Effect.tryPromise({
+              try: () => writePrivateJson(target, content),
+              catch: (cause) => new FSUtil.FileSystemError({ method: "writePrivateJson", cause }),
+            }).pipe(Effect.uninterruptible)
+          }),
+        ),
+      )
+    })
+
     const list: Interface["list"] = Effect.fn("Storage.list")(function* (prefix: string[]) {
       const dir = (yield* state).dir
       const cwd = path.join(dir, ...prefix)
@@ -317,6 +335,7 @@ const layer = Layer.effect(
       read,
       update,
       write,
+      writeAtomic,
       list,
     })
   }),

@@ -8,7 +8,7 @@ import { MenuV2 } from "@opencode-ai/ui/v2/menu-v2"
 import { useGlobal } from "@/context/global"
 import { useLanguage } from "@/context/language"
 import { ServerConnection, serverName } from "@/context/server"
-import { displayName, projectForSession } from "@/pages/layout/helpers"
+import { displayName, projectForSessionPresentation } from "@/pages/layout/helpers"
 import { SessionTabAvatar } from "@/pages/layout/session-tab-avatar"
 import type { Session } from "@opencode-ai/sdk/v2"
 import type { TabContent } from "@/context/settings"
@@ -60,11 +60,12 @@ export function TabNavItem(props: {
     const directory = session?.directory ?? props.fallbackDirectory
     if (!directory) return
     const ctx = serverCtx()
-    const value = session ?? { projectID: "", directory }
-    const open = projectForSession(value, ctx?.projects.list() ?? [])
-    if (open) return open
-    const known = projectForSession(value, ctx?.sync.data.project ?? [])
-    return known ? { ...known, expanded: false } : undefined
+    if (!ctx) return
+    return projectForSessionPresentation(
+      session ?? { projectID: "", directory },
+      ctx.projects.list(),
+      () => ctx.sync.data.project,
+    )
   })
   const title = createMemo(() => props.session()?.title ?? props.fallbackTitle)
 

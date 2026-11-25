@@ -6,7 +6,6 @@ import { For, Show } from "solid-js"
 import { type LocalProject, getAvatarColors } from "@/context/layout"
 import { Avatar } from "@opencode-ai/ui/avatar"
 import { useLanguage } from "@/context/language"
-import { getProjectAvatarSource } from "@/pages/layout/helpers"
 import { ServerConnection } from "@/context/server"
 import { createEditProjectModel } from "./edit-project"
 
@@ -50,11 +49,7 @@ export function DialogEditProject(props: { project: LocalProject; server: Server
                   onClick={model.iconClick}
                 >
                   <Show
-                    when={getProjectAvatarSource(props.project.id, {
-                      color: model.store.color,
-                      url: props.project.icon?.url,
-                      override: model.store.iconOverride,
-                    })}
+                    when={model.avatar()}
                     fallback={
                       <div class="size-full flex items-center justify-center">
                         <Avatar
@@ -150,7 +145,9 @@ export function DialogEditProject(props: { project: LocalProject; server: Server
             description={language.t("dialog.project.edit.worktree.startup.description")}
             placeholder={language.t("dialog.project.edit.worktree.startup.placeholder")}
             value={model.store.startup}
-            onChange={(v) => model.setStore("startup", v)}
+            onFocus={model.focusStartup}
+            onChange={model.changeStartup}
+            readOnly={model.save.isPending}
             spellcheck={false}
             class="max-h-14 w-full overflow-y-auto font-mono text-xs"
           />
@@ -160,7 +157,7 @@ export function DialogEditProject(props: { project: LocalProject; server: Server
           <Button type="button" variant="ghost" size="large" onClick={model.close}>
             {language.t("common.cancel")}
           </Button>
-          <Button type="submit" variant="primary" size="large" disabled={model.save.isPending}>
+          <Button type="submit" variant="primary" size="large" disabled={model.saveDisabled()}>
             {model.save.isPending ? language.t("common.saving") : language.t("common.save")}
           </Button>
         </div>

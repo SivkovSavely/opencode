@@ -10,7 +10,6 @@ import { For, Show } from "solid-js"
 import { useLanguage } from "@/context/language"
 import { getProjectAvatarVariant, type LocalProject } from "@/context/layout"
 import { ServerConnection } from "@/context/server"
-import { getProjectAvatarSource } from "@/pages/layout/helpers"
 import { createEditProjectModel } from "./edit-project"
 
 export function DialogEditProjectV2(props: { project: LocalProject; server: ServerConnection.Any }) {
@@ -58,11 +57,7 @@ export function DialogEditProjectV2(props: { project: LocalProject; server: Serv
               >
                 <ProjectAvatar
                   fallback={model.store.name || model.defaultName()}
-                  src={getProjectAvatarSource(props.project.id, {
-                    color: model.store.color,
-                    url: props.project.icon?.url,
-                    override: model.store.iconOverride,
-                  })}
+                  src={model.avatar()}
                   variant={getProjectAvatarVariant(model.store.color)}
                   class="!size-16 [&_[data-slot=project-avatar-surface]]:!rounded-[6px] [&_[data-slot=project-avatar-surface]]:!text-[32px]"
                 />
@@ -138,7 +133,9 @@ export function DialogEditProjectV2(props: { project: LocalProject; server: Serv
               value={model.store.startup}
               placeholder={language.t("dialog.project.edit.worktree.startup.placeholder")}
               spellcheck={false}
-              onInput={(event) => model.setStore("startup", event.currentTarget.value)}
+              onFocus={model.focusStartup}
+              onInput={(event) => model.changeStartup(event.currentTarget.value)}
+              readOnly={model.save.isPending}
             />
           </Field>
         </DialogBody>
@@ -146,7 +143,7 @@ export function DialogEditProjectV2(props: { project: LocalProject; server: Serv
           <ButtonV2 type="button" variant="neutral" disabled={model.save.isPending} onClick={model.close}>
             {language.t("common.cancel")}
           </ButtonV2>
-          <ButtonV2 type="submit" variant="contrast" disabled={model.save.isPending}>
+          <ButtonV2 type="submit" variant="contrast" disabled={model.saveDisabled()}>
             {model.save.isPending ? language.t("common.saving") : language.t("common.save")}
           </ButtonV2>
         </DialogFooter>

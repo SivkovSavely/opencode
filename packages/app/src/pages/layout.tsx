@@ -35,7 +35,7 @@ import type { DragEvent } from "@thisbeyond/solid-dnd"
 import { useProviders } from "@/hooks/use-providers"
 import { dismissToast, setV2Toast, showToast, ToastRegion } from "@/utils/toast"
 import { useServerSDK } from "@/context/server-sdk"
-import { normalizeProjectInfo } from "@/context/global-sync/utils"
+import { useGlobal } from "@/context/global"
 import { clearWorkspaceTerminals } from "@/context/terminal"
 import { pickSessionCacheEvictions } from "@/context/global-sync/session-cache"
 import { useNotification } from "@/context/notification"
@@ -113,6 +113,7 @@ export default function LegacyLayout(props: ParentProps) {
   const pickDirectory = useDirectoryPicker()
   const settings = useSettings()
   const server = useServer()
+  const global = useGlobal()
   const notification = useNotification()
   const permission = usePermission()
   const navigate = useNavigate()
@@ -1282,25 +1283,18 @@ export default function LegacyLayout(props: ParentProps) {
   })
 
   async function renameProject(project: LocalProject, next: string) {
-    const current = displayName(project)
-    if (next === current) return
-    const name = next === getFilename(project.worktree) ? "" : next
-
-    if (project.id && project.id !== "global") {
-      const sdk = serverSDK()
-      if ((await sdk.protocol) !== "v1") return
-      const result = await sdk.client.project
-        .update({ projectID: project.id, directory: project.worktree, name })
-        .then((response) => response.data)
-      if (!result) return
-      // const result = await serverSDK().api.project.update({ projectID: project.id, name })
-      serverSync().set("project", (items) =>
-        items.map((item) => (item.id === result.id ? normalizeProjectInfo(result) : item)),
+    const value = next.trim()
+    if (value === displayName(project)) return
+    const name = value && value !== getFilename(project.worktree) ? value : null
+    await global
+      .ensureServerCtx(serverSDK().server)
+      .appearance.update(project.worktree, { name })
+      .catch((cause) =>
+        showToast({
+          title: language.t("common.requestFailed"),
+          description: errorMessage(cause, language.t("common.requestFailed")),
+        }),
       )
-      return
-    }
-
-    serverSync().project.meta(project.worktree, { name })
   }
 
   const renameWorkspace = (directory: string, next: string, projectId?: string, branch?: string) => {
@@ -1930,7 +1924,6 @@ export default function LegacyLayout(props: ParentProps) {
       if (!item) return ""
       return item.name || getFilename(item.worktree)
     })
-    const projectId = createMemo(() => project()?.id ?? "")
     const worktree = createMemo(() => project()?.worktree ?? "")
     const slug = createMemo(() => {
       const dir = worktree()
@@ -2004,7 +1997,7 @@ export default function LegacyLayout(props: ParentProps) {
                 <div class="group/project flex items-start justify-between gap-2 py-2 pl-2 pr-0">
                   <div class="flex flex-col min-w-0">
                     <InlineEditor
-                      id={`project:${projectId()}`}
+                      id={`project:${panelProps.mobile ? "mobile" : panelProps.merged ? "desktop" : "peek"}:${project.worktree}`}
                       value={projectName}
                       onSave={(next) => {
                         void renameProject(project, next)

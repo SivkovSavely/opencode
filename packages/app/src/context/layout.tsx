@@ -5,10 +5,11 @@ import { createSimpleContext } from "@opencode-ai/ui/context"
 import { makeEventListener } from "@solid-primitives/event-listener"
 import { useServerSync } from "./server-sync"
 import { useServerSDK } from "./server-sdk"
-import { RECENTLY_CLOSED_DISPLAY_LIMIT, ServerConnection, useServer } from "./server"
+import { ServerConnection, useServer } from "./server"
 import { usePlatform } from "./platform"
 import { Project } from "@opencode-ai/sdk/v2"
-import { normalizeProjectInfo } from "./global-sync/utils"
+import { useGlobal } from "./global"
+import { AVATAR_COLOR_KEYS } from "./project-appearance"
 import { Persist, persisted, removePersisted } from "@/utils/persist"
 import { pathKey } from "@/utils/path-key"
 import { decode64 } from "@/utils/base64"
@@ -26,7 +27,6 @@ export { createSessionKeyReader, ensureSessionKey, pruneSessionKeys }
 
 export type { ProjectAvatarVariant }
 
-const AVATAR_COLOR_KEYS = ["pink", "mint", "orange", "purple", "cyan", "lime"] as const
 const DEFAULT_SIDEBAR_WIDTH = 344
 const DEFAULT_FILE_TREE_WIDTH = 200
 const DEFAULT_SESSION_WIDTH = 600
@@ -39,6 +39,12 @@ export function getAvatarColors(key?: string) {
     return {
       background: `var(--avatar-background-${key})`,
       foreground: `var(--avatar-text-${key})`,
+    }
+  }
+  if (key) {
+    return {
+      background: `var(--v2-avatar-bg-${getProjectAvatarVariant(key)})`,
+      foreground: "var(--text-base)",
     }
   }
   return {
@@ -163,6 +169,10 @@ export const { use: useLayout, provider: LayoutProvider } = createSimpleContext(
     const serverSdk = useServerSDK()
     const serverSync = useServerSync()
     const server = useServer()
+    const global = useGlobal()
+    const serverProjects = createMemo(() =>
+      server.current ? global.ensureServerCtx(server.current).projects : undefined,
+    )
     const tabs = useTabs()
     const platform = usePlatform()
     const location = useLocation()
@@ -433,32 +443,6 @@ export const { use: useLayout, provider: LayoutProvider } = createSimpleContext(
       })
     })
 
-    const [colors, setColors] = createStore<Record<string, AvatarColorKey>>({})
-    const colorRequested = new Map<string, AvatarColorKey>()
-
-    function pickAvailableColor(used: Set<string>): AvatarColorKey {
-      const available = AVATAR_COLOR_KEYS.filter((c) => !used.has(c))
-      if (available.length === 0) return AVATAR_COLOR_KEYS[Math.floor(Math.random() * AVATAR_COLOR_KEYS.length)]
-      return available[Math.floor(Math.random() * available.length)]
-    }
-
-    function enrich(project: { worktree: string; expanded: boolean }) {
-      const [childStore] = serverSync().child(project.worktree, { bootstrap: false })
-      const projectID = childStore.project
-      const metadata = projectID
-        ? serverSync().data.project.find((x) => x.id === projectID)
-        : serverSync().data.project.find((x) => x.worktree === project.worktree)
-
-      // Preserve local icon override from per-workspace localStorage cache (childStore.icon).
-      // Without this, different subdirectories of the same git repo would share the same
-      // icon from the database instead of using their individual overrides.
-      const base = { ...metadata, ...project }
-      if (childStore.icon) {
-        return { ...base, icon: { ...base.icon, override: childStore.icon } }
-      }
-      return base
-    }
-
     const roots = createMemo(() => {
       const map = new Map<string, string>()
       for (const project of serverSync().data.project) {
@@ -513,82 +497,6 @@ export const { use: useLayout, provider: LayoutProvider } = createSimpleContext(
       })
     })
 
-    const enriched = createMemo(() => server.projects.list().map(enrich))
-    const list = createMemo(() => {
-      const projects = enriched()
-      return projects.map((project) => {
-        const color = project.icon?.color ?? colors[project.worktree]
-        if (!color) return project
-        const icon = project.icon ? { ...project.icon, color } : { color }
-        return { ...project, icon }
-      })
-    })
-
-    createEffect(() => {
-      const projects = enriched()
-      if (projects.length === 0) return
-      if (!serverSync().ready) return
-
-      for (const project of projects) {
-        if (!project.id) continue
-        if (project.id === "global") continue
-        serverSync().project.icon(project.worktree, project.icon?.override)
-      }
-    })
-
-    createEffect(() => {
-      const projects = enriched()
-      if (projects.length === 0) return
-
-      for (const project of projects) {
-        if (project.icon?.color) colorRequested.delete(project.worktree)
-      }
-
-      const used = new Set<string>()
-      for (const project of projects) {
-        const color = project.icon?.color ?? colors[project.worktree]
-        if (color) used.add(color)
-      }
-
-      for (const project of projects) {
-        if (project.icon?.color || project.icon?.override || project.icon?.url) continue
-        const worktree = project.worktree
-        const existing = colors[worktree]
-        const color = existing ?? pickAvailableColor(used)
-        if (!existing) {
-          used.add(color)
-          setColors(worktree, color)
-        }
-        if (!project.id) continue
-
-        const requested = colorRequested.get(worktree)
-        if (requested === color) continue
-        colorRequested.set(worktree, color)
-
-        if (project.id === "global") {
-          serverSync().project.meta(worktree, { icon: { color } })
-          continue
-        }
-
-        const projectID = project.id
-        void (async () => {
-          const sdk = serverSdk()
-          if ((await sdk.protocol) !== "v1") return
-          return sdk.client.project
-            .update({ projectID, directory: worktree, icon: { color } })
-            .then((response) => response.data)
-            .then((result) => {
-              if (!result) return
-              serverSync().set("project", (items) =>
-                items.map((item) => (item.id === result.id ? normalizeProjectInfo(result) : item)),
-              )
-            })
-        })().catch(() => {
-          if (colorRequested.get(worktree) === color) colorRequested.delete(worktree)
-        })
-      }
-    })
-
     let sessionFrame: number | undefined
     let sessionTimer: number | undefined
 
@@ -631,15 +539,8 @@ export const { use: useLayout, provider: LayoutProvider } = createSimpleContext(
         },
       },
       projects: {
-        list,
-        recentlyClosed: createMemo(() => {
-          const known = new Set(serverSync().data.project.map((project) => pathKey(project.worktree)))
-          return server.projects
-            .recentlyClosed()
-            .filter((worktree) => known.has(pathKey(worktree)))
-            .slice(0, RECENTLY_CLOSED_DISPLAY_LIMIT)
-            .map((worktree) => enrich({ worktree, expanded: false }))
-        }),
+        list: () => serverProjects()?.list() ?? [],
+        recentlyClosed: () => serverProjects()?.recentlyClosed() ?? [],
         open(directory: string) {
           const root = rootFor(directory)
           if (server.projects.list().find((x) => x.worktree === root)) return

@@ -1,10 +1,13 @@
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { Context, Effect, Layer, Option, Schema, SynchronizedRef } from "effect"
+import { directoryKey, ProjectAppearance } from "@opencode-ai/schema/project-appearance"
+import { GlobalBus } from "@/bus/global"
 import { Storage } from "@/storage/storage"
 
 export * as GlobalProjectList from "./global-project-list"
 
 const KEY = ["global", "projects"]
+const APPEARANCE_KEY = ["global", "project-appearance"]
 
 const File = Schema.Struct({ projects: Schema.Array(Schema.String) })
 const decode = Schema.decodeUnknownOption(File, { onExcessProperty: "preserve" })
@@ -20,30 +23,23 @@ export type Operation = Schema.Schema.Type<typeof Operation>
 export interface Interface {
   readonly list: () => Effect.Effect<Array<string>, Storage.Error>
   readonly apply: (operation: Operation) => Effect.Effect<Array<string>, Storage.Error>
+  readonly getAppearance: () => Effect.Effect<ProjectAppearance.Snapshot, Storage.Error | Schema.SchemaError>
+  readonly patchAppearance: (
+    patch: ProjectAppearance.Patch,
+  ) => Effect.Effect<ProjectAppearance.Snapshot, Storage.Error | Schema.SchemaError>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/GlobalProjectList") {}
 
-// Identity for dedup/lookup. Mirrors the web `pathKey` rules so separator and
-// trailing-slash spellings from different clients collapse to one entry, while the
-// first spelling seen stays in the stored list.
-function identity(input: string) {
-  const value = input[1] === ":" || input.startsWith("\\\\") ? input.replaceAll("\\", "/") : input
-  const trimmed = value.replace(/\/+$/, "")
-  if (!trimmed) return value.startsWith("/") ? "/" : trimmed
-  if (/^[A-Za-z]:$/.test(trimmed)) return trimmed + "/"
-  return trimmed
-}
-
 function present(input: string) {
-  return identity(input) !== ""
+  return directoryKey(input) !== ""
 }
 
 export function applyOperation(current: ReadonlyArray<string>, operation: Operation) {
   if (operation.type === "merge") {
-    const seen = new Set(current.map(identity))
+    const seen = new Set(current.map(directoryKey))
     const added = operation.projects.filter((directory) => {
-      const key = identity(directory)
+      const key = directoryKey(directory)
       if (!present(directory) || seen.has(key)) return false
       seen.add(key)
       return true
@@ -51,17 +47,17 @@ export function applyOperation(current: ReadonlyArray<string>, operation: Operat
     return [...current, ...added]
   }
   if (operation.type === "add") {
-    const key = identity(operation.directory)
+    const key = directoryKey(operation.directory)
     if (!present(operation.directory)) return [...current]
-    if (current.some((directory) => identity(directory) === key)) return [...current]
+    if (current.some((directory) => directoryKey(directory) === key)) return [...current]
     // Match the web open() behavior: the newest project leads the list.
     return [operation.directory, ...current]
   }
   if (operation.type === "remove") {
-    const key = identity(operation.directory)
-    return current.filter((directory) => identity(directory) !== key)
+    const key = directoryKey(operation.directory)
+    return current.filter((directory) => directoryKey(directory) !== key)
   }
-  const from = current.findIndex((directory) => identity(directory) === identity(operation.directory))
+  const from = current.findIndex((directory) => directoryKey(directory) === directoryKey(operation.directory))
   if (from === -1) return [...current]
   const next = [...current]
   const [item] = next.splice(from, 1)
@@ -79,10 +75,12 @@ const layer = Layer.effect(
     const state = yield* Effect.cached(
       Effect.gen(function* () {
         const content = yield* storage.read<unknown>(KEY)
-        return SynchronizedRef.makeUnsafe(Option.match(decode(content), {
-          onNone: () => [] as Array<string>,
-          onSome: (value) => applyOperation([], { type: "merge", projects: value.projects }),
-        }))
+        return SynchronizedRef.makeUnsafe(
+          Option.match(decode(content), {
+            onNone: () => [] as Array<string>,
+            onSome: (value) => applyOperation([], { type: "merge", projects: value.projects }),
+          }),
+        )
       }).pipe(Effect.catch(() => Effect.succeed(SynchronizedRef.makeUnsafe<Array<string>>([])))),
     )
 
@@ -101,7 +99,49 @@ const layer = Layer.effect(
       )
     })
 
-    return Service.of({ list, apply })
+    const appearanceState = yield* Effect.cached(
+      storage.read<unknown>(APPEARANCE_KEY).pipe(
+        Effect.flatMap(Schema.decodeUnknownEffect(ProjectAppearance.Snapshot)),
+        Effect.catchTag("NotFoundError", () => Effect.succeed({ revision: 0, entries: {} })),
+        Effect.flatMap(SynchronizedRef.make<ProjectAppearance.Snapshot>),
+      ),
+    )
+
+    const getAppearance = Effect.fn("GlobalProjectList.getAppearance")(function* () {
+      return yield* SynchronizedRef.get(yield* appearanceState)
+    })
+
+    const patchAppearance = Effect.fn("GlobalProjectList.patchAppearance")(function* (patch: ProjectAppearance.Patch) {
+      const directory = directoryKey(patch.directory)
+      const ref = yield* appearanceState
+      return yield* SynchronizedRef.updateAndGetEffect(ref, (current) =>
+        Effect.gen(function* () {
+          const revision = current.revision + 1
+          if (!Number.isSafeInteger(revision))
+            return yield* Effect.die(new Error("Project appearance revision exhausted"))
+          const previous = Object.hasOwn(current.entries, directory) ? current.entries[directory] : undefined
+          const next = {
+            revision,
+            entries: { ...current.entries, [directory]: { ...previous, ...patch.appearance } },
+          }
+          yield* storage.writeAtomic(APPEARANCE_KEY, next)
+          return next
+        }),
+      ).pipe(
+        Effect.tap(() =>
+          Effect.sync(() => {
+            GlobalBus.emit("event", {
+              directory: "global",
+              payload: { type: ProjectAppearance.updated, properties: {} },
+            })
+          }),
+        ),
+        // A disconnected client must not interrupt us between persistence and invalidation.
+        Effect.uninterruptible,
+      )
+    })
+
+    return Service.of({ list, apply, getAppearance, patchAppearance })
   }),
 )
 

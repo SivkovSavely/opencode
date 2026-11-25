@@ -1,37 +1,58 @@
 import { getFilename } from "@opencode-ai/core/util/path"
+import { ProjectAppearance } from "@opencode-ai/schema/project-appearance"
 import { useDialog } from "@opencode-ai/ui/context/dialog"
 import { useMutation } from "@tanstack/solid-query"
 import { normalizeProjectInfo } from "@/context/global-sync/utils"
-import { createMemo } from "solid-js"
+import { Schema } from "effect"
+import { createMemo, onCleanup } from "solid-js"
 import { createStore } from "solid-js/store"
 import { useGlobal } from "@/context/global"
 import { type LocalProject } from "@/context/layout"
 import { ServerConnection } from "@/context/server"
+import { useLanguage } from "@/context/language"
+import { errorMessage, getProjectAvatarSource } from "@/pages/layout/helpers"
+import { showToast } from "@/utils/toast"
+
+const isAppearance = Schema.is(ProjectAppearance.Fields)
 
 export function createEditProjectModel(props: { project: LocalProject; server: ServerConnection.Any }) {
   const dialog = useDialog()
   const global = useGlobal()
+  const language = useLanguage()
   const serverCtx = createMemo(() => global.ensureServerCtx(props.server))
   const folderName = createMemo(() => getFilename(props.project.worktree))
   const defaultName = createMemo(() => props.project.name || folderName())
-  const [store, setStore] = createStore({
+  const initial = {
     name: defaultName(),
     color: props.project.icon?.color,
     iconOverride: props.project.icon?.override,
     startup: props.project.commands?.start ?? "",
     dragOver: false,
     iconHover: false,
-  })
+  }
+  const [store, setStore] = createStore({ ...initial, iconStatus: undefined as "reading" | "failed" | undefined })
+  let startupLoad: Promise<{ id: string; start: string }> | undefined
+  let startupEdited = false
+  let savedStartup: string | undefined
+  let disposed = false
   let iconInput: HTMLInputElement | undefined
+  let iconReader: FileReader | undefined
+
+  onCleanup(() => (disposed = true))
 
   function selectFile(file: File) {
     if (!file.type.startsWith("image/")) return
     const reader = new FileReader()
-    reader.onload = (event) => {
-      const result = event.target?.result
-      if (typeof result !== "string") return
-      setStore("iconOverride", result)
-      setStore("iconHover", false)
+    iconReader = reader
+    setStore("iconStatus", "reading")
+    reader.onloadend = () => {
+      if (iconReader !== reader) return
+      iconReader = undefined
+      if (typeof reader.result !== "string") {
+        setStore("iconStatus", "failed")
+        return
+      }
+      setStore({ iconOverride: reader.result, iconHover: false, iconStatus: undefined })
     }
     reader.readAsDataURL(file)
   }
@@ -58,56 +79,116 @@ export function createEditProjectModel(props: { project: LocalProject; server: S
   }
 
   function iconClick() {
-    if (store.iconOverride && store.iconHover) {
-      setStore("iconOverride", "")
+    if (store.iconOverride) {
+      iconReader = undefined
+      setStore({ iconOverride: "", iconStatus: undefined })
       return
     }
     iconInput?.click()
   }
 
+  const avatar = () =>
+    getProjectAvatarSource(props.project.id, {
+      color: store.color,
+      url: store.iconOverride === "" || (store.color && store.color !== initial.color) ? "" : props.project.icon?.url,
+      override: store.iconOverride,
+    })
+
+  const loadFailure = () => language.t("toast.project.reloadFailed.title", { project: defaultName() })
+
+  function loadStartup() {
+    return (startupLoad ??= (async () => {
+      const { sdk } = serverCtx()
+      // Resolving an unknown ID can boot the folder, and current's metadata is an instance-time snapshot.
+      const id =
+        props.project.id || (await sdk.api.project.current({ location: { directory: props.project.worktree } })).id
+      if (!id) throw new Error(loadFailure())
+      if (id === "global") return { id, start: initial.startup.trim() }
+      const project = (await sdk.api.project.list()).find((item) => item.id === id)
+      if (!project) throw new Error(loadFailure())
+      const start = project.commands?.start ?? ""
+      if (!disposed && !startupEdited) setStore("startup", start)
+      return { id, start: start.trim() }
+    })().catch((cause) => {
+      startupLoad = undefined
+      throw cause
+    }))
+  }
+
+  function focusStartup() {
+    if (startupLoad || save.isPending) return
+    void loadStartup().catch((cause) => {
+      if (disposed || save.isPending) return
+      showToast({
+        title: language.t("dialog.project.edit.worktree.startup"),
+        description: errorMessage(cause, loadFailure()),
+      })
+    })
+  }
+
+  function changeStartup(value: string) {
+    startupEdited = true
+    setStore("startup", value)
+  }
+
+  async function updateStartup(start: string) {
+    const { id, start: baseline } = await loadStartup()
+    if (start === (savedStartup ?? baseline)) return
+    const ctx = serverCtx()
+    const { worktree } = props.project
+    if (id === "global") {
+      ctx.sync.project.meta(worktree, { commands: { start: start || undefined } })
+      savedStartup = start
+      return
+    }
+    const failure = language.t("dialog.project.edit.worktree.startup.error")
+    if ((await ctx.sdk.protocol) !== "v1") throw new Error(failure)
+    const { data, response } = await ctx.sdk.client.project.update({
+      projectID: id,
+      directory: worktree,
+      commands: { start },
+    })
+    if (!response?.ok || data?.id !== id || (data.commands?.start ?? "") !== start) throw new Error(failure)
+    ctx.sync.set("project", (items) => items.map((item) => (item.id === id ? normalizeProjectInfo(data) : item)))
+    savedStartup = start
+  }
+
   const save = useMutation(() => ({
     mutationFn: async () => {
-      const name = store.name.trim() === folderName() ? "" : store.name.trim()
-      const start = store.startup.trim()
-
-      if (props.project.id && props.project.id !== "global") {
-        if ((await serverCtx().sdk.protocol) !== "v1") return
-        const project = await serverCtx()
-          .sdk.client.project.update({
-            projectID: props.project.id,
-            directory: props.project.worktree,
-            name,
-            icon: { color: store.color || "", override: store.iconOverride || "" },
-            commands: { start },
-          })
-          .then((result) => result.data)
-        if (!project) return
-        // const project = await serverCtx().sdk.api.project.update({
-        //   projectID: props.project.id,
-        //   name,
-        //   icon: { color: store.color || "", override: store.iconOverride || "" },
-        //   commands: { start },
-        // })
-        serverCtx().sync.set("project", (items) =>
-          items.map((item) => (item.id === project.id ? normalizeProjectInfo(project) : item)),
-        )
-        serverCtx().sync.project.icon(props.project.worktree, store.iconOverride || undefined)
-        dialog.close()
-        return
+      const ctx = serverCtx()
+      const { worktree } = props.project
+      const name = store.name.trim()
+      const patch: ProjectAppearance.Fields = {
+        ...(name !== initial.name.trim() && { name: name && name !== folderName() ? name : null }),
+        ...(store.color !== initial.color && { color: store.color || null }),
+        ...(store.iconOverride !== initial.iconOverride && { icon: store.iconOverride || null }),
+      }
+      if (store.iconStatus === "failed" || !isAppearance(patch)) {
+        throw new Error(language.t("dialog.project.edit.icon.invalid"))
       }
 
-      serverCtx().sync.project.meta(props.project.worktree, {
-        name,
-        icon: { color: store.color || undefined, override: store.iconOverride || undefined },
-        commands: { start: start || undefined },
-      })
+      if (startupEdited) await updateStartup(store.startup.trim())
+
+      if (Object.keys(patch).length) {
+        await ctx.appearance.update(worktree, patch).catch((cause) => {
+          if (savedStartup === undefined) throw cause
+          throw new Error(language.t("dialog.project.edit.appearance.partial"), { cause })
+        })
+      }
       dialog.close()
     },
+    onError: (cause) =>
+      showToast({
+        title: language.t("common.requestFailed"),
+        description: errorMessage(cause, language.t("common.requestFailed")),
+      }),
   }))
+
+  const saveDisabled = () => save.isPending || store.iconStatus === "reading"
 
   function submit(event: SubmitEvent) {
     event.preventDefault()
-    if (save.isPending) return
+    if (saveDisabled()) return
     save.mutate()
   }
 
@@ -117,12 +198,16 @@ export function createEditProjectModel(props: { project: LocalProject; server: S
     folderName,
     defaultName,
     save,
+    saveDisabled,
+    avatar,
     submit,
     drop,
     dragOver,
     dragLeave,
     inputChange,
     iconClick,
+    focusStartup,
+    changeStartup,
     close() {
       dialog.close()
     },

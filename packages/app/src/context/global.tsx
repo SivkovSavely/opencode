@@ -10,6 +10,8 @@ import { createServerProjectSync } from "./project-list-sync"
 import { getOwner } from "solid-js/web"
 import { QueryClient } from "@tanstack/solid-query"
 import type { ServerScope } from "@/utils/server-scope"
+import { applyProjectAppearance, createServerProjectAppearance } from "./project-appearance"
+import { usePlatform } from "./platform"
 
 export const { use: useGlobal, provider: GlobalProvider } = createSimpleContext({
   name: "Global",
@@ -111,22 +113,21 @@ function createServerCtx(
   const sdk = createServerSdkContext(conn, scope)
   const sync = createServerSyncContext(sdk)
   const projectSync = createServerProjectSync({ sdk, projects })
+  const appearance = createServerProjectAppearance(sdk, usePlatform().fetch ?? globalThis.fetch)
 
   function enrich(project: { worktree: string; expanded: boolean }) {
     const [childStore] = sync.child(project.worktree, { bootstrap: false })
     const projectID = childStore.project
-    const metadata = projectID
-      ? sync.data.project.find((x) => x.id === projectID)
-      : sync.data.project.find((x) => x.worktree === project.worktree)
-
-    // Preserve local icon override from per-workspace localStorage cache (childStore.icon).
-    // Without this, different subdirectories of the same git repo would share the same
-    // icon from the database instead of using their individual overrides.
-    const base = { ...metadata, ...project }
-    if (childStore.icon) {
-      return { ...base, icon: { ...base.icon, override: childStore.icon } }
-    }
-    return base
+    const metadata =
+      projectID && projectID !== "global"
+        ? sync.data.project.find((x) => x.id === projectID)
+        : sync.data.project.find((x) => pathKey(x.worktree) === pathKey(project.worktree))
+    return applyProjectAppearance(
+      { ...metadata, id: metadata?.id ?? (projectID || undefined), ...project },
+      appearance.get(project.worktree),
+      !projectID || projectID === "global" ? childStore.projectMeta : undefined,
+      childStore.icon,
+    )
   }
 
   const projectsList = createMemo(() => projects.list().map(enrich))
@@ -146,6 +147,7 @@ function createServerCtx(
     queryClient,
     sdk,
     sync,
+    appearance,
     isLocal,
     projects: {
       ...projects,
