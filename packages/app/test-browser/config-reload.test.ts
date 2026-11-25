@@ -37,7 +37,7 @@ plugin({
 
 const { PlatformProvider } = await import("../src/context/platform")
 const { LanguageProvider } = await import("../src/context/language")
-const { SettingsProvider } = await import("../src/context/settings")
+const { SettingsProvider, useSettings } = await import("../src/context/settings")
 const { DialogProvider } = await import("@opencode-ai/ui/context/dialog")
 const { CommandProvider, useCommand } = await import("../src/context/command")
 const { ServerLifecycleCommands } = await import("../src/components/server-lifecycle-commands")
@@ -80,7 +80,10 @@ export const selectionFromLines = (selection: unknown) => selection
 export const useLayout = () => ({})
 export const useComments = () => ({ all: () => [] })
 export const usePermission = () => ({ isAutoAcceptingDirectory: () => false, isAutoAccepting: () => false })
-export const createPromptSubmit = () => ({ handleSubmit() {}, abort() {} })
+export const createPromptSubmit = (input: { onSubmit?: () => void }) => ({
+  handleSubmit: () => input.onSubmit?.(),
+  abort() {},
+})
 
 const cleanup: (() => void)[] = []
 afterEach(() => {
@@ -597,17 +600,32 @@ function composer(layout: "v1" | "v2", initial: ReturnType<typeof skillServer>, 
   selected = () => servers[selection.index]!.server
   composerSDK = () => servers[selection.index]!.directory
   const state = createPromptState()
-  const result: { controller?: ReturnType<typeof usePromptInputV2Controller>; editor?: HTMLDivElement } = {}
+  const result: {
+    controller?: ReturnType<typeof usePromptInputV2Controller>
+    editor?: HTMLDivElement
+    settings?: ReturnType<typeof useSettings>
+    command?: ReturnType<typeof useCommand>
+  } = {}
+  const submissions: string[] = []
+  const draft = () =>
+    state
+      .current()
+      .map((part) => ("content" in part ? part.content : ""))
+      .join("")
+  const submit = () => submissions.push(draft())
   const props = {
     state,
     controls: composerControls,
     history: { entries: () => [], add() {} },
-    submission: { handleSubmit() {}, abort() {} },
+    submission: { handleSubmit: submit, abort() {} },
+    onSubmit: submit,
     ref: (element: HTMLDivElement) => {
       result.editor = element
     },
   } as Parameters<typeof PromptInput>[0]
   const content = () => {
+    result.settings = useSettings()
+    result.command = useCommand()
     if (layout === "v1") return createComponent(PromptInput, props)
     result.controller = usePromptInputV2Controller(props)
     return suspense ? createComponent(PromptInputV2Composer, { controller: result.controller }) : null
@@ -639,12 +657,83 @@ function composer(layout: "v1" | "v2", initial: ReturnType<typeof skillServer>, 
     ...mounted,
     state,
     result,
+    draft,
+    submissions,
     select: (next: ReturnType<typeof skillServer>) => {
       servers.push(next)
       setSelection("index", servers.length - 1)
     },
   }
 }
+
+test.each(["v1", "v2"] as const)(
+  "%s composer sends on the configured chord and keeps Enter as newline",
+  async (layout) => {
+    const mounted = composer(layout, skillServer("keybind"), layout === "v2")
+    await waitFor(() => !!mounted.host.querySelector('[data-component="prompt-input"][contenteditable="true"]'))
+    const editor = mounted.host.querySelector<HTMLDivElement>(
+      '[data-component="prompt-input"][contenteditable="true"]',
+    )!
+    const settings = mounted.result.settings!
+    settings.general.setEnterNewline(true)
+    settings.keybinds.set("prompt.send", "ctrl+shift+enter")
+    try {
+      editor.focus()
+      editor.textContent = "draft"
+      const selection = window.getSelection()!
+      selection.collapse(editor.firstChild!, 5)
+      editor.dispatchEvent(new InputEvent("input", { bubbles: true }))
+      const press = (key: string, options: KeyboardEventInit = {}) =>
+        editor.dispatchEvent(new KeyboardEvent("keydown", { key, bubbles: true, cancelable: true, ...options }))
+
+      press("Enter", { shiftKey: true })
+      expect(mounted.submissions).toEqual([])
+      press("Enter")
+      expect(mounted.draft()).toBe("draft\n")
+      press("Enter", { ctrlKey: true, shiftKey: true, isComposing: true })
+      press("Enter", { ctrlKey: true, shiftKey: true, repeat: true })
+      expect(mounted.submissions).toEqual([])
+      press("Enter", { ctrlKey: true, shiftKey: true })
+      expect(mounted.submissions).toEqual(["draft\n"])
+
+      settings.keybinds.set("prompt.newline", "alt+;")
+      expect(press("Enter")).toBe(false)
+      expect(mounted.draft()).toBe("draft\n")
+      press(";", { altKey: true })
+      expect(mounted.draft()).toBe("draft\n\n")
+
+      settings.keybinds.set("prompt.send", "alt+s")
+      press("Enter", { ctrlKey: true, shiftKey: true })
+      expect(mounted.submissions).toEqual(["draft\n"])
+      press("s", { altKey: true })
+      expect(mounted.submissions).toEqual(["draft\n", "draft\n\n"])
+    } finally {
+      settings.keybinds.resetAll()
+      settings.general.setEnterNewline(false)
+    }
+  },
+)
+
+test("the shortcut catalog shows composer defaults and the current overrides", () => {
+  const mounted = composer("v2", skillServer("keybind-catalog"))
+  const command = mounted.result.command!
+  const settings = mounted.result.settings!
+  try {
+    settings.general.setEnterNewline(true)
+    expect(command.catalog.filter((item) => item.id === "prompt.send" || item.id === "prompt.newline")).toEqual([
+      { id: "prompt.send", title: "Send", keybind: "shift+enter" },
+      { id: "prompt.newline", title: "New line", keybind: "enter" },
+    ])
+    const initial = command.keybind("prompt.send")
+    settings.keybinds.set("prompt.send", "enter")
+    expect(command.keybind("prompt.send")).toBe("Enter")
+    settings.keybinds.resetAll()
+    expect(command.keybind("prompt.send")).toBe(initial)
+  } finally {
+    settings.keybinds.resetAll()
+    settings.general.setEnterNewline(false)
+  }
+})
 
 test.each(["v1", "v2"] as const)("V1 composer reloads actual skill suggestions using %s protocol", async (protocol) => {
   const server = skillServer("legacy", protocol)

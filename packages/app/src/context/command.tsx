@@ -348,6 +348,26 @@ export const { use: useCommand, provider: CommandProvider } = createSimpleContex
 
     const suspended = () => store.suspendCount > 0
 
+    // Editor shortcuts belong in settings, but not in the global keymap or command palette.
+    const promptCatalog = createMemo(() => {
+      const swapped = settings.general.enterNewline()
+      return [
+        { id: "prompt.send", title: language.t("prompt.action.send"), keybind: swapped ? "shift+enter" : "enter" },
+        {
+          id: "prompt.newline",
+          title: language.t("prompt.action.newline"),
+          keybind: swapped ? "enter" : "shift+enter",
+        },
+      ] as const
+    })
+    const fullCatalog = createMemo((): (CommandCatalogItem & { id: string })[] => [
+      ...catalogOptions(),
+      ...promptCatalog(),
+    ])
+    const promptKeymap = createMemo(() =>
+      promptCatalog().map((item) => ({ id: item.id, keys: parseKeybind(bind(item.id, item.keybind) ?? "") })),
+    )
+
     const palette = createMemo(() => {
       const config = settings.keybinds.get(PALETTE_ID) ?? DEFAULT_PALETTE_KEYBIND
       const keybinds = parseKeybind(config)
@@ -443,6 +463,8 @@ export const { use: useCommand, provider: CommandProvider } = createSimpleContex
     const keybindConfig = (id: string) => {
       if (id === PALETTE_ID) return settings.keybinds.get(PALETTE_ID) ?? DEFAULT_PALETTE_KEYBIND
       const base = actionId(id)
+      const prompt = promptCatalog().find((item) => item.id === base)
+      if (prompt) return bind(base, prompt.keybind)
       return options().find((x) => actionId(x.id) === base)?.keybind ?? bind(base, catalog[base]?.keybind)
     }
 
@@ -460,13 +482,17 @@ export const { use: useCommand, provider: CommandProvider } = createSimpleContex
         const config = keybindConfig(id)
         return config ? formatKeybindParts(config, language.t) : []
       },
+      promptKeybind(event: KeyboardEvent) {
+        if (suspended() || dialog.active || event.defaultPrevented || event.isComposing || event.keyCode === 229) return
+        return promptKeymap().find((item) => matchKeybind(item.keys, event))?.id
+      },
       show: showPalette,
       keybinds(enabled: boolean) {
         setStore("suspendCount", (count) => Math.max(0, count + (enabled ? -1 : 1)))
       },
       suspended,
       get catalog() {
-        return catalogOptions()
+        return fullCatalog()
       },
       get options() {
         return options()

@@ -43,7 +43,7 @@ export type PromptInputV2Props = {
   variantControlVisible?: boolean
   attachKeybind?: string[]
   attachShortcut?: string
-  enterNewline?: boolean
+  keyAction?: (event: KeyboardEvent) => "prompt.send" | "prompt.newline" | undefined
 }
 
 export function PromptInputV2(props: PromptInputV2Props) {
@@ -56,6 +56,14 @@ export function PromptInputV2(props: PromptInputV2Props) {
   const updateCursor = () => {
     if (composing || !editor || !window.getSelection()?.isCollapsed) return
     props.controller.onCursor(promptInputV2Cursor(editor))
+  }
+  const updateInput = (target: HTMLDivElement) => {
+    const cursor = promptInputV2Cursor(target)
+    const prompt = parsePromptInputV2Editor(target)
+    const images = props.controller.parts().filter((part) => part.type === "image")
+    localInput = true
+    if (!composing)
+      props.controller.onInput(prompt.map((part) => part.content).join(""), [...prompt, ...images], cursor)
   }
   const mode = createMemo(() => state.mode)
   const buttons = createMemo(() => ({
@@ -168,14 +176,7 @@ export function PromptInputV2(props: PromptInputV2Props) {
               event.preventDefault()
               props.controller.undo(event.inputType === "historyRedo")
             }}
-            onInput={(event) => {
-              const cursor = promptInputV2Cursor(event.currentTarget)
-              const prompt = parsePromptInputV2Editor(event.currentTarget)
-              const images = props.controller.parts().filter((part) => part.type === "image")
-              localInput = true
-              if (!composing)
-                props.controller.onInput(prompt.map((part) => part.content).join(""), [...prompt, ...images], cursor)
-            }}
+            onInput={(event) => updateInput(event.currentTarget)}
             onCompositionStart={() => {
               composing = true
             }}
@@ -190,13 +191,35 @@ export function PromptInputV2(props: PromptInputV2Props) {
               )
             }}
             onKeyDown={(event) => {
-              if (composing || event.isComposing) return
-              if (props.controller.onKeyDown(event)) return
-              if (event.key === "Enter" && !event.isComposing && event.shiftKey === !!props.enterNewline) {
+              if (props.disabled || props.readOnly || composing || event.isComposing || event.keyCode === 229) return
+              if (event.defaultPrevented) return
+              const enter = event.key === "Enter" && !event.ctrlKey && !event.metaKey && !event.altKey
+              const action = props.keyAction
+                ? props.keyAction(event)
+                : enter && !event.shiftKey
+                  ? "prompt.send"
+                  : undefined
+              if (action === "prompt.newline") {
                 event.preventDefault()
-                if (event.repeat) return
-                if (!props.disabled && props.controller.canSubmit()) props.controller.submit()
+                const target = event.currentTarget
+                const selection = window.getSelection()
+                if (!selection?.rangeCount) return
+                const range = selection.getRangeAt(0)
+                if (!target.contains(range.commonAncestorContainer)) return
+                range.deleteContents()
+                const newline = document.createTextNode("\n")
+                range.insertNode(newline)
+                selection.collapse(newline, 1)
+                updateInput(target)
+                return
               }
+              if ((action !== "prompt.send" || enter) && props.controller.onKeyDown(event)) return
+              if (action === "prompt.send") {
+                event.preventDefault()
+                if (!event.repeat && props.controller.canSubmit()) props.controller.submit()
+                return
+              }
+              if (props.keyAction && event.key === "Enter") event.preventDefault()
             }}
             onKeyUp={updateCursor}
             onPointerUp={updateCursor}

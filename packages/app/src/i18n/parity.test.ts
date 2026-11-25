@@ -195,6 +195,7 @@ const appFallbackKeys = new Set([
   "queue.retry",
   "queue.migrate.failed",
   "prompt.action.queue",
+  "prompt.action.newline",
   "prompt.action.steer",
   "session.jumpToMessage.title",
   "session.jumpToMessage.menu",

@@ -53,7 +53,6 @@ import { useCommand } from "@/context/command"
 import { usePermission } from "@/context/permission"
 import { useLanguage } from "@/context/language"
 import { usePlatform } from "@/context/platform"
-import { useSettings } from "@/context/settings"
 import { createSessionTabs } from "@/pages/session/helpers"
 import {
   copyEditorSelection,
@@ -146,7 +145,6 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
   const permission = usePermission()
   const language = useLanguage()
   const platform = usePlatform()
-  const settings = useSettings()
   const tabs = () => props.controls.session.tabs
   let editorRef!: HTMLDivElement
   let fileInputRef: HTMLInputElement | undefined
@@ -1443,6 +1441,27 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
     })
 
   const handleKeyDown = (event: KeyboardEvent) => {
+    if (event.defaultPrevented || isImeComposing(event)) return
+
+    const action = command.promptKeybind(event)
+    if (action === "prompt.newline") {
+      event.preventDefault()
+      addPart({ type: "text", content: "\n", start: 0, end: 0 })
+      return
+    }
+
+    const enter = event.key === "Enter" && !event.ctrlKey && !event.metaKey && !event.altKey
+    if (
+      action === "prompt.send" &&
+      (!enter ||
+        !store.popover ||
+        (store.mode === "normal" && parseQueueCommand(materializePrompt(prompt.current()).text)))
+    ) {
+      event.preventDefault()
+      if (!event.repeat && !(working() && blank())) void handleSubmit(event)
+      return
+    }
+
     if ((event.metaKey || event.ctrlKey) && !event.altKey && !event.shiftKey && event.key.toLowerCase() === "u") {
       event.preventDefault()
       if (store.mode !== "normal") return
@@ -1517,28 +1536,6 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
       }
     }
 
-    // Handle the newline key BEFORE IME check - it is never used for IME input
-    // and should always insert a newline regardless of composition state
-    if (event.key === "Enter" && event.shiftKey !== settings.general.enterNewline()) {
-      addPart({ type: "text", content: "\n", start: 0, end: 0 })
-      event.preventDefault()
-      return
-    }
-
-    if (event.key === "Enter" && isImeComposing(event)) {
-      return
-    }
-
-    if (
-      store.mode === "normal" &&
-      event.key === "Enter" &&
-      parseQueueCommand(materializePrompt(prompt.current()).text)
-    ) {
-      event.preventDefault()
-      if (!event.repeat) void handleSubmit(event)
-      return
-    }
-
     const ctrl = event.ctrlKey && !event.metaKey && !event.altKey && !event.shiftKey
 
     if (store.popover) {
@@ -1547,7 +1544,7 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
         event.preventDefault()
         return
       }
-      const nav = event.key === "ArrowUp" || event.key === "ArrowDown" || event.key === "Enter"
+      const nav = event.key === "ArrowUp" || event.key === "ArrowDown" || enter
       const ctrlNav = ctrl && (event.key === "n" || event.key === "p")
       if (nav || ctrlNav) {
         if (store.popover === "at") {
@@ -1597,13 +1594,7 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
       return
     }
 
-    // Note: the newline key is handled earlier, before IME check
-    if (event.key === "Enter" && event.shiftKey === settings.general.enterNewline()) {
-      event.preventDefault()
-      if (event.repeat) return
-      if (working() && blank()) return
-      void handleSubmit(event)
-    }
+    if (event.key === "Enter") event.preventDefault()
   }
 
   const handleSlashMenuKeyDown = (event: KeyboardEvent) => {

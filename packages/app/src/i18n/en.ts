@@ -539,6 +539,7 @@ export const dict = {
   "prompt.menu.shellCommand": "Shell command",
   "prompt.attachment.remove": "Remove attachment",
   "prompt.action.send": "Send",
+  "prompt.action.newline": "New line",
   "prompt.action.stop": "Stop",
 
   "prompt.toast.pasteUnsupported.title": "Unsupported attachment",
